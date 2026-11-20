@@ -3,7 +3,8 @@
 //! [`StarField`] uploads one [`StarInstance`] per catalogue star and draws them all with one
 //! instanced draw of a six-vertex quad, blended additively into `hdr`. The projection, PSF,
 //! brightness and culling rules live in `shaders/stars.wgsl`. [`crate::psf`] and
-//! [`project_star`], [`pixel_solid_angle`] and [`star_display_energy`] here are their CPU twins.
+//! [`project_star`], [`off_axis_cos`], [`pixel_solid_angle`], [`pixel_solid_angle_off_axis`],
+//! [`star_display_energy`] and [`star_display_energy_off_axis`] here are their CPU twins.
 
 use std::sync::OnceLock;
 
@@ -24,14 +25,19 @@ pub const STARS_SHADER: &str = "sky/stars.wgsl";
 /// Default star exposure [EV at ISO 100]: an artistic choice, the "Eye-adapted stars" dual
 /// exposure of design §7 item 4. The HUD exposes it as the star EV slider.
 ///
-/// On screen, a star's pixels are E·w/(Ω_pixel·1.2·2^star_ev100), where w is the PSF weight.
-/// That is the shader's E/Ω·2^(scene − star) times the tonemap's exposure_scale(scene), and the
-/// scene EV cancels. Calibrated at 1920×1080 with fov_y = 60° against uni-post's AgX (black point
-/// 0.18·2^−12.47 ≈ 3.2e-5; the display-encoded output is roughly the sRGB code / 255):
+/// On screen, a star's pixels are E·w/(Ω(θ)·1.2·2^star_ev100), where w is the PSF weight and
+/// Ω(θ) = Ω_c·cos³θ the solid angle of a pixel θ off the optical axis. That is the shader's
+/// E/Ω(θ)·2^(scene − star) times the tonemap's exposure_scale(scene), and the scene EV cancels.
+/// Calibrated on the optical axis at 1920×1080 with fov_y = 60° against uni-post's AgX (black
+/// point 0.18·2^−12.47 ≈ 3.2e-5; the display-encoded output is roughly the sRGB code / 255):
 /// - V = 6.5, the naked-eye limit, centred on a pixel, peaks at 7.2e-4: 4.5 stops above AgX
 ///   black, about 12/255, just visible on black.
 /// - V = 0 peaks at 0.29 (about 216/255); its glare halo fades to black about 6 px out.
 /// - Sirius (V = −1.46) peaks at 1.1 (about 245/255).
+///
+/// Off the axis, pixel values are 1/cos³θ higher (+1.6 EV at the side edges and +1.9 EV in the
+/// corners at 60° and 16:9). Off-axis pixels subtend less sky, so this keeps each star as bright
+/// relative to the sky around it as at the centre.
 ///
 /// Each +1 EV halves star brightness. `default_star_exposure_calibration` pins these numbers.
 pub const DEFAULT_STAR_EV100: f32 = 1.0;
@@ -83,20 +89,58 @@ pub fn register_shaders(lib: &mut ShaderLib) {
     lib.add(STARS_SHADER, include_str!("../shaders/stars.wgsl"));
 }
 
-/// Solid angle of one pixel [sr]: (2·tan(fov_y/2) / H)², the small-angle value at the image
-/// centre. `fov_y` is the full vertical field of view [rad] and `height_px` the image height.
-/// Twin of `pixel_solid_angle` in `stars.wgsl`.
+/// Solid angle Ω_c of one pixel on the optical axis [sr]: (2·tan(fov_y/2) / H)², the small-angle
+/// value at the image centre. `fov_y` is the full vertical field of view [rad] and `height_px`
+/// the image height. Off the axis use [`pixel_solid_angle_off_axis`]. Twin of
+/// `pixel_solid_angle` in `stars.wgsl`.
 pub fn pixel_solid_angle(fov_y: f32, height_px: f32) -> f32 {
     let side = 2.0 * (0.5 * fov_y).tan() / height_px;
     side * side
 }
 
-/// A star's display-normalised energy: the sum of its pixel values after the tonemap's exposure,
-/// E/(Ω_pixel·1.2·2^star_ev100). It equals E/Ω·2^(scene − star) × exposure_scale(scene), where
-/// exposure_scale(ev) = 1/(1.2·2^ev) (uni-gfx `camera.wgsl`; Lagarde & de Rousiers 2014 §4.1.1).
-/// The scene EV cancels. Twin of `energy` in `vs_main` of `stars.wgsl`.
+/// Solid angle [sr] of a pixel whose centre lies θ off the optical axis, with
+/// `cos_theta` = cos θ (from [`off_axis_cos`]): Ω(θ) = Ω_c·cos³θ.
+///
+/// On a rectilinear (pinhole) image plane at distance d, that pixel is d/cosθ from the eye and
+/// tilted by θ to the line of sight, so it subtends dA·cosθ/(d/cosθ)² = (dA/d²)·cos³θ. This uses
+/// dω = dA·cosθ/r² (Pharr, Jakob & Humphreys, *Physically Based Rendering*, 3rd ed. 2016,
+/// §5.5.3). `off_axis_pixel_solid_angle_matches_exact_pixel` checks it against exact pixel
+/// solid angles. Twin of `pixel_solid_angle_off_axis` in `stars.wgsl`.
+pub fn pixel_solid_angle_off_axis(fov_y: f32, height_px: f32, cos_theta: f32) -> f32 {
+    pixel_solid_angle(fov_y, height_px) * cos_theta * cos_theta * cos_theta
+}
+
+/// Cosine of the angle θ between `dir` (root axes) and the camera's optical axis, view-space −Z:
+/// cosθ = −z_view/|dir_view|, with dir_view = view_rot·dir. Under the reversed-Z infinite
+/// projection, −z_view is also clip w. Twin of `cos_theta` in `vs_main` of `stars.wgsl`.
+pub fn off_axis_cos(view_rot: Mat4, dir: Vec3) -> f32 {
+    let v = (view_rot * dir.extend(0.0)).truncate();
+    -v.z / v.length()
+}
+
+/// A star's display-normalised energy on the optical axis: [`star_display_energy_off_axis`]
+/// with θ = 0, i.e. E/(Ω_c·1.2·2^star_ev100).
 pub fn star_display_energy(lux: f32, fov_y: f32, height_px: f32, star_ev100: f32) -> f32 {
-    lux / (pixel_solid_angle(fov_y, height_px) * 1.2 * star_ev100.exp2())
+    star_display_energy_off_axis(lux, fov_y, height_px, star_ev100, 1.0)
+}
+
+/// A star's display-normalised energy θ off the optical axis (`cos_theta` = cos θ): the sum of
+/// its pixel values after the tonemap's exposure, E/(Ω(θ)·1.2·2^star_ev100) with
+/// Ω(θ) = [`pixel_solid_angle_off_axis`]. It equals E/Ω(θ)·2^(scene − star) times
+/// exposure_scale(scene), where exposure_scale(ev) = 1/(1.2·2^ev) (uni-gfx `camera.wgsl`;
+/// Lagarde & de Rousiers 2014 §4.1.1), so the scene EV cancels.
+///
+/// Dividing by the pixel's own solid angle keeps a star consistent with the sky radiance in the
+/// same pixels: off-axis pixels subtend less solid angle, so the star's energy is 1/cos³θ larger
+/// there. Twin of `energy` in `vs_main` of `stars.wgsl`.
+pub fn star_display_energy_off_axis(
+    lux: f32,
+    fov_y: f32,
+    height_px: f32,
+    star_ev100: f32,
+    cos_theta: f32,
+) -> f32 {
+    lux / (pixel_solid_angle_off_axis(fov_y, height_px, cos_theta) * 1.2 * star_ev100.exp2())
 }
 
 /// Framebuffer position [px] of the star in direction `dir` (root axes), or `None` when the star
@@ -422,7 +466,7 @@ mod tests {
         MIN_RADIUS_PX, VISIBILITY_CUTOFF, footprint_radius_px, halo_fraction, psf_weights,
     };
     use core::mem::{offset_of, size_of};
-    use glam::{Quat, Vec4};
+    use glam::{DVec3, Quat, Vec4};
     use uni_core::{blackbody_linear_srgb, star_illuminance_lux};
     use uni_gfx::{reversed_z_infinite_proj, validate_wgsl};
     use wgpu::naga;
@@ -671,5 +715,140 @@ mod tests {
         let r0 = footprint_radius_px(energy(0.0), halo_fraction(lux(0.0)));
         assert!(r0 > MIN_RADIUS_PX && r0 < 12.0, "{r0}");
         assert_eq!(footprint_radius_px(energy(6.5), 0.0), MIN_RADIUS_PX);
+    }
+
+    /// The camera → root rotation used by the off-axis tests: yawed and pitched, so no axis is
+    /// trivial.
+    fn tilted_camera() -> Quat {
+        Quat::from_rotation_y(0.7) * Quat::from_rotation_x(-0.3)
+    }
+
+    #[test]
+    fn off_axis_solid_angle_factor() {
+        let (fov_y, size) = (60f32.to_radians(), Vec2::new(1920.0, 1080.0));
+        let cam_to_root = tilted_camera();
+        let view = Mat4::from_quat(cam_to_root.inverse());
+        // The optical axis, and a direction 30° off it diagonally (both screen axes non-zero).
+        let axis = cam_to_root * Vec3::NEG_Z;
+        let tilt = cam_to_root * Vec3::new(1.0, 1.0, 0.0).normalize();
+        let off = Quat::from_axis_angle(tilt, 30f32.to_radians()) * axis;
+        // The off-axis star is on screen, so the factor reaches a visible splat.
+        let proj = reversed_z_infinite_proj(fov_y, size.x / size.y, 0.1);
+        let p = project_star(proj * view, off, size).expect("in front of the camera");
+        assert!(p.cmpge(Vec2::ZERO).all() && p.cmplt(size).all(), "{p}");
+
+        let lux = star_illuminance_lux(2.0) as f32;
+        let energy = |dir: Vec3| {
+            let cos_theta = off_axis_cos(view, dir);
+            star_display_energy_off_axis(lux, fov_y, size.y, DEFAULT_STAR_EV100, cos_theta)
+        };
+        let ratio = energy(off) / energy(axis);
+        // 1/cos³(30°) = 1.5396.
+        let want = 1.0 / 30f32.to_radians().cos().powi(3);
+        assert!((want - 1.5396).abs() < 1e-4, "{want}");
+        assert!((ratio / want - 1.0).abs() < 1e-4, "{ratio} vs {want}");
+    }
+
+    #[test]
+    fn on_axis_unchanged() {
+        let (fov_y, h, ev) = (60f32.to_radians(), 1080.0, DEFAULT_STAR_EV100);
+        // The on-axis pixel solid angle before the off-axis fix: (2·tan(fov_y/2)/H)².
+        let side = 2.0 * (0.5 * fov_y).tan() / h;
+        let omega_c = side * side;
+        // An unrotated camera's axis (−Z) has cosθ exactly 1; a rotated camera's own axis has
+        // cosθ = 1 to f32 rounding.
+        let cos_unrotated = off_axis_cos(Mat4::IDENTITY, Vec3::NEG_Z);
+        assert_eq!(cos_unrotated, 1.0);
+        let cam_to_root = tilted_camera();
+        let view = Mat4::from_quat(cam_to_root.inverse());
+        let cos_rotated = off_axis_cos(view, cam_to_root * Vec3::NEG_Z);
+        for v_mag in [-1.46, 0.0, 6.5] {
+            let lux = star_illuminance_lux(v_mag) as f32;
+            // The energy formula before the off-axis fix: E/(Ω_c·1.2·2^star_ev100).
+            let old = lux / (omega_c * 1.2 * ev.exp2());
+            assert_eq!(star_display_energy(lux, fov_y, h, ev), old);
+            let e = star_display_energy_off_axis(lux, fov_y, h, ev, cos_unrotated);
+            assert_eq!(e, old);
+            let e = star_display_energy_off_axis(lux, fov_y, h, ev, cos_rotated);
+            assert!((e / old - 1.0).abs() < 1e-6, "V = {v_mag}: {e} vs {old}");
+        }
+    }
+
+    /// Solid angle [sr] of the spherical triangle with unit-vector corners a, b, c: Van Oosterom
+    /// & Strackee 1983, "The Solid Angle of a Plane Triangle", IEEE Trans. Biomed. Eng. 30(2), 125.
+    fn triangle_solid_angle(a: DVec3, b: DVec3, c: DVec3) -> f64 {
+        let num = a.dot(b.cross(c)).abs();
+        let den = 1.0 + a.dot(b) + b.dot(c) + c.dot(a);
+        2.0 * num.atan2(den)
+    }
+
+    #[test]
+    fn off_axis_pixel_solid_angle_matches_exact_pixel() {
+        // Ω_c·cos³θ at a pixel's centre direction against the exact solid angle of the whole
+        // pixel, at the centre, the edge midpoints and the corners of a 1920×1080, 60° frame.
+        let (fov_y, size) = (60f32.to_radians(), Vec2::new(1920.0, 1080.0));
+        let view = Mat4::from_quat(tilted_camera().inverse());
+        let inv = (reversed_z_infinite_proj(fov_y, size.x / size.y, 0.1) * view).inverse();
+        // View-space direction through framebuffer point (x, y) [px], on the image plane z = −1.
+        let (w, h) = (f64::from(size.x), f64::from(size.y));
+        let t = (0.5 * f64::from(fov_y)).tan();
+        let tx = t * w / h;
+        let corner = |x: f64, y: f64| {
+            DVec3::new((2.0 * x / w - 1.0) * tx, (1.0 - 2.0 * y / h) * t, -1.0).normalize()
+        };
+        for pix in [
+            Vec2::new(959.0, 539.0),
+            Vec2::new(1919.0, 539.0),
+            Vec2::new(959.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1919.0, 1079.0),
+        ] {
+            let (x, y) = (f64::from(pix.x), f64::from(pix.y));
+            let [a, b, c, d] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                .map(|(dx, dy)| corner(x + dx, y + dy));
+            let exact = triangle_solid_angle(a, b, c) + triangle_solid_angle(a, c, d);
+            // The pixel's centre direction by uni-gfx's `pixel_dir`, through the f32 twins.
+            let cos_theta = off_axis_cos(view, pixel_dir(inv, size, pix));
+            let approx = f64::from(pixel_solid_angle_off_axis(fov_y, size.y, cos_theta));
+            assert!(
+                (approx / exact - 1.0).abs() < 1e-5,
+                "{pix}: {approx} vs {exact}"
+            );
+        }
+    }
+
+    /// Whether `block`, or a block nested in it, calls `f`.
+    fn calls(block: &naga::Block, f: naga::Handle<naga::Function>) -> bool {
+        block.iter().any(|s| match s {
+            naga::Statement::Call { function, .. } => *function == f,
+            naga::Statement::Block(b) => calls(b, f),
+            naga::Statement::If { accept, reject, .. } => calls(accept, f) || calls(reject, f),
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => calls(body, f) || calls(continuing, f),
+            naga::Statement::Switch { cases, .. } => cases.iter().any(|c| calls(&c.body, f)),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn shader_uses_off_axis_solid_angle() {
+        let m = stars_module();
+        let func = |name: &str| {
+            m.functions
+                .iter()
+                .find(|(_, f)| f.name.as_deref() == Some(name))
+                .map(|(h, _)| h)
+                .unwrap_or_else(|| panic!("no fn {name} in stars.wgsl"))
+        };
+        let vs = &m
+            .entry_points
+            .iter()
+            .find(|e| e.name == "vs_main")
+            .expect("vs_main")
+            .function;
+        // vs_main divides by the off-axis solid angle, never the on-axis one directly.
+        assert!(calls(&vs.body, func("pixel_solid_angle_off_axis")));
+        assert!(!calls(&vs.body, func("pixel_solid_angle")));
     }
 }

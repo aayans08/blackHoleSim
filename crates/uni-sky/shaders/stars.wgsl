@@ -9,13 +9,15 @@
 //   PSF = (1 − h)·Gaussian core (σ = CORE_SIGMA_PX) + h·Moffat glare halo,
 //   h = HALO_ENERGY_FRACTION above HALO_MIN_LUX, else 0.
 //
-//   pixel luminance [cd/m²] = E / Ω_pixel × exp2(scene_ev100 − star_ev100) × (1 − lens_mask)
+//   pixel luminance [cd/m²] = E / Ω(θ) × exp2(scene_ev100 − star_ev100) × (1 − lens_mask)
 //                             × PSF weight
 //
-// E is the star's illuminance at the observer [lux], and Ω_pixel = (2·tan(fov_y/2) / H)² is the
-// pixel solid angle [sr] (small-angle). The tonemap then multiplies by exposure_scale(scene_ev100),
-// so on screen a star is exposed at star_ev100 whatever the scene exposure is. That is the
-// "Eye-adapted stars" dual exposure of design §7 item 4.
+// E is the star's illuminance at the observer [lux]. Ω(θ) = Ω_c·cos³θ is the solid angle [sr] of
+// a pixel θ off the optical axis, where Ω_c = (2·tan(fov_y/2) / H)² is the value at the centre.
+// Dividing by the pixel's own solid angle keeps a star consistent with the sky radiance in the
+// same pixels. The tonemap then multiplies by exposure_scale(scene_ev100), so on screen a star is
+// exposed at star_ev100 whatever the scene exposure is. That is the "Eye-adapted stars" dual
+// exposure of design §7 item 4.
 //
 // Blending is additive into `hdr`. Depth is tested (GreaterEqual, no writes) at the far plane.
 // The CPU twins are in crates/uni-sky/src/psf.rs and stars.rs. `shader_constants_match_cpu`
@@ -117,11 +119,20 @@ fn footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     return min(r, MAX_RADIUS_PX);
 }
 
-// Solid angle of one pixel [sr]: (2·tan(fov_y/2) / H)², the small-angle value at the image
-// centre. Twin of `uni_sky::pixel_solid_angle`.
+// Solid angle Ω_c of one pixel on the optical axis [sr]: (2·tan(fov_y/2) / H)², the small-angle
+// value at the image centre. Twin of `uni_sky::stars::pixel_solid_angle`.
 fn pixel_solid_angle(fov_y: f32, height_px: f32) -> f32 {
     let side = 2.0 * tan(0.5 * fov_y) / height_px;
     return side * side;
+}
+
+// Solid angle [sr] of a pixel whose centre lies θ off the optical axis (cos_theta = cos θ):
+// Ω_c·cos³θ. On a rectilinear image plane at distance d, that pixel is d/cosθ away and tilted by
+// θ to the line of sight, so it subtends dA·cosθ/(d/cosθ)² (dω = dA·cosθ/r²: Pharr, Jakob &
+// Humphreys, Physically Based Rendering, 3rd ed. 2016, §5.5.3). Twin of
+// `uni_sky::stars::pixel_solid_angle_off_axis`.
+fn pixel_solid_angle_off_axis(fov_y: f32, height_px: f32, cos_theta: f32) -> f32 {
+    return pixel_solid_angle(fov_y, height_px) * cos_theta * cos_theta * cos_theta;
 }
 
 // Corner (±1, ±1) of the quad for vertex `vi` in 0..6, as two triangles (−−, +−, −+) and
@@ -136,7 +147,7 @@ struct VsOut {
     // Star centre in framebuffer pixels: x right, y down, and pixel k spans [k, k + 1].
     @location(0) @interpolate(flat) centre_px: vec2<f32>,
     // Pixel luminance [cd/m²] per unit PSF weight, before the lens mask:
-    // colour · E/Ω_pixel · 2^(scene_ev100 − star_ev100).
+    // colour · E/Ω(θ) · 2^(scene_ev100 − star_ev100).
     @location(1) @interpolate(flat) radiance: vec3<f32>,
     // x: halo share h; y: footprint radius R [px].
     @location(2) @interpolate(flat) halo: vec2<f32>,
@@ -156,7 +167,8 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // projection maps view-space (x, y, z, 0) to clip (f·x/aspect, f·y, 0, −z). Depth is
     // exactly 0, the far plane, and clip.w = −z is positive only in front of the camera
     // (which looks along −Z).
-    let clip = camera.proj * camera.view_rot * vec4<f32>(star.dir.xyz, 0.0);
+    let view_dir = (camera.view_rot * vec4<f32>(star.dir.xyz, 0.0)).xyz;
+    let clip = camera.proj * vec4<f32>(view_dir, 0.0);
     // Behind the camera, on its plane, without light, or NaN: no quad.
     if (!(clip.w > MIN_CLIP_W) || !(lux > 0.0)) {
         return out;
@@ -168,11 +180,15 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let ndc = clip.xy / clip.w;
     let centre = vec2<f32>(0.5 * (ndc.x + 1.0) * size.x, 0.5 * (1.0 - ndc.y) * size.y);
 
-    // lux → pixel luminance [cd/m²] per unit PSF weight: 2^(scene_ev100 − star_ev100) / Ω_pixel.
-    let omega = pixel_solid_angle(camera.time.z, size.y);
+    // cos θ off the optical axis: −z_view/|dir_view| (= clip.w/|dir_view|, since the projection's
+    // w row is (0, 0, −1, 0)). It is positive, because clip.w > MIN_CLIP_W.
+    let cos_theta = -view_dir.z / length(view_dir);
+    // lux → pixel luminance [cd/m²] per unit PSF weight: 2^(scene_ev100 − star_ev100) / Ω(θ).
+    let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
     let to_luminance = exp2(camera.exposure.x - camera.exposure.y) / omega;
     // Display-normalised energy (the footprint's sum after the tonemap's exposure). It sizes the
-    // quad: E/(Ω·1.2·2^star_ev100), whatever the scene exposure is.
+    // quad: E/(Ω(θ)·1.2·2^star_ev100), whatever the scene exposure is. Twin of
+    // `uni_sky::stars::star_display_energy_off_axis`.
     let energy = lux * to_luminance * exposure_scale(camera.exposure.x);
     let h = select(0.0, HALO_ENERGY_FRACTION, lux > HALO_MIN_LUX);
     let radius = footprint_radius_px(energy, h);
