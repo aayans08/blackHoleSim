@@ -1,0 +1,33 @@
+[package]
+name = "black_hole_renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core graphics framework (optimized for M3 Metal backend)
+wgpu = "0.19"
+winit = "0.29"
+pollster = "0.3"
+
+# Math libraries
+glam = { version = "0.27", features = ["bytemuck"] }
+
+# Image loading
+image = "0.24"
+
+# Serialization for shader data
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Async runtime
+futures = "0.3"
+
+# High-precision timing
+instant = "0.1"
+
+# Logging
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,12 @@
+# Core dependencies
+pygame>=2.0.0
+numpy>=1.20.0
+
+# Panda3D for professional 3D universe renderer (RECOMMENDED)
+panda3d>=1.10.13
+
+# GPU acceleration (for --realistic, --interstellar and --gpu renderers)
+moderngl>=5.6.0
+
+# Texture support for realistic renderer and texture downloading
+Pillow>=9.0.0
