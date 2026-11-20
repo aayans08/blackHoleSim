@@ -29,18 +29,25 @@ pub const STARS_SHADER: &str = "sky/stars.wgsl";
 /// Ω(θ) = Ω_c·cos³θ the solid angle of a pixel θ off the optical axis. That is the shader's
 /// E/Ω(θ)·2^(scene − star) times the tonemap's exposure_scale(scene), and the scene EV cancels.
 /// Calibrated on the optical axis at 1920×1080 with fov_y = 60° against uni-post's AgX (black
-/// point 0.18·2^−12.47 ≈ 3.2e-5; the display-encoded output is roughly the sRGB code / 255):
-/// - V = 6.5, the naked-eye limit, centred on a pixel, peaks at 7.2e-4: 4.5 stops above AgX
-///   black, about 12/255, just visible on black.
-/// - V = 0 peaks at 0.29 (about 216/255); its glare halo fades to black about 6 px out.
-/// - Sirius (V = −1.46) peaks at 1.1 (about 245/255).
+/// point 0.18·2^−12.47 ≈ 3.2e-5, white 0.18·2^6.5 ≈ 16.3). The 8-bit codes are uni-post's
+/// `agx` of a grey pixel at the peak, as the sRGB target stores it:
+/// - V = 6.5, the naked-eye limit, centred on a pixel, peaks at 2.315e-2: 9.5 stops above AgX
+///   black, about 46/255. It keeps the minimum 3 px footprint.
+/// - V = 0 peaks at 9.215 (about 249/255), a white core; its glare halo fades to black
+///   13.75 px out.
+/// - Sirius (V = −1.46) peaks at 35.36, past AgX white (255/255); its glare reaches 18.31 px.
+///
+/// The rule: V = 6.5 is clearly visible on black (≥ about 8 stops above AgX black); V ≤ 1 stars
+/// saturate to a white core with a visible glare. The M0 gate's capture sweep chose −4.0: at the
+/// earlier 1.0, V = 6.5 sat only 4.5 stops above black (about 3/255) and the sky looked black.
 ///
 /// Off the axis, pixel values are 1/cos³θ higher (+1.6 EV at the side edges and +1.9 EV in the
 /// corners at 60° and 16:9). Off-axis pixels subtend less sky, so this keeps each star as bright
 /// relative to the sky around it as at the centre.
 ///
-/// Each +1 EV halves star brightness. `default_star_exposure_calibration` pins these numbers.
-pub const DEFAULT_STAR_EV100: f32 = 1.0;
+/// Each +1 EV halves star brightness. `default_star_exposure_calibration` pins the peaks and
+/// radii above.
+pub const DEFAULT_STAR_EV100: f32 = -4.0;
 
 /// Stars whose clip-space w is at most this are behind the camera or on its plane, and are
 /// culled. Directions are unit vectors, so an on-screen star has w ≥ cos(fov/2), far above this.
@@ -703,18 +710,36 @@ mod tests {
         assert!((omega - 1.143_118e-6).abs() < 1e-11, "{omega}");
         let lux = |v_mag: f64| star_illuminance_lux(v_mag) as f32;
         let energy = |v_mag: f64| star_display_energy(lux(v_mag), fov_y, h, DEFAULT_STAR_EV100);
+        let radius = |v_mag: f64| footprint_radius_px(energy(v_mag), halo_fraction(lux(v_mag)));
+        // Centre-pixel weight of a star centred on its pixel: the peak.
         let centre = psf_weights(Vec2::splat(0.5), CORE_SIGMA_PX, 3)[24];
+        let peak = |v_mag: f64| energy(v_mag) * centre;
         // Task 5's AgX maps 0.18·2^−12.47393 to black and 0.18 to mid-grey.
         let agx_black = 0.18 * (-12.47393f32).exp2();
-        // V = 6.5, the naked-eye limit: 3 to 6 stops above black, so just visible.
-        let faint = energy(6.5) * centre;
-        assert!((8.0..64.0).contains(&(faint / agx_black)), "{faint}");
-        // V = 0: brighter than mid-grey but not blown out, with a glare a few px wide.
-        let bright = energy(0.0) * centre;
-        assert!(bright > 0.18 && bright < 1.0, "{bright}");
-        let r0 = footprint_radius_px(energy(0.0), halo_fraction(lux(0.0)));
-        assert!(r0 > MIN_RADIUS_PX && r0 < 12.0, "{r0}");
-        assert_eq!(footprint_radius_px(energy(6.5), 0.0), MIN_RADIUS_PX);
+
+        // V = 6.5, the naked-eye limit: clearly visible on black, 8 to 12 stops above it, and
+        // still on the minimum footprint.
+        let faint = peak(6.5) / agx_black;
+        assert!((2f32.powi(8)..=2f32.powi(12)).contains(&faint), "{faint}");
+        assert_eq!(radius(6.5), MIN_RADIUS_PX);
+        // V ≤ 1: a white core (above 1.0 after exposure) and a glare wider than the minimum
+        // footprint, within the cap.
+        for v_mag in [1.0, 0.0, -1.46] {
+            let (p, r) = (peak(v_mag), radius(v_mag));
+            assert!(p > 1.0, "V = {v_mag}: peak {p}");
+            assert!(r > MIN_RADIUS_PX && r <= MAX_RADIUS_PX, "V = {v_mag}: R {r}");
+        }
+
+        // The doc comment's numbers: peaks to 0.1%, footprint radii to 0.01 px.
+        for (v_mag, want_peak, want_radius) in [
+            (6.5, 2.315e-2, MIN_RADIUS_PX),
+            (0.0, 9.215, 13.75),
+            (-1.46, 35.36, 18.31),
+        ] {
+            let (p, r) = (peak(v_mag), radius(v_mag));
+            assert!((p / want_peak - 1.0).abs() < 1e-3, "V = {v_mag}: peak {p}");
+            assert!((r - want_radius).abs() < 0.01, "V = {v_mag}: R {r}");
+        }
     }
 
     /// The camera → root rotation used by the off-axis tests: yawed and pitched, so no axis is
