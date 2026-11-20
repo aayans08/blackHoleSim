@@ -38,12 +38,20 @@ const CONTROLS: [(&str, &str); 8] = [
     ("Right mouse (hold)", "Look"),
     ("Wheel or = / -", "Speed ×10^±0.1 per notch"),
     ("Tab", "Show / hide HUD"),
-    ("F12", "Screenshot"),
+    ("F12", "Save view bookmark (captures/views/)"),
     ("F1", "Show / hide this list"),
 ];
 
+/// What is approximate wherever the lens pass draws in M0 (Global Constraints, Honesty): it
+/// bends a debug grid, not the real sky, and the catalogue stars are drawn unlensed over it.
+/// Shown only while it draws ([`honesty_labels`]).
+const HONESTY_LABELS: [&str; 2] = [
+    "Lens background: M0 debug grid",
+    "Stars near the hole are not yet lensed (M0)",
+];
+
 /// The app's own hotkeys in uni-nav's key map (Task 6): Tab hides the HUD, F1 shows the
-/// controls list, F12 takes a screenshot. Matched by physical key, as uni-nav does.
+/// controls list, F12 saves the view as a bookmark. Matched by physical key, as uni-nav does.
 const APP_HOTKEYS: [KeyCode; 3] = [KeyCode::Tab, KeyCode::F1, KeyCode::F12];
 
 /// Most egui runs per headless draw. egui lays out a new window invisibly on its first run
@@ -72,6 +80,10 @@ pub struct HudData {
     pub warnings: Vec<String>,
     /// Shows "Inside event horizon" in red.
     pub inside_horizon: bool,
+    /// True when the lens pass draws this frame. Only then does the HUD show, in amber, "Lens
+    /// background: M0 debug grid" and "Stars near the hole are not yet lensed (M0)". Sky views
+    /// skip the pass, so neither line would be true there.
+    pub lens_on_screen: bool,
 }
 
 /// Settings the HUD edits. The app reads them back after [`Hud::draw`].
@@ -519,7 +531,9 @@ fn show_panel(ctx: &egui::Context, data: &HudData, controls: &mut HudControls) {
                     .text("Lens scale")
                     .fixed_decimals(2),
             );
-            ui.label(RichText::new("Lens background: M0 debug grid").color(AMBER));
+            for label in honesty_labels(data.lens_on_screen) {
+                ui.label(RichText::new(*label).color(AMBER));
+            }
             ui.small("F1 controls · Tab hide HUD");
         });
 }
@@ -543,6 +557,12 @@ fn show_controls_list(ctx: &egui::Context, open: &mut bool) {
                     }
                 });
         });
+}
+
+/// The amber honesty lines for a frame: [`HONESTY_LABELS`] when the lens pass draws, else none,
+/// since a label must be true where it is shown (design anti-goal 2).
+fn honesty_labels(lens_on_screen: bool) -> &'static [&'static str] {
+    if lens_on_screen { &HONESTY_LABELS } else { &[] }
 }
 
 /// One `"GPU <pass> <ms> ms"` line per timed pass, or `"GPU ms n/a"` when the device has no
@@ -580,8 +600,15 @@ mod tests {
             star_count: 0,
             warnings: Vec::new(),
             inside_horizon: false,
+            lens_on_screen: false,
         }
     }
+
+    /// The M0 honesty lines, verbatim (Task 10b brief).
+    const HONESTY_LINES: [&str; 2] = [
+        "Lens background: M0 debug grid",
+        "Stars near the hole are not yet lensed (M0)",
+    ];
 
     fn controls(show_help: bool) -> HudControls {
         HudControls {
@@ -593,12 +620,31 @@ mod tests {
         }
     }
 
-    /// Every text shape egui painted, with its top-left position in points.
-    fn texts(out: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
-        fn walk(shape: &egui::Shape, acc: &mut Vec<(String, egui::Pos2)>) {
+    /// A text shape egui painted.
+    #[derive(Debug)]
+    struct Painted {
+        text: String,
+        /// Top left, in points.
+        pos: egui::Pos2,
+        /// The colour of its first section: `Color32::PLACEHOLDER` for the theme's text colour.
+        color: Color32,
+    }
+
+    /// Every text shape egui painted.
+    fn texts(out: &egui::FullOutput) -> Vec<Painted> {
+        fn walk(shape: &egui::Shape, acc: &mut Vec<Painted>) {
             match shape {
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, acc)),
-                egui::Shape::Text(t) => acc.push((t.galley.text().to_owned(), t.pos)),
+                egui::Shape::Text(t) => acc.push(Painted {
+                    text: t.galley.text().to_owned(),
+                    pos: t.pos,
+                    color: t
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(Color32::PLACEHOLDER, |s| s.format.color),
+                }),
                 _ => {}
             }
         }
@@ -609,21 +655,59 @@ mod tests {
         acc
     }
 
-    /// A fresh headless HUD's first draw at 1920×1080: its pixels per point and its text.
-    fn first_headless_draw(ppp: f32, mut c: HudControls) -> (f32, Vec<(String, egui::Pos2)>) {
+    /// A fresh headless HUD's first draw of `d` at 1920×1080: its pixels per point and its text.
+    fn first_headless_draw(ppp: f32, d: &HudData, mut c: HudControls) -> (f32, Vec<Painted>) {
         let ctx = headless_context();
-        let d = data(Vec::new(), false);
-        let (mut out, _runs) = run_hud_settled(&ctx, [1920, 1080], ppp, 8192, &d, &mut c);
+        let (mut out, _runs) = run_hud_settled(&ctx, [1920, 1080], ppp, 8192, d, &mut c);
         // No GPU here to upload to; epaint asserts that deltas are not silently dropped.
         out.textures_delta.clear();
         (out.pixels_per_point, texts(&out))
     }
 
-    fn find<'a>(texts: &'a [(String, egui::Pos2)], needle: &str) -> Option<&'a egui::Pos2> {
-        texts
+    fn find<'a>(texts: &'a [Painted], needle: &str) -> Option<&'a Painted> {
+        texts.iter().find(|p| p.text.contains(needle))
+    }
+
+    /// M0 gate: the lens labels are true only while the lens pass draws (design anti-goal 2).
+    /// Sky views skip the pass and show black space with real stars.
+    #[test]
+    fn honesty_labels_iff_lens_on_screen() {
+        assert_eq!(honesty_labels(true), HONESTY_LINES);
+        assert!(honesty_labels(false).is_empty());
+    }
+
+    #[test]
+    fn honesty_lines_are_drawn_in_amber_iff_lens_on_screen() {
+        for lens_on_screen in [true, false] {
+            let mut d = data(Vec::new(), false);
+            d.lens_on_screen = lens_on_screen;
+            let (_, texts) = first_headless_draw(1.0, &d, controls(false));
+            for line in HONESTY_LINES {
+                match (lens_on_screen, find(&texts, line)) {
+                    (true, Some(p)) => assert_eq!(p.color, AMBER, "{line:?}"),
+                    (true, None) => panic!("lens on screen: no {line:?} in {texts:?}"),
+                    (false, Some(p)) => panic!("no lens on screen, yet {p:?} is drawn"),
+                    (false, None) => {}
+                }
+            }
+        }
+    }
+
+    /// M0 gate: F12 saves the view as a bookmark in `captures/views/` (uni-app); it takes no
+    /// screenshot.
+    #[test]
+    fn help_names_f12_save_view_bookmark() {
+        let f12 = CONTROLS
             .iter()
-            .find(|(t, _)| t.contains(needle))
-            .map(|(_, p)| p)
+            .find(|(keys, _)| *keys == "F12")
+            .map(|(_, action)| *action);
+        assert_eq!(f12, Some("Save view bookmark (captures/views/)"));
+        assert!(
+            CONTROLS
+                .iter()
+                .all(|(_, action)| !action.contains("Screenshot")),
+            "{CONTROLS:?}"
+        );
     }
 
     #[test]
@@ -753,34 +837,37 @@ mod tests {
     /// panel at the top left, the controls list against the right edge.
     #[test]
     fn first_headless_draw_shows_the_hud_laid_out_for_the_target() {
+        let mut d = data(Vec::new(), false);
+        // Every line the panel can show, the longest honesty line included.
+        d.lens_on_screen = true;
         for ppp in [1.0, 2.0] {
-            let (out_ppp, texts) = first_headless_draw(ppp, controls(true));
+            let (out_ppp, texts) = first_headless_draw(ppp, &d, controls(true));
             assert_eq!(out_ppp, ppp);
             let screen =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0 / ppp, 1080.0 / ppp));
-            for needle in [
-                "fps",
-                "GPU ms n/a",
-                "Lens background: M0 debug grid",
-                "Show / hide HUD",
-            ] {
+            for needle in ["fps", "GPU ms n/a", "Show / hide HUD", "Save view bookmark"]
+                .into_iter()
+                .chain(HONESTY_LINES)
+            {
                 assert!(
                     find(&texts, needle).is_some(),
                     "ppp {ppp}: no {needle:?} in {texts:?}"
                 );
             }
-            for (text, pos) in &texts {
+            for Painted { text, pos, .. } in &texts {
                 assert!(
                     screen.contains(*pos),
                     "ppp {ppp}: {text:?} at {pos:?} is off {screen:?}"
                 );
             }
-            let fps = find(&texts, "fps").copied().unwrap_or_default();
+            let fps = find(&texts, "fps").map(|p| p.pos).unwrap_or_default();
             assert!(
                 fps.x < 50.0 && fps.y < 50.0,
                 "ppp {ppp}: panel not top left: {fps:?}"
             );
-            let list = find(&texts, "Show / hide HUD").copied().unwrap_or_default();
+            let list = find(&texts, "Show / hide HUD")
+                .map(|p| p.pos)
+                .unwrap_or_default();
             assert!(
                 list.x > screen.width() / 2.0,
                 "ppp {ppp}: controls list not on the right half of {screen:?}: {list:?}"
@@ -810,6 +897,8 @@ mod tests {
     fn hidden_headless_hud_draws_nothing() {
         let mut c = controls(true);
         c.visible = false;
-        assert!(first_headless_draw(1.0, c).1.is_empty());
+        let mut d = data(Vec::new(), false);
+        d.lens_on_screen = true;
+        assert!(first_headless_draw(1.0, &d, c).1.is_empty());
     }
 }
