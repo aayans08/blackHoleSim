@@ -22,16 +22,28 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: Task 1 (M0, wave 0).
-> **The Cargo workspace does not exist yet at this commit.** Task 2 creates it. Until then the repository
-> holds no buildable code of the new engine.
+> **Updated by the lead after each wave.** Last update: after Task 2 (M0, wave 0).
+> The Cargo workspace exists and `cargo check --workspace` passes, but every function body is still a `todo!()`
+> stub or an empty module. **Nothing renders yet.** Wave 1 fills in the bodies.
 
 What exists now:
 ```
+Cargo.toml                   workspace root: members, [workspace.dependencies] pins (Global Constraints + serde_json)
+.cargo/config.toml           shared target dir /Users/aayan/.cargo/shared-target/blackhole + dev/release/dist profiles
+crates/
+  uni-core/     frozen interface stubs: units, pos (UniversePos), epoch, frame (FrameTree), camera, hash,
+                color, galactic
+  uni-gfx/      frozen interface stubs: context (GpuContext), targets, frame (FrameCtx, CameraUniform), timer
+                (PassTimer), renderer (RenderFeature, Renderer), shader (ShaderLib), capture, proj;
+                shaders/common/*.wgsl placeholders
+  uni-post/ (agx, tonemap)  uni-nav/ (camera, input, bookmark)  uni-data/ (bsc5)  uni-sky/ (stars, psf)
+  uni-rel/ (binet, tracer)  uni-ui/ (format, hud)               empty modules; each task defines its API
+  uni-app/      binary `universe` (main, app, world, capture, selftest): empty modules
+  uni-planet/, uni-atmo/, uni-physics/, uni-procgen/, uni-sim/   doc comment only (later milestones)
+tools/bake/     bin `uni-bake` (main, bsc5): empty modules
+tools/verify/   bin `uni-verify` (main, sheet, shadow): empty modules
 archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old CLAUDE.md (reference only)
-Cargo.toml, Cargo.lock       old single-package manifest (wgpu 0.19); Task 2 replaces it
-src/main.rs                  old renderer (every frame one flat colour); Task 2 moves it to archive/old-rust/
-shaders/{compute,display}.wgsl  old shaders; Task 2 moves them to archive/old-rust/
+archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
 textures/*.jpg               7 Solar System Scope 2k maps (CC BY 4.0, see ATTRIBUTION.md);
                              stars_milky_way.jpg is never the sky: no photo skyboxes (design §7.6)
 data/manifest.toml           one entry per data file: id, url, sha256, license, credit, paths (empty)
@@ -41,33 +53,9 @@ docs/superpowers/plans/      milestone plans
 docs/research/               research reports, golden values, wgpu30-skeleton/
 .superpowers/sdd/            workflow ledger, task briefs and reports (git-ignored)
 ```
-
-Target layout (design §5.1). **None of this exists yet:**
-```
-crates/
-  uni-app/      binary `universe`: winit ApplicationHandler, main loop, wiring
-  uni-core/     UniversePos, FrameTree, Epoch, units/constants, hash + RNG (Rust/WGSL twins), Planck→XYZ→sRGB
-  uni-gfx/      device/surface, render targets, fixed pass scheduler, WGSL #import preprocessor + naga
-                tests, GPU timestamps, headless capture; shaders/common/*.wgsl
-  uni-sky/      star point-spread-function splats, galaxy/Milky-Way cubemap, clusters, impostors
-  uni-planet/   cube-sphere quadtree terrain, materials, ocean, rings, night lights, star surfaces
-  uni-atmo/     Hillaire 2020 atmosphere LUTs, cloud shells
-  uni-rel/      black hole / wormhole / neutron star lensing, lens pass, accretion-disk shading
-  uni-post/     auto-exposure, bloom, TAA/TAAU, AgX tonemap, blue-noise dither
-  uni-physics/  orbits, IAU rotation, Galaxy potential, integrators, ship SR/GR, Hawking/tidal calculators
-  uni-data/     loaders for baked catalogues; known-object tables
-  uni-procgen/  galaxy model, sector octree, stellar and planetary generation
-  uni-sim/      world state, time controller, streaming/LOD scheduler, rayon jobs
-  uni-nav/      camera/ship controller, flight modes, autopilot, jumps, bookmarks
-  uni-ui/       egui HUD, search, info cards, overlays, settings
-tools/bake/     offline bake (bin `uni-bake`): raw data → packed .bin / KTX2 tiles
-tools/verify/   headless capture checks, golden physics metrics, perf reports (bin `uni-verify`)
-.cargo/config.toml   shared target dir and build profiles
-data/cache/     raw downloads, git-ignored, deleted after baking
-captures/       capture PNG + JSON output, git-ignored
-```
-Every render crate will implement the `uni-gfx` `RenderFeature` trait (prepare + encode; exact signature in the
-M0 plan, Task 2). The `uni-core` and `uni-gfx` interfaces freeze at the end of M0.
+Target responsibilities per crate are in design §5.1. Every render crate implements `uni_gfx::RenderFeature`
+(prepare + encode). The `uni-core` and `uni-gfx` interfaces are frozen. After M0 only the lead changes them.
+Git-ignored outputs: `data/cache/` (raw downloads), `captures/` (capture PNG + JSON).
 
 ## 3. Global Constraints
 
@@ -127,7 +115,8 @@ Verbatim from the M0 plan. They bind every task.
 **Honesty**
 - Anything approximate or non-physical is labelled on screen. In M0 that means the lens background ("M0 debug grid") and speeds faster than c ("FTL · non-physical").
 
-**M0 execution ruling on commits** (lead, recorded in `.superpowers/sdd/2026-11-20-m0-foundation/progress.md`):
+**M0 execution ruling on commits**, which overrides "Agents never commit" above for M0 only. The lead removes or
+renews it at tag `m0`; it is recorded in `.superpowers/sdd/2026-11-20-m0-foundation/progress.md`:
 when a workflow task tells an implementer to commit, it commits only its own paths with a pathspec commit
 (`git add -- <own paths> && git commit -m "..." -- <own paths>`), retrying on `index.lock`. Never
 `git add -A`, `git commit -a`, `git stash` or `git reset`, and never push.
@@ -135,8 +124,8 @@ when a workflow task tells an implementer to commit, it commits only its own pat
 ## 4. Build, disk and GPU rules (design §4, §10)
 
 **Build**
-- One shared target dir, `/Users/aayan/.cargo/shared-target/blackhole`, set in `.cargo/config.toml` (Task 2
-  creates that file). Never override it with `--target-dir` or `CARGO_TARGET_DIR`.
+- One shared target dir, `/Users/aayan/.cargo/shared-target/blackhole`, set in `.cargo/config.toml`. Never
+  override it with `--target-dir` or `CARGO_TARGET_DIR`. Parallel agents wait on Cargo's lock; that is expected.
 - Profiles: dev has `debug = "line-tables-only"`, `incremental = false`, dependencies at `opt-level = 2` with
   `debug = false`. Release has `lto = "thin"`. The fat-LTO `dist` profile is built only at the very end.
 - Run `cargo clean` for a profile before building another heavy one.
@@ -206,7 +195,9 @@ and ' = d/dφ. Move the ray as a particle in flat Cartesian 3-space (Schwarzschi
     d²x/dλ² = −(3/2)·r_s·h²·x/r⁵ = −3M·h²·x/r⁵,    h = |x × dx/dλ| (conserved)
 
 - The acceleration points toward the hole. The legacy reference code had this sign wrong.
-- λ is not affine. Take redshifts from conserved quantities (b = L/E), not from λ.
+- λ is the affine parameter. With h = L, the radial equation r'' = h²/r³ − 3M·h²/r⁴ and the integral
+  r'² = E² − (1 − 2M/r)·h²/r² match the Schwarzschild null geodesic exactly. Never renormalise dx/dλ: that
+  changes h. Take redshifts from the conserved quantities (b = h/E).
 - Static camera at r_c: b = r_c·sin δ / √(1 − 2M/r_c), δ = angle between the ray and the inward radial direction.
 - Captured when r < 2M(1 + ε). Escaped when r > R_esc (about 1000M) and moving outward. RK4 or leapfrog, step ∝ r.
 
@@ -227,7 +218,9 @@ torque at the ISCO:
   T_eff(r) = (F/σ_SB)^{1/4}. F(r_isco) = 0. Compute F once on the CPU as a 1D LUT.
 - Newtonian check (Shakura & Sunyaev 1973): σT⁴ = (3GMṀ/(8πr³))·(1 − √(r_in/r)), peaking at r = (49/36)·r_in.
 - Redshift g = (p·u_cam)/(p·u_em). Schwarzschild, observer at infinity: g = √(1 − 3M/r)/(1 − Ωλ), with
-  Ω = √(M/r³) and λ = L_z/E of the photon (Binet tracer: λ = b·(ĥ·ẑ), ĥ the unit normal of the ray plane).
+  Ω = √(M/r³) and λ = L_z/E of the photon travelling emitter → camera. Binet tracer: λ = b·(ĥ·ẑ), with
+  ĥ = −normalize(x × v) of the BACKWARD-traced ray (camera → emitter) and ẑ the disk's angular-momentum axis.
+  Getting this sign wrong puts the bright side on the receding half, which is exactly the old renderer's bug.
   For a static camera at r_c, divide by √(1 − 2M/r_c).
 - Observed colour is Planck at T_obs = g·T; bolometric intensity ∝ g⁴ (I_ν/ν³ is invariant).
 - Real disks are blue-white in the visible band, and the approaching side is the brighter one. A film-style
