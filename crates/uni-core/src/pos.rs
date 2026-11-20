@@ -57,11 +57,13 @@ mod tests {
     fn offset_precision_far_from_origin() {
         // Review Focus 5. At 1 Gpc, `far.local.x` is 772·2^32 m ≈ 3.3e12 m, where f64 values are
         // 2^-11 m apart. A 1 mm step therefore lands within half that spacing (≈0.24 mm) and no
-        // closer (2.34e-5 m here). The brief's 1e-6 m bound is guaranteed only while
-        // |local| < 2^34 m: from 2^34 m on, values are 2^-18 m apart and one rounding can cost
-        // 1.9e-6 m. We assert the one-rounding bound and 0.1 mm, which is "mm-precise" with a 10×
-        // margin over an absolute-metres `offset` (it drops the step, an error of the full 1 mm).
-        // `offset_precision_across_cell_far_from_origin` sweeps the same bound across the cell.
+        // closer (2.34e-5 m here). The brief's 1e-6 m bound is guaranteed only while the stepped
+        // |local| (`local + step`, not `local`) stays below 2^34 m: from 2^34 m on, values are
+        // 2^-18 m apart and one rounding can cost 1.9e-6 m, even for a `local` just under 2^34 m
+        // that the step carries across. We assert the one-rounding bound and 0.1 mm, which is
+        // "mm-precise" with a 10× margin over an absolute-metres `offset` (it drops the step, an
+        // error of the full 1 mm). `offset_precision_across_cell_far_from_origin` sweeps the
+        // same bound across the cell.
         let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0));
         let near = far.offset(DVec3::new(0.001, 0.0, 0.0));
         let half_spacing = 0.5 * (far.local.x.abs().next_up() - far.local.x.abs());
