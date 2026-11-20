@@ -1,7 +1,7 @@
 # Universe Explorer: Design
 
 **Date:** 2026-11-20
-**Status:** Draft, awaiting owner approval. A builder check by 4 reviewers has been folded in.
+**Status:** Approved by the owner on 2026-11-20, with the owner's clarifications on the look and the content folded in.
 **Repo:** `/Users/aayan/Documents/GitHub/blackHoleSim`
 **Research behind this doc:** `docs/research/2026-11-20-*.md` (nine reports: rust, python, docs, assets, rendering, physics, procgen, wgpu, synthesis). Builders should read the ones relevant to their crate. They hold the equations, data sources, measured numbers and citations that this doc only summarises.
 
@@ -19,6 +19,10 @@ The reference screenshot (a Mars-like planet) sets the visual bar:
 - a dense field of colour-varied point stars
 - a blue-white open star cluster
 - a faint dust-laned Milky Way band
+
+The owner later clarified that the reference is about **the look**: "it looks very visually appealing… I want to make it like that. Not lowpoly."
+- Every object must be smooth and detailed at every distance, with no visible polygons or texels.
+- Lighting must be cinematic but physically based.
 
 **This is an original engine.** The genre is "universe explorer", but no code, assets, UI or signature look are taken from any existing product. We match the reference's *quality*, not its *look*.
 
@@ -40,6 +44,9 @@ Details are in `docs/research/2026-11-20-rust.md` and `2026-11-20-docs.md`. The 
    - about 2.5M catalogued stars at their real 3-D positions with real motions
    - known deep-sky objects
    - known black holes (Sgr A\*, Cygnus X-1, Gaia BH1–3, …)
+   - **real exoplanet systems** around their real host stars
+   - **real comets and asteroids** on their real orbits
+   - **real pulsars and magnetars**
    - nearby galaxies
 3. **Procedural worlds and stars that are physically consistent** wherever the catalogue runs out. Star masses, ages, colours, binaries, clusters, remnants and planetary systems follow published astrophysics. Special objects behave correctly: rogue planets drift, hypervelocity stars are unbound from the Galaxy, and runaway stars move fast.
 4. **Real relativistic and gravitational physics:**
@@ -78,6 +85,9 @@ Details are in `docs/research/2026-11-20-rust.md` and `2026-11-20-docs.md`. The 
 - **Graphics:** use both CPU and GPU so it looks good, with nothing pixelated; "a real feel like Space Engine".
 - **Content:** real objects from known astronomy, plus generated worlds. Generated worlds must be physically realistic in how they formed and how they behave. A rogue star or hypervelocity star must act like one.
 - **Physics:** all real, as far as current knowledge goes: Hawking radiation, accretion disks, light bending, gravitational pull, etc.
+- **Real objects wanted:** real planetary systems, black holes, comets, planets, magnetars, "etc."
+- **The look:** the reference image's visual appeal, "not lowpoly".
+- **UI design:** the agents may create their own design, "using Claude design and/or online" references.
 - **Language and stack:** build on the existing Rust code. Compress the Python experiments to save space.
 - **Agents:** use as many as needed (30 or more is fine), with a manager agent checking that everything works.
 - **Toolchain:** Rust updated to 1.100 (done).
@@ -246,6 +256,13 @@ trait RenderFeature {
   - NASA public-domain sources where better: Blue Marble NG + GEBCO elevation, Black Marble, LRO colour + LOLA elevation, MOLA elevation
   - Transcode to KTX2 BC7.
 - **Exoplanets:** NASA Exoplanet Archive PSCompPars.
+- **Comets and asteroids:** JPL Small-Body Database orbital elements.
+  - All numbered periodic comets plus notable long-period ones (for example 1P/Halley, Hale–Bopp, 67P, NEOWISE).
+  - About the brightest 10⁴–10⁵ asteroids, with H magnitude and diameter.
+  - The rest of the main belt, Kuiper belt and Oort cloud is procedural, drawn from the catalogue's statistical distributions.
+- **Pulsars and magnetars:**
+  - ATNF Pulsar Catalogue: position, distance, period, period derivative, inferred magnetic field.
+  - McGill Online Magnetar Catalog.
 - **Black holes and special stars:** a hand-curated table with citations. Sgr A\* and the S-stars, M87\*, Cyg X-1, Gaia BH1/2/3, S5-HVS1 and other known hypervelocity stars.
 
 **Total real-data budget:** about 0.5 GB peak, about 0.35 GB steady (`docs/research/2026-11-20-assets.md` §4.6).
@@ -369,6 +386,11 @@ trait RenderFeature {
 4. **Dual exposure for stars, on by default, labelled "Eye-adapted stars".** The reference screenshot shows stars next to a sunlit planet, which a physical exposure would hide. A toggle switches to strict photometric exposure.
 5. **Tonemapping:** AgX by default, with ACES and PBR-Neutral as options.
 6. **The sky is rendered from data and models, never from a photo skybox.**
+7. **HUD and UI design is original.**
+   - The Nav/UI team first produces a visual design: a mockup made with Claude's design tools, informed by online references for space UI and scientific instruments.
+   - The owner sees the mockup before it is built in egui.
+   - Direction: minimal, translucent and instrument-like. Thin type, real units, and colour used only for meaning. Non-physical modes are clearly labelled.
+   - The UI never covers the view more than necessary. Tab hides it entirely.
 
 ## 8. Verification (the core anti-failure rule)
 
@@ -462,6 +484,14 @@ Each milestone ends with something the owner can fly.
 - Bloom, auto-exposure, dual star exposure.
 - Target selection, goto, info cards.
 - Cruise mode.
+- **Comets** on real orbits:
+  - irregular nucleus
+  - coma and gas production scaled by heliocentric distance
+  - a curved dust tail from radiation pressure (Finson–Probstein)
+  - a straight ion tail pointing directly away from the Sun
+- **Asteroids:** real bright ones, plus the procedural belt.
+- **Exoplanet host stars** marked, with their known planets' orbits drawn. Full planet rendering comes in M5.
+- **Original HUD design** (§7.7).
 
 **Gate**
 - Standish positions within the error table.
@@ -503,6 +533,11 @@ Each milestone ends with something the owner can fly.
   - octree-streamed stars with IMF and stellar-evolution properties, epicycle motion and binaries
   - young blue open clusters
   - remnants
+  - **real pulsars (ATNF) and magnetars (McGill), plus procedural ones:**
+    - the correct spin period
+    - rotating beams along the magnetic axis
+    - a dipole magnetic-field visualisation, labelled
+    - magnetar bursts as rare, labelled events
   - S5-HVS1 and procedural hypervelocity and runaway stars that move correctly under time warp
   - the band generated from the same model as the stars
   - the Galaxy viewable from outside
@@ -531,7 +566,7 @@ Each milestone ends with something the owner can fly.
   - Local Group and nearby galaxies as volumes or impostors; Andromeda enterable with the same pipeline and different parameters
   - large-scale structure
   - fast Kerr (LUTs or analytic paths)
-  - neutron stars and pulsars
+  - neutron-star lensing close up
   - a cluster n-body sandbox
 
 ### M7: Hardening (continuous from M2)
