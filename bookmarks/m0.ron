@@ -1,0 +1,84 @@
+#![enable(implicit_some)]
+// M0 capture sheet (design §8). `universe` starts at "start"; `universe --capture
+// bookmarks/m0.ron --out captures/m0` renders all six.
+//
+// Axes: ICRS/J2000, origin at the Solar System barycentre (SSB), metres; +x toward RA 0h
+// Dec 0°, +z toward the north celestial pole. The camera looks along its local −Z with +Y up;
+// `orient` (x, y, z, w) turns camera axes into ICRS axes.
+//
+// TestBH-1 (crates/uni-app/src/world.rs): 10 M☉ at SSB + (1000 AU, 0, 0), spin 0, so
+// M = GM/c² = 14 766.250 385 m and the hole sits at x = 149 597 870 700 000 m.
+// Positions are written as SSB-relative metres in cell 0; the app normalises them on load.
+// `uni-app` tests check every position and orientation below against this intent.
+//
+// Fields left out keep their defaults: scene EV100 0, star EV100 uni-sky's default, lens
+// scale 1.0 in captures.
+[
+    // 60 M sunward of TestBH-1 (x = 1000 AU − 60 M), north up, turned 15° left so the hole
+    // sits 15° right of centre on the horizontal midline.
+    (
+        name: "start",
+        view: (
+            pos: (cell: (0, 0, 0), local: (149597869814024.97, 0.0, 0.0)),
+            orient: (0.5609855267969309, -0.4304593345768794, -0.4304593345768794, 0.560985526796931),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // At the SSB looking at Orion (RA 83.8°, Dec −1.2°), north up.
+    (
+        name: "sky-orion",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.6986395023855304, -0.03783696294392544, -0.03863783442459364, 0.7134271705595857),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // At the SSB looking at the Galactic Centre (RA 266.405°, Dec −28.936°), north up.
+    (
+        name: "sky-galactic-center",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.015935122771616423, 0.5077695271067934, 0.8609217208370549, 0.02701795319710947),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // At the SSB looking at Sirius (HR 2491, RA 101.2872°, Dec −16.7161°) with a 2° field,
+    // north up.
+    (
+        name: "sky-zoom-sirius",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.5939196735697798, 0.058690663558033075, 0.0789062835194903, 0.7984914688204413),
+            fov_y_rad: 0.03490658503988659, // 2°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // Static observer 30 M sunward of TestBH-1 (x = 1000 AU − 30 M), looking straight at it,
+    // north up. The shadow is centred; its radius at 1920×1080 and fov_y 60° is
+    // tan(α)/tan(30°)·540 = 158.745 px, with sin α = 3√3·√(1 − 2/30)/30 (Synge 1966).
+    (
+        name: "bh-shadow-30M",
+        view: (
+            pos: (cell: (0, 0, 0), local: (149597870257012.5, 0.0, 0.0)),
+            orient: (-0.5, 0.5, 0.5, -0.5),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+        lens_scale: 1.0,
+    ),
+    // 15 M from TestBH-1 along (−1, −1, 1)/√3 (35° above the hole's equatorial plane), facing
+    // the hole with north up, then turned 20° right about the camera's up axis, so the hole
+    // sits 20° left of centre on the horizontal midline.
+    (
+        name: "bh-oblique-15M",
+        view: (
+            pos: (cell: (0, 0, 0), local: (149597870572120.53, -127879.47952106407, 127879.47952106407)),
+            orient: (0.35924139674500677, -0.31572096078906786, -0.40843784549520523, 0.7774602370220353),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+]
