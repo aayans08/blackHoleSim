@@ -87,8 +87,17 @@ mod tests {
     #[test]
     fn targets_clamp_zero_size() {
         assert_eq!(FrameTargets::clamp_size(UVec2::ZERO), UVec2::ONE);
-        assert_eq!(FrameTargets::clamp_size(UVec2::new(0, 720)), UVec2::new(1, 720));
-        assert_eq!(FrameTargets::clamp_size(UVec2::new(1280, 0)), UVec2::new(1280, 1));
-        assert_eq!(FrameTargets::clamp_size(UVec2::new(1920, 1080)), UVec2::new(1920, 1080));
+        assert_eq!(
+            FrameTargets::clamp_size(UVec2::new(0, 720)),
+            UVec2::new(1, 720)
+        );
+        assert_eq!(
+            FrameTargets::clamp_size(UVec2::new(1280, 0)),
+            UVec2::new(1280, 1)
+        );
+        assert_eq!(
+            FrameTargets::clamp_size(UVec2::new(1920, 1080)),
+            UVec2::new(1920, 1080)
+        );
     }
 }

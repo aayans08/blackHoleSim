@@ -22,6 +22,4 @@ pub use frame::{FrameId, FrameMotion, FrameTree, MotionFn, ROOT_FRAME};
 pub use galactic::{ICRS_TO_GALACTIC, icrs_to_galactic, radec_to_icrs};
 pub use hash::{hash_u64s, pcg3d, splitmix64};
 pub use pos::{CELL_SIZE_M, UniversePos};
-pub use units::{
-    AU, C, DAY, G, GM_SUN, LY, M_SUN, PC, gravitational_radius, schwarzschild_radius,
-};
+pub use units::{AU, C, DAY, G, GM_SUN, LY, M_SUN, PC, gravitational_radius, schwarzschild_radius};

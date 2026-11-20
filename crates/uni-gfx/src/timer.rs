@@ -289,7 +289,11 @@ mod tests {
     #[test]
     fn pass_times_converts_ticks_to_ms() {
         // period 1 ns/tick (Apple M3, docs/research/wgpu30-skeleton/m3-probe-output.txt).
-        let t = pass_times(&["lens", "stars"], &[1_000, 2_501_000, 3_000_000, 3_250_000], 1.0);
+        let t = pass_times(
+            &["lens", "stars"],
+            &[1_000, 2_501_000, 3_000_000, 3_250_000],
+            1.0,
+        );
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].0, "lens");
         assert!((t[0].1 - 2.5).abs() < 1e-6);

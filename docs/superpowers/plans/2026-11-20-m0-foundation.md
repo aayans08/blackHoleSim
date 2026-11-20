@@ -417,7 +417,7 @@ impl CaptureTarget {
   #[test] fn offset_precision_far_from_origin() { // Review Focus 5
       let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0)); // 1 Gpc
       let near = far.offset(DVec3::new(0.001, 0.0, 0.0));
-      assert!((near.delta_from(far).x - 0.001).abs() < 1e-6); }
+      assert!((near.delta_from(far).x - 0.001).abs() < 1e-4); } // amended in M0 wave 1a: at 1 Gpc, |local| ≈ 3.3e12 m has f64 spacing 2^-11 m, so 1e-6 m is unreachable for the frozen layout; the 1e-6 m bound holds while the stepped |local| < 2^34 m
   #[test] fn normalized_local_within_half_cell() { /* offset by 3.7 * CELL_SIZE_M on every axis; every |local| ≤ CELL_SIZE_M/2 */ }
   #[test] fn j2000_from_unix() { let e = Epoch::from_unix_utc(946_727_935.816); assert!(e.seconds_since(Epoch::J2000).abs() < 1e-3); }
   #[test] fn parse_2026_11_20() { let e = Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap(); assert_eq!(e.day, 9819); assert!((e.sec - 43_269.184).abs() < 1e-3); }
@@ -428,7 +428,8 @@ impl CaptureTarget {
       assert_eq!(pcg3d(UVec3::new(1, 2, 3)), UVec3::new(0xfa9f79a6, 0x48f2f44c, 0x596f5ab1));
       assert_eq!(pcg3d(UVec3::new(0xFFFF_FFFF, 7, 42)), UVec3::new(0xe387d2d4, 0x47aa5f4a, 0xd51ae662)); }
   #[test] fn splitmix64_golden() { assert_eq!(splitmix64(0), 0xE220_A839_7B1D_CDAF); }
-  #[test] fn blackbody_6504_is_white() { let c = blackbody_linear_srgb(6504.0); assert!((c.x / c.y - 1.0).abs() < 0.05 && (c.z / c.y - 1.0).abs() < 0.05); }
+  #[test] fn blackbody_6504_is_white() { let c = blackbody_linear_srgb(6504.0); assert!((c.x / c.y - 1.0).abs() < 0.07 && (c.z / c.y - 1.0).abs() < 0.07); } // amended in M0 wave 1a: D65 lies off the Planckian locus, so an exact 6504 K blackbody gives R/G ≈ 1.061, B/G ≈ 1.054 (Krystek 1985); 0.05 was unreachable
+  #[test] fn planckian_locus_chromaticity() { /* amended in M0 wave 1a: chromaticity (x, y) of blackbody_xyz(T) within 0.002 of Krystek 1985 for T in 3000..=15000 K */ }
   #[test] fn blackbody_ordering() { let a = blackbody_linear_srgb(3000.0); assert!(a.x > a.y && a.y > a.z); let b = blackbody_linear_srgb(20000.0); assert!(b.z > b.x); }
   #[test] fn sun_teff_from_bv() { assert!((bv_to_teff(0.65) - 5778.4).abs() < 1.0); }
   #[test] fn star_lux_golden() { assert!((star_illuminance_lux(0.0) / 2.5351e-6 - 1.0).abs() < 1e-3); assert!((star_illuminance_lux(-26.74) / 1.2589e5 - 1.0).abs() < 1e-3); }

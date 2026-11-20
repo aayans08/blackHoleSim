@@ -17,7 +17,10 @@ pub type MotionFn = Box<dyn Fn(Epoch) -> (UniversePos, DQuat) + Send + Sync>;
 /// How a frame moves relative to its parent.
 pub enum FrameMotion {
     /// Constant origin and rotation, relative to the parent.
-    Fixed { origin: UniversePos, rotation: DQuat },
+    Fixed {
+        origin: UniversePos,
+        rotation: DQuat,
+    },
     /// Arbitrary motion relative to the parent; used by uni-physics later.
     Custom(MotionFn),
 }
@@ -65,15 +68,25 @@ impl FrameTree {
     /// # Panics
     /// If `parent` is not a frame of this tree.
     pub fn add(&mut self, parent: FrameId, name: &str, motion: FrameMotion) -> FrameId {
-        assert!((parent as usize) < self.frames.len(), "FrameTree has no frame with id {parent}");
+        assert!(
+            (parent as usize) < self.frames.len(),
+            "FrameTree has no frame with id {parent}"
+        );
         let id = self.frames.len() as FrameId;
-        self.frames.push(Frame { name: name.to_owned(), parent: Some(parent), motion });
+        self.frames.push(Frame {
+            name: name.to_owned(),
+            parent: Some(parent),
+            motion,
+        });
         id
     }
 
     /// Looks a frame up by name. If several frames share a name, the first one added wins.
     pub fn find(&self, name: &str) -> Option<FrameId> {
-        self.frames.iter().position(|f| f.name == name).map(|i| i as FrameId)
+        self.frames
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| i as FrameId)
     }
 
     /// The frame's origin in the root frame at time `t`.
@@ -137,7 +150,10 @@ mod tests {
     use std::f64::consts::{FRAC_PI_2, PI};
 
     fn fixed(origin_m: DVec3, rotation: DQuat) -> FrameMotion {
-        FrameMotion::Fixed { origin: UniversePos::from_meters(origin_m), rotation }
+        FrameMotion::Fixed {
+            origin: UniversePos::from_meters(origin_m),
+            rotation,
+        }
     }
 
     fn meters(p: UniversePos) -> DVec3 {
@@ -148,9 +164,16 @@ mod tests {
     fn frame_tree_fixed_child() {
         let mut tree = FrameTree::new();
         let quarter_turn = DQuat::from_rotation_z(FRAC_PI_2);
-        let child = tree.add(ROOT_FRAME, "child", fixed(DVec3::new(AU, 0.0, 0.0), quarter_turn));
+        let child = tree.add(
+            ROOT_FRAME,
+            "child",
+            fixed(DVec3::new(AU, 0.0, 0.0), quarter_turn),
+        );
         let p = tree.to_root(child, DVec3::X, Epoch::J2000);
-        assert!((meters(p) - DVec3::new(AU, 1.0, 0.0)).length() < 1e-6, "{p:?}");
+        assert!(
+            (meters(p) - DVec3::new(AU, 1.0, 0.0)).length() < 1e-6,
+            "{p:?}"
+        );
     }
 
     #[test]
@@ -167,14 +190,24 @@ mod tests {
     fn nested_frames_compose() {
         let mut tree = FrameTree::new();
         let quarter_turn = DQuat::from_rotation_z(FRAC_PI_2);
-        let a = tree.add(ROOT_FRAME, "a", fixed(DVec3::new(AU, 0.0, 0.0), quarter_turn));
+        let a = tree.add(
+            ROOT_FRAME,
+            "a",
+            fixed(DVec3::new(AU, 0.0, 0.0), quarter_turn),
+        );
         let b = tree.add(a, "b", fixed(DVec3::new(0.0, 2.0, 0.0), quarter_turn));
         let t = Epoch::J2000;
         assert_eq!(tree.find("b"), Some(b));
         // b sits 2 m along a's +y, which is root −x; b's axes are turned 180° about z.
         let origin = meters(tree.origin_in_root(b, t));
-        assert!((origin - DVec3::new(AU - 2.0, 0.0, 0.0)).length() < 1e-6, "{origin}");
-        assert!(tree.rotation_to_root(b, t).abs_diff_eq(DQuat::from_rotation_z(PI), 1e-12));
+        assert!(
+            (origin - DVec3::new(AU - 2.0, 0.0, 0.0)).length() < 1e-6,
+            "{origin}"
+        );
+        assert!(
+            tree.rotation_to_root(b, t)
+                .abs_diff_eq(DQuat::from_rotation_z(PI), 1e-12)
+        );
         let p = meters(tree.to_root(b, DVec3::X, t));
         assert!((p - DVec3::new(AU - 3.0, 0.0, 0.0)).length() < 1e-6, "{p}");
     }
@@ -187,11 +220,17 @@ mod tests {
             "probe",
             FrameMotion::Custom(Box::new(|t: Epoch| {
                 let x = 1000.0 * t.seconds_since(Epoch::J2000);
-                (UniversePos::from_meters(DVec3::new(x, 0.0, 0.0)), DQuat::IDENTITY)
+                (
+                    UniversePos::from_meters(DVec3::new(x, 0.0, 0.0)),
+                    DQuat::IDENTITY,
+                )
             })),
         );
         let t = Epoch::J2000.add_seconds(10.0);
-        assert_eq!(meters(tree.origin_in_root(probe, t)), DVec3::new(10_000.0, 0.0, 0.0));
+        assert_eq!(
+            meters(tree.origin_in_root(probe, t)),
+            DVec3::new(10_000.0, 0.0, 0.0)
+        );
     }
 
     #[test]
@@ -204,7 +243,10 @@ mod tests {
         let system = tree.add(
             ROOT_FRAME,
             "system",
-            FrameMotion::Fixed { origin: galactic, rotation: DQuat::IDENTITY },
+            FrameMotion::Fixed {
+                origin: galactic,
+                rotation: DQuat::IDENTITY,
+            },
         );
         let body = tree.add(system, "body", fixed(DVec3::X, DQuat::IDENTITY));
         let t = Epoch::J2000;

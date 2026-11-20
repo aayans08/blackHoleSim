@@ -32,7 +32,11 @@ pub fn blackbody_xyz(temp_k: f64) -> DVec3 {
         .map(|(i, &ln)| (ln - peak).exp() * cie_1931_cmf(lambda_nm(i)))
         .sum();
     // A bad temperature leaves every sample NaN or ±∞, so there is nothing finite to normalise.
-    if xyz.is_finite() && xyz.y > 0.0 { xyz / xyz.y } else { DVec3::ZERO }
+    if xyz.is_finite() && xyz.y > 0.0 {
+        xyz / xyz.y
+    } else {
+        DVec3::ZERO
+    }
 }
 
 /// ln of Planck's spectral radiance B_λ(T) = (2hc²/λ⁵) / (exp(c₂/λT) − 1) (Planck 1901), without
@@ -40,7 +44,11 @@ pub fn blackbody_xyz(temp_k: f64) -> DVec3 {
 fn ln_planck_shape(lambda_m: f64, temp_k: f64) -> f64 {
     let x = C2 / (lambda_m * temp_k);
     // ln(eˣ − 1) as x + ln(1 − e⁻ˣ) for large x, which cannot overflow.
-    let ln_exp_m1 = if x < 1.0 { x.exp_m1().ln() } else { x + (-(-x).exp()).ln_1p() };
+    let ln_exp_m1 = if x < 1.0 {
+        x.exp_m1().ln()
+    } else {
+        x + (-(-x).exp()).ln_1p()
+    };
     -5.0 * lambda_m.ln() - ln_exp_m1
 }
 
@@ -73,7 +81,9 @@ pub fn xyz_to_linear_srgb(xyz: DVec3) -> DVec3 {
 
 /// Blackbody colour in linear sRGB with Y = 1; negative components clamped to 0.
 pub fn blackbody_linear_srgb(temp_k: f64) -> Vec3 {
-    xyz_to_linear_srgb(blackbody_xyz(temp_k)).max(DVec3::ZERO).as_vec3()
+    xyz_to_linear_srgb(blackbody_xyz(temp_k))
+        .max(DVec3::ZERO)
+        .as_vec3()
 }
 
 /// Effective temperature [K] from B−V colour index (Ballesteros 2012, EPL 97 34008).
@@ -122,7 +132,10 @@ mod tests {
         // "near white", and the tint must point the physical way (R and B above G). Colour
         // accuracy is pinned by `planckian_locus_chromaticity` and `illuminant_a_chromaticity`.
         let c = blackbody_linear_srgb(6504.0);
-        assert!((c.x / c.y - 1.0).abs() < 0.07 && (c.z / c.y - 1.0).abs() < 0.07, "{c}");
+        assert!(
+            (c.x / c.y - 1.0).abs() < 0.07 && (c.z / c.y - 1.0).abs() < 0.07,
+            "{c}"
+        );
         assert!(c.x > c.y && c.z > c.y, "{c}");
     }
 
@@ -131,7 +144,10 @@ mod tests {
         // A blackbody lies on the Planckian locus by definition, so the locus, not D65, is the
         // reference for its chromaticity. 6500 K sits at (0.3135, 0.3235) (Krystek 1985).
         let (x, y) = chromaticity(6500.0);
-        assert!((x - 0.3135).abs() < 0.002 && (y - 0.3235).abs() < 0.002, "x {x} y {y}");
+        assert!(
+            (x - 0.3135).abs() < 0.002 && (y - 0.3235).abs() < 0.002,
+            "x {x} y {y}"
+        );
         // From 3000 K up the multi-lobe fit stays within 0.002 of the locus (worst 0.0013, at
         // 3000 K). It drifts further below about 2500 K (0.011 at 1000 K); 2856 K is pinned by
         // `illuminant_a_chromaticity`.
@@ -157,7 +173,10 @@ mod tests {
         // CIE standard illuminant A is a ≈2856 K Planckian radiator at x 0.44757, y 0.40745
         // (CIE 15:2004). The multi-lobe fit over 380–780 nm lands within 0.002.
         let (x, y) = chromaticity(2856.0);
-        assert!((x - 0.44757).abs() < 0.002 && (y - 0.40745).abs() < 0.002, "x {x} y {y}");
+        assert!(
+            (x - 0.44757).abs() < 0.002 && (y - 0.40745).abs() < 0.002,
+            "x {x} y {y}"
+        );
         assert_eq!(blackbody_xyz(2856.0).y, 1.0);
     }
 

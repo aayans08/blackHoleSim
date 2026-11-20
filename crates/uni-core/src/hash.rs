@@ -7,7 +7,9 @@ use glam::UVec3;
 pub fn pcg3d(v: UVec3) -> UVec3 {
     // One LCG step per lane (Numerical Recipes constants), then cross-lane mixing around an
     // xorshift. All arithmetic wraps mod 2^32, as u32 does in WGSL.
-    let mut v = v.wrapping_mul(UVec3::splat(1_664_525)).wrapping_add(UVec3::splat(1_013_904_223));
+    let mut v = v
+        .wrapping_mul(UVec3::splat(1_664_525))
+        .wrapping_add(UVec3::splat(1_013_904_223));
     v = pcg3d_mix(v);
     v ^= v >> 16_u32;
     pcg3d_mix(v)
@@ -41,8 +43,14 @@ mod tests {
 
     #[test]
     fn pcg3d_golden() {
-        assert_eq!(pcg3d(UVec3::new(0, 0, 0)), UVec3::new(0x9bafd7c6, 0xa8e88a6b, 0x3f15482c));
-        assert_eq!(pcg3d(UVec3::new(1, 2, 3)), UVec3::new(0xfa9f79a6, 0x48f2f44c, 0x596f5ab1));
+        assert_eq!(
+            pcg3d(UVec3::new(0, 0, 0)),
+            UVec3::new(0x9bafd7c6, 0xa8e88a6b, 0x3f15482c)
+        );
+        assert_eq!(
+            pcg3d(UVec3::new(1, 2, 3)),
+            UVec3::new(0xfa9f79a6, 0x48f2f44c, 0x596f5ab1)
+        );
         assert_eq!(
             pcg3d(UVec3::new(0xFFFF_FFFF, 7, 42)),
             UVec3::new(0xe387d2d4, 0x47aa5f4a, 0xd51ae662)

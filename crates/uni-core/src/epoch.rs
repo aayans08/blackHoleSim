@@ -72,7 +72,10 @@ impl Epoch {
         // Split off whole days first so a large `s` cannot swamp the sub-second part of `sec`.
         let (days, rem) = split_days(s);
         let (carry, sec) = split_days(self.sec + rem);
-        Epoch { day: self.day.saturating_add(days).saturating_add(carry), sec }
+        Epoch {
+            day: self.day.saturating_add(days).saturating_add(carry),
+            sec,
+        }
     }
 
     /// Returns `self − other` in seconds.
@@ -150,9 +153,8 @@ impl Epoch {
             return None;
         }
         let unix_day = days_from_civil(year, month, day);
-        let ends_with_leap_second = hour == 23
-            && minute == 59
-            && tai_minus_utc(unix_day + 1) > tai_minus_utc(unix_day);
+        let ends_with_leap_second =
+            hour == 23 && minute == 59 && tai_minus_utc(unix_day + 1) > tai_minus_utc(unix_day);
         if second > 60 || (second == 60 && !ends_with_leap_second) {
             return None;
         }
@@ -169,7 +171,10 @@ impl Epoch {
     /// The epoch `utc_sec` seconds after 00:00:00 UTC on `unix_day`. `utc_sec` reaches past
     /// 86400 only inside a leap second, which then lands on the right TT instant.
     fn from_utc_day(unix_day: i64, utc_sec: f64) -> Self {
-        let midnight = Epoch { day: unix_day.saturating_sub(J2000_UNIX_DAY), sec: 0.0 };
+        let midnight = Epoch {
+            day: unix_day.saturating_sub(J2000_UNIX_DAY),
+            sec: 0.0,
+        };
         midnight.add_seconds(utc_sec + utc_to_epoch_sec(tai_minus_utc(unix_day)))
     }
 }
@@ -252,20 +257,40 @@ mod tests {
 
     #[test]
     fn add_seconds_keeps_sec_in_range() {
-        for s in [-1e-300, 1e-300, 86_400.0, -86_400.0, 3.0 * 86_400.0 + 5.0, 1e12 + 0.25] {
+        for s in [
+            -1e-300,
+            1e-300,
+            86_400.0,
+            -86_400.0,
+            3.0 * 86_400.0 + 5.0,
+            1e12 + 0.25,
+        ] {
             let e = Epoch::from_tdb_seconds(s);
             assert!((0.0..86_400.0).contains(&e.sec), "{s} -> {e:?}");
             let tol = (s.abs() * f64::EPSILON).max(1e-12);
-            assert!((e.seconds_since(Epoch::J2000) - s).abs() <= tol, "{s} -> {e:?}");
+            assert!(
+                (e.seconds_since(Epoch::J2000) - s).abs() <= tol,
+                "{s} -> {e:?}"
+            );
         }
-        assert_eq!(Epoch::from_tdb_seconds(3.0 * 86_400.0 + 5.0), Epoch { day: 3, sec: 5.0 });
+        assert_eq!(
+            Epoch::from_tdb_seconds(3.0 * 86_400.0 + 5.0),
+            Epoch { day: 3, sec: 5.0 }
+        );
     }
 
     #[test]
     fn unix_roundtrip_including_pre_1972() {
         // 1966-10-31, 1970-01-01, 1971-12-31T23:59:59.5, either side of the 2016 leap second,
         // and 2026-11-20.
-        for u in [-1e8, 0.0, 63_071_999.5, 1_483_228_799.5, 1_483_228_800.5, 1_795_132_800.0] {
+        for u in [
+            -1e8,
+            0.0,
+            63_071_999.5,
+            1_483_228_799.5,
+            1_483_228_800.5,
+            1_795_132_800.0,
+        ] {
             let back = Epoch::from_unix_utc(u).to_unix_utc();
             assert!((back - u).abs() < 1e-6, "{u} -> {back}");
         }
@@ -317,8 +342,19 @@ mod tests {
     #[test]
     fn julian_centuries_count_36525_days() {
         assert_eq!(Epoch::J2000.julian_centuries(), 0.0);
-        assert_eq!(Epoch { day: 36_525, sec: 0.0 }.julian_centuries(), 1.0);
-        let c = Epoch { day: -36_525, sec: 43_200.0 }.julian_centuries();
+        assert_eq!(
+            Epoch {
+                day: 36_525,
+                sec: 0.0
+            }
+            .julian_centuries(),
+            1.0
+        );
+        let c = Epoch {
+            day: -36_525,
+            sec: 43_200.0,
+        }
+        .julian_centuries();
         assert!((c + 36_524.5 / 36_525.0).abs() < 1e-15);
     }
 }

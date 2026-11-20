@@ -26,11 +26,25 @@ pub struct ShaderLib {
 impl ShaderLib {
     /// A library with every `common/*.wgsl` file registered.
     pub fn with_common() -> Self {
-        let mut lib = Self { sources: HashMap::new() };
-        lib.add("common/constants.wgsl", include_str!("../shaders/common/constants.wgsl"));
-        lib.add("common/hash.wgsl", include_str!("../shaders/common/hash.wgsl"));
-        lib.add("common/color.wgsl", include_str!("../shaders/common/color.wgsl"));
-        lib.add("common/camera.wgsl", include_str!("../shaders/common/camera.wgsl"));
+        let mut lib = Self {
+            sources: HashMap::new(),
+        };
+        lib.add(
+            "common/constants.wgsl",
+            include_str!("../shaders/common/constants.wgsl"),
+        );
+        lib.add(
+            "common/hash.wgsl",
+            include_str!("../shaders/common/hash.wgsl"),
+        );
+        lib.add(
+            "common/color.wgsl",
+            include_str!("../shaders/common/color.wgsl"),
+        );
+        lib.add(
+            "common/camera.wgsl",
+            include_str!("../shaders/common/camera.wgsl"),
+        );
         lib
     }
 
@@ -118,8 +132,8 @@ fn import_path(line: &str) -> Option<&str> {
 /// Capabilities are naga's defaults plus `SHADER_FLOAT16`, matching the device on the
 /// target M3 (which enables `SHADER_F16`; see docs/research/wgpu30-skeleton/m3-probe-output.txt).
 pub fn validate_wgsl(src: &str) -> Result<naga::Module, ShaderError> {
-    let module = naga::front::wgsl::parse_str(src)
-        .map_err(|e| ShaderError::Naga(e.emit_to_string(src)))?;
+    let module =
+        naga::front::wgsl::parse_str(src).map_err(|e| ShaderError::Naga(e.emit_to_string(src)))?;
     let caps = naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16;
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
         .validate(&module)
@@ -155,7 +169,9 @@ mod tests {
         let lib = ShaderLib::with_common();
         let has_fn = |path: &str, name: &str| {
             let m = validate_wgsl(&lib.compose(path).unwrap()).unwrap();
-            m.functions.iter().any(|(_, f)| f.name.as_deref() == Some(name))
+            m.functions
+                .iter()
+                .any(|(_, f)| f.name.as_deref() == Some(name))
         };
         assert!(has_fn("common/camera.wgsl", "pixel_dir"));
         assert!(has_fn("common/camera.wgsl", "exposure_scale"));
@@ -165,7 +181,10 @@ mod tests {
         let consts = validate_wgsl(&lib.compose("common/constants.wgsl").unwrap()).unwrap();
         for name in ["PI", "TAU"] {
             assert!(
-                consts.constants.iter().any(|(_, c)| c.name.as_deref() == Some(name)),
+                consts
+                    .constants
+                    .iter()
+                    .any(|(_, c)| c.name.as_deref() == Some(name)),
                 "missing const {name}"
             );
         }
@@ -237,8 +256,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     #[test]
     fn compose_terminates_on_import_cycle() {
         let mut lib = ShaderLib::with_common();
-        lib.add("test/x.wgsl", "#import \"test/y.wgsl\"\nfn x() -> f32 { return 1.0; }\n");
-        lib.add("test/y.wgsl", "#import \"test/x.wgsl\"\nfn y() -> f32 { return 2.0; }\n");
+        lib.add(
+            "test/x.wgsl",
+            "#import \"test/y.wgsl\"\nfn x() -> f32 { return 1.0; }\n",
+        );
+        lib.add(
+            "test/y.wgsl",
+            "#import \"test/x.wgsl\"\nfn y() -> f32 { return 2.0; }\n",
+        );
         let out = lib.compose("test/x.wgsl").unwrap();
         assert_eq!(out.matches("fn x()").count(), 1, "{out}");
         assert_eq!(out.matches("fn y()").count(), 1, "{out}");
@@ -249,7 +274,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let mut lib = ShaderLib::with_common();
         lib.add("test/needs.wgsl", "#import \"test/nope.wgsl\"\nfn f() {}\n");
         let err = lib.compose("test/needs.wgsl").unwrap_err();
-        assert!(matches!(&err, ShaderError::MissingImport(p) if p == "test/nope.wgsl"), "{err}");
+        assert!(
+            matches!(&err, ShaderError::MissingImport(p) if p == "test/nope.wgsl"),
+            "{err}"
+        );
         let err = lib.compose("test/not-registered.wgsl").unwrap_err();
         assert!(
             matches!(&err, ShaderError::MissingImport(p) if p == "test/not-registered.wgsl"),

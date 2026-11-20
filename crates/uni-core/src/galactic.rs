@@ -5,9 +5,21 @@ use glam::DVec3;
 /// ICRS → Galactic rotation (ESA 1997, Vol. 1 §1.5.3).
 /// Rows are the galactic x, y, z axes expressed in ICRS.
 pub const ICRS_TO_GALACTIC: [[f64; 3]; 3] = [
-    [-0.054_875_560_416_215_4, -0.873_437_090_234_885_0, -0.483_835_015_548_713_2],
-    [ 0.494_109_427_875_583_7, -0.444_829_629_960_011_2,  0.746_982_244_497_218_9],
-    [-0.867_666_149_019_004_7, -0.198_076_373_431_201_5,  0.455_983_776_175_066_9],
+    [
+        -0.054_875_560_416_215_4,
+        -0.873_437_090_234_885_0,
+        -0.483_835_015_548_713_2,
+    ],
+    [
+        0.494_109_427_875_583_7,
+        -0.444_829_629_960_011_2,
+        0.746_982_244_497_218_9,
+    ],
+    [
+        -0.867_666_149_019_004_7,
+        -0.198_076_373_431_201_5,
+        0.455_983_776_175_066_9,
+    ],
 ];
 
 /// Rotates an ICRS vector into Galactic axes.
@@ -35,7 +47,10 @@ mod tests {
         let gx = DVec3::from_array(ICRS_TO_GALACTIC[0]);
         let ra = gx.y.atan2(gx.x).to_degrees().rem_euclid(360.0);
         let dec = gx.z.asin().to_degrees();
-        assert!((ra - 266.4050).abs() < 1e-3 && (dec + 28.9362).abs() < 1e-3, "RA {ra} Dec {dec}");
+        assert!(
+            (ra - 266.4050).abs() < 1e-3 && (dec + 28.9362).abs() < 1e-3,
+            "RA {ra} Dec {dec}"
+        );
         let (ra, dec) = (266.4050_f64.to_radians(), (-28.9362_f64).to_radians());
         let gc = icrs_to_galactic(radec_to_icrs(ra, dec));
         assert!(gc.abs_diff_eq(DVec3::X, 2e-5), "{gc}");

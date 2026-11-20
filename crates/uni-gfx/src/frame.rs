@@ -132,7 +132,13 @@ mod tests {
             .find(|(_, v)| v.name.as_deref() == Some("camera"))
             .expect("var camera in camera.wgsl");
         assert_eq!(var.space, naga::AddressSpace::Uniform);
-        assert_eq!(var.binding, Some(naga::ResourceBinding { group: 0, binding: 0 }));
+        assert_eq!(
+            var.binding,
+            Some(naga::ResourceBinding {
+                group: 0,
+                binding: 0
+            })
+        );
         assert_eq!(var.ty, handle);
     }
 
@@ -156,7 +162,10 @@ mod tests {
             view_rot: Mat4::from_quat(orient().as_quat().inverse()),
             proj: reversed_z_infinite_proj(fov_y, aspect, 0.1),
             viewport,
-            exposure: Exposure { scene_ev100: 3.0, star_ev100: -2.0 },
+            exposure: Exposure {
+                scene_ev100: 3.0,
+                star_ev100: -2.0,
+            },
             lenses: Vec::new(),
         }
     }
@@ -201,7 +210,10 @@ mod tests {
         assert!((top.y.atan2(-top.z) - want).abs() < 1e-5, "top = {top}");
         assert!(top.x.abs() < 1e-5);
         let left = to_cam(pixel_dir(&u, glam::Vec2::new(0.0, 30.0)));
-        assert!(left.x < 0.0 && left.y.abs() < 1e-5 && left.z < 0.0, "left = {left}");
+        assert!(
+            left.x < 0.0 && left.y.abs() < 1e-5 && left.z < 0.0,
+            "left = {left}"
+        );
     }
 
     #[test]

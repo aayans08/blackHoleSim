@@ -15,7 +15,11 @@ pub struct UniversePos {
 impl UniversePos {
     /// Builds a normalized position from absolute metres.
     pub fn from_meters(m: DVec3) -> Self {
-        UniversePos { cell: I64Vec3::ZERO, local: m }.normalized()
+        UniversePos {
+            cell: I64Vec3::ZERO,
+            local: m,
+        }
+        .normalized()
     }
 
     /// Moves whole cells out of `local` so each |local| component is ≤ CELL_SIZE_M / 2.
@@ -33,7 +37,11 @@ impl UniversePos {
 
     /// Adds a displacement in metres; the result is normalized.
     pub fn offset(self, d: DVec3) -> Self {
-        UniversePos { cell: self.cell, local: self.local + d }.normalized()
+        UniversePos {
+            cell: self.cell,
+            local: self.local + d,
+        }
+        .normalized()
     }
 
     /// Returns `self − origin` in metres.
@@ -87,10 +95,16 @@ mod tests {
         let step = DVec3::new(0.001, 0.0, 0.0);
         for k in 0..=42 {
             for sign in [1.0, -1.0] {
-                let far = UniversePos { cell, local: DVec3::new(sign * 2_f64.powi(k), 0.0, 0.0) };
+                let far = UniversePos {
+                    cell,
+                    local: DVec3::new(sign * 2_f64.powi(k), 0.0, 0.0),
+                };
                 let err = (far.offset(step).delta_from(far).x - step.x).abs();
                 let half_spacing = 0.5 * (far.local.x.abs().next_up() - far.local.x.abs());
-                assert!(err <= half_spacing && err < 1e-3, "|local| 2^{k} m: error {err} m");
+                assert!(
+                    err <= half_spacing && err < 1e-3,
+                    "|local| 2^{k} m: error {err} m"
+                );
                 if k <= 33 {
                     assert!(err < 1e-6, "|local| 2^{k} m: error {err} m");
                 }
@@ -111,8 +125,14 @@ mod tests {
 
     #[test]
     fn delta_from_spans_cells() {
-        let a = UniversePos { cell: I64Vec3::new(5, -3, 0), local: DVec3::new(1.0, 2.0, 3.0) };
-        let b = UniversePos { cell: I64Vec3::new(2, -3, 1), local: DVec3::new(0.5, 0.0, -1.0) };
+        let a = UniversePos {
+            cell: I64Vec3::new(5, -3, 0),
+            local: DVec3::new(1.0, 2.0, 3.0),
+        };
+        let b = UniversePos {
+            cell: I64Vec3::new(2, -3, 1),
+            local: DVec3::new(0.5, 0.0, -1.0),
+        };
         let expected = DVec3::new(3.0 * CELL_SIZE_M + 0.5, 2.0, -CELL_SIZE_M + 4.0);
         assert_eq!(a.delta_from(b), expected);
     }
