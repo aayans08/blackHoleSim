@@ -20,5 +20,20 @@
 # credit = ""
 # raw_path = "data/cache/<id>/..."
 # baked_path = "data/baked/<id>.bin"
-#
-# No entries yet. Task 7 adds the first one (bsc5).
+
+# Yale Bright Star Catalogue, 5th revised ed. (CDS V/50), baked by `uni-bake bsc5`.
+# Canonical CDS URL: https://cdsarc.cds.unistra.fr/ftp/V/50/catalog.gz. On 2026-11-20 that server
+# answered 404 ("This page is currently unavailable") for every V/50 file, so the file was
+# fetched from CDS's VizieR mirror at the CfA (url below). The gzip header names the member
+# "catalog", modified 1993-10-04, matching the CDS history note of 02-Oct-1993.
+# Format description used for the byte columns: the same mirror's ReadMe,
+# https://vizier.cfa.harvard.edu/ftp/cats/V/50/ReadMe (data/cache/bsc5/ReadMe),
+# sha256 44fd9c73e2eecad0beb47bdfa3f01c60fd43f93d6964198e31fcd48732de5b33.
+[[entry]]
+id = "bsc5"
+url = "https://vizier.cfa.harvard.edu/ftp/cats/V/50/catalog.gz"
+sha256 = "3dc44b1e90be8fbe5bcc7656032560f51275f985c7e3f783c9028e1838ec7bed"
+license = "public (CDS V/50)"
+credit = "Hoffleit & Warren 1991, Yale Bright Star Catalogue 5th ed. via CDS"
+raw_path = "data/cache/bsc5/catalog.gz"
+baked_path = "data/baked/bsc5.bin"

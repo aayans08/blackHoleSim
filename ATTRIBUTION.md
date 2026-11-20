@@ -5,7 +5,12 @@ Downloaded data files are also recorded, with URL and SHA-256, in `data/manifest
 
 ## Data
 
-None yet. Catalogues are added here when they are baked into `data/baked/`.
+**Yale Bright Star Catalogue, 5th Revised Ed.** (`data/baked/bsc5.bin`). Hoffleit, D. & Warren Jr., W. H. 1991,
+*The Bright Star Catalogue, 5th Revised Ed. (Preliminary Version)*, Astronomical Data Center, NSSDC/ADC; CDS
+catalogue [V/50](https://cdsarc.cds.unistra.fr/viz-bin/cat/V/50), obtained via CDS (VizieR mirror at the CfA). Licence:
+public (CDS V/50). The baked file keeps, for 9096 of the 9110 entries, the J2000 direction, V magnitude and HR number,
+plus an effective temperature derived from B−V with Ballesteros (2012, EPL 97, 34008). The 14 entries without a
+position (novae and non-stellar objects) are omitted.
 
 ## Textures
 

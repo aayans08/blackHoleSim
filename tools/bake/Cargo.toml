@@ -11,3 +11,5 @@ uni-core.workspace = true
 uni-data.workspace = true
 flate2.workspace = true
 anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
