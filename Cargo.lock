@@ -2594,7 +2594,9 @@ name = "uni-bake"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "env_logger",
  "flate2",
+ "log",
  "uni-core",
  "uni-data",
 ]
@@ -2612,9 +2614,7 @@ name = "uni-data"
 version = "0.1.0"
 dependencies = [
  "glam",
- "log",
  "thiserror 2.0.21",
- "uni-core",
 ]
 
 [[package]]
@@ -2661,6 +2661,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "pollster",
  "uni-core",
  "uni-gfx",
  "wgpu",
@@ -2677,6 +2678,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "pollster",
  "uni-core",
  "uni-gfx",
  "wgpu",
@@ -2693,6 +2695,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "pollster",
  "uni-core",
  "uni-data",
  "uni-gfx",

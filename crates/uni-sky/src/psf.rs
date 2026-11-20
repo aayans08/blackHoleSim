@@ -251,7 +251,9 @@ mod tests {
         for radius in [MIN_RADIUS_PX, 6.0, 30.0] {
             for (x, y) in SUB_PX {
                 let sub = Vec2::new(x, y);
-                let core: f32 = psf_weights(sub, CORE_SIGMA_PX, radius.ceil() as i32).iter().sum();
+                let core: f32 = psf_weights(sub, CORE_SIGMA_PX, radius.ceil() as i32)
+                    .iter()
+                    .sum();
                 let h = HALO_ENERGY_FRACTION;
                 let total = (1.0 - h) * core + h * halo_sum(sub, radius);
                 let err = (total - 1.0).abs();

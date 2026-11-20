@@ -76,7 +76,11 @@ pub fn bake(input: &Path, out: &Path) -> anyhow::Result<Summary> {
     uni_data::write_bsc5(out, &stars).with_context(|| format!("writing {}", out.display()))?;
     let written =
         uni_data::load_bsc5(out).with_context(|| format!("reading back {}", out.display()))?;
-    ensure!(written == stars, "{} does not read back as written", out.display());
+    ensure!(
+        written == stars,
+        "{} does not read back as written",
+        out.display()
+    );
     Ok(summary)
 }
 
@@ -259,7 +263,11 @@ mod tests {
         let (sirius, colour) = star(parse_record(SIRIUS).expect("parse"));
         let expected = radec_to_icrs(101.2872_f64.to_radians(), (-16.7161_f64).to_radians());
         let dir = sirius.dir_icrs.as_dvec3();
-        let angle_deg = dir.cross(expected).length().atan2(dir.dot(expected)).to_degrees();
+        let angle_deg = dir
+            .cross(expected)
+            .length()
+            .atan2(dir.dot(expected))
+            .to_degrees();
         assert!(angle_deg < 0.01, "{angle_deg}° from the expected direction");
         assert!((sirius.dir_icrs.length() - 1.0).abs() < 1e-6);
         assert_eq!(sirius.v_mag, -1.46);

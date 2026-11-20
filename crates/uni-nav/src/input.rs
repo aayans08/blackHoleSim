@@ -259,11 +259,17 @@ mod tests {
         assert!(input.is_down(Action::Forward));
         assert!(input.take_pressed_once(Action::Forward));
         assert!(!input.take_pressed_once(Action::Forward));
-        assert!(input.is_down(Action::Forward), "taking a press must not release the key");
+        assert!(
+            input.is_down(Action::Forward),
+            "taking a press must not release the key"
+        );
         input.on_key(KeyCode::KeyW, false, false);
         assert!(!input.is_down(Action::Forward));
         input.on_key(KeyCode::KeyZ, true, false);
-        assert!(ALL_ACTIONS.iter().all(|&a| !input.is_down(a)), "unmapped key changed state");
+        assert!(
+            ALL_ACTIONS.iter().all(|&a| !input.is_down(a)),
+            "unmapped key changed state"
+        );
     }
 
     #[test]
@@ -281,7 +287,10 @@ mod tests {
         }
         assert_eq!(speed_presses, 3);
         assert!(input.take_pressed_once(Action::ToggleHud));
-        assert!(!input.take_pressed_once(Action::ToggleHud), "a held Tab toggled the HUD twice");
+        assert!(
+            !input.take_pressed_once(Action::ToggleHud),
+            "a held Tab toggled the HUD twice"
+        );
     }
 
     #[test]

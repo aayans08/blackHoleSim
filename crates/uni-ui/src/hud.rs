@@ -756,10 +756,8 @@ mod tests {
         for ppp in [1.0, 2.0] {
             let (out_ppp, texts) = first_headless_draw(ppp, controls(true));
             assert_eq!(out_ppp, ppp);
-            let screen = egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1920.0 / ppp, 1080.0 / ppp),
-            );
+            let screen =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0 / ppp, 1080.0 / ppp));
             for needle in [
                 "fps",
                 "GPU ms n/a",

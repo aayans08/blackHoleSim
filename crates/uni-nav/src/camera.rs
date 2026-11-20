@@ -132,7 +132,10 @@ mod tests {
         input.set_down(Action::Forward, true);
         cam.update(&mut input, 1.0);
         let moved = cam.view.pos.delta_from(start);
-        assert!((moved - DVec3::new(0.0, 0.0, -1000.0)).length() < 1e-6, "{moved}");
+        assert!(
+            (moved - DVec3::new(0.0, 0.0, -1000.0)).length() < 1e-6,
+            "{moved}"
+        );
     }
 
     #[test]
@@ -161,7 +164,11 @@ mod tests {
         let mut cam = camera_at_origin();
         input.add_mouse_delta(DVec2::new(10.0, 0.0));
         cam.update(&mut input, 0.0);
-        assert!(forward(&cam).x > 0.0 && forward(&cam).y.abs() < 1e-12, "{}", forward(&cam));
+        assert!(
+            forward(&cam).x > 0.0 && forward(&cam).y.abs() < 1e-12,
+            "{}",
+            forward(&cam)
+        );
         let yaw = forward(&cam).x.atan2(-forward(&cam).z);
         assert!((yaw - 10.0 * cam.look_sensitivity).abs() < 1e-12);
 
@@ -169,7 +176,11 @@ mod tests {
         let mut cam = camera_at_origin();
         input.add_mouse_delta(DVec2::new(0.0, 10.0));
         cam.update(&mut input, 0.0);
-        assert!(forward(&cam).y < 0.0 && forward(&cam).x.abs() < 1e-12, "{}", forward(&cam));
+        assert!(
+            forward(&cam).y < 0.0 && forward(&cam).x.abs() < 1e-12,
+            "{}",
+            forward(&cam)
+        );
 
         // E rolls right: up tilts towards camera +X; the view direction is unchanged.
         let mut cam = camera_at_origin();
@@ -185,7 +196,11 @@ mod tests {
         cam.view.orient = DQuat::from_axis_angle(DVec3::NEG_Z, FRAC_PI_2);
         input.add_mouse_delta(DVec2::new(10.0, 0.0));
         cam.update(&mut input, 0.0);
-        assert!(forward(&cam).y < 0.0 && forward(&cam).x.abs() < 1e-12, "{}", forward(&cam));
+        assert!(
+            forward(&cam).y < 0.0 && forward(&cam).x.abs() < 1e-12,
+            "{}",
+            forward(&cam)
+        );
     }
 
     #[test]
@@ -222,7 +237,10 @@ mod tests {
         input.press(Action::SpeedDown);
         cam.update(&mut input, 0.0);
         assert!((cam.speed_log10 - 3.2).abs() < 1e-12, "{}", cam.speed_log10);
-        assert!(!input.take_pressed_once(Action::SpeedUp), "update left a speed press untaken");
+        assert!(
+            !input.take_pressed_once(Action::SpeedUp),
+            "update left a speed press untaken"
+        );
         assert_eq!(input.take_wheel(), 0.0, "update left wheel notches untaken");
     }
 
@@ -255,14 +273,23 @@ mod tests {
         }
         let pos = cam.view.pos;
         assert!(pos.local.is_finite(), "{pos:?}");
-        assert!(pos.local.abs().max_element() <= CELL_SIZE_M / 2.0, "{pos:?}");
+        assert!(
+            pos.local.abs().max_element() <= CELL_SIZE_M / 2.0,
+            "{pos:?}"
+        );
         let max_cell = pos.cell.abs().max_element();
-        assert!(max_cell > 0 && max_cell < i64::MAX, "cell saturated: {pos:?}");
+        assert!(
+            max_cell > 0 && max_cell < i64::MAX,
+            "cell saturated: {pos:?}"
+        );
         assert!(cam.view.orient.is_finite());
 
         let moved = pos.delta_from(start);
         let expected = -1000.0 * 1e26 * 0.016;
-        assert!(moved.is_finite() && moved.x == 0.0 && moved.y == 0.0, "{moved}");
+        assert!(
+            moved.is_finite() && moved.x == 0.0 && moved.y == 0.0,
+            "{moved}"
+        );
         assert!((moved.z / expected - 1.0).abs() < 1e-9, "{moved}");
 
         // Back at 1 m/s, a 1 m step out there is still mm-precise.
@@ -270,7 +297,10 @@ mod tests {
         let before = cam.view.pos;
         cam.update(&mut input, 1.0);
         let step = cam.view.pos.delta_from(before);
-        assert!((step - DVec3::new(0.0, 0.0, -1.0)).length() < 1e-3, "{step}");
+        assert!(
+            (step - DVec3::new(0.0, 0.0, -1.0)).length() < 1e-3,
+            "{step}"
+        );
     }
 
     #[test]
@@ -291,7 +321,11 @@ mod tests {
         let mut input = InputState::new();
         input.set_down(Action::Forward, true);
         cam.update(&mut input, 1.0);
-        assert!(cam.view.orient.is_finite() && cam.view.pos.local.is_finite(), "{:?}", cam.view);
+        assert!(
+            cam.view.orient.is_finite() && cam.view.pos.local.is_finite(),
+            "{:?}",
+            cam.view
+        );
         assert!((cam.view.orient.length() - 1.0).abs() < 1e-12);
     }
 }

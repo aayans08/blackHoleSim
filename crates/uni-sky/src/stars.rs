@@ -147,8 +147,8 @@ impl StarField {
         stars: &[CatalogStar],
     ) -> anyhow::Result<Self> {
         let device = &gpu.device;
-        let count = u32::try_from(stars.len())
-            .context("more stars than one instanced draw can hold")?;
+        let count =
+            u32::try_from(stars.len()).context("more stars than one instanced draw can hold")?;
         let mut instances: Vec<StarInstance> = stars.iter().map(star_instance).collect();
         if instances.is_empty() {
             // A storage binding cannot be empty, so an empty sky keeps one dark instance and

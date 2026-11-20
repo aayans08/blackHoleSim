@@ -30,8 +30,7 @@ pub struct Bookmark {
 pub fn load_bookmarks(path: &Path) -> anyhow::Result<Vec<Bookmark>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading bookmarks from {}", path.display()))?;
-    ron::from_str(&text)
-        .with_context(|| format!("parsing bookmarks in {}", path.display()))
+    ron::from_str(&text).with_context(|| format!("parsing bookmarks in {}", path.display()))
 }
 
 /// Writes `b` as a pretty-printed RON list, replacing the file. Floats are written in their
@@ -39,8 +38,7 @@ pub fn load_bookmarks(path: &Path) -> anyhow::Result<Vec<Bookmark>> {
 pub fn save_bookmarks(path: &Path, b: &[Bookmark]) -> anyhow::Result<()> {
     let text = ron::ser::to_string_pretty(b, PrettyConfig::new())
         .context("serialising bookmarks to RON")?;
-    std::fs::write(path, text)
-        .with_context(|| format!("writing bookmarks to {}", path.display()))
+    std::fs::write(path, text).with_context(|| format!("writing bookmarks to {}", path.display()))
 }
 
 #[cfg(test)]
@@ -143,11 +141,17 @@ mod tests {
     fn load_errors_name_the_file() {
         let missing = TempFile::new("load_errors_name_the_file-missing");
         let err = load_bookmarks(&missing.0).unwrap_err();
-        assert!(format!("{err:#}").contains(&*missing.0.to_string_lossy()), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(&*missing.0.to_string_lossy()),
+            "{err:#}"
+        );
 
         let corrupt = TempFile::new("load_errors_name_the_file-corrupt");
         std::fs::write(&corrupt.0, "[(name: \"x\", view: oops)]").unwrap();
         let err = load_bookmarks(&corrupt.0).unwrap_err();
-        assert!(format!("{err:#}").contains(&*corrupt.0.to_string_lossy()), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(&*corrupt.0.to_string_lossy()),
+            "{err:#}"
+        );
     }
 }

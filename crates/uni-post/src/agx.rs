@@ -206,7 +206,10 @@ mod tests {
             assert_eq!(wgsl.len(), cpu.len(), "{name}");
             for (w, c) in wgsl.iter().zip(cpu) {
                 // Decimal → f64 → f32 (naga) and decimal → f32 (rustc) may differ by one ulp.
-                assert!((w - c).abs() <= c.abs() * f32::EPSILON, "{name}: {w} vs {c}");
+                assert!(
+                    (w - c).abs() <= c.abs() * f32::EPSILON,
+                    "{name}: {w} vs {c}"
+                );
             }
         };
         close(
@@ -219,8 +222,16 @@ mod tests {
             &AGX_OUTSET.to_cols_array(),
             "AGX_OUTSET",
         );
-        close(&const_f32s(&module, "AGX_MIN_EV"), &[AGX_MIN_EV], "AGX_MIN_EV");
-        close(&const_f32s(&module, "AGX_MAX_EV"), &[AGX_MAX_EV], "AGX_MAX_EV");
+        close(
+            &const_f32s(&module, "AGX_MIN_EV"),
+            &[AGX_MIN_EV],
+            "AGX_MIN_EV",
+        );
+        close(
+            &const_f32s(&module, "AGX_MAX_EV"),
+            &[AGX_MAX_EV],
+            "AGX_MAX_EV",
+        );
         close(
             &const_f32s(&module, "AGX_LOG_FLOOR"),
             &[AGX_LOG_FLOOR],

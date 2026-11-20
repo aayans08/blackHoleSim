@@ -65,7 +65,10 @@ pub fn write_bsc5(path: &Path, stars: &[CatalogStar]) -> Result<(), DataError> {
 
 fn decode(bytes: &[u8]) -> Result<Vec<CatalogStar>, String> {
     let (header, body) = bytes.split_at_checked(HEADER_LEN).ok_or_else(|| {
-        format!("{} bytes is shorter than the {HEADER_LEN}-byte header", bytes.len())
+        format!(
+            "{} bytes is shorter than the {HEADER_LEN}-byte header",
+            bytes.len()
+        )
     })?;
     if header[..8] != MAGIC {
         return Err("bad magic: not a UNIBSC5 file".into());
@@ -98,7 +101,10 @@ fn decode_record(index: usize, record: &[u8]) -> Result<CatalogStar, String> {
     };
     let finite = star.dir_icrs.is_finite() && star.v_mag.is_finite() && star.teff_k.is_finite();
     if !finite || (star.dir_icrs.length() - 1.0).abs() > UNIT_TOLERANCE {
-        return Err(format!("record {index} (HR {}) is invalid: {star:?}", star.hr));
+        return Err(format!(
+            "record {index} (HR {}) is invalid: {star:?}",
+            star.hr
+        ));
     }
     Ok(star)
 }
