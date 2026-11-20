@@ -57,8 +57,9 @@ mod tests {
     fn offset_precision_far_from_origin() {
         // Review Focus 5. At 1 Gpc, `far.local.x` is 772·2^32 m ≈ 3.3e12 m, where f64 values are
         // 2^-11 m apart. A 1 mm step therefore lands within half that spacing (≈0.24 mm) and no
-        // closer; the brief's 1e-6 m bound is out of reach once |local| ≳ 2^33 m. We assert the
-        // one-rounding bound, which is also the "mm-precise" requirement.
+        // closer (2.34e-5 m here); the brief's 1e-6 m bound is out of reach once |local| > 2^33 m.
+        // We assert the one-rounding bound, which is also the "mm-precise" requirement.
+        // `offset_precision_across_cell_far_from_origin` sweeps the same bound across the cell.
         let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0));
         let near = far.offset(DVec3::new(0.001, 0.0, 0.0));
         let half_spacing = 0.5 * (far.local.x.abs().next_up() - far.local.x.abs());
@@ -67,6 +68,29 @@ mod tests {
         // A step that is a multiple of the local spacing comes back exactly.
         let step = DVec3::new(0.5, -0.25, 1.0);
         assert_eq!(far.offset(step).delta_from(far), step);
+    }
+
+    #[test]
+    fn offset_precision_across_cell_far_from_origin() {
+        // Review Focus 5, swept across one cell 1 Gpc from the origin. A step's error depends
+        // only on |local| (the distance to the cell centre), never on the distance from the
+        // origin: it is at most one f64 rounding at |local|. That meets the brief's 1e-6 m bound
+        // while |local| ≤ 2^33 m (≈0.057 au). Out to the CELL_SIZE_M / 2 = 2^43 m edge, f64 values
+        // are at most 2^-10 m apart, so the error stays under 0.5 mm. The sweep stops at 2^42 m,
+        // because a step from exactly ±2^43 m can cross into the next cell.
+        let cell = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0)).cell;
+        let step = DVec3::new(0.001, 0.0, 0.0);
+        for k in 0..=42 {
+            for sign in [1.0, -1.0] {
+                let far = UniversePos { cell, local: DVec3::new(sign * 2_f64.powi(k), 0.0, 0.0) };
+                let err = (far.offset(step).delta_from(far).x - step.x).abs();
+                let half_spacing = 0.5 * (far.local.x.abs().next_up() - far.local.x.abs());
+                assert!(err <= half_spacing && err < 1e-3, "|local| 2^{k} m: error {err} m");
+                if k <= 33 {
+                    assert!(err < 1e-6, "|local| 2^{k} m: error {err} m");
+                }
+            }
+        }
     }
 
     #[test]

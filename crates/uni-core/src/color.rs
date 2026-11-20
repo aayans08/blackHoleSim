@@ -95,14 +95,53 @@ pub fn star_illuminance_lux(v_mag: f64) -> f64 {
 mod tests {
     use super::*;
 
+    /// CIE 1931 (x, y) on the Planckian locus, from Krystek's rational approximation of the
+    /// CIE 1960 (u, v) locus (Krystek 1985, "An algorithm to calculate correlated colour
+    /// temperature", Color Res. Appl. 10(1), 38–40; valid 1000–15000 K to about 1e-4 in u and v),
+    /// converted with x = 3u / (2u − 8v + 4), y = 2v / (2u − 8v + 4) (CIE 1960 UCS, CIE 15:2004).
+    fn planckian_locus_xy(t: f64) -> (f64, f64) {
+        let u = (0.860_117_757 + 1.541_182_54e-4 * t + 1.286_412_12e-7 * t * t)
+            / (1.0 + 8.424_202_35e-4 * t + 7.081_451_63e-7 * t * t);
+        let v = (0.317_398_726 + 4.228_062_45e-5 * t + 4.204_816_91e-8 * t * t)
+            / (1.0 - 2.897_418_16e-5 * t + 1.614_560_53e-7 * t * t);
+        let d = 2.0 * u - 8.0 * v + 4.0;
+        (3.0 * u / d, 2.0 * v / d)
+    }
+
+    fn chromaticity(temp_k: f64) -> (f64, f64) {
+        let c = blackbody_xyz(temp_k);
+        (c.x / c.element_sum(), c.y / c.element_sum())
+    }
+
     #[test]
     fn blackbody_6504_is_white() {
-        // D65 (x 0.3127, y 0.3290) lies above the Planckian locus at 6504 K (x 0.3134, y 0.3238
-        // here), so the blackbody is faintly magenta in sRGB: R/G ≈ 1.056, B/G ≈ 1.050. That is
-        // physics, not fit error, and it exceeds the brief's 0.05 bound; 0.07 still pins
-        // "near white".
+        // D65 (x 0.3127, y 0.3290) lies above the Planckian locus, which at 6504 K is at
+        // (0.3135, 0.3235) (Krystek 1985). A blackbody there is therefore faintly magenta in sRGB:
+        // the exact locus point gives R/G 1.061 and B/G 1.054, and this fit gives 1.056 and 1.050.
+        // Both exceed the brief's 0.05 bound, so no correct blackbody passes it. 0.07 still pins
+        // "near white", and the tint must point the physical way (R and B above G). Colour
+        // accuracy is pinned by `planckian_locus_chromaticity` and `illuminant_a_chromaticity`.
         let c = blackbody_linear_srgb(6504.0);
         assert!((c.x / c.y - 1.0).abs() < 0.07 && (c.z / c.y - 1.0).abs() < 0.07, "{c}");
+        assert!(c.x > c.y && c.z > c.y, "{c}");
+    }
+
+    #[test]
+    fn planckian_locus_chromaticity() {
+        // A blackbody lies on the Planckian locus by definition, so the locus, not D65, is the
+        // reference for its chromaticity. 6500 K sits at (0.3135, 0.3235) (Krystek 1985).
+        let (x, y) = chromaticity(6500.0);
+        assert!((x - 0.3135).abs() < 0.002 && (y - 0.3235).abs() < 0.002, "x {x} y {y}");
+        // From 3000 K up the multi-lobe fit stays within 0.002 of the locus (worst 0.0013, at
+        // 3000 K). It drifts further below about 2500 K (0.011 at 1000 K); 2856 K is pinned by
+        // `illuminant_a_chromaticity`.
+        for t in [3000.0, 4000.0, 5000.0, 6500.0, 8000.0, 10_000.0, 15_000.0] {
+            let ((x, y), (lx, ly)) = (chromaticity(t), planckian_locus_xy(t));
+            assert!(
+                (x - lx).abs() < 0.002 && (y - ly).abs() < 0.002,
+                "{t} K: ({x}, {y}) vs locus ({lx}, {ly})"
+            );
+        }
     }
 
     #[test]
@@ -117,10 +156,9 @@ mod tests {
     fn illuminant_a_chromaticity() {
         // CIE standard illuminant A is a ≈2856 K Planckian radiator at x 0.44757, y 0.40745
         // (CIE 15:2004). The multi-lobe fit over 380–780 nm lands within 0.002.
-        let c = blackbody_xyz(2856.0);
-        let (x, y) = (c.x / c.element_sum(), c.y / c.element_sum());
+        let (x, y) = chromaticity(2856.0);
         assert!((x - 0.44757).abs() < 0.002 && (y - 0.40745).abs() < 0.002, "x {x} y {y}");
-        assert_eq!(c.y, 1.0);
+        assert_eq!(blackbody_xyz(2856.0).y, 1.0);
     }
 
     #[test]
