@@ -1,1 +1,909 @@
 //! Lens tracer render feature: half-resolution per-pixel geodesic trace on the GPU (M0 Task 9).
+//!
+//! For the first lens in [`FrameCtx::lenses`] (only one in M0), [`LensTracer`] works out the
+//! screen rectangle where light is bent by at least half a pixel, traces one Binet geodesic
+//! per sample there (at the resolution scale) and upsamples the result bilinearly into `hdr`
+//! and `lens_mask`. Outside the rectangle it draws the unlensed M0 debug sky. The shaders are
+//! `shaders/lens_trace.wgsl` (passes), `binet.wgsl` (integrator) and `debug_sky.wgsl`.
+//!
+//! The lens is treated as a static Schwarzschild hole seen by a static camera; `LensView::spin`
+//! is ignored in M0 (Kerr comes in M3, design §5.5).
+//!
+//! The feature writes every `hdr` pixel, so it must run before features that add to `hdr`
+//! (Task 11's order: lens, stars, tonemap).
+
+use std::f64::consts::FRAC_PI_2;
+
+use anyhow::Context as _;
+use glam::{DVec3, Mat4, UVec2};
+use uni_gfx::{
+    CameraUniform, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT, LensView,
+    PassTimer, RenderFeature, ShaderLib,
+};
+
+use crate::binet;
+
+/// Most RK4 steps per GPU ray.
+const GPU_MAX_STEPS: u32 = 2000;
+/// Smallest GPU escape radius [M]; a ray escapes beyond max(2·r_cam, this), moving outwards.
+const GPU_MIN_R_FAR: f64 = 1000.0;
+/// Interactive default resolution scale; captures set 1.0.
+const DEFAULT_RESOLUTION_SCALE: f32 = 0.5;
+const MIN_RESOLUTION_SCALE: f32 = 0.25;
+const MAX_RESOLUTION_SCALE: f32 = 1.0;
+/// Ray samples: exit direction (xyz) and capture flag (w). f32, because f16's ~5e-4 rad
+/// direction error is half a pixel at 1080p with a 60° field of view.
+const SAMPLES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// Workgroup edge of both entry points (`@workgroup_size(8, 8, 1)`).
+const WORKGROUP: u32 = 8;
+
+/// GPU twin of `struct LensParams` in `shaders/lens_trace.wgsl` (vec4 members only;
+/// `lens_params_layout_matches_wgsl` checks the layout with naga).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct LensParams {
+    /// xyz: camera position relative to the hole [M], root axes; w: r_cam [M].
+    cam: [f32; 4],
+    /// Traced rectangle in full-resolution pixels: min x, min y, width, height.
+    rect: [u32; 4],
+    /// Samples across the rectangle (x, y; 0 = nothing traced), max steps,
+    /// camera inside the horizon (1 = the whole frame is black).
+    grid: [u32; 4],
+    /// Full-resolution pixels per sample (x, y), r_far [M], 1 / resolution scale.
+    scale: [f32; 4],
+}
+
+/// A rectangle of full-resolution pixels, `[min, min + size)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelRect {
+    min: UVec2,
+    size: UVec2,
+}
+
+/// True when the camera is on or inside the lens's horizon (r < 2(1 + ε) M, the capture
+/// radius of [`binet::trace`]), including at its centre. The lens pass then draws the whole
+/// frame black; the app shows "inside event horizon" (Review Focus 2).
+pub fn inside_horizon(lens: &LensView) -> bool {
+    camera_in_m(lens).is_some_and(|c| c.length() < binet::CAPTURE_RADIUS)
+}
+
+/// Camera position relative to the hole in units of M = GM/c², or `None` if the lens has no
+/// positive, finite mass.
+fn camera_in_m(lens: &LensView) -> Option<DVec3> {
+    let m = uni_core::gravitational_radius(lens.mass_kg);
+    (m > 0.0 && m.is_finite()).then(|| -lens.rel_pos_m / m)
+}
+
+/// Half-angle [rad] of the cone around the hole's direction inside which light is deflected by
+/// at least half a pixel, for a static camera at `r_cam` [M] and pixels `pixel_angle` [rad]
+/// across. The weak-field deflection α = 2r_s/b = 4M/b (Einstein 1915) falls to half a pixel
+/// at b_max = 8M/pixel_angle, and a static observer sees impact parameter b at
+/// sin δ = b·√(1 − 2/r)/r (CLAUDE.md §6). π/2 once b_max reaches every forward direction.
+fn cone_half_angle(r_cam: f64, pixel_angle: f64) -> f64 {
+    let b_max = 8.0 / pixel_angle;
+    let s = b_max * (1.0 - 2.0 / r_cam).sqrt() / r_cam;
+    if s >= 1.0 { FRAC_PI_2 } else { s.asin() }
+}
+
+/// Slopes c/w (low, high) of the two lines through the origin tangent to the circle of radius
+/// `radius` centred at (c, w), where w > radius (the circle lies in front).
+fn tangent_slopes(c: f64, w: f64, radius: f64) -> (f64, f64) {
+    let centre = c.atan2(w);
+    let half = (radius / c.hypot(w)).asin();
+    ((centre - half).tan(), (centre + half).tan())
+}
+
+/// Full-resolution pixels covering the cone of half-angle `theta` around the unit camera-space
+/// direction `axis` (camera looks along −Z, +Y up), padded by one pixel and clamped to the
+/// screen. `proj_x`, `proj_y` are the projection's x and y scales (f/aspect and f).
+///
+/// The cone is the tangent cone of the sphere of radius sin θ centred at `axis`. Its projected
+/// x range is the range of x/w (w = −z) over that sphere, i.e. over the sphere's disk in the
+/// x–w plane: the slopes of the two tangent lines from the eye. Likewise for y. A cone that
+/// reaches the camera plane projects to an unbounded region (full screen); one entirely
+/// behind it projects to nothing.
+fn cone_rect(axis: DVec3, theta: f64, proj_x: f64, proj_y: f64, size: UVec2) -> PixelRect {
+    let full = PixelRect {
+        min: UVec2::ZERO,
+        size,
+    };
+    let empty = PixelRect {
+        min: UVec2::ZERO,
+        size: UVec2::ZERO,
+    };
+    if theta >= FRAC_PI_2 {
+        return full;
+    }
+    let radius = theta.sin();
+    let ahead = -axis.z; // cosine of the angle between the axis and the view direction
+    if ahead <= -radius {
+        return empty;
+    }
+    if ahead <= radius {
+        return full;
+    }
+    let (x_lo, x_hi) = tangent_slopes(axis.x, ahead, radius);
+    let (y_lo, y_hi) = tangent_slopes(axis.y, ahead, radius);
+    // pixel_dir's convention: x = (ndc_x + 1)/2·w; row = (1 − ndc_y)/2·h, row 0 at the top.
+    let (w, h) = (f64::from(size.x), f64::from(size.y));
+    let left = ((x_lo * proj_x + 1.0) * 0.5 * w).floor() - 1.0;
+    let right = ((x_hi * proj_x + 1.0) * 0.5 * w).ceil() + 1.0;
+    let top = ((1.0 - y_hi * proj_y) * 0.5 * h).floor() - 1.0;
+    let bottom = ((1.0 - y_lo * proj_y) * 0.5 * h).ceil() + 1.0;
+    let (left, right) = (left.clamp(0.0, w), right.clamp(0.0, w));
+    let (top, bottom) = (top.clamp(0.0, h), bottom.clamp(0.0, h));
+    if right <= left || bottom <= top {
+        return empty;
+    }
+    PixelRect {
+        min: UVec2::new(left as u32, top as u32),
+        size: UVec2::new((right - left) as u32, (bottom - top) as u32),
+    }
+}
+
+/// Samples needed to cover `rect_size` pixels at resolution `scale`: ⌈size·scale⌉, at least 1.
+fn sample_grid(rect_size: UVec2, scale: f32) -> UVec2 {
+    (rect_size.as_vec2() * scale)
+        .ceil()
+        .as_uvec2()
+        .max(UVec2::ONE)
+}
+
+/// `s` clamped to 0.25..=1.0; a NaN keeps `current`.
+fn clamp_resolution_scale(s: f32, current: f32) -> f32 {
+    if s.is_nan() {
+        current
+    } else {
+        s.clamp(MIN_RESOLUTION_SCALE, MAX_RESOLUTION_SCALE)
+    }
+}
+
+/// This frame's GPU parameters for `lens` (the first lens, if any) on a `size` frame.
+///
+/// Nothing is traced without a lens, when the lens's cone is under half a pixel, or when its
+/// rectangle is off screen; the resolve pass then draws only the unlensed sky. A camera inside
+/// the horizon sets the black-frame flag and leaves every other field finite (Review Focus 2).
+fn frame_params(
+    lens: Option<&LensView>,
+    view_rot: Mat4,
+    proj: Mat4,
+    size: UVec2,
+    scale: f32,
+) -> LensParams {
+    let size = size.max(UVec2::ONE);
+    let mut p = LensParams {
+        cam: [0.0; 4],
+        rect: [0; 4],
+        grid: [0; 4],
+        scale: [1.0, 1.0, 0.0, 1.0 / scale],
+    };
+    let Some(cam) = lens.and_then(camera_in_m) else {
+        return p;
+    };
+    let r_cam = cam.length();
+    if !r_cam.is_finite() {
+        return p;
+    }
+    if r_cam < binet::CAPTURE_RADIUS {
+        p.grid[3] = 1;
+        return p;
+    }
+    p.cam = [cam.x as f32, cam.y as f32, cam.z as f32, r_cam as f32];
+    let (proj_x, proj_y) = (f64::from(proj.x_axis.x), f64::from(proj.y_axis.y));
+    if !(proj_x > 0.0 && proj_y > 0.0 && proj_x.is_finite() && proj_y.is_finite()) {
+        return p;
+    }
+    // Angular size of one full-resolution pixel at the screen centre (2 NDC units over h rows).
+    let pixel_angle = 2.0 / (proj_y * f64::from(size.y));
+    let theta = cone_half_angle(r_cam, pixel_angle);
+    if theta < 0.5 * pixel_angle {
+        return p;
+    }
+    let axis = view_rot
+        .as_dmat4()
+        .transform_vector3(-cam / r_cam)
+        .normalize();
+    let rect = cone_rect(axis, theta, proj_x, proj_y, size);
+    if rect.size.x == 0 || rect.size.y == 0 {
+        return p;
+    }
+    let grid = sample_grid(rect.size, scale);
+    let per_sample = rect.size.as_vec2() / grid.as_vec2();
+    p.rect = [rect.min.x, rect.min.y, rect.size.x, rect.size.y];
+    p.grid = [grid.x, grid.y, GPU_MAX_STEPS, 0];
+    p.scale = [
+        per_sample.x,
+        per_sample.y,
+        (2.0 * r_cam).max(GPU_MIN_R_FAR) as f32,
+        1.0 / scale,
+    ];
+    p
+}
+
+/// Group 1, binding 0: the `LensParams` uniform.
+fn params_entry() -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: wgpu::BufferSize::new(size_of::<LensParams>() as u64),
+        },
+        count: None,
+    }
+}
+
+fn storage_entry(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+/// Group 1 of `cs_trace`: params and the samples it writes.
+fn trace_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [params_entry(), storage_entry(1, SAMPLES_FORMAT)]
+}
+
+/// Group 1 of `cs_resolve`: params, the samples it reads, `hdr` and `lens_mask`.
+fn resolve_layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+    [
+        params_entry(),
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        storage_entry(3, HDR_FORMAT),
+        storage_entry(4, LENS_MASK_FORMAT),
+    ]
+}
+
+fn compute_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    module: &wgpu::ShaderModule,
+    entry_point: &str,
+    layouts: [&wgpu::BindGroupLayout; 2],
+) -> wgpu::ComputePipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(label),
+        bind_group_layouts: &layouts.map(Some),
+        immediate_size: 0,
+    });
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        module,
+        entry_point: Some(entry_point),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// The brute-force Schwarzschild lens pass (`RenderFeature` named "lens").
+pub struct LensTracer {
+    trace_pipeline: wgpu::ComputePipeline,
+    resolve_pipeline: wgpu::ComputePipeline,
+    trace_bgl: wgpu::BindGroupLayout,
+    resolve_bgl: wgpu::BindGroupLayout,
+    /// This feature's own copy of the camera uniform: `RenderFeature::encode` is not handed
+    /// the renderer's camera bind group, so the feature binds its own buffer with the shared
+    /// layout at group 0 and writes `CameraUniform::from_ctx` into it in `prepare`.
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    params_buffer: wgpu::Buffer,
+    params: LensParams,
+    resolution_scale: f32,
+    /// Size-dependent resources; `prepare` rebuilds them after a resize or a scale change.
+    frame: Option<FrameResources>,
+}
+
+/// Resources that depend on the frame targets and the resolution scale.
+struct FrameResources {
+    target_size: UVec2,
+    samples_size: UVec2,
+    /// Held alongside the bind groups that view it.
+    _samples: wgpu::Texture,
+    trace_bind_group: wgpu::BindGroup,
+    resolve_bind_group: wgpu::BindGroup,
+}
+
+impl LensTracer {
+    /// Registers the uni-rel shaders in `lib`, compiles the lens pass and creates its
+    /// pipelines and uniforms. `camera_bgl` is `Renderer::camera_bind_group_layout()`.
+    /// Shader or pipeline validation errors are returned, not raised on the device.
+    pub fn new(
+        gpu: &GpuContext,
+        lib: &mut ShaderLib,
+        camera_bgl: &wgpu::BindGroupLayout,
+    ) -> anyhow::Result<Self> {
+        crate::register_shaders(lib);
+        let device = &gpu.device;
+        let module = lib
+            .module(device, crate::LENS_TRACE_WGSL)
+            .context("compiling the lens shader")?;
+
+        // Pipeline creation reports validation errors to the device, not as a Result.
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lens trace bgl"),
+            entries: &trace_layout_entries(),
+        });
+        let resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lens resolve bgl"),
+            entries: &resolve_layout_entries(),
+        });
+        let trace_pipeline = compute_pipeline(
+            device,
+            "lens trace",
+            &module,
+            "cs_trace",
+            [camera_bgl, &trace_bgl],
+        );
+        let resolve_pipeline = compute_pipeline(
+            device,
+            "lens resolve",
+            &module,
+            "cs_resolve",
+            [camera_bgl, &resolve_bgl],
+        );
+        let uniform = |label: &str, size: usize| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let camera_buffer = uniform("lens camera uniform", size_of::<CameraUniform>());
+        let params_buffer = uniform("lens params", size_of::<LensParams>());
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lens camera bg"),
+            layout: camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            anyhow::bail!("creating the lens pipelines: {err}");
+        }
+
+        Ok(Self {
+            trace_pipeline,
+            resolve_pipeline,
+            trace_bgl,
+            resolve_bgl,
+            camera_buffer,
+            camera_bind_group,
+            params_buffer,
+            params: bytemuck::Zeroable::zeroed(),
+            resolution_scale: DEFAULT_RESOLUTION_SCALE,
+            frame: None,
+        })
+    }
+
+    /// Fraction of full resolution at which rays are traced, clamped to 0.25..=1.0 (NaN is
+    /// ignored). Default 0.5 for interactive use; captures use 1.0. Applies from the next frame.
+    pub fn set_resolution_scale(&mut self, s: f32) {
+        self.resolution_scale = clamp_resolution_scale(s, self.resolution_scale);
+    }
+
+    fn frame_resources(
+        &self,
+        device: &wgpu::Device,
+        targets: &FrameTargets,
+        samples_size: UVec2,
+    ) -> FrameResources {
+        let samples = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lens samples"),
+            size: wgpu::Extent3d {
+                width: samples_size.x,
+                height: samples_size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SAMPLES_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = samples.create_view(&wgpu::TextureViewDescriptor::default());
+        let params = || wgpu::BindGroupEntry {
+            binding: 0,
+            resource: self.params_buffer.as_entire_binding(),
+        };
+        let trace_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lens trace bg"),
+            layout: &self.trace_bgl,
+            entries: &[
+                params(),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+        });
+        let resolve_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lens resolve bg"),
+            layout: &self.resolve_bgl,
+            entries: &[
+                params(),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&targets.lens_mask_view),
+                },
+            ],
+        });
+        FrameResources {
+            target_size: targets.size,
+            samples_size,
+            _samples: samples,
+            trace_bind_group,
+            resolve_bind_group,
+        }
+    }
+}
+
+impl RenderFeature for LensTracer {
+    fn name(&self) -> &'static str {
+        "lens"
+    }
+
+    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
+        gpu.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
+        );
+        self.params = frame_params(
+            ctx.lenses.first(),
+            ctx.view_rot,
+            ctx.proj,
+            targets.size,
+            self.resolution_scale,
+        );
+        gpu.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.params));
+        // Sized for the largest rectangle (the whole frame) at the current scale.
+        let samples_size = sample_grid(targets.size, self.resolution_scale);
+        let stale = self
+            .frame
+            .as_ref()
+            .is_none_or(|f| f.target_size != targets.size || f.samples_size != samples_size);
+        if stale {
+            self.frame = Some(self.frame_resources(&gpu.device, targets, samples_size));
+        }
+    }
+
+    fn encode(
+        &mut self,
+        _gpu: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        _targets: &FrameTargets,
+        _output: &wgpu::TextureView,
+        timer: &mut PassTimer,
+    ) {
+        let Some(frame) = &self.frame else {
+            return; // prepare has not run yet
+        };
+        // One pass, two dispatches: each dispatch is its own usage scope, so the samples
+        // written by cs_trace are visible to cs_resolve.
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("lens"),
+            timestamp_writes: timer.compute_writes("lens"),
+        });
+        let grid = UVec2::new(self.params.grid[0], self.params.grid[1]);
+        if grid.x > 0 && grid.y > 0 {
+            pass.set_pipeline(&self.trace_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &frame.trace_bind_group, &[]);
+            pass.dispatch_workgroups(grid.x.div_ceil(WORKGROUP), grid.y.div_ceil(WORKGROUP), 1);
+        }
+        pass.set_pipeline(&self.resolve_pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &frame.resolve_bind_group, &[]);
+        pass.dispatch_workgroups(
+            frame.target_size.x.div_ceil(WORKGROUP),
+            frame.target_size.y.div_ceil(WORKGROUP),
+            1,
+        );
+    }
+
+    fn resize(&mut self, _gpu: &GpuContext, _targets: &FrameTargets) {
+        // The bind groups view the old targets; prepare rebuilds them.
+        self.frame = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BINET_WGSL, DEBUG_SKY_WGSL, LENS_TRACE_WGSL};
+    use core::mem::{offset_of, size_of};
+    use glam::{DQuat, DVec2};
+    use uni_gfx::{reversed_z_infinite_proj, validate_wgsl};
+    use wgpu::naga;
+
+    fn lib() -> ShaderLib {
+        let mut lib = ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        lib
+    }
+
+    fn lens_trace_module() -> naga::Module {
+        let src = lib().compose(LENS_TRACE_WGSL).unwrap();
+        validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn lens_shaders_validate() {
+        let lib = lib();
+        for path in [BINET_WGSL, DEBUG_SKY_WGSL, LENS_TRACE_WGSL] {
+            let src = lib.compose(path).unwrap();
+            if let Err(e) = validate_wgsl(&src) {
+                panic!("{path}: {e}");
+            }
+        }
+        // Names the lens pass and the selftest (Task 11) rely on.
+        let m = lens_trace_module();
+        let has_fn = |name: &str| {
+            m.functions
+                .iter()
+                .any(|(_, f)| f.name.as_deref() == Some(name))
+        };
+        for name in ["binet_trace", "static_observer_ray", "debug_sky"] {
+            assert!(has_fn(name), "missing fn {name}");
+        }
+        let entries: Vec<&str> = m.entry_points.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(entries, ["cs_trace", "cs_resolve"]);
+    }
+
+    #[test]
+    fn lens_params_layout_matches_wgsl() {
+        let module = lens_trace_module();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (handle, ty) = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("LensParams"))
+            .expect("struct LensParams in lens_trace.wgsl");
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("LensParams is not a struct");
+        };
+        assert_eq!(size_of::<LensParams>(), 64);
+        assert_eq!(layouter[handle].size as usize, size_of::<LensParams>());
+        let wgsl: Vec<(String, usize)> = members
+            .iter()
+            .map(|m| (m.name.clone().unwrap_or_default(), m.offset as usize))
+            .collect();
+        let rust: Vec<(String, usize)> = [
+            ("cam", offset_of!(LensParams, cam)),
+            ("rect", offset_of!(LensParams, rect)),
+            ("grid", offset_of!(LensParams, grid)),
+            ("scale", offset_of!(LensParams, scale)),
+        ]
+        .into_iter()
+        .map(|(n, o)| (n.to_owned(), o))
+        .collect();
+        assert_eq!(wgsl, rust);
+    }
+
+    /// What a binding is, as a comparable string, from the WGSL side.
+    fn wgsl_binding_kind(module: &naga::Module, var: &naga::GlobalVariable) -> String {
+        match (&var.space, &module.types[var.ty].inner) {
+            (naga::AddressSpace::Uniform, _) => "uniform".into(),
+            (
+                naga::AddressSpace::Handle,
+                naga::TypeInner::Image {
+                    dim: naga::ImageDimension::D2,
+                    arrayed: false,
+                    class,
+                },
+            ) => match class {
+                naga::ImageClass::Storage { format, access } => {
+                    assert_eq!(
+                        *access,
+                        naga::StorageAccess::STORE,
+                        "storage textures are write-only"
+                    );
+                    format!("storage {format:?}")
+                }
+                naga::ImageClass::Sampled {
+                    kind: naga::ScalarKind::Float,
+                    multi: false,
+                } => "texture float".into(),
+                other => panic!("unexpected image class {other:?}"),
+            },
+            other => panic!("unexpected binding {other:?}"),
+        }
+    }
+
+    /// The same, from a Rust bind group layout entry.
+    fn rust_binding_kind(e: &wgpu::BindGroupLayoutEntry) -> String {
+        assert_eq!(e.visibility, wgpu::ShaderStages::COMPUTE);
+        match e.ty {
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                min_binding_size,
+                ..
+            } => {
+                assert_eq!(
+                    min_binding_size.map(|s| s.get()),
+                    Some(size_of::<LensParams>() as u64)
+                );
+                "uniform".into()
+            }
+            wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            } => format!(
+                "storage {:?}",
+                match format {
+                    wgpu::TextureFormat::Rgba32Float => naga::StorageFormat::Rgba32Float,
+                    wgpu::TextureFormat::Rgba16Float => naga::StorageFormat::Rgba16Float,
+                    wgpu::TextureFormat::R32Float => naga::StorageFormat::R32Float,
+                    other => panic!("unexpected storage format {other:?}"),
+                }
+            ),
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            } => "texture float".into(),
+            other => panic!("unexpected layout entry {other:?}"),
+        }
+    }
+
+    /// Each entry point uses exactly the group-1 bindings of its layout (plus the camera at
+    /// group 0, binding 0), with matching types, so pipeline creation cannot fail on layout.
+    #[test]
+    fn bind_group_layouts_match_shader_bindings() {
+        let module = lens_trace_module();
+        let caps = naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16;
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+            .validate(&module)
+            .unwrap();
+        let layouts: [(&str, Vec<wgpu::BindGroupLayoutEntry>); 2] = [
+            ("cs_trace", trace_layout_entries().to_vec()),
+            ("cs_resolve", resolve_layout_entries().to_vec()),
+        ];
+        for (i, (name, entries)) in layouts.iter().enumerate() {
+            assert_eq!(module.entry_points[i].name, *name);
+            let used = info.get_entry_point(i);
+            let mut wgsl: Vec<(u32, String)> = Vec::new();
+            for (h, var) in module.global_variables.iter() {
+                if used[h].is_empty() {
+                    continue;
+                }
+                let rb = var.binding.as_ref().expect("resource binding");
+                if rb.group == 0 {
+                    assert_eq!((rb.binding, var.name.as_deref()), (0, Some("camera")));
+                    continue;
+                }
+                assert_eq!(rb.group, 1, "{name}: {:?}", var.name);
+                wgsl.push((rb.binding, wgsl_binding_kind(&module, var)));
+            }
+            wgsl.sort();
+            let mut rust: Vec<(u32, String)> = entries
+                .iter()
+                .map(|e| (e.binding, rust_binding_kind(e)))
+                .collect();
+            rust.sort();
+            assert_eq!(wgsl, rust, "{name}");
+        }
+    }
+
+    // ---- CPU planning ----
+
+    const W: u32 = 1920;
+    const H: u32 = 1080;
+
+    fn proj() -> Mat4 {
+        reversed_z_infinite_proj(60f32.to_radians(), W as f32 / H as f32, 0.1)
+    }
+
+    /// A 10 M☉ lens with the camera at `cam_m` (in units of M, hole at the origin).
+    fn lens_at(cam_m: DVec3) -> LensView {
+        let mass_kg = 10.0 * uni_core::M_SUN;
+        LensView {
+            rel_pos_m: -cam_m * uni_core::gravitational_radius(mass_kg),
+            mass_kg,
+            spin: 0.0,
+        }
+    }
+
+    /// Pixel coordinates (x right, y down from the top) of a camera-space direction in front.
+    fn project(d: DVec3, sx: f64, sy: f64) -> DVec2 {
+        let w = -d.z;
+        assert!(w > 0.0);
+        DVec2::new(
+            (d.x / w * sx + 1.0) * 0.5 * f64::from(W),
+            (1.0 - d.y / w * sy) * 0.5 * f64::from(H),
+        )
+    }
+
+    #[test]
+    fn cone_rect_bounds_the_projected_cone_tightly() {
+        let p = proj();
+        let (sx, sy) = (f64::from(p.x_axis.x), f64::from(p.y_axis.y));
+        let size = UVec2::new(W, H);
+        let axes = [
+            DVec3::NEG_Z,
+            DVec3::new(0.3, -0.2, -1.0).normalize(),
+            DVec3::new(-0.5, 0.4, -0.7).normalize(),
+            DVec3::new(0.9, 0.0, -0.6).normalize(), // partly off screen: clamped
+        ];
+        for axis in axes {
+            for theta in [0.002, 0.05, 0.3] {
+                let rect = cone_rect(axis, theta, sx, sy, size);
+                // Orthonormal basis around the axis; sample the cone's boundary.
+                let u = axis.any_orthonormal_vector();
+                let v = axis.cross(u);
+                let (mut lo, mut hi) =
+                    (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY));
+                for k in 0..4096 {
+                    let phi = std::f64::consts::TAU * f64::from(k) / 4096.0;
+                    let d = axis * theta.cos() + (u * phi.cos() + v * phi.sin()) * theta.sin();
+                    let q = project(d, sx, sy);
+                    lo = lo.min(q);
+                    hi = hi.max(q);
+                }
+                let screen = DVec2::new(f64::from(W), f64::from(H));
+                let (lo, hi) = (lo.clamp(DVec2::ZERO, screen), hi.clamp(DVec2::ZERO, screen));
+                let ctx = format!("axis {axis} theta {theta}: rect {rect:?}, cone {lo}..{hi}");
+                if hi.x <= lo.x || hi.y <= lo.y {
+                    assert_eq!(rect.size, UVec2::ZERO, "off screen: {ctx}");
+                    continue;
+                }
+                let min = rect.min.as_dvec2();
+                let max = (rect.min + rect.size).as_dvec2();
+                assert!(min.x <= lo.x && min.y <= lo.y, "{ctx}");
+                assert!(max.x >= hi.x && max.y >= hi.y, "{ctx}");
+                // Tight: one pixel of padding plus rounding.
+                assert!(lo.x - min.x <= 2.0 && lo.y - min.y <= 2.0, "{ctx}");
+                assert!(max.x - hi.x <= 2.0 && max.y - hi.y <= 2.0, "{ctx}");
+            }
+        }
+    }
+
+    #[test]
+    fn cone_rect_full_or_empty_when_unbounded_or_behind() {
+        let size = UVec2::new(W, H);
+        let full = PixelRect {
+            min: UVec2::ZERO,
+            size,
+        };
+        // A cone of ≥ 90° covers every direction in front of the camera.
+        assert_eq!(
+            cone_rect(DVec3::NEG_Z, std::f64::consts::FRAC_PI_2, 1.0, 1.7, size),
+            full
+        );
+        // Straddling the camera plane: its projection is unbounded.
+        assert_eq!(cone_rect(DVec3::X, 0.1, 1.0, 1.7, size), full);
+        // Entirely behind the camera.
+        assert_eq!(cone_rect(DVec3::Z, 0.1, 1.0, 1.7, size).size, UVec2::ZERO);
+        // In front but entirely off screen to the right.
+        let off = DVec3::new(3.0, 0.0, -1.0).normalize();
+        assert_eq!(cone_rect(off, 0.01, 1.0, 1.7, size).size, UVec2::ZERO);
+    }
+
+    #[test]
+    fn close_camera_traces_full_screen_at_half_resolution() {
+        // Camera 30 M from the hole along +z, looking along −z: the hole is dead ahead.
+        let lens = lens_at(DVec3::new(0.0, 0.0, 30.0));
+        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(p.rect, [0, 0, W, H]);
+        assert_eq!(p.grid, [W / 2, H / 2, 2000, 0]);
+        assert_eq!(p.scale, [2.0, 2.0, 1000.0, 2.0]);
+        assert!(
+            (p.cam[2] - 30.0).abs() < 1e-4
+                && p.cam[0].abs() < 1e-6
+                && (p.cam[3] - 30.0).abs() < 1e-4
+        );
+        // Full resolution: one sample per pixel.
+        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 1.0);
+        assert_eq!((p.grid[0], p.grid[1]), (W, H));
+        assert_eq!((p.scale[0], p.scale[1], p.scale[3]), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn far_camera_traces_a_small_rect_around_the_hole() {
+        let lens = lens_at(DVec3::new(0.0, 0.0, 1e6));
+        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        let (min, size) = (
+            UVec2::new(p.rect[0], p.rect[1]),
+            UVec2::new(p.rect[2], p.rect[3]),
+        );
+        // θ_max = asin(8/(pixel·r)) ≈ 7.5e-3 rad ≈ 7 px at 1080p, fov 60°.
+        assert!(
+            size.x > 8 && size.x < 24 && size.y > 8 && size.y < 24,
+            "{p:?}"
+        );
+        let centre = UVec2::new(W / 2, H / 2);
+        assert!(
+            min.cmple(centre).all() && (min + size).cmpgt(centre).all(),
+            "{p:?}"
+        );
+        assert_eq!(p.scale[2], 2e6);
+        // Looking the other way: nothing to trace.
+        let back = Mat4::from_quat(DQuat::from_rotation_y(std::f64::consts::PI).as_quat());
+        let p = frame_params(Some(&lens), back, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!((p.grid[0], p.grid[1]), (0, 0));
+        // So far away that the whole cone is under half a pixel: nothing to trace.
+        let far = lens_at(DVec3::new(0.0, 0.0, 1e9));
+        let p = frame_params(Some(&far), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!((p.grid[0], p.grid[1], p.grid[3]), (0, 0, 0));
+    }
+
+    // Review Focus 2: inside or on the horizon, or at the centre, the frame is black and no
+    // NaN reaches the GPU.
+    #[test]
+    fn camera_inside_horizon_blacks_out_the_frame() {
+        for cam in [
+            DVec3::new(1.5, 0.0, 0.0),
+            DVec3::new(0.0, 2.0, 0.0),
+            DVec3::ZERO,
+        ] {
+            let lens = lens_at(cam);
+            assert!(inside_horizon(&lens), "{cam}");
+            let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+            assert_eq!(p.grid, [0, 0, 0, 1], "{cam}");
+            assert!(p.cam.iter().chain(&p.scale).all(|x| x.is_finite()), "{p:?}");
+        }
+        assert!(!inside_horizon(&lens_at(DVec3::new(2.1, 0.0, 0.0))));
+    }
+
+    #[test]
+    fn no_lens_or_bad_mass_traces_nothing() {
+        let p = frame_params(None, Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(p.grid, [0, 0, 0, 0]);
+        assert_eq!(p.scale[3], 2.0);
+        let mut lens = lens_at(DVec3::new(0.0, 0.0, 30.0));
+        lens.mass_kg = 0.0;
+        assert!(!inside_horizon(&lens));
+        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(p.grid, [0, 0, 0, 0]);
+        assert!(p.cam.iter().chain(&p.scale).all(|x| x.is_finite()), "{p:?}");
+    }
+
+    #[test]
+    fn sample_grid_rounds_up() {
+        assert_eq!(sample_grid(UVec2::new(W, H), 0.5), UVec2::new(960, 540));
+        assert_eq!(sample_grid(UVec2::new(3, 5), 0.5), UVec2::new(2, 3));
+        assert_eq!(sample_grid(UVec2::new(1, 1), 0.25), UVec2::ONE);
+        assert_eq!(sample_grid(UVec2::new(7, 9), 1.0), UVec2::new(7, 9));
+    }
+
+    #[test]
+    fn resolution_scale_is_clamped() {
+        assert_eq!(clamp_resolution_scale(2.0, 0.5), 1.0);
+        assert_eq!(clamp_resolution_scale(0.1, 0.5), 0.25);
+        assert_eq!(clamp_resolution_scale(0.75, 0.5), 0.75);
+        assert_eq!(clamp_resolution_scale(f32::NAN, 0.5), 0.5);
+    }
+}
