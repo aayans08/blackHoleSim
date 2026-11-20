@@ -32,9 +32,6 @@ pub const DEFAULT_SCENE_EV100: f32 = 0.0;
 pub const INTERACTIVE_LENS_SCALE: f32 = 0.5;
 /// Lens tracer resolution scale in captures, unless a bookmark sets one.
 pub const CAPTURE_LENS_SCALE: f32 = 1.0;
-/// HUD line whenever a lens is on screen: M0 draws catalogue stars unlensed, over the lensed
-/// debug grid (Global Constraints, Honesty; Task 8 note).
-pub const UNLENSED_STARS_LABEL: &str = "Stars near the hole are not yet lensed (M0)";
 
 /// The renderer with the M0 feature stack, plus the handles the app keeps to steer it.
 pub struct Scene {
@@ -290,19 +287,22 @@ pub fn hud_data(
         star_count,
         warnings,
         inside_horizon: ctx.lenses.iter().any(uni_rel::inside_horizon),
+        // uni-ui shows its two M0 honesty lines ("Lens background: M0 debug grid", "Stars near
+        // the hole are not yet lensed (M0)") only when the debug grid is actually visible: the
+        // lens pass traced this frame. From inside the horizon the frame is all black, so no
+        // grid is shown and the labels would be false (lead ruling, M0 gate, Task 10b).
+        lens_on_screen: matches!(uni_rel::lens_coverage(ctx), LensCoverage::Traced),
     }
 }
 
-/// The lens labels the HUD needs for `ctx`: uni-rel's coverage warning (lens too far to
-/// trace), and [`UNLENSED_STARS_LABEL`] whenever a lens bends light on screen. "Lens
-/// background: M0 debug grid" is part of the uni-ui panel and always shown.
+/// uni-rel's coverage warning for `ctx` (a lens too far away for the tracer's step budget), if
+/// any. The M0 honesty lines are uni-ui's, driven by `HudData::lens_on_screen`.
 pub fn lens_warnings(ctx: &FrameCtx) -> Vec<String> {
-    let coverage = uni_rel::lens_coverage(ctx);
-    let mut out: Vec<String> = coverage.warning().map(str::to_owned).into_iter().collect();
-    if matches!(coverage, LensCoverage::Traced | LensCoverage::BeyondReach) {
-        out.push(UNLENSED_STARS_LABEL.to_owned());
-    }
-    out
+    uni_rel::lens_coverage(ctx)
+        .warning()
+        .map(str::to_owned)
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn near_the_hole_the_lens_runs_and_the_hud_says_stars_are_unlensed() {
+    fn near_the_hole_the_lens_runs_and_the_hud_shows_the_m0_labels() {
         let (world, ctx) = ctx_near_hole(30.0);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::Traced);
         assert!(lens_pass_runs(uni_rel::lens_coverage(&ctx)));
@@ -415,7 +415,8 @@ mod tests {
             gpu_timing_available: true,
         };
         let data = hud_data(&world, &ctx, perf, 0.0, 9096, &["sky ok?".to_owned()]);
-        assert_eq!(data.warnings, ["sky ok?", UNLENSED_STARS_LABEL]);
+        assert_eq!(data.warnings, ["sky ok?"]);
+        assert!(data.lens_on_screen);
         assert_eq!(data.nearest_name, "TestBH-1");
         let m = gravitational_radius(10.0 * M_SUN);
         assert!((data.nearest_dist_m - 30.0 * m).abs() < 1.0);
@@ -428,10 +429,7 @@ mod tests {
         let (_, ctx) = ctx_near_hole(1e5);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::BeyondReach);
         assert!(!lens_pass_runs(uni_rel::lens_coverage(&ctx)));
-        assert_eq!(
-            lens_warnings(&ctx),
-            [uni_rel::BEYOND_REACH_WARNING, UNLENSED_STARS_LABEL]
-        );
+        assert_eq!(lens_warnings(&ctx), [uni_rel::BEYOND_REACH_WARNING]);
     }
 
     #[test]
