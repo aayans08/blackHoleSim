@@ -14,3 +14,4 @@ wgpu.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 anyhow.workspace = true
+pollster.workspace = true
