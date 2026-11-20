@@ -24,6 +24,8 @@ pub fn bv_to_teff(bv: f64) -> f64 {
 }
 
 /// Illuminance [lux] at the observer from a star of apparent V magnitude: 10^(−0.4 (m + 13.99)).
+/// Zero point: an m_V = 0 star gives 2.54 × 10⁻⁶ lx outside the atmosphere (Allen 1973,
+/// *Astrophysical Quantities*, 3rd ed., Athlone Press, p. 197); −2.5 log₁₀(2.54e-6) = 13.99.
 pub fn star_illuminance_lux(v_mag: f64) -> f64 {
     todo!()
 }
