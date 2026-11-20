@@ -57,14 +57,16 @@ mod tests {
     fn offset_precision_far_from_origin() {
         // Review Focus 5. At 1 Gpc, `far.local.x` is 772·2^32 m ≈ 3.3e12 m, where f64 values are
         // 2^-11 m apart. A 1 mm step therefore lands within half that spacing (≈0.24 mm) and no
-        // closer (2.34e-5 m here); the brief's 1e-6 m bound is out of reach once |local| > 2^33 m.
-        // We assert the one-rounding bound, which is also the "mm-precise" requirement.
+        // closer (2.34e-5 m here). The brief's 1e-6 m bound is guaranteed only while
+        // |local| < 2^34 m: from 2^34 m on, values are 2^-18 m apart and one rounding can cost
+        // 1.9e-6 m. We assert the one-rounding bound and 0.1 mm, which is "mm-precise" with a 10×
+        // margin over an absolute-metres `offset` (it drops the step, an error of the full 1 mm).
         // `offset_precision_across_cell_far_from_origin` sweeps the same bound across the cell.
         let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0));
         let near = far.offset(DVec3::new(0.001, 0.0, 0.0));
         let half_spacing = 0.5 * (far.local.x.abs().next_up() - far.local.x.abs());
         let err = (near.delta_from(far).x - 0.001).abs();
-        assert!(err <= half_spacing && err < 1e-3, "error {err} m");
+        assert!(err <= half_spacing && err < 1e-4, "error {err} m");
         // A step that is a multiple of the local spacing comes back exactly.
         let step = DVec3::new(0.5, -0.25, 1.0);
         assert_eq!(far.offset(step).delta_from(far), step);
@@ -74,10 +76,11 @@ mod tests {
     fn offset_precision_across_cell_far_from_origin() {
         // Review Focus 5, swept across one cell 1 Gpc from the origin. A step's error depends
         // only on |local| (the distance to the cell centre), never on the distance from the
-        // origin: it is at most one f64 rounding at |local|. That meets the brief's 1e-6 m bound
-        // while |local| ≤ 2^33 m (≈0.057 au). Out to the CELL_SIZE_M / 2 = 2^43 m edge, f64 values
-        // are at most 2^-10 m apart, so the error stays under 0.5 mm. The sweep stops at 2^42 m,
-        // because a step from exactly ±2^43 m can cross into the next cell.
+        // origin: it is at most one f64 rounding at |local|. That guarantees the brief's 1e-6 m
+        // bound whenever the stepped |local| is below 2^34 m (≈0.11 au), so it is asserted for
+        // every sample with k ≤ 33. Out to the CELL_SIZE_M / 2 = 2^43 m edge, f64 values are at
+        // most 2^-10 m apart, so the error stays under 0.5 mm. The sweep stops at 2^42 m, because
+        // a step from exactly ±2^43 m can cross into the next cell.
         let cell = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0)).cell;
         let step = DVec3::new(0.001, 0.0, 0.0);
         for k in 0..=42 {
