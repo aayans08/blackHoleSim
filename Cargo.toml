@@ -1,33 +1,71 @@
-[package]
-name = "black_hole_renderer"
+[workspace]
+resolver = "3"
+members = [
+    "crates/uni-app",
+    "crates/uni-core",
+    "crates/uni-gfx",
+    "crates/uni-sky",
+    "crates/uni-planet",
+    "crates/uni-atmo",
+    "crates/uni-rel",
+    "crates/uni-post",
+    "crates/uni-physics",
+    "crates/uni-data",
+    "crates/uni-procgen",
+    "crates/uni-sim",
+    "crates/uni-nav",
+    "crates/uni-ui",
+    "tools/bake",
+    "tools/verify",
+]
+
+[workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
+publish = false
 
-[dependencies]
-# Core graphics framework (optimized for M3 Metal backend)
-wgpu = "0.19"
-winit = "0.29"
-pollster = "0.3"
+# Every dependency is declared once here; crates use `x.workspace = true`.
+# Adding a crate needs the lead's approval (see CLAUDE.md / global constraints).
+[workspace.dependencies]
+# Internal crates
+uni-core = { path = "crates/uni-core" }
+uni-gfx = { path = "crates/uni-gfx" }
+uni-sky = { path = "crates/uni-sky" }
+uni-planet = { path = "crates/uni-planet" }
+uni-atmo = { path = "crates/uni-atmo" }
+uni-rel = { path = "crates/uni-rel" }
+uni-post = { path = "crates/uni-post" }
+uni-physics = { path = "crates/uni-physics" }
+uni-data = { path = "crates/uni-data" }
+uni-procgen = { path = "crates/uni-procgen" }
+uni-sim = { path = "crates/uni-sim" }
+uni-nav = { path = "crates/uni-nav" }
+uni-ui = { path = "crates/uni-ui" }
 
-# Math libraries
-glam = { version = "0.27", features = ["bytemuck"] }
+# GPU and windowing (Metal only)
+wgpu = { version = "=30.0.2", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+naga = { version = "=30.0.2", features = ["wgsl-in"] }
+winit = "=0.30.13"
+egui = { version = "=0.37.0", features = ["default_fonts"] }
+egui-wgpu = { version = "=0.37.0", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+egui-winit = { version = "=0.37.0", default-features = false, features = ["clipboard", "links"] }
+pollster = "=1.0.3"
 
-# Image loading
-image = "0.24"
+# Maths and plain-data
+glam = { version = "=0.34.3", features = ["bytemuck", "serde"] }
+bytemuck = { version = "=1.25.2", features = ["derive"] }
 
-# Serialization for shader data
-bytemuck = { version = "1.14", features = ["derive"] }
+# Files and serialisation
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+ron = "=0.12.3"
+flate2 = "=1.1.11"
+sha2 = "=0.11.1"
 
-# Async runtime
-futures = "0.3"
-
-# High-precision timing
-instant = "0.1"
-
-# Logging
-env_logger = "0.11"
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
+# Errors and logging
+anyhow = "=1.0.104"
+thiserror = "=2.0.21"
+log = "=0.4.35"
+env_logger = "=0.11.11"

@@ -1,0 +1,13 @@
+[package]
+name = "uni-bake"
+description = "Offline data baker: raw catalogues to packed binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+uni-core.workspace = true
+uni-data.workspace = true
+flate2.workspace = true
+anyhow.workspace = true
