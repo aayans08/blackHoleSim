@@ -1,0 +1,110 @@
+INFO AdapterInfo {
+    name: "Apple M3",
+    vendor: 0,
+    device: 0,
+    device_type: IntegratedGpu,
+    device_pci_bus_id: "",
+    driver: "",
+    driver_info: "",
+    backend: Metal,
+    subgroup_min_size: 4,
+    subgroup_max_size: 64,
+    transient_saves_memory: Some(
+        true,
+    ),
+    limit_bucket: None,
+}
+FEATURE SHADER_F16: true
+FEATURE SHADER_F64: false
+FEATURE SHADER_I16: true
+FEATURE SHADER_INT64: true
+FEATURE FLOAT32_FILTERABLE: true
+FEATURE FLOAT32_BLENDABLE: true
+FEATURE TIMESTAMP_QUERY: true
+FEATURE TIMESTAMP_QUERY_INSIDE_ENCODERS: false
+FEATURE TIMESTAMP_QUERY_INSIDE_PASSES: false
+FEATURE TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES: true
+FEATURE TEXTURE_FORMAT_16BIT_NORM: true
+FEATURE RG11B10UFLOAT_RENDERABLE: true
+FEATURE BGRA8UNORM_STORAGE: true
+FEATURE TEXTURE_COMPRESSION_BC: true
+FEATURE TEXTURE_COMPRESSION_ASTC: true
+FEATURE TEXTURE_COMPRESSION_ETC2: true
+FEATURE SUBGROUP: true
+FEATURE TEXTURE_BINDING_ARRAY: true
+FEATURE IMMEDIATES: true
+FEATURE INDIRECT_FIRST_INSTANCE: true
+FEATURE EXPERIMENTAL_RAY_QUERY: false
+FEATURE SHADER_FLOAT32_ATOMIC: true
+FEATURE TEXTURE_ATOMIC: true
+FEATURE PIPELINE_CACHE: false
+FEATURE DUAL_SOURCE_BLENDING: true
+FEATURE CLIP_DISTANCES: true
+LIMITS Limits {
+    max_texture_dimension_1d: 16384,
+    max_texture_dimension_2d: 16384,
+    max_texture_dimension_3d: 2048,
+    max_texture_array_layers: 2048,
+    max_bind_groups: 8,
+    max_bind_groups_plus_vertex_buffers: 24,
+    max_bindings_per_bind_group: 4294967295,
+    max_dynamic_uniform_buffers_per_pipeline_layout: 29,
+    max_dynamic_storage_buffers_per_pipeline_layout: 29,
+    max_sampled_textures_per_shader_stage: 96,
+    max_samplers_per_shader_stage: 16,
+    max_storage_buffers_per_shader_stage: 29,
+    max_storage_textures_per_shader_stage: 32,
+    max_uniform_buffers_per_shader_stage: 29,
+    max_binding_array_elements_per_shader_stage: 1000000,
+    max_binding_array_acceleration_structure_elements_per_shader_stage: 0,
+    max_binding_array_sampler_elements_per_shader_stage: 500000,
+    max_uniform_buffer_binding_size: 4294967295,
+    max_storage_buffer_binding_size: 4294967292,
+    max_vertex_buffers: 16,
+    max_buffer_size: 4294967295,
+    max_vertex_attributes: 31,
+    max_vertex_buffer_array_stride: 2048,
+    max_inter_stage_shader_variables: 31,
+    min_uniform_buffer_offset_alignment: 256,
+    min_storage_buffer_offset_alignment: 32,
+    max_color_attachments: 8,
+    max_color_attachment_bytes_per_sample: 64,
+    max_compute_workgroup_storage_size: 32768,
+    max_compute_invocations_per_workgroup: 1024,
+    max_compute_workgroup_size_x: 1024,
+    max_compute_workgroup_size_y: 1024,
+    max_compute_workgroup_size_z: 1024,
+    max_compute_workgroups_per_dimension: 65535,
+    max_immediate_size: 256,
+    max_non_sampler_bindings: 4294967295,
+    max_task_workgroup_total_count: 4294967295,
+    max_task_workgroups_per_dimension: 4294967295,
+    max_mesh_workgroup_total_count: 1048576,
+    max_mesh_workgroups_per_dimension: 1048576,
+    max_task_invocations_per_workgroup: 1024,
+    max_task_invocations_per_dimension: 1024,
+    max_mesh_invocations_per_workgroup: 1024,
+    max_mesh_invocations_per_dimension: 1024,
+    max_task_payload_size: 16352,
+    max_mesh_output_vertices: 256,
+    max_mesh_output_primitives: 256,
+    max_mesh_output_layers: 2048,
+    max_mesh_multiview_view_count: 0,
+    max_blas_primitive_count: 268435456,
+    max_blas_geometry_count: 16777216,
+    max_tlas_instance_count: 16777216,
+    max_acceleration_structures_per_shader_stage: 29,
+    max_buffers_and_acceleration_structures_per_shader_stage: 29,
+    max_multiview_view_count: 8,
+    max_ray_dispatch_count: 0,
+    max_ray_recursion_depth: 0,
+}
+FORMAT Rgba32Float: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | STORAGE_READ_WRITE | BLENDABLE) }
+FORMAT Rgba16Float: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | STORAGE_READ_WRITE | BLENDABLE) }
+FORMAT R32Float: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | STORAGE_READ_WRITE | BLENDABLE) }
+FORMAT Rg11b10Ufloat: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | BLENDABLE) }
+FORMAT Rgba8Unorm: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | STORAGE_READ_WRITE | BLENDABLE) }
+FORMAT Bgra8Unorm: TextureFormatFeatures { allowed_usages: TextureUsages(COPY_SRC | COPY_DST | TEXTURE_BINDING | STORAGE_BINDING | RENDER_ATTACHMENT | TRANSIENT_ATTACHMENT), flags: TextureFormatFeatureFlags(FILTERABLE | MULTISAMPLE_X2 | MULTISAMPLE_X4 | MULTISAMPLE_RESOLVE | STORAGE_READ_ONLY | STORAGE_WRITE_ONLY | BLENDABLE) }
+TIMESTAMP_PERIOD_NS 1
+F64_SHADER_ERROR Some("Validation Error\n\nCaused by:\n  In Device::create_shader_module, label = 'f64 test'\n    \nShader validation error: Type [0] '' is invalid\n = Using `f64` values requires the `naga::valid::Capabilities::FLOAT64` flag\n\n\n      Using `f64` values requires the `naga::valid::Capabilities::FLOAT64` flag\n")
+F16_SHADER_ERROR None

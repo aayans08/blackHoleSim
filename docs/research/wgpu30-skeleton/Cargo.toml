@@ -1,0 +1,15 @@
+[package]
+name = "skel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+winit = "0.30.13"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37.0", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links"] }
+pollster = "1.0.3"
+bytemuck = { version = "1.25", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
