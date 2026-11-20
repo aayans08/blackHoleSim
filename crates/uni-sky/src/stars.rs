@@ -28,18 +28,23 @@ pub const STARS_SHADER: &str = "sky/stars.wgsl";
 /// On screen, a star's pixels are E·w/(Ω(θ)·1.2·2^star_ev100), where w is the PSF weight and
 /// Ω(θ) = Ω_c·cos³θ the solid angle of a pixel θ off the optical axis. That is the shader's
 /// E/Ω(θ)·2^(scene − star) times the tonemap's exposure_scale(scene), and the scene EV cancels.
-/// Calibrated on the optical axis at 1920×1080 with fov_y = 60° against uni-post's AgX (black
-/// point 0.18·2^−12.47 ≈ 3.2e-5, white 0.18·2^6.5 ≈ 16.3). The 8-bit codes are uni-post's
-/// `agx` of a grey pixel at the peak, as the sRGB target stores it:
-/// - V = 6.5, the naked-eye limit, centred on a pixel, peaks at 2.315e-2: 9.5 stops above AgX
-///   black, about 46/255. It keeps the minimum 3 px footprint.
-/// - V = 0 peaks at 9.215 (about 249/255), a white core; its glare halo fades to black
-///   13.75 px out.
-/// - Sirius (V = −1.46) peaks at 35.36, past AgX white (255/255); its glare reaches 18.31 px.
+/// Calibrated on the optical axis at 1920×1080 with fov_y = 60° against uni-post's AgX, which
+/// clamps log2 of the exposed value to [−12.47393, 4.026069]: black is 2^−12.47393 =
+/// 0.18·2^−10 ≈ 1.76e-4 and white 2^4.026069 = 0.18·2^6.5 ≈ 16.3. The peaks listed are core
+/// peaks: the energy times the Gaussian core's centre weight, for a star centred on its pixel. For
+/// V ≤ 1 the shader moves 2% of the energy into the wide halo, so the rendered centre is about
+/// 1.8% lower. The 8-bit codes are uni-post's `agx` of a grey pixel at the peak, as the sRGB
+/// target stores it. A footprint radius is where the PSF falls below
+/// [`crate::psf::VISIBILITY_CUTOFF`], 2.55 stops under AgX black.
+/// - V = 6.5, the naked-eye limit, peaks at 2.315e-2: 7.04 stops above AgX black, about
+///   46/255. It keeps the minimum 3 px footprint.
+/// - V = 0 peaks at 9.215 (about 249/255), a white core; its glare footprint reaches 13.75 px.
+/// - Sirius (V = −1.46) peaks at 35.36, past AgX white (255/255); its glare footprint reaches
+///   18.31 px.
 ///
-/// The rule: V = 6.5 is clearly visible on black (≥ about 8 stops above AgX black); V ≤ 1 stars
+/// The rule: V = 6.5 is clearly visible on black (≥ about 7 stops above AgX black); V ≤ 1 stars
 /// saturate to a white core with a visible glare. The M0 gate's capture sweep chose −4.0: at the
-/// earlier 1.0, V = 6.5 sat only 4.5 stops above black (about 3/255) and the sky looked black.
+/// earlier 1.0, V = 6.5 sat only 2.04 stops above black (about 3/255) and the sky looked black.
 ///
 /// Off the axis, pixel values are 1/cos³θ higher (+1.6 EV at the side edges and +1.9 EV in the
 /// corners at 60° and 16:9). Off-axis pixels subtend less sky, so this keeps each star as bright
@@ -470,7 +475,8 @@ mod tests {
     use super::*;
     use crate::psf::{
         CORE_SIGMA_PX, HALO_ALPHA_PX, HALO_BETA, HALO_ENERGY_FRACTION, HALO_MIN_LUX, MAX_RADIUS_PX,
-        MIN_RADIUS_PX, VISIBILITY_CUTOFF, footprint_radius_px, halo_fraction, psf_weights,
+        MIN_RADIUS_PX, VISIBILITY_CUTOFF, footprint_radius_px, halo_fraction, halo_weight,
+        psf_weights,
     };
     use core::mem::{offset_of, size_of};
     use glam::{DVec3, Quat, Vec4};
@@ -711,23 +717,43 @@ mod tests {
         let lux = |v_mag: f64| star_illuminance_lux(v_mag) as f32;
         let energy = |v_mag: f64| star_display_energy(lux(v_mag), fov_y, h, DEFAULT_STAR_EV100);
         let radius = |v_mag: f64| footprint_radius_px(energy(v_mag), halo_fraction(lux(v_mag)));
-        // Centre-pixel weight of a star centred on its pixel: the peak.
+        // Core centre-pixel weight of a star centred on its pixel: the doc's "core peak".
         let centre = psf_weights(Vec2::splat(0.5), CORE_SIGMA_PX, 3)[24];
         let peak = |v_mag: f64| energy(v_mag) * centre;
-        // Task 5's AgX maps 0.18·2^−12.47393 to black and 0.18 to mid-grey.
-        let agx_black = 0.18 * (-12.47393f32).exp2();
+        // The centre pixel the shader renders: the core minus the halo's share, plus the halo.
+        let rendered = |v_mag: f64| {
+            let hf = halo_fraction(lux(v_mag));
+            energy(v_mag) * ((1.0 - hf) * centre + hf * halo_weight(0.0, radius(v_mag)))
+        };
+        // uni-post's AgX (agx.rs) clamps log2 of the exposed value to [−12.47393, 4.026069], so
+        // black is 2^−12.47393 = 0.18·2^−10, and 0.18 is mid-grey. Grey passes the inset
+        // matrix unchanged (its rows sum to 1).
+        let agx_black = (-12.47393f32).exp2();
 
-        // V = 6.5, the naked-eye limit: clearly visible on black, 8 to 12 stops above it, and
-        // still on the minimum footprint.
-        let faint = peak(6.5) / agx_black;
-        assert!((2f32.powi(8)..=2f32.powi(12)).contains(&faint), "{faint}");
+        // V = 6.5, the naked-eye limit: clearly visible on black, about 7 stops above it (the
+        // doc's 7.04 to 0.01 stops), and still on the minimum footprint.
+        let faint = (peak(6.5) / agx_black).log2();
+        assert!((6.5..=7.5).contains(&faint), "{faint}");
+        assert!((faint - 7.04).abs() < 0.01, "{faint}");
         assert_eq!(radius(6.5), MIN_RADIUS_PX);
-        // V ≤ 1: a white core (above 1.0 after exposure) and a glare wider than the minimum
-        // footprint, within the cap.
+        assert_eq!(rendered(6.5), peak(6.5)); // no halo, so the core peak is what renders
+        // At the earlier default, 1.0, it sat only 2.04 stops above black.
+        let old = (star_display_energy(lux(6.5), fov_y, h, 1.0) * centre / agx_black).log2();
+        assert!((old - 2.04).abs() < 0.01, "{old}");
+        // V ≤ 1: a white core (above 1.0 after exposure, as rendered) and a glare wider than the
+        // minimum footprint, within the cap. The halo's 2% share leaves the rendered centre
+        // about 1.8% below the core peak.
         for v_mag in [1.0, 0.0, -1.46] {
-            let (p, r) = (peak(v_mag), radius(v_mag));
-            assert!(p > 1.0, "V = {v_mag}: peak {p}");
-            assert!(r > MIN_RADIUS_PX && r <= MAX_RADIUS_PX, "V = {v_mag}: R {r}");
+            let (p, r, shown) = (peak(v_mag), radius(v_mag), rendered(v_mag));
+            assert!(shown > 1.0, "V = {v_mag}: rendered centre {shown}");
+            assert!(
+                r > MIN_RADIUS_PX && r <= MAX_RADIUS_PX,
+                "V = {v_mag}: R {r}"
+            );
+            assert!(
+                (1.0 - shown / p - 0.018).abs() < 5e-4,
+                "V = {v_mag}: {shown} vs {p}"
+            );
         }
 
         // The doc comment's numbers: peaks to 0.1%, footprint radii to 0.01 px.

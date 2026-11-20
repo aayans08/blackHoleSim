@@ -12,7 +12,7 @@
 //! `psf_erf`), and `shader_constants_match_cpu` keeps the constants equal.
 //!
 //! "Display-normalised" values are pixel values after the tonemap's exposure: what AgX
-//! (uni-post) receives, where 0.18 is mid-grey and about 3.2e-5 is black.
+//! (uni-post) receives, where 0.18 is mid-grey and 2^−12.47393 = 0.18·2^−10 ≈ 1.76e-4 is black.
 
 use std::f32::consts::{PI, SQRT_2, TAU};
 
@@ -39,9 +39,11 @@ pub const HALO_BETA: f32 = 2.5;
 pub const MIN_RADIUS_PX: f32 = 3.0;
 /// Largest footprint radius [px]. It bounds the fill cost of the brightest stars.
 pub const MAX_RADIUS_PX: f32 = 64.0;
-/// Display-normalised value treated as invisible when sizing a footprint. It is just below the
-/// black point of uni-post's AgX, 0.18·2^−12.47393 = 3.2e-5 (Sobotka's AgX log2 range, Task 5),
-/// so cutting the PSF there leaves no visible edge.
+/// Display-normalised value treated as invisible when sizing a footprint. uni-post's AgX clamps
+/// log2 of its input at −12.47393 (Sobotka's AgX log2 range, Task 5), so its black point is
+/// 2^−12.47393 = 0.18·2^−10 ≈ 1.76e-4. This cutoff is 2.55 stops below that, so cutting the PSF
+/// there leaves no visible edge; it is conservative, and footprints are somewhat larger than
+/// the black point alone needs.
 pub const VISIBILITY_CUTOFF: f32 = 3.0e-5;
 
 /// erf(x), by Abramowitz & Stegun 1964, *Handbook of Mathematical Functions*, eq. 7.1.26
