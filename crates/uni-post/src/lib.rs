@@ -2,3 +2,6 @@
 
 pub mod agx;
 pub mod tonemap;
+
+pub use agx::agx;
+pub use tonemap::{TONEMAP_SHADER, TonemapFeature, register_shaders};
