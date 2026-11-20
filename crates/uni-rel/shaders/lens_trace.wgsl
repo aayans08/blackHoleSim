@@ -10,9 +10,21 @@
 //    deflection there is under half a pixel. If the camera is inside the horizon, every pixel
 //    is black with lens_mask 1.
 //
-// Rays that use up the step budget (BINET_MAX_STEPS) are shaded as escaping along their last
-// tangent. This only happens for cameras beyond about 3000 M (the 5 M step cap) or for rays
-// orbiting the photon sphere more than ~6 times, and drops the deflection still to come.
+// Step budget. The step cap is 5 M, so 2000 steps carry a ray at most about 1e4 M. Measured
+// with the CPU twin, as the camera moves out:
+// - from about 7500 M, rays grazing the photon sphere run out before they leave it;
+// - from about 8600 M, rays inside the shadow are no longer captured;
+// - beyond about 1e4 M, every ray runs out before it gets near the hole, so all of the
+//   deflection and the capture are lost, not just the end of the path.
+// The host therefore traces only cameras within TRACE_REACH = 5000 M of the hole
+// (crates/uni-rel/src/tracer.rs). Farther out the grid is empty, and the frame shows the
+// unlensed sky with no shadow, which the app labels on the HUD (LensCoverage::BeyondReach).
+//
+// Within the reach, an escaping ray usually runs out on its way back out. cs_trace then shades
+// it along its last tangent. It has passed periapsis by then, and the deflection still to come
+// is under 2e-5 rad; the CPU twin checks this in gpu_budget_is_exact_within_trace_reach. Rays
+// that orbit the photon sphere many times, in the sub-pixel band around the critical impact
+// parameter, still lose the rest of their path.
 
 #import "common/camera.wgsl"
 #import "rel/binet.wgsl"

@@ -6,6 +6,11 @@
 //! and `lens_mask`. Outside the rectangle it draws the unlensed M0 debug sky. The shaders are
 //! `shaders/lens_trace.wgsl` (passes), `binet.wgsl` (integrator) and `debug_sky.wgsl`.
 //!
+//! The brute-force step budget only reaches the hole from cameras within [`TRACE_REACH`]
+//! (5000 M). Farther out, nothing is traced and the frame shows the unlensed sky with no
+//! shadow; [`lens_coverage`] reports this as [`LensCoverage::BeyondReach`], and the app must
+//! put [`LensCoverage::warning`] on the HUD (Global Constraints, Honesty).
+//!
 //! The lens is treated as a static Schwarzschild hole seen by a static camera; `LensView::spin`
 //! is ignored in M0 (Kerr comes in M3, design §5.5).
 //!
@@ -23,10 +28,29 @@ use uni_gfx::{
 
 use crate::binet;
 
-/// Most RK4 steps per GPU ray.
+/// Most RK4 steps per GPU ray (the brief's budget).
 const GPU_MAX_STEPS: u32 = 2000;
 /// Smallest GPU escape radius [M]; a ray escapes beyond max(2·r_cam, this), moving outwards.
 const GPU_MIN_R_FAR: f64 = 1000.0;
+
+/// Farthest camera distance from the hole [M] at which the lens is traced.
+///
+/// The step rule caps dλ at 5 M (`binet::step_size`), so a GPU ray covers at most about
+/// 2000 × 5 = 1e4 M. A ray aimed at the hole needs ≈ (r_cam − 250)/5 steps to reach r = 250 M,
+/// where the cap stops applying, and about 330 more to be captured. These numbers are measured
+/// with the CPU twin; with them:
+/// - captures fail from about 8600 M on (a ray inside the shadow ends short of the hole);
+/// - from about 7500 M, rays that graze the photon sphere run out before they leave it.
+///
+/// At 5000 M, rays aimed at the hole are captured within about 1300 steps. Every other ray has
+/// passed periapsis before the budget ends, and its exit direction is within 2e-5 rad (about
+/// 0.02 px at 1080p and 60°) of a long-budget trace. `gpu_budget_is_exact_within_trace_reach`
+/// and `gpu_budget_fails_beyond_trace_reach` pin both sides.
+pub const TRACE_REACH: f64 = 5000.0;
+
+/// HUD line for [`LensCoverage::BeyondReach`] (Global Constraints, Honesty).
+pub const BEYOND_REACH_WARNING: &str = "Lens not traced (camera > 5000 M): unlensed, no shadow";
+
 /// Interactive default resolution scale; captures set 1.0.
 const DEFAULT_RESOLUTION_SCALE: f32 = 0.5;
 const MIN_RESOLUTION_SCALE: f32 = 0.25;
@@ -58,6 +82,49 @@ struct LensParams {
 struct PixelRect {
     min: UVec2,
     size: UVec2,
+}
+
+/// What the lens pass draws this frame. [`lens_coverage`] and [`LensTracer`] use the same plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LensCoverage {
+    /// No lens, or its light bending is under half a pixel everywhere on screen. The pass
+    /// draws the unlensed sky, which is then correct to half a pixel.
+    Unlensed,
+    /// Geodesics are traced on the GPU over the lens rectangle.
+    Traced,
+    /// The camera is on or inside the horizon, so the frame is black ([`inside_horizon`]).
+    InsideHorizon,
+    /// The lens bends light by at least half a pixel on screen, but the camera is farther than
+    /// [`TRACE_REACH`] from it, so the step budget cannot reach the hole. Nothing is traced:
+    /// the frame shows the unlensed sky with no shadow and `lens_mask` stays 0. The app must
+    /// label this on screen ([`LensCoverage::warning`]).
+    BeyondReach,
+}
+
+impl LensCoverage {
+    /// The HUD warning for this coverage, if it needs one. The app adds it to the HUD's
+    /// warnings. `InsideHorizon` has its own HUD flag, so it returns `None` here.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::BeyondReach => Some(BEYOND_REACH_WARNING),
+            Self::Unlensed | Self::Traced | Self::InsideHorizon => None,
+        }
+    }
+}
+
+/// What the lens pass draws for `ctx`. This is the same plan [`LensTracer`] makes in
+/// `prepare`, sized by `ctx.viewport`, so the app can label the frame without access to the
+/// feature. `LensTracer` plans with `FrameTargets::size`, which the app makes equal to
+/// `ctx.viewport`.
+pub fn lens_coverage(ctx: &FrameCtx) -> LensCoverage {
+    frame_params(
+        ctx.lenses.first(),
+        ctx.view_rot,
+        ctx.proj,
+        ctx.viewport,
+        MAX_RESOLUTION_SCALE,
+    )
+    .0
 }
 
 /// True when the camera is on or inside the lens's horizon (r < 2(1 + ε) M, the capture
@@ -158,18 +225,31 @@ fn clamp_resolution_scale(s: f32, current: f32) -> f32 {
     }
 }
 
-/// This frame's GPU parameters for `lens` (the first lens, if any) on a `size` frame.
+/// GPU escape radius [M] for a camera at `r_cam` [M]: max(2·r_cam, 1000).
+fn gpu_r_far(r_cam: f64) -> f64 {
+    (2.0 * r_cam).max(GPU_MIN_R_FAR)
+}
+
+/// This frame's plan for `lens` (the first lens, if any) on a `size` frame: what the pass
+/// draws, and its GPU parameters.
 ///
-/// Nothing is traced without a lens, when the lens's cone is under half a pixel, or when its
-/// rectangle is off screen; the resolve pass then draws only the unlensed sky. A camera inside
-/// the horizon sets the black-frame flag and leaves every other field finite (Review Focus 2).
+/// - [`LensCoverage::Unlensed`]: there is no lens (or its mass is not positive and finite),
+///   its cone is under half a pixel, or its rectangle is off screen. Nothing is traced, and the
+///   resolve pass draws only the unlensed sky.
+/// - [`LensCoverage::InsideHorizon`]: sets the black-frame flag.
+/// - [`LensCoverage::BeyondReach`]: the rectangle is on screen but r_cam > [`TRACE_REACH`].
+///   Nothing is traced, as for `Unlensed`.
+/// - [`LensCoverage::Traced`]: the rectangle is traced.
+///
+/// `cam` is written only when tracing (r_cam ≤ [`TRACE_REACH`]), so every float sent to the
+/// GPU is finite however far the camera is (Review Focus 2).
 fn frame_params(
     lens: Option<&LensView>,
     view_rot: Mat4,
     proj: Mat4,
     size: UVec2,
     scale: f32,
-) -> LensParams {
+) -> (LensCoverage, LensParams) {
     let size = size.max(UVec2::ONE);
     let mut p = LensParams {
         cam: [0.0; 4],
@@ -177,27 +257,27 @@ fn frame_params(
         grid: [0; 4],
         scale: [1.0, 1.0, 0.0, 1.0 / scale],
     };
+    let unlensed = (LensCoverage::Unlensed, p);
     let Some(cam) = lens.and_then(camera_in_m) else {
-        return p;
+        return unlensed;
     };
     let r_cam = cam.length();
     if !r_cam.is_finite() {
-        return p;
+        return unlensed;
     }
     if r_cam < binet::CAPTURE_RADIUS {
         p.grid[3] = 1;
-        return p;
+        return (LensCoverage::InsideHorizon, p);
     }
-    p.cam = [cam.x as f32, cam.y as f32, cam.z as f32, r_cam as f32];
     let (proj_x, proj_y) = (f64::from(proj.x_axis.x), f64::from(proj.y_axis.y));
     if !(proj_x > 0.0 && proj_y > 0.0 && proj_x.is_finite() && proj_y.is_finite()) {
-        return p;
+        return unlensed;
     }
     // Angular size of one full-resolution pixel at the screen centre (2 NDC units over h rows).
     let pixel_angle = 2.0 / (proj_y * f64::from(size.y));
     let theta = cone_half_angle(r_cam, pixel_angle);
     if theta < 0.5 * pixel_angle {
-        return p;
+        return unlensed;
     }
     let axis = view_rot
         .as_dmat4()
@@ -205,19 +285,25 @@ fn frame_params(
         .normalize();
     let rect = cone_rect(axis, theta, proj_x, proj_y, size);
     if rect.size.x == 0 || rect.size.y == 0 {
-        return p;
+        return unlensed;
+    }
+    // Lensing is visible on screen. Beyond the reach the step budget ends before the rays get
+    // near the hole, so a trace would draw the unlensed sky anyway, at full cost.
+    if r_cam > TRACE_REACH {
+        return (LensCoverage::BeyondReach, p);
     }
     let grid = sample_grid(rect.size, scale);
     let per_sample = rect.size.as_vec2() / grid.as_vec2();
+    p.cam = [cam.x as f32, cam.y as f32, cam.z as f32, r_cam as f32];
     p.rect = [rect.min.x, rect.min.y, rect.size.x, rect.size.y];
     p.grid = [grid.x, grid.y, GPU_MAX_STEPS, 0];
     p.scale = [
         per_sample.x,
         per_sample.y,
-        (2.0 * r_cam).max(GPU_MIN_R_FAR) as f32,
+        gpu_r_far(r_cam) as f32,
         1.0 / scale,
     ];
-    p
+    (LensCoverage::Traced, p)
 }
 
 /// Group 1, binding 0: the `LensParams` uniform.
@@ -478,7 +564,7 @@ impl RenderFeature for LensTracer {
             0,
             bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
         );
-        self.params = frame_params(
+        (_, self.params) = frame_params(
             ctx.lenses.first(),
             ctx.view_rot,
             ctx.proj,
@@ -816,7 +902,9 @@ mod tests {
     fn close_camera_traces_full_screen_at_half_resolution() {
         // Camera 30 M from the hole along +z, looking along −z: the hole is dead ahead.
         let lens = lens_at(DVec3::new(0.0, 0.0, 30.0));
-        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        let (coverage, p) =
+            frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(coverage, LensCoverage::Traced);
         assert_eq!(p.rect, [0, 0, W, H]);
         assert_eq!(p.grid, [W / 2, H / 2, 2000, 0]);
         assert_eq!(p.scale, [2.0, 2.0, 1000.0, 2.0]);
@@ -826,38 +914,217 @@ mod tests {
                 && (p.cam[3] - 30.0).abs() < 1e-4
         );
         // Full resolution: one sample per pixel.
-        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 1.0);
+        let (_, p) = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 1.0);
         assert_eq!((p.grid[0], p.grid[1]), (W, H));
         assert_eq!((p.scale[0], p.scale[1], p.scale[3]), (1.0, 1.0, 1.0));
     }
 
+    /// Nothing traced, and every float the GPU receives is finite.
+    fn assert_untraced(p: &LensParams, ctx: &str) {
+        assert_eq!(p.grid, [0; 4], "{ctx}: {p:?}");
+        assert_eq!(p.rect, [0; 4], "{ctx}: {p:?}");
+        assert!(
+            p.cam.iter().chain(&p.scale).all(|x| x.is_finite()),
+            "{ctx}: {p:?}"
+        );
+    }
+
+    /// Review I1: from 1e6 M, light within ~7 px of the hole is bent by half a pixel or more,
+    /// but the step budget cannot carry a ray to the hole. Nothing is traced, and the coverage
+    /// asks the app for a HUD label.
     #[test]
-    fn far_camera_traces_a_small_rect_around_the_hole() {
+    fn far_camera_beyond_reach_is_labelled_not_traced() {
+        let size = UVec2::new(W, H);
         let lens = lens_at(DVec3::new(0.0, 0.0, 1e6));
-        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        let (coverage, p) = frame_params(Some(&lens), Mat4::IDENTITY, proj(), size, 0.5);
+        assert_eq!(coverage, LensCoverage::BeyondReach);
+        assert_eq!(coverage.warning(), Some(BEYOND_REACH_WARNING));
+        assert_untraced(&p, "1e6 M");
+
+        // Either side of the reach.
+        let inside = lens_at(DVec3::new(0.0, 0.0, 0.999 * TRACE_REACH));
+        let (coverage, p) = frame_params(Some(&inside), Mat4::IDENTITY, proj(), size, 0.5);
+        assert_eq!(coverage, LensCoverage::Traced);
+        assert_eq!(coverage.warning(), None);
+        assert_eq!(p.grid, [W / 2, H / 2, GPU_MAX_STEPS, 0]);
+        assert_eq!(p.scale[2], (2.0 * 0.999 * TRACE_REACH) as f32);
+        let outside = lens_at(DVec3::new(0.0, 0.0, 1.001 * TRACE_REACH));
+        let (coverage, p) = frame_params(Some(&outside), Mat4::IDENTITY, proj(), size, 0.5);
+        assert_eq!(coverage, LensCoverage::BeyondReach);
+        assert_untraced(&p, "just beyond the reach");
+
+        // Hole behind the camera: no lensing on screen, so nothing to label.
+        let back = Mat4::from_quat(DQuat::from_rotation_y(std::f64::consts::PI).as_quat());
+        let (coverage, p) = frame_params(Some(&lens), back, proj(), size, 0.5);
+        assert_eq!(coverage, LensCoverage::Unlensed);
+        assert_untraced(&p, "behind");
+        // So far away that the whole cone is under half a pixel: unlensed is exact to ½ px.
+        // 1e40 M also overflows f32, which must not reach the GPU.
+        for r in [1e9, 1e40] {
+            let far = lens_at(DVec3::new(0.0, 0.0, r));
+            let (coverage, p) = frame_params(Some(&far), Mat4::IDENTITY, proj(), size, 0.5);
+            assert_eq!(coverage, LensCoverage::Unlensed, "{r}");
+            assert_untraced(&p, "far");
+        }
+    }
+
+    /// The cone is narrower than the screen only for coarse pixels inside the reach: at 180
+    /// rows and 60°, θ_max = asin(8/(pixel·r)·√(1 − 2/r)) ≈ 18° from 4000 M.
+    #[test]
+    fn low_resolution_traces_a_rect_around_the_hole() {
+        let (w, h) = (320, 180);
+        let proj = reversed_z_infinite_proj(60f32.to_radians(), w as f32 / h as f32, 0.1);
+        let lens = lens_at(DVec3::new(0.0, 0.0, 4000.0));
+        let (coverage, p) = frame_params(Some(&lens), Mat4::IDENTITY, proj, UVec2::new(w, h), 1.0);
+        assert_eq!(coverage, LensCoverage::Traced);
         let (min, size) = (
             UVec2::new(p.rect[0], p.rect[1]),
             UVec2::new(p.rect[2], p.rect[3]),
         );
-        // θ_max = asin(8/(pixel·r)) ≈ 7.5e-3 rad ≈ 7 px at 1080p, fov 60°.
+        // tan 18.2° × f = 0.57 NDC: about 51 px each way from the centre, plus padding.
         assert!(
-            size.x > 8 && size.x < 24 && size.y > 8 && size.y < 24,
+            size.x > 95 && size.x < 115 && size.y > 95 && size.y < 115,
             "{p:?}"
         );
-        let centre = UVec2::new(W / 2, H / 2);
+        let centre = UVec2::new(w / 2, h / 2);
         assert!(
             min.cmple(centre).all() && (min + size).cmpgt(centre).all(),
             "{p:?}"
         );
-        assert_eq!(p.scale[2], 2e6);
-        // Looking the other way: nothing to trace.
-        let back = Mat4::from_quat(DQuat::from_rotation_y(std::f64::consts::PI).as_quat());
-        let p = frame_params(Some(&lens), back, proj(), UVec2::new(W, H), 0.5);
-        assert_eq!((p.grid[0], p.grid[1]), (0, 0));
-        // So far away that the whole cone is under half a pixel: nothing to trace.
-        let far = lens_at(DVec3::new(0.0, 0.0, 1e9));
-        let p = frame_params(Some(&far), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
-        assert_eq!((p.grid[0], p.grid[1], p.grid[3]), (0, 0, 0));
+        assert_eq!((p.grid[0], p.grid[1]), (size.x, size.y));
+    }
+
+    /// A ray from a static camera at r [M] on +x, at angle `delta` from the hole's direction,
+    /// turning towards +y: (camera, initial tangent).
+    fn ray_at(r: f64, delta: f64) -> (DVec3, DVec3) {
+        let cam = DVec3::new(r, 0.0, 0.0);
+        let local = DVec3::new(-delta.cos(), delta.sin(), 0.0);
+        (cam, binet::static_observer_ray(cam, local).unwrap())
+    }
+
+    /// What the GPU pass shows for a ray, from the CPU twin with the pass's budget and escape
+    /// radius: `None` if captured, or else the exit direction (the last tangent if the budget
+    /// ran out, as `cs_trace` does).
+    fn gpu_view(cam: DVec3, v0: DVec3) -> Option<DVec3> {
+        let r_far = gpu_r_far(cam.length());
+        let (end, _, v) = binet::trace_state(cam, v0, r_far, GPU_MAX_STEPS);
+        (end != binet::RayEnd::Captured).then(|| v.normalize())
+    }
+
+    /// The reference: the same integrator with a budget it never exhausts, escaping at 10·r_cam.
+    /// There the remaining deflection, ≈ 0.75·b³/D⁴ in Binet form, is below 1e-7 rad for every
+    /// b ≤ r_cam.
+    fn long_trace(cam: DVec3, v0: DVec3) -> binet::RayEnd {
+        binet::trace(cam, v0, 10.0 * cam.length(), 1_000_000)
+    }
+
+    /// Review I1: at the reach, the GPU budget gives the long-budget answer for every ray: the
+    /// same capture flag, and an exit direction within 2e-5 rad. This covers both sides of the
+    /// shadow edge (b_c = 3√3 ≈ 5.196 M), out to the edge of the hemisphere (b ≈ r_cam),
+    /// towards and away from the hole.
+    #[test]
+    fn gpu_budget_is_exact_within_trace_reach() {
+        let r = TRACE_REACH;
+        let lapse = (1.0 - 2.0 / r).sqrt();
+        let bs = [
+            0.0, 1.0, 3.0, 5.0, 5.19, 5.2, 5.25, 5.5, 6.0, 8.0, 10.0, 20.0, 50.0, 100.0, 300.0,
+            1000.0, 3000.0, 4990.0,
+        ];
+        let mut captured = 0;
+        for b in bs {
+            // sin δ = b·√(1 − 2/r)/r for a static observer (CLAUDE.md §6).
+            let towards = (b * lapse / r).asin();
+            for delta in [towards, std::f64::consts::PI - towards] {
+                let (cam, v0) = ray_at(r, delta);
+                let gpu = gpu_view(cam, v0);
+                match long_trace(cam, v0) {
+                    binet::RayEnd::Captured => {
+                        assert_eq!(gpu, None, "b = {b}, δ = {delta}: not captured");
+                        captured += 1;
+                    }
+                    binet::RayEnd::Escaped { dir } => {
+                        let got = gpu.unwrap_or_else(|| panic!("b = {b}, δ = {delta}: captured"));
+                        let err = (got - dir).length();
+                        assert!(err < 2e-5, "b = {b}, δ = {delta}: off by {err:e} rad");
+                    }
+                    binet::RayEnd::MaxSteps => panic!("reference ran out of steps"),
+                }
+            }
+        }
+        // b ≤ 5.19 towards the hole are captured; everything else escapes.
+        assert_eq!(captured, 5);
+    }
+
+    /// Review I1: just beyond the reach the budget starts to fail, which is why the tracer stops
+    /// there. At 1.5× the reach, a ray grazing the photon sphere comes out more than 1e-4 rad
+    /// off. At 2× the reach, a ray aimed straight at the hole runs out ~90 M short of it, so the
+    /// shadow would vanish.
+    #[test]
+    fn gpu_budget_fails_beyond_trace_reach() {
+        let r = 1.5 * TRACE_REACH;
+        let towards = (5.2 * (1.0 - 2.0 / r).sqrt() / r).asin();
+        let (cam, v0) = ray_at(r, towards);
+        let binet::RayEnd::Escaped { dir } = long_trace(cam, v0) else {
+            panic!("b = 5.2 escapes");
+        };
+        let err = (gpu_view(cam, v0).expect("escapes") - dir).length();
+        assert!(err > 1e-4, "{err:e}");
+
+        let r = 2.0 * TRACE_REACH;
+        let (cam, v0) = ray_at(r, 0.0);
+        assert_eq!(long_trace(cam, v0), binet::RayEnd::Captured);
+        let (end, x, _) = binet::trace_state(cam, v0, gpu_r_far(r), GPU_MAX_STEPS);
+        assert_eq!(end, binet::RayEnd::MaxSteps);
+        assert!(x.length() > 50.0, "stopped at r = {}", x.length());
+    }
+
+    /// The public predicate is the tracer's own plan, sized by the viewport.
+    #[test]
+    fn lens_coverage_matches_the_tracer_plan() {
+        let ctx_at = |cam_m: Option<DVec3>| FrameCtx {
+            frame_index: 0,
+            epoch: uni_core::Epoch { day: 0, sec: 0.0 },
+            dt_real_s: 0.0,
+            camera: uni_core::CameraView {
+                pos: uni_core::UniversePos::default(),
+                orient: DQuat::IDENTITY,
+                fov_y_rad: 60f64.to_radians(),
+            },
+            view_rot: Mat4::IDENTITY,
+            proj: proj(),
+            viewport: UVec2::new(W, H),
+            exposure: uni_gfx::Exposure {
+                scene_ev100: 0.0,
+                star_ev100: 0.0,
+            },
+            lenses: cam_m.map(lens_at).into_iter().collect(),
+        };
+        let cases = [
+            (None, LensCoverage::Unlensed),
+            (Some(DVec3::new(0.0, 0.0, 30.0)), LensCoverage::Traced),
+            (Some(DVec3::new(0.0, 0.0, 1.0)), LensCoverage::InsideHorizon),
+            (Some(DVec3::new(0.0, 0.0, 1e6)), LensCoverage::BeyondReach),
+            (Some(DVec3::new(0.0, 0.0, 1e9)), LensCoverage::Unlensed),
+        ];
+        for (cam_m, expected) in cases {
+            let ctx = ctx_at(cam_m);
+            assert_eq!(lens_coverage(&ctx), expected, "{cam_m:?}");
+            let plan = frame_params(
+                ctx.lenses.first(),
+                ctx.view_rot,
+                ctx.proj,
+                ctx.viewport,
+                0.5,
+            );
+            assert_eq!(plan.0, expected, "{cam_m:?}");
+        }
+        assert_eq!(LensCoverage::InsideHorizon.warning(), None);
+        assert_eq!(LensCoverage::Unlensed.warning(), None);
+    }
+
+    #[test]
+    fn beyond_reach_warning_names_the_reach() {
+        assert!(BEYOND_REACH_WARNING.contains(&format!("> {TRACE_REACH} M")));
     }
 
     // Review Focus 2: inside or on the horizon, or at the centre, the frame is black and no
@@ -871,7 +1138,9 @@ mod tests {
         ] {
             let lens = lens_at(cam);
             assert!(inside_horizon(&lens), "{cam}");
-            let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+            let (coverage, p) =
+                frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+            assert_eq!(coverage, LensCoverage::InsideHorizon, "{cam}");
             assert_eq!(p.grid, [0, 0, 0, 1], "{cam}");
             assert!(p.cam.iter().chain(&p.scale).all(|x| x.is_finite()), "{p:?}");
         }
@@ -880,13 +1149,16 @@ mod tests {
 
     #[test]
     fn no_lens_or_bad_mass_traces_nothing() {
-        let p = frame_params(None, Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        let (coverage, p) = frame_params(None, Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(coverage, LensCoverage::Unlensed);
         assert_eq!(p.grid, [0, 0, 0, 0]);
         assert_eq!(p.scale[3], 2.0);
         let mut lens = lens_at(DVec3::new(0.0, 0.0, 30.0));
         lens.mass_kg = 0.0;
         assert!(!inside_horizon(&lens));
-        let p = frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        let (coverage, p) =
+            frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
+        assert_eq!(coverage, LensCoverage::Unlensed);
         assert_eq!(p.grid, [0, 0, 0, 0]);
         assert!(p.cam.iter().chain(&p.scale).all(|x| x.is_finite()), "{p:?}");
     }

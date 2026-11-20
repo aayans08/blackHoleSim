@@ -80,21 +80,32 @@ fn rk4_step(x: DVec3, v: DVec3, dl: f64) -> (DVec3, DVec3) {
 /// outwards (x·v > 0). After `max_steps` steps without either, [`RayEnd::MaxSteps`]. A start
 /// inside the capture radius (including the centre) is captured at once.
 pub fn trace(x0: DVec3, v0: DVec3, r_far: f64, max_steps: u32) -> RayEnd {
+    trace_state(x0, v0, r_far, max_steps).0
+}
+
+/// [`trace`], also returning the final position and tangent (x, v), as `binet_trace` in
+/// `binet.wgsl` does. On [`RayEnd::MaxSteps`] the GPU pass shades along `v`.
+pub(crate) fn trace_state(
+    x0: DVec3,
+    v0: DVec3,
+    r_far: f64,
+    max_steps: u32,
+) -> (RayEnd, DVec3, DVec3) {
     let (mut x, mut v) = (x0, v0);
     for i in 0..=max_steps {
         let r = x.length();
         if r < CAPTURE_RADIUS {
-            return RayEnd::Captured;
+            return (RayEnd::Captured, x, v);
         }
         if r > r_far && x.dot(v) > 0.0 {
-            return RayEnd::Escaped { dir: v.normalize() };
+            return (RayEnd::Escaped { dir: v.normalize() }, x, v);
         }
         if i == max_steps {
             break;
         }
         (x, v) = rk4_step(x, v, step_size(r));
     }
-    RayEnd::MaxSteps
+    (RayEnd::MaxSteps, x, v)
 }
 
 /// Total deflection angle [rad] of a ray sent along +x from x = −1e4 M with impact parameter

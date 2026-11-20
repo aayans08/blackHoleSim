@@ -3,7 +3,9 @@
 pub mod binet;
 pub mod tracer;
 
-pub use tracer::{LensTracer, inside_horizon};
+pub use tracer::{
+    BEYOND_REACH_WARNING, LensCoverage, LensTracer, TRACE_REACH, inside_horizon, lens_coverage,
+};
 
 /// `ShaderLib` path of the Binet integrator (`binet_trace`, `static_observer_ray`).
 pub const BINET_WGSL: &str = "rel/binet.wgsl";
