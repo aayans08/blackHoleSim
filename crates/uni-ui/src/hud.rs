@@ -130,16 +130,21 @@ impl Hud {
     /// [`Self::draw_headless`] lays it out for its `size_px` at `pixels_per_point` physical
     /// pixels per egui point: 1.0 draws it at 1:1, 2.0 matches a Retina window. A value that is
     /// not finite and positive falls back to 1.0. Nothing animates, so every draw is a finished
-    /// frame. `plain_format` is the non-sRGB format of the target view.
+    /// frame.
+    ///
+    /// `target_format` is the format of the view it will draw over. A non-sRGB view matches
+    /// the window exactly. An sRGB one, such as `uni_gfx::CAPTURE_FORMAT`, also works:
+    /// egui-wgpu then decodes its colours to linear in the shader so the view re-encodes them
+    /// (and logs a warning), and translucent edges blend in linear rather than gamma space.
     pub fn new_headless(
         gpu: &uni_gfx::GpuContext,
-        plain_format: wgpu::TextureFormat,
+        target_format: wgpu::TextureFormat,
         pixels_per_point: f32,
     ) -> Self {
         Self {
             ctx: headless_context(),
             state: None,
-            renderer: hud_renderer(gpu, plain_format),
+            renderer: hud_renderer(gpu, target_format),
             pixels_per_point,
             max_texture_side: gpu.device.limits().max_texture_dimension_2d as usize,
         }
@@ -313,14 +318,14 @@ fn headless_context() -> egui::Context {
     ctx
 }
 
-/// The wgpu renderer every HUD uses, writing to `plain_format`.
+/// The wgpu renderer every HUD uses, writing to `target_format`.
 fn hud_renderer(
     gpu: &uni_gfx::GpuContext,
-    plain_format: wgpu::TextureFormat,
+    target_format: wgpu::TextureFormat,
 ) -> egui_wgpu::Renderer {
     egui_wgpu::Renderer::new(
         &gpu.device,
-        plain_format,
+        target_format,
         egui_wgpu::RendererOptions::default(),
     )
 }
