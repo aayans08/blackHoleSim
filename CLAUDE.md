@@ -22,26 +22,32 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: after Task 2 (M0, wave 0).
-> The Cargo workspace exists and `cargo check --workspace` passes, but every function body is still a `todo!()`
-> stub or an empty module. **Nothing renders yet.** Wave 1 fills in the bodies.
+> **Updated by the lead after each wave.** Last update: after M0 wave 1 (commit a7eed55).
+> The library crates below are implemented, and 177 unit tests pass (including uni-bake). Every crate was reviewed against the plan.
+> **No GPU code path has been run yet.** The `universe` binary (uni-app) is being wired up in wave 2, and the
+> first real GPU run (selftest and captures) happens there. Until then nothing has been seen rendering.
 
 What exists now:
 ```
 Cargo.toml                   workspace root: members, [workspace.dependencies] pins (Global Constraints + serde_json)
 .cargo/config.toml           shared target dir /Users/aayan/.cargo/shared-target/blackhole + dev/release/dist profiles
 crates/
-  uni-core/     frozen interface stubs: units, pos (UniversePos), epoch, frame (FrameTree), camera, hash,
-                color, galactic
-  uni-gfx/      frozen interface stubs: context (GpuContext), targets, frame (FrameCtx, CameraUniform), timer
-                (PassTimer), renderer (RenderFeature, Renderer), shader (ShaderLib), capture, proj;
-                shaders/common/*.wgsl placeholders
-  uni-post/ (agx, tonemap)  uni-nav/ (camera, input, bookmark)  uni-data/ (bsc5)  uni-sky/ (stars, psf)
-  uni-rel/ (binet, tracer)  uni-ui/ (format, hud)               empty modules; each task defines its API
-  uni-app/      binary `universe` (main, app, world, capture, selftest): empty modules
+  uni-core/     FROZEN API, implemented: units, pos (UniversePos), epoch (TDB, leap seconds), frame (FrameTree),
+                camera, hash (pcg3d, splitmix64), color (CIE blackbody, B−V→Teff, star lux), galactic
+  uni-gfx/      FROZEN API, implemented: context (GpuContext, headless + windowed), targets, frame (FrameCtx,
+                CameraUniform 240 B), timer (PassTimer), renderer (RenderFeature, Renderer), shader
+                (ShaderLib #import + naga validate), capture, proj (reversed-Z infinite); shaders/common/*.wgsl
+  uni-post/     AgX tonemap + exposure + TPDF dither pass; CPU twin uni_post::agx
+  uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks
+  uni-data/     BSC5 loader (binary format v1); data_dir()
+  uni-sky/      StarField: energy-conserving erf-integrated PSF splats, Moffat glare, Planck LUT
+  uni-rel/      binet CPU tracer (golden-tested) + LensTracer compute pass (lens_mask, M0 debug grid)
+  uni-ui/       egui HUD v0 (windowed + headless) and unit formatting
+  uni-app/      binary `universe` (main, app, world, capture, selftest): wave 2 in progress
   uni-planet/, uni-atmo/, uni-physics/, uni-procgen/, uni-sim/   doc comment only (later milestones)
-tools/bake/     bin `uni-bake` (main, bsc5): empty modules
-tools/verify/   bin `uni-verify` (main, sheet, shadow): empty modules
+tools/bake/     bin `uni-bake bsc5`: data/cache/bsc5/catalog.gz → data/baked/bsc5.bin (9096 stars)
+tools/verify/   bin `uni-verify` (sheet, shadow): wave 2 in progress
+data/baked/bsc5.bin          Yale Bright Star Catalogue, 9096 stars (CDS V/50), committed
 archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old CLAUDE.md (reference only)
 archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
 textures/*.jpg               7 Solar System Scope 2k maps (CC BY 4.0, see ATTRIBUTION.md);
