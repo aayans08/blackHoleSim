@@ -22,10 +22,12 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: after M0 wave 1 (commit a7eed55).
-> The library crates below are implemented, and 177 unit tests pass (including uni-bake). Every crate was reviewed against the plan.
-> **No GPU code path has been run yet.** The `universe` binary (uni-app) is being wired up in wave 2, and the
-> first real GPU run (selftest and captures) happens there. Until then nothing has been seen rendering.
+> **Updated by the lead after each wave.** Last update: M0 complete (tag `m0`).
+> 241 unit tests pass (workspace lib + bins). On the M3, `universe --selftest` passes 3/3 (pcg3d bit-exact,
+> AgX 1.5e-5, Binet 1.27e-4 rad), `--capture bookmarks/m0.ron` renders 6/6 bookmarks, the shadow measures
+> 158.745 px (GR: 158.745), and the window ran 15 s with no errors. Window FPS is not measured yet. The brute-force
+> lens pass costs about 140 ms of GPU per frame at full 1080p (ground truth only; M3 replaces it).
+> Capture sheet: https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE
 
 What exists now:
 ```
@@ -43,10 +45,12 @@ crates/
   uni-sky/      StarField: energy-conserving erf-integrated PSF splats, Moffat glare, Planck LUT
   uni-rel/      binet CPU tracer (golden-tested) + LensTracer compute pass (lens_mask, M0 debug grid)
   uni-ui/       egui HUD v0 (windowed + headless) and unit formatting
-  uni-app/      binary `universe` (main, app, world, capture, selftest): wave 2 in progress
+  uni-app/      binary `universe`: windowed app; `--capture <bookmarks.ron> --out <dir> [--size WxH] [--hud]`;
+                `--selftest`. World (TestBH-1: 10 M☉ at SSB + 1000 AU), scene wiring, F12 saves a view bookmark
   uni-planet/, uni-atmo/, uni-physics/, uni-procgen/, uni-sim/   doc comment only (later milestones)
 tools/bake/     bin `uni-bake bsc5`: data/cache/bsc5/catalog.gz → data/baked/bsc5.bin (9096 stars)
-tools/verify/   bin `uni-verify` (sheet, shadow): wave 2 in progress
+tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html>`, `shadow --png <f> --expected-px <r> --tol <t>`
+bookmarks/m0.ron             the six M0 capture bookmarks (RON, implicit_some)
 data/baked/bsc5.bin          Yale Bright Star Catalogue, 9096 stars (CDS V/50), committed
 archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old CLAUDE.md (reference only)
 archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
@@ -121,9 +125,9 @@ Verbatim from the M0 plan. They bind every task.
 **Honesty**
 - Anything approximate or non-physical is labelled on screen. In M0 that means the lens background ("M0 debug grid") and speeds faster than c ("FTL · non-physical").
 
-**M0 execution ruling on commits**, which overrides "Agents never commit" above for M0 only. The lead removes or
-renews it at tag `m0`; it is recorded in `.superpowers/sdd/2026-11-20-m0-foundation/progress.md`:
-when a workflow task tells an implementer to commit, it commits only its own paths with a pathspec commit
+**Standing commit rule** (renewed at tag `m0`; it overrides "Agents never commit" above, which is kept verbatim
+from the M0 plan). When a workflow task tells an implementer to commit, it commits only its own paths with a
+pathspec commit
 (`git add -- <own paths> && git commit -m "..." -- <own paths>`), retrying on `index.lock`. Never
 `git add -A`, `git commit -a`, `git stash` or `git reset`, and never push.
 
