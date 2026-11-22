@@ -22,12 +22,16 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: M0 complete (tag `m0`).
-> 241 unit tests pass (workspace lib + bins). On the M3, `universe --selftest` passes 3/3 (pcg3d bit-exact,
-> AgX 1.5e-5, Binet 1.27e-4 rad), `--capture bookmarks/m0.ron` renders 6/6 bookmarks, the shadow measures
-> 158.745 px (GR: 158.745), and the window ran 15 s with no errors. Window FPS is not measured yet. The brute-force
-> lens pass costs about 140 ms of GPU per frame at full 1080p (ground truth only; M3 replaces it).
-> Capture sheet: https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE
+> **Updated by the lead after each wave.** Last update: the M0 final-review fix wave (after tag `m0`; report:
+> `.superpowers/sdd/2026-11-20-m0-foundation/final-fix-report.md`).
+> 272 unit tests pass (workspace lib + bins; 241 at tag `m0`). On the M3, `universe --selftest` passes 3/3
+> (pcg3d bit-exact, AgX 1.5e-5, Binet 1.27e-4 rad), `--capture bookmarks/m0.ron` renders 6/6 bookmarks (each
+> within 1 code value of its `m0` capture), and the shadow measures 158.745 px (GR: 158.745). Every GPU pass time
+> is now a valid measurement. `--bench` at 1920×1080 measured: sky views 0.9–1.3 ms GPU per frame; `start`
+> (lens scale 0.5) 38.7 ms GPU, 25.6 fps serial; `bh-shadow-30M` (lens scale 1.0) 157 ms. At the window's
+> 1728×1080 internal size, `start` runs at 27 fps. The brute-force lens pass is ground truth only; M3 replaces it.
+> The window itself was not run in this wave, so its FPS is still unmeasured; the HUD now shows it.
+> M0 capture sheet (numbers from tag `m0`, before this wave): https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE
 
 What exists now:
 ```
@@ -36,28 +40,35 @@ Cargo.toml                   workspace root: members, [workspace.dependencies] p
 crates/
   uni-core/     FROZEN API, implemented: units, pos (UniversePos), epoch (TDB, leap seconds), frame (FrameTree),
                 camera, hash (pcg3d, splitmix64), color (CIE blackbody, B−V→Teff, star lux), galactic
-  uni-gfx/      FROZEN API, implemented: context (GpuContext, headless + windowed), targets, frame (FrameCtx,
-                CameraUniform 240 B), timer (PassTimer), renderer (RenderFeature, Renderer), shader
-                (ShaderLib #import + naga validate), capture, proj (reversed-Z infinite); shaders/common/*.wgsl
-  uni-post/     AgX tonemap + exposure + TPDF dither pass; CPU twin uni_post::agx
+  uni-gfx/      FROZEN API, implemented: context (GpuContext, headless + windowed, GPU error log), targets (pass
+                contract, HDR_MAX), frame (FrameCtx, CameraUniform 240 B, ExposureUniform 32 B, exposure_scale),
+                timer (PassTimer: Option ms per pass + whole-frame ms), renderer (RenderFeature, Renderer,
+                FrameBindings), shader (ShaderLib #import + naga validate), capture, proj (reversed-Z
+                infinite); shaders/common/*.wgsl
+  uni-post/     upscale (internal → output) + AgX tonemap + TPDF dither pass on pre-exposed HDR; CPU twin
+                uni_post::agx
   uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks
   uni-data/     BSC5 loader (binary format v1); data_dir()
   uni-sky/      StarField: energy-conserving erf-integrated PSF splats, Moffat glare, Planck LUT
-  uni-rel/      binet CPU tracer (golden-tested) + LensTracer compute pass (lens_mask, M0 debug grid)
+  uni-rel/      binet CPU tracer (golden-tested); LensTracer compute pass (writes only its traced rectangle,
+                lens_mask); DebugSkyBackground (the M0 debug grid, drawn only while the lens is traced); LensScale
   uni-ui/       egui HUD v0 (windowed + headless) and unit formatting
-  uni-app/      binary `universe`: windowed app; `--capture <bookmarks.ron> --out <dir> [--size WxH] [--hud]`;
-                `--selftest`. World (TestBH-1: 10 M☉ at SSB + 1000 AU), scene wiring, F12 saves a view bookmark
+  uni-app/      binary `universe`: windowed app (internal ~1080 lines, upscaled to the window);
+                `--capture <bookmarks.ron> --out <dir> [--size WxH] [--frames N] [--hud]`;
+                `--bench <bookmarks.ron> [--size WxH] [--frames N]`; `--selftest`. World (TestBH-1: 10 M☉ at
+                SSB + 1000 AU), scene wiring, F12 saves a view bookmark
   uni-planet/, uni-atmo/, uni-physics/, uni-procgen/, uni-sim/   doc comment only (later milestones)
 tools/bake/     bin `uni-bake bsc5`: data/cache/bsc5/catalog.gz → data/baked/bsc5.bin (9096 stars)
-tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html>`, `shadow --png <f> --expected-px <r> --tol <t>`
+tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html>`, `contact --captures <dir> --out <png>
+                [--width 2400]` (one labelled grid PNG), `shadow --png <f> --expected-px <r> --tol <t>`
 bookmarks/m0.ron             the six M0 capture bookmarks (RON, implicit_some)
 data/baked/bsc5.bin          Yale Bright Star Catalogue, 9096 stars (CDS V/50), committed
 archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old CLAUDE.md (reference only)
 archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
 textures/*.jpg               7 Solar System Scope 2k maps (CC BY 4.0, see ATTRIBUTION.md);
                              stars_milky_way.jpg is never the sky: no photo skyboxes (design §7.6)
-data/manifest.toml           one entry per data file: id, url, sha256, license, credit, paths (empty)
-data/baked/                  small baked outputs, committed (empty)
+data/manifest.toml           one entry per data file: id, url, sha256, license, credit, paths (BSC5 so far)
+data/baked/                  small baked outputs, committed (bsc5.bin so far)
 docs/superpowers/specs/      the design (binding)
 docs/superpowers/plans/      milestone plans
 docs/research/               research reports, golden values, wgpu30-skeleton/
@@ -66,6 +77,33 @@ docs/research/               research reports, golden values, wgpu30-skeleton/
 Target responsibilities per crate are in design §5.1. Every render crate implements `uni_gfx::RenderFeature`
 (prepare + encode). The `uni-core` and `uni-gfx` interfaces are frozen. After M0 only the lead changes them.
 Git-ignored outputs: `data/cache/` (raw downloads), `captures/` (capture PNG + JSON).
+
+**Render contract (uni-gfx, changed in the M0 final-review fix wave; every feature follows it)**
+- *Shared group 0.* `RenderFeature::encode(gpu, enc, frame: &FrameBindings, targets, output, timer)`. Bind
+  `frame.camera` at group 0 (binding 0 `CameraUniform`, binding 1 `ExposureUniform`, layout
+  `Renderer::camera_bind_group_layout()`). The `Renderer` is the only writer of both buffers; features keep no
+  camera copies and put their own bindings in groups ≥ 1.
+- *Pre-exposed HDR.* `hdr` (Rgba16Float) holds light × exposure, and the tonemap applies AgX with no exposure
+  of its own. World light writes luminance [cd/m²] × `scene_pre()`. Catalogue stars write E/Ω × `star_pre()`,
+  with no scene term. Each is `exposure_scale(EV) = 1/(1.2·2^EV)` from `ExposureUniform`. Clamp what you write
+  to `HDR_MAX` (60000 < f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4 at scene EV 15. The exposure buffer
+  is also `STORAGE`, so M1's histogram auto-exposure can write it on the GPU. That histogram must run before the
+  star pass (or mask stars out): stars are pre-exposed on their own scale and must not feed back into the scene
+  exposure.
+- *Pass order and lens mask.* Background → opaque → lens → stars → post. The lens pass writes `hdr` and
+  `lens_mask` only on the pixels it traces (its screen rectangle, or the whole frame from inside a horizon).
+  Everything outside keeps what the background drew. Its escaped rays must show the same environment the
+  background draws (M0: both draw the debug grid; M1: sample the shared environment). `lens_mask.r` is the
+  captured fraction of a traced pixel (1 = shadow), 0 elsewhere. Every feature drawn after the lens multiplies
+  by `1 − lens_mask`. M3's per-pixel magnification needs a second channel.
+- *Internal vs output size.* `FrameCtx.viewport` is the internal render size, and `Renderer::render` keeps the
+  targets at it. `FrameCtx.output_size` is the swapchain or capture size. The tonemap reads `hdr` 1:1 when the
+  two are equal (captures, `--bench`) and bilinearly upscales otherwise (the window: about 1080 lines at the
+  window's aspect, `scene::internal_size`). The lens rectangle and `pixel_dir` both use the internal size.
+- *Timing.* `Renderer::gpu_ms() -> Vec<(&str, Option<f32>)>` and `gpu_frame_ms() -> Option<f32>`. `None` means
+  no valid measurement: show "n/a" (HUD, terminal, sheet) or write `null` (capture JSON), never 0.
+- *GPU errors.* `GpuContext` logs uncaptured errors and device loss instead of panicking. The window shows the
+  latest on the HUD; `--capture`, `--bench` and `--selftest` fail on them.
 
 ## 3. Global Constraints
 
@@ -104,6 +142,7 @@ Verbatim from the M0 plan. They bind every task.
 - Camera space: looks along −Z, up is +Y.
 
 **Depth:** reversed-Z, infinite far plane, `Depth32Float`, `CompareFunction::Greater`.
+(Note added after M0: things drawn exactly on the far plane at depth 0, such as stars, use `GreaterEqual`.)
 
 **Uniform layout rule (this exact bug blanked the old renderer)**
 - GPU uniform and storage structs contain only `vec4`/`mat4`-sized members, or `f32` groups padded to 16 bytes.
@@ -124,6 +163,8 @@ Verbatim from the M0 plan. They bind every task.
 
 **Honesty**
 - Anything approximate or non-physical is labelled on screen. In M0 that means the lens background ("M0 debug grid") and speeds faster than c ("FTL · non-physical").
+- (Added after M0, review I4.) Dual exposure: whenever star EV ≠ scene EV (the default: star EV −4, scene EV 0),
+  the HUD shows the amber line "Eye-adapted stars (dual exposure, non-physical)" (design §2, §7.4).
 
 **Standing commit rule** (renewed at tag `m0`; it overrides "Agents never commit" above, which is kept verbatim
 from the M0 plan). When a workflow task tells an implementer to commit, it commits only its own paths with a
@@ -154,6 +195,10 @@ pathspec commit
 **GPU (Metal via wgpu 30)**
 - No f64 in shaders: the M3 has no FP64. Double-precision work stays on the CPU.
 - GPU timestamps only at pass boundaries (`TIMESTAMP_QUERY_INSIDE_PASSES` is false on this M3).
+- Measured on this M3 (M0 fix wave). Metal writes pass timestamps into the counter buffer late. A query resolve
+  in the same command buffer read stale values, so `PassTimer` resolves only after the frame has finished.
+  Metal also orders encoders only through shared tracked resources (wgpu-hal barriers are no-ops), so a pass
+  that touches nothing can run alongside others. The frame brackets therefore write a texel of `hdr`.
 - 32 storage textures per shader stage. BC and ASTC texture compression are available.
 - `MTLCreateSystemDefaultDevice()` returns nil from a windowless shell, but `MTLCopyAllDevices()` sees the M3,
   and wgpu enumerates adapters the same way.
@@ -170,9 +215,14 @@ without asking the owner.
 **Nothing is done without captures plus measured numbers.**
 - "Done", "achieved", "works" and ✅ never appear without evidence: capture PNGs from fixed bookmarks, measured
   GPU and CPU ms, and passing test output.
-- Headless capture (target; must exist by the end of M0): `universe --capture <bookmarks.ron> --out <dir>`
-  renders each bookmark to PNG after TAA and exposure settle, and writes JSON with GPU ms per pass, CPU ms and
-  object counts.
+- Headless capture (exists): `universe --capture <bookmarks.ron> --out <dir>` renders each bookmark `--frames`
+  times (default 4) and saves the last as PNG. It writes JSON with GPU ms per pass (`null` = not validly
+  measured), whole-frame GPU ms, CPU ms, star count, lens scale and epoch. M0 has no TAA or auto-exposure
+  (target: once they exist, captures must render until they settle).
+- Frame rate: `universe --bench <bookmarks.ron> [--size 1920x1080] [--frames 120]` prints mean and p95 frame ms
+  (serial: encode + submit + GPU wait, an upper bound on the window's frame time), GPU frame ms and GPU ms per
+  pass at that internal resolution. The window's HUD shows fps, frame ms and the render size.
+- Cheap visual check: `uni-verify contact --captures <dir> --out <png>` tiles every capture into one PNG.
 - Each milestone ends with a capture sheet (an HTML or Markdown page of the PNGs plus numbers). An agent or
   report may say "done" only with a link to that sheet and the test output.
 - The lead opens and looks at every capture PNG and checks the numbers before the next wave starts. The owner
@@ -187,9 +237,10 @@ without asking the owner.
 **Precision (design §5.2, frozen in M0)**
 - Absolute position: `UniversePos { cell: I64Vec3, local: DVec3 }`, cell size 2⁴⁴ m (≈117 AU): sub-millimetre
   locally, range about 10³² m.
-- Every origin is made camera-relative in f64 on the CPU, then cast to f32. Star batches use a per-sector
-  f64→f32 origin plus f32 offsets.
-- Frames nest Galaxy → system barycentre → body; the camera joins the nearest dominant frame.
+- Every origin is made camera-relative in f64 on the CPU, then cast to f32. Target (not built yet): star
+  batches use a per-sector f64→f32 origin plus f32 offsets (M0's BSC5 stars are unit directions at infinity).
+- Frames nest Galaxy → system barycentre → body (`FrameTree` exists). Target (not built yet): the camera joins
+  the nearest dominant frame (M0's camera lives in the root frame).
 - Time: `Epoch { day: i64, sec: f64 }`, TDB since J2000.
 - Determinism: noise takes integer-lattice + fraction inputs; one integer hash in Rust and WGSL, tested to agree.
 - No depth writes from fragment shaders (Apple GPUs are tile-based).
