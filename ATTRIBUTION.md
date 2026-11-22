@@ -4,8 +4,8 @@ Every third-party data file, texture and published algorithm used by this projec
 Downloaded data files are also recorded, with URL and SHA-256, in `data/manifest.toml`.
 
 <!-- M1 Wave A sections (pre-split by Task A0b, review I8): each Data task writes only between its own
-`<!-- A7 -->` … `<!-- /A7 -->` markers (A7 and A9 under Data, A8 under Textures; A9 may open a Fonts
-heading inside its section). -->
+opening and closing comment markers, named after the task (A7 and A9 under Data, A8 under Textures; A9 may
+open a Fonts heading inside its own section). -->
 
 ## Data
 

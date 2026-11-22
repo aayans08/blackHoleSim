@@ -30,8 +30,10 @@ pub fn load_comets(_path: &Path) -> Result<Vec<Comet>, DataError> {
 
 /// One asteroid's osculating elements (J2000 ecliptic) and photometry, as stored on disk.
 ///
-/// The plan calls this record 72 B, but the fields as listed are 7 × f64 + 4 × f32 + 2 × u32
-/// = 80 B with no padding (A0b report; the lead settles it with A9).
+/// **80 B, no padding:** 7 × f64 + 4 × f32 + 2 × u32. Lead ruling (A0b fix round 1, review
+/// I2): the contracted fields stand, so the record is 80 B. The plan's "72 B; ≈ 3.6 MB at 50 k"
+/// was a miscount: 80 B gives ≈ 4.0 MB at 50 k, still far below the 10 MB commit limit. The test
+/// `asteroid_record_is_80_bytes` below replaces A9's brief test `asteroid_record_is_72_bytes`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AsteroidRecord {
@@ -59,4 +61,23 @@ pub fn load_asteroids(
     _names: &Path,
 ) -> Result<(Vec<AsteroidRecord>, Vec<String>), DataError> {
     todo!("A9")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, offset_of, size_of};
+
+    use super::*;
+
+    /// Lead ruling (review I2): the on-disk record is 80 B. A9 keeps this layout.
+    #[test]
+    fn asteroid_record_is_80_bytes() {
+        assert_eq!(size_of::<AsteroidRecord>(), 80);
+        assert_eq!(align_of::<AsteroidRecord>(), 8);
+        assert_eq!(offset_of!(AsteroidRecord, epoch_jd_tdb), 48);
+        assert_eq!(offset_of!(AsteroidRecord, h), 56);
+        assert_eq!(offset_of!(AsteroidRecord, albedo), 68);
+        assert_eq!(offset_of!(AsteroidRecord, spkid), 72);
+        assert_eq!(offset_of!(AsteroidRecord, name_index), 76);
+    }
 }

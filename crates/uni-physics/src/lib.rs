@@ -6,6 +6,9 @@
 //! - A2: [`moon`], [`galilean`], [`saturn_moons`], [`sat_elements`], [`rotation`], [`ephemeris`]
 //! - A3: [`photometry`], [`smallbody`], [`dust`], [`calc`]
 //!
+//! One exception: [`photometry::rho_from_geometric_albedo`] is already implemented (A0b fix
+//! round 1, review I3), because A8 calls it before A3 lands.
+//!
 //! CPU maths is SI units in `f64`; positions are ICRS/J2000 axes (CLAUDE.md §3).
 
 pub mod bodies;
