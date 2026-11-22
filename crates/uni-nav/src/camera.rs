@@ -168,9 +168,15 @@ impl FlyCamera {
     ///
     /// `body_name` must name the object whose centre is the frame's origin, because
     /// [`crate::resolve_bookmark`] measures the saved offset from the object's centre. A4's
-    /// frames are body-centred (the Sun, each planet, each moon), so with uni-sim's `World` it
-    /// is `|f| world.objects().iter().find(|o| o.frame == Some(f)).map(|o| o.name.clone())`.
-    /// The app's F12 must save this pair, not `view` with `anchor: None` (review r0 I2).
+    /// contract makes its frames body-centred (the Sun, each planet, each moon; not built yet:
+    /// `World::objects()` is still a stub), so with uni-sim's `World` it will be
+    /// `|f| world.objects().iter().find(|o| o.frame == Some(f)).map(|o| o.name.clone())`.
+    ///
+    /// The app's F12 must save this pair, not `view` with `anchor: None` (review r0 I2). F12
+    /// writes the epoch floored to the whole UTC second (uni-app `iso_utc`), so a loaded root
+    /// position lands up to 1 s of the body's motion away from it (about 30 km at Earth). The
+    /// anchored offset is applied to wherever the body is at the loaded epoch, so it lands
+    /// where the camera was relative to the body.
     pub fn bookmark_view(
         &self,
         body_name: impl FnOnce(FrameId) -> Option<String>,

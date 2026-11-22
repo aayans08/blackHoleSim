@@ -565,4 +565,60 @@ mod tests {
         let err = view.pos.delta_from(cam.view.pos).length();
         assert!(err < 1e-4, "resolved {err} m from the camera");
     }
+
+    #[test]
+    fn anchored_save_survives_the_whole_second_epoch() {
+        // Review r2 I2: why F12 must save the anchored pair. F12 writes the epoch floored to
+        // the whole UTC second (uni-app `iso_utc`), so the bookmark is loaded up to 1 s before
+        // the moment it was saved; here 0.75 s, with Mars moving at 24 km/s.
+        let mut frames = FrameTree::new();
+        let mars = frames.add(
+            ROOT_FRAME,
+            "Mars",
+            FrameMotion::Custom(Box::new(|t: Epoch| {
+                let y = 24_000.0 * t.seconds_since(Epoch::J2000);
+                (
+                    UniversePos::from_meters(DVec3::new(1.5 * AU, y, 0.0)),
+                    DQuat::IDENTITY,
+                )
+            })),
+        );
+        let t = Epoch::J2000.add_seconds(86_400.75);
+        let t_loaded = Epoch::J2000.add_seconds(86_400.0);
+        let mut cam = FlyCamera::new(CameraView {
+            pos: frames
+                .origin_in_root(mars, t)
+                .offset(DVec3::new(2.0e6, -3.0e6, 4.0e6)),
+            orient: DQuat::from_rotation_x(0.2),
+            fov_y_rad: 0.7,
+            velocity_mps: DVec3::ZERO,
+        });
+        cam.reanchor(&frames, t, mars);
+        cam.sync(&frames, t);
+        let from_mars = delta_m(cam.view.pos, frames.origin_in_root(mars, t));
+        let world = FakeWorld(vec![("Mars", frames.origin_in_root(mars, t_loaded), mars)]);
+        // Where a loaded bookmark puts the camera relative to Mars, minus where it was.
+        let off_by = |b: &Bookmark| {
+            let (view, _) = resolve_bookmark(b, &world).unwrap();
+            delta_m(view.pos, frames.origin_in_root(mars, t_loaded)) - from_mars
+        };
+
+        // The anchored pair: the camera comes back where it was relative to Mars (one
+        // cell-local rounding at 1.5 AU, 2^-15 m apart, on each side).
+        let mut anchored = bookmark(DVec3::ZERO);
+        (anchored.view, anchored.anchor) =
+            cam.bookmark_view(|f| (f == mars).then(|| "Mars".to_owned()));
+        let err = off_by(&anchored).length();
+        assert!(err < 1e-4, "anchored save is {err} m off");
+
+        // The control, what app.rs's `save_view` writes today (the root view, `anchor: None`):
+        // the camera comes back 0.75 s × 24 km/s = 18 km ahead of Mars along its motion (+y).
+        let mut root = bookmark(DVec3::ZERO);
+        root.view = cam.view.clone();
+        let miss = off_by(&root);
+        assert!(
+            (miss - DVec3::new(0.0, 18_000.0, 0.0)).length() < 1e-3,
+            "root save is {miss} m off"
+        );
+    }
 }
