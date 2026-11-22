@@ -1,9 +1,12 @@
-//! universe: the explorer binary. Windowed by default; `--capture` and `--selftest` run headless.
+//! universe: the explorer binary. Windowed by default; `--capture`, `--bench` and `--selftest`
+//! run headless.
 //!
-//! Exit codes: 0 on success; 2 when a baked data file is missing or unreadable (`--capture`);
-//! 1 for every other failure, including bad arguments and failed `--selftest` checks.
+//! Exit codes: 0 on success; 2 when a baked data file is missing or unreadable (`--capture`,
+//! `--bench`); 1 for every other failure, including bad arguments, GPU errors and failed
+//! `--selftest` checks.
 
 mod app;
+mod bench;
 mod capture;
 mod scene;
 mod selftest;
@@ -14,6 +17,7 @@ use std::process::ExitCode;
 
 use glam::UVec2;
 
+use crate::bench::BenchArgs;
 use crate::capture::{CaptureArgs, CaptureError, DEFAULT_FRAMES, DEFAULT_SIZE};
 
 const USAGE: &str = "\
@@ -21,6 +25,9 @@ usage:
   universe                         open the window at bookmark \"start\" of bookmarks/m0.ron
   universe --capture <bookmarks.ron> --out <dir> [--size 1920x1080] [--frames 4] [--hud]
                                    render each bookmark headless to <dir>/<name>.png + .json
+  universe --bench <bookmarks.ron> [--size 1920x1080] [--frames 120]
+                                   time each bookmark headless at that internal resolution:
+                                   mean and p95 frame ms, GPU frame ms, GPU ms per pass
   universe --selftest              compare the GPU shader twins with their CPU twins";
 
 /// Exit code for a missing or unreadable baked data file (brief).
@@ -33,6 +40,7 @@ const EXIT_FAILURE: u8 = 1;
 enum Command {
     Window,
     Capture(CaptureArgs),
+    Bench(BenchArgs),
     Selftest,
     Help,
 }
@@ -58,17 +66,8 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         }
-        Command::Capture(args) => match capture::run(&args) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(CaptureError::MissingData(msg)) => {
-                eprintln!("universe --capture: missing data: {msg}");
-                ExitCode::from(EXIT_MISSING_DATA)
-            }
-            Err(CaptureError::Failed(e)) => {
-                eprintln!("universe --capture: {e:#}");
-                ExitCode::from(EXIT_FAILURE)
-            }
-        },
+        Command::Capture(args) => headless_exit("--capture", capture::run(&args)),
+        Command::Bench(args) => headless_exit("--bench", bench::run(&args)),
         Command::Window => match app::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -76,6 +75,21 @@ fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILURE)
             }
         },
+    }
+}
+
+/// The exit code of a headless run, with its error on stderr.
+fn headless_exit(mode: &str, result: Result<(), CaptureError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(CaptureError::MissingData(msg)) => {
+            eprintln!("universe {mode}: missing data: {msg}");
+            ExitCode::from(EXIT_MISSING_DATA)
+        }
+        Err(CaptureError::Failed(e)) => {
+            eprintln!("universe {mode}: {e:#}");
+            ExitCode::from(EXIT_FAILURE)
+        }
     }
 }
 
@@ -95,6 +109,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String>
             let bookmarks = args.next().ok_or("--capture needs a bookmarks file")?;
             parse_capture(PathBuf::from(bookmarks), args).map(Command::Capture)
         }
+        "--bench" => {
+            let bookmarks = args.next().ok_or("--bench needs a bookmarks file")?;
+            parse_bench(PathBuf::from(bookmarks), args).map(Command::Bench)
+        }
         other => Err(format!("unknown argument {other:?}")),
     }
 }
@@ -113,14 +131,7 @@ fn parse_capture(
         match flag.as_str() {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--size" => size = parse_size(&value()?)?,
-            "--frames" => {
-                let v = value()?;
-                frames = v
-                    .parse()
-                    .ok()
-                    .filter(|&n: &u32| n >= 1)
-                    .ok_or(format!("--frames needs a whole number ≥ 1, not {v:?}"))?;
-            }
+            "--frames" => frames = parse_frames(&value()?)?,
             "--hud" => hud = true,
             other => return Err(format!("unknown capture option {other:?}")),
         }
@@ -132,6 +143,36 @@ fn parse_capture(
         frames,
         hud,
     })
+}
+
+/// The options after `--bench <bookmarks.ron>`.
+fn parse_bench(
+    bookmarks: PathBuf,
+    mut args: impl Iterator<Item = String>,
+) -> Result<BenchArgs, String> {
+    let mut size = bench::DEFAULT_SIZE;
+    let mut frames = bench::DEFAULT_FRAMES;
+    while let Some(flag) = args.next() {
+        let mut value = || args.next().ok_or(format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--size" => size = parse_size(&value()?)?,
+            "--frames" => frames = parse_frames(&value()?)?,
+            other => return Err(format!("unknown bench option {other:?}")),
+        }
+    }
+    Ok(BenchArgs {
+        bookmarks,
+        size,
+        frames,
+    })
+}
+
+/// A whole number of frames, at least 1.
+fn parse_frames(v: &str) -> Result<u32, String> {
+    v.parse()
+        .ok()
+        .filter(|&n: &u32| n >= 1)
+        .ok_or(format!("--frames needs a whole number ≥ 1, not {v:?}"))
 }
 
 /// `WIDTHxHEIGHT` in pixels, each at least 1.
@@ -196,6 +237,26 @@ mod tests {
     }
 
     #[test]
+    fn bench_takes_defaults_and_options() {
+        assert_eq!(
+            parse(&["--bench", "bookmarks/m0.ron"]),
+            Ok(Command::Bench(BenchArgs {
+                bookmarks: "bookmarks/m0.ron".into(),
+                size: UVec2::new(1920, 1080),
+                frames: 120,
+            }))
+        );
+        assert_eq!(
+            parse(&["--bench", "b.ron", "--frames", "30", "--size", "1728x1080"]),
+            Ok(Command::Bench(BenchArgs {
+                bookmarks: "b.ron".into(),
+                size: UVec2::new(1728, 1080),
+                frames: 30,
+            }))
+        );
+    }
+
+    #[test]
     fn bad_arguments_are_errors() {
         for bad in [
             &["--capture"][..],
@@ -209,6 +270,10 @@ mod tests {
             &["--capture", "b.ron", "--out", "o", "--zoom"],
             &["--selftest", "now"],
             &["--fly"],
+            &["--bench"],
+            &["--bench", "b.ron", "--frames", "0"],
+            &["--bench", "b.ron", "--hud"],
+            &["--bench", "b.ron", "--size"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

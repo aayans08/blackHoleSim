@@ -2,8 +2,13 @@
 //!
 //! Starts at the `start` bookmark of `bookmarks/m0.ron`, renders continuously
 //! (`ControlFlow::Poll`, Fifo present), and feeds winit input to the HUD and the fly camera.
-//! Tab hides the HUD, F1 shows the controls list, F12 saves the current view as a bookmark
-//! that `--capture` renders at full quality, and Esc quits.
+//! The scene renders at a fixed internal resolution of about 1080 lines at the window's aspect
+//! ([`internal_size`]), decoupled from the window's physical size; the tonemap upscales it to
+//! the swapchain and the HUD draws at full resolution on top (review I6).
+//! Tab hides the HUD, F1 shows the controls list, F12 saves the current view (position,
+//! orientation, field of view, epoch and exposures) as a bookmark that `--capture` renders,
+//! with the lens traced at the capture scale of 1.0 rather than the window's slider value,
+//! and Esc quits. GPU errors are logged and shown on the HUD instead of aborting the app.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,7 +32,7 @@ use winit::{
 
 use crate::scene::{
     INTERACTIVE_LENS_SCALE, Perf, Scene, apply_bookmark, default_controls, exposure, frame_ctx,
-    hud_data,
+    hud_data, internal_size,
 };
 use crate::world::{World, iso_utc, m0_bookmarks_path, sky_path};
 
@@ -45,6 +50,8 @@ const FPS_SMOOTHING: f32 = 0.1;
 /// Longest frame time the camera moves by [s]. After a stall (a minimised window, a debugger)
 /// a held key moves the camera one short step instead of speed × the stall.
 const MAX_CAMERA_DT_S: f64 = 0.1;
+/// GPU error lines kept on the HUD (the most recent ones; review m6).
+const MAX_GPU_ERROR_NOTICES: usize = 3;
 
 /// Opens the window and runs until it is closed.
 pub fn run() -> anyhow::Result<()> {
@@ -78,6 +85,7 @@ pub fn run() -> anyhow::Result<()> {
         input: InputState::new(),
         gfx: None,
         error: None,
+        gpu_errors: Vec::new(),
         frame_index: 0,
         last_frame: None,
         fps: 0.0,
@@ -130,14 +138,15 @@ struct Gfx {
 }
 
 impl Gfx {
-    /// Follows a window resize. A zero axis (minimised) changes nothing: frames are skipped
-    /// until the window comes back (Review Focus 1).
+    /// Follows a window resize: only the swapchain changes. The renderer's targets follow the
+    /// internal resolution the next frame asks for ([`internal_size`]; `Renderer::render`
+    /// resizes them when the frame's viewport changes). A zero axis (minimised) changes nothing:
+    /// frames are skipped until the window comes back (Review Focus 1).
     fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;
         }
         self.gpu.resize_surface(w, h);
-        self.scene.renderer.resize(&self.gpu, UVec2::new(w, h));
     }
 }
 
@@ -157,6 +166,8 @@ struct App {
     gfx: Option<Gfx>,
     /// Set if the window or GPU could not be created; `run` returns it.
     error: Option<anyhow::Error>,
+    /// The latest uncaptured GPU errors (at most [`MAX_GPU_ERROR_NOTICES`]), shown on the HUD.
+    gpu_errors: Vec<String>,
     frame_index: u64,
     last_frame: Option<Instant>,
     fps: f32,
@@ -188,9 +199,15 @@ impl App {
             config.view_formats.contains(&srgb_format),
             "the surface has no {srgb_format:?} view"
         );
-        let size = UVec2::new(config.width, config.height);
+        let internal = internal_size(UVec2::new(config.width, config.height));
         let stars = std::mem::take(&mut self.stars);
-        let scene = Scene::new(&gpu, size, srgb_format, &stars, self.controls.lens_scale)?;
+        let scene = Scene::new(
+            &gpu,
+            internal,
+            srgb_format,
+            &stars,
+            self.controls.lens_scale,
+        )?;
         let hud = Hud::new(&window, &gpu, plain_format);
         Ok(Gfx {
             window,
@@ -253,10 +270,12 @@ impl App {
         }
 
         g.scene.set_lens_scale(self.controls.lens_scale);
+        let output = UVec2::new(frame.texture.width(), frame.texture.height());
         let ctx = frame_ctx(
             &self.world,
             &self.camera.view,
-            g.scene.renderer.targets().size,
+            internal_size(output),
+            output,
             exposure(&self.controls),
             self.frame_index,
             dt,
@@ -273,14 +292,15 @@ impl App {
         if self.flash.as_ref().is_some_and(|(_, until)| now >= *until) {
             self.flash = None;
         }
+        keep_latest(
+            &mut self.gpu_errors,
+            g.gpu.take_errors(),
+            MAX_GPU_ERROR_NOTICES,
+        );
         let mut notices = self.notices.clone();
+        notices.extend(self.gpu_errors.iter().cloned());
         notices.extend(self.flash.iter().map(|(msg, _)| msg.clone()));
-        let perf = Perf {
-            fps: self.fps,
-            cpu_ms: self.cpu_ms,
-            gpu_ms: g.scene.renderer.gpu_ms(),
-            gpu_timing_available: g.gpu.has_timestamps(),
-        };
+        let perf = Perf::from_renderer(&g.scene.renderer, &g.gpu, self.fps, self.cpu_ms);
         let data = hud_data(
             &self.world,
             &ctx,
@@ -390,6 +410,13 @@ fn grab_cursor(window: &Window, look: bool) {
     }
 }
 
+/// Appends `new` to `kept`, keeping only the `max` most recent entries.
+fn keep_latest(kept: &mut Vec<String>, new: Vec<String>, max: usize) {
+    kept.extend(new);
+    let excess = kept.len().saturating_sub(max);
+    kept.drain(..excess);
+}
+
 /// FPS readout: exponentially smoothed 1/dt; the first frame (dt = 0) leaves it unchanged.
 fn smoothed_fps(fps: f32, dt_s: f64) -> f32 {
     if !(dt_s > 0.0) {
@@ -408,9 +435,10 @@ fn views_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/views")
 }
 
-/// F12: saves the current view, epoch, exposures and lens scale as a one-bookmark RON file in
-/// `dir`, named after the wall-clock time, so `universe --capture <file>` renders it. Returns
-/// the file's path.
+/// F12: saves the current view, epoch and exposures as a one-bookmark RON file in `dir`, named
+/// after the wall-clock time, so `universe --capture <file>` renders it. Returns the file's
+/// path. The window's lens scale is left out (review m2): it is an interactive speed setting,
+/// and a capture of the view traces the lens at the full capture scale.
 fn save_view(
     dir: &Path,
     view: &CameraView,
@@ -427,7 +455,7 @@ fn save_view(
         epoch_utc: Some(iso_utc(world.epoch)),
         scene_ev100: Some(controls.scene_ev100),
         star_ev100: Some(controls.star_ev100),
-        lens_scale: Some(controls.lens_scale),
+        lens_scale: None,
     };
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{name}.ron"));
@@ -502,10 +530,22 @@ mod tests {
         assert_eq!(b.view, view);
         assert_eq!(b.epoch_utc.as_deref(), Some("2026-11-20T00:00:00Z"));
         assert_eq!(b.scene_ev100, Some(2.5));
-        assert_eq!(b.lens_scale, Some(0.75));
+        // Review m2: the window's interactive lens scale is not saved, so `--capture` traces
+        // the view at its full capture scale.
+        assert_eq!(b.lens_scale, None);
         let mut again = World::new(Epoch::J2000);
-        let mut c = default_controls(1.0);
+        let mut c = default_controls(crate::scene::CAPTURE_LENS_SCALE);
         assert_eq!(apply_bookmark(b, &mut again, &mut c).unwrap(), view);
+        assert_eq!(c.lens_scale, crate::scene::CAPTURE_LENS_SCALE);
+    }
+
+    #[test]
+    fn gpu_error_notices_keep_the_latest() {
+        let mut kept = vec!["a".to_owned()];
+        keep_latest(&mut kept, vec!["b".into(), "c".into(), "d".into()], 3);
+        assert_eq!(kept, ["b", "c", "d"]);
+        keep_latest(&mut kept, Vec::new(), 3);
+        assert_eq!(kept.len(), 3);
     }
 
     #[test]

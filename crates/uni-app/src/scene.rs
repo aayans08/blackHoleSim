@@ -1,23 +1,21 @@
-//! The render stack and per-frame data shared by the window and `--capture` (M0 Task 11).
+//! The render stack and per-frame data shared by the window, `--capture` and `--bench`.
 //!
-//! [`Scene`] owns the [`Renderer`] with the M0 features in their fixed order: the lens pass,
-//! then stars, then the tonemap (design §5.3; the HUD draws after them). The pure helpers
+//! [`Scene`] owns the [`Renderer`] with the M0 features in their fixed order (design §5.3;
+//! uni-gfx `targets` documents the contract): the debug-grid background (only while the lens is
+//! traced), the lens pass (only its traced pixels), then stars, then the tonemap (which
+//! upscales the internal resolution to the output); the HUD draws after them. The pure helpers
 //! below turn the world and a camera view into the [`FrameCtx`] the features read and the
 //! [`HudData`] the HUD shows.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::ops::RangeInclusive;
 
 use anyhow::Context as _;
 use glam::{DMat4, UVec2};
 use uni_core::{CameraView, Epoch};
 use uni_data::CatalogStar;
-use uni_gfx::{
-    Exposure, FrameCtx, FrameTargets, GpuContext, PassTimer, RenderFeature, Renderer, ShaderLib,
-    reversed_z_infinite_proj,
-};
+use uni_gfx::{Exposure, FrameCtx, GpuContext, Renderer, ShaderLib, reversed_z_infinite_proj};
 use uni_nav::Bookmark;
-use uni_rel::{LensCoverage, LensTracer};
+use uni_rel::{DebugSkyBackground, LensCoverage, LensScale, LensTracer};
 use uni_ui::{HudControls, HudData};
 
 use crate::world::World;
@@ -26,50 +24,56 @@ use crate::world::World;
 /// infinity, so this only fixes the depth scale for later geometry.
 pub const NEAR_PLANE_M: f32 = 0.1;
 /// Scene exposure when nothing sets it [EV100]. The scene's only light in M0 is the debug grid,
-/// which uni-rel scales to sit at this exposure.
+/// which is display-referred (pre-exposed to the same values at any scene EV).
 pub const DEFAULT_SCENE_EV100: f32 = 0.0;
 /// Lens tracer resolution scale in the window (the HUD slider); the tracer's own default.
-pub const INTERACTIVE_LENS_SCALE: f32 = 0.5;
+pub const INTERACTIVE_LENS_SCALE: f32 = uni_rel::DEFAULT_RESOLUTION_SCALE;
 /// Lens tracer resolution scale in captures, unless a bookmark sets one.
 pub const CAPTURE_LENS_SCALE: f32 = 1.0;
+/// Lines of the window's internal render resolution (design §6: "1080p internal").
+pub const INTERNAL_LINES: u32 = 1080;
+/// The exposures the renderer accepts [EV100] (review m5): a typed slider value outside this is
+/// clamped, so 2^EV never overflows and no inf or NaN reaches the HDR target. It spans a
+/// moonless sky (about −6) to the Sun's disk (about 30) with margin.
+pub const EV100_LIMITS: RangeInclusive<f32> = -30.0..=40.0;
 
 /// The renderer with the M0 feature stack, plus the handles the app keeps to steer it.
 pub struct Scene {
     pub renderer: Renderer,
-    /// Shared with the lens feature inside `renderer`, which reads it in `prepare`.
-    lens_scale: Rc<Cell<f32>>,
+    /// Shared with the lens pass and the debug background inside `renderer`.
+    lens_scale: LensScale,
     /// Catalogue stars the star feature draws.
     pub star_count: u32,
 }
 
 impl Scene {
-    /// Builds the renderer at `size` and pushes the lens pass, the stars and the tonemap, in
-    /// that order. `output_format` is the sRGB format the tonemap writes (the window's sRGB
-    /// view, or `uni_gfx::CAPTURE_FORMAT`).
+    /// Builds the renderer at the internal resolution `internal_size` and pushes the debug
+    /// background, the lens pass, the stars and the tonemap, in that order. `output_format` is
+    /// the sRGB format the tonemap writes (the window's sRGB view, or
+    /// `uni_gfx::CAPTURE_FORMAT`).
     pub fn new(
         gpu: &GpuContext,
-        size: UVec2,
+        internal_size: UVec2,
         output_format: wgpu::TextureFormat,
         stars: &[CatalogStar],
         lens_scale: f32,
     ) -> anyhow::Result<Self> {
-        let mut renderer = Renderer::new(gpu, size);
+        let mut renderer = Renderer::new(gpu, internal_size);
         let mut lib = ShaderLib::with_common();
         let camera_bgl = renderer.camera_bind_group_layout();
-        let tracer =
-            LensTracer::new(gpu, &mut lib, camera_bgl).context("creating the lens pass")?;
+        let lens_scale = LensScale::new(lens_scale);
+        let background = DebugSkyBackground::new(gpu, &mut lib, camera_bgl, lens_scale.clone())
+            .context("creating the debug background pass")?;
+        let tracer = LensTracer::new(gpu, &mut lib, camera_bgl, lens_scale.clone())
+            .context("creating the lens pass")?;
         let star_field = uni_sky::StarField::new(gpu, &mut lib, camera_bgl, stars)
             .context("creating the star pass")?;
         let tonemap = uni_post::TonemapFeature::new(gpu, &mut lib, camera_bgl, output_format)
             .context("creating the tonemap pass")?;
         let star_count = star_field.count();
 
-        let lens_scale = Rc::new(Cell::new(lens_scale));
-        renderer.push(Box::new(LensGate {
-            tracer,
-            scale: Rc::clone(&lens_scale),
-            runs: false,
-        }));
+        renderer.push(Box::new(background));
+        renderer.push(Box::new(tracer));
         renderer.push(Box::new(star_field));
         renderer.push(Box::new(tonemap));
         Ok(Self {
@@ -79,9 +83,14 @@ impl Scene {
         })
     }
 
-    /// Lens tracer resolution scale from the next frame on (the tracer clamps it to 0.25..=1).
+    /// Lens tracer resolution scale from the next frame on (clamped to 0.25..=1).
     pub fn set_lens_scale(&self, s: f32) {
         self.lens_scale.set(s);
+    }
+
+    /// The lens tracer resolution scale in use.
+    pub fn lens_scale(&self) -> f32 {
+        self.lens_scale.get()
     }
 
     /// Records one frame into `output` (see [`Renderer::render`]).
@@ -95,55 +104,14 @@ impl Scene {
     }
 }
 
-/// Whether the lens pass draws this frame. It runs only where it traces geodesics, or to black
-/// out the frame from inside the horizon. Elsewhere it would paint the M0 debug grid over the
-/// whole frame (uni-rel draws the unlensed grid outside its rectangle, even with no lens), so
-/// the cleared black stays and the sky shows the real stars (lead ruling, wave 2).
-pub fn lens_pass_runs(coverage: LensCoverage) -> bool {
-    match coverage {
-        LensCoverage::Traced | LensCoverage::InsideHorizon => true,
-        LensCoverage::Unlensed | LensCoverage::BeyondReach => false,
-    }
-}
-
-/// The lens tracer, run only when [`lens_pass_runs`], at the resolution scale the app sets.
-/// `Renderer` owns its features, so the app reaches the tracer through the shared `scale`.
-struct LensGate {
-    tracer: LensTracer,
-    scale: Rc<Cell<f32>>,
-    /// Decided in `prepare` for this frame's `encode`.
-    runs: bool,
-}
-
-impl RenderFeature for LensGate {
-    fn name(&self) -> &'static str {
-        self.tracer.name()
-    }
-
-    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
-        self.tracer.set_resolution_scale(self.scale.get());
-        self.runs = lens_pass_runs(uni_rel::lens_coverage(ctx));
-        if self.runs {
-            self.tracer.prepare(gpu, ctx, targets);
-        }
-    }
-
-    fn encode(
-        &mut self,
-        gpu: &GpuContext,
-        enc: &mut wgpu::CommandEncoder,
-        targets: &FrameTargets,
-        output: &wgpu::TextureView,
-        timer: &mut PassTimer,
-    ) {
-        if self.runs {
-            self.tracer.encode(gpu, enc, targets, output, timer);
-        }
-    }
-
-    fn resize(&mut self, gpu: &GpuContext, targets: &FrameTargets) {
-        self.tracer.resize(gpu, targets);
-    }
+/// The internal render resolution for an output (window) of `output` pixels: about
+/// [`INTERNAL_LINES`] lines at the output's aspect ratio, never more pixels than the output
+/// (a smaller window renders 1:1). The tonemap upscales it to the output.
+pub fn internal_size(output: UVec2) -> UVec2 {
+    let out = output.max(UVec2::ONE);
+    let lines = INTERNAL_LINES.min(out.y);
+    let width = (f64::from(lines) * f64::from(out.x) / f64::from(out.y)).round() as u32;
+    UVec2::new(width.clamp(1, out.x), lines)
 }
 
 /// Root → camera rotation for a camera whose `orient` turns camera axes into root axes.
@@ -151,13 +119,15 @@ pub fn view_rot(orient: glam::DQuat) -> glam::Mat4 {
     DMat4::from_quat(orient.inverse()).as_mat4()
 }
 
-/// The frame context for `view` on a `viewport`-sized frame. `viewport` must equal the
-/// renderer's target size: the lens pass plans with the targets and the HUD's lens status with
-/// this viewport (`uni_rel::lens_coverage`).
+/// The frame context for `view`, rendered at the internal resolution `viewport` and shown on an
+/// output of `output_size` pixels. The renderer keeps its targets at `viewport`, so the lens
+/// pass (which plans with the targets) and the HUD's lens status (`uni_rel::lens_coverage`, with
+/// this viewport) agree.
 pub fn frame_ctx(
     world: &World,
     view: &CameraView,
     viewport: UVec2,
+    output_size: UVec2,
     exposure: Exposure,
     frame_index: u64,
     dt_real_s: f64,
@@ -172,6 +142,7 @@ pub fn frame_ctx(
         view_rot: view_rot(view.orient),
         proj: reversed_z_infinite_proj(view.fov_y_rad as f32, aspect, NEAR_PLANE_M),
         viewport,
+        output_size: output_size.max(UVec2::ONE),
         exposure,
         lenses: world.lens_views(&view.pos),
     }
@@ -188,11 +159,20 @@ pub fn default_controls(lens_scale: f32) -> HudControls {
     }
 }
 
-/// The exposures the HUD controls hold.
+/// The exposures the HUD controls hold, clamped to [`EV100_LIMITS`] (a NaN gives the default).
 pub fn exposure(controls: &HudControls) -> Exposure {
     Exposure {
-        scene_ev100: controls.scene_ev100,
-        star_ev100: controls.star_ev100,
+        scene_ev100: clamp_ev(controls.scene_ev100, DEFAULT_SCENE_EV100),
+        star_ev100: clamp_ev(controls.star_ev100, uni_sky::DEFAULT_STAR_EV100),
+    }
+}
+
+/// `ev` clamped to [`EV100_LIMITS`], or `fallback` if it is NaN.
+fn clamp_ev(ev: f32, fallback: f32) -> f32 {
+    if ev.is_nan() {
+        fallback
+    } else {
+        ev.clamp(*EV100_LIMITS.start(), *EV100_LIMITS.end())
     }
 }
 
@@ -252,8 +232,23 @@ fn checked_view(b: &Bookmark) -> anyhow::Result<CameraView> {
 pub struct Perf {
     pub fps: f32,
     pub cpu_ms: f32,
-    pub gpu_ms: Vec<(&'static str, f32)>,
+    /// Per pass; `None` for an invalid measurement.
+    pub gpu_ms: Vec<(&'static str, Option<f32>)>,
+    pub gpu_frame_ms: Option<f32>,
     pub gpu_timing_available: bool,
+}
+
+impl Perf {
+    /// The renderer's latest GPU timings, with the window's (or capture's) fps and CPU time.
+    pub fn from_renderer(renderer: &Renderer, gpu: &GpuContext, fps: f32, cpu_ms: f32) -> Self {
+        Self {
+            fps,
+            cpu_ms,
+            gpu_ms: renderer.gpu_ms(),
+            gpu_frame_ms: renderer.gpu_frame_ms(),
+            gpu_timing_available: gpu.has_timestamps(),
+        }
+    }
 }
 
 /// What the HUD shows for this frame. `notices` (catalogue warnings and the like) come first,
@@ -269,11 +264,16 @@ pub fn hud_data(
     let (nearest_name, nearest_dist_m) = world.nearest(&ctx.camera.pos);
     let mut warnings = notices.to_vec();
     warnings.extend(lens_warnings(ctx));
+    // One source for the lens state, so the HUD and the lens pass agree (review m7).
+    let coverage = uni_rel::lens_coverage(ctx);
     HudData {
         fps: perf.fps,
         cpu_ms: perf.cpu_ms,
         gpu_ms: perf.gpu_ms,
+        gpu_frame_ms: perf.gpu_frame_ms,
         gpu_timing_available: perf.gpu_timing_available,
+        render_size: ctx.viewport.to_array(),
+        output_size: ctx.output_size.to_array(),
         dist_from_sun_m: ctx
             .camera
             .pos
@@ -286,12 +286,16 @@ pub fn hud_data(
         time_rate: world.time_rate,
         star_count,
         warnings,
-        inside_horizon: ctx.lenses.iter().any(uni_rel::inside_horizon),
+        inside_horizon: coverage == LensCoverage::InsideHorizon,
         // uni-ui shows its two M0 honesty lines ("Lens background: M0 debug grid", "Stars near
         // the hole are not yet lensed (M0)") only when the debug grid is actually visible: the
-        // lens pass traced this frame. From inside the horizon the frame is all black, so no
-        // grid is shown and the labels would be false (lead ruling, M0 gate, Task 10b).
-        lens_on_screen: matches!(uni_rel::lens_coverage(ctx), LensCoverage::Traced),
+        // lens pass traced this frame (and the debug background drew; the same condition,
+        // `uni_rel::debug_background_draws`). From inside the horizon the frame is all black, so
+        // no grid is shown and the labels would be false (lead ruling, M0 gate, Task 10b).
+        lens_on_screen: uni_rel::debug_background_draws(coverage),
+        // uni-ui's amber "Eye-adapted stars (dual exposure, non-physical)" while the stars'
+        // exposure differs from the scene's (review I4, design §2 and §7.4).
+        eye_adapted_stars: ctx.exposure.eye_adapted_stars(),
     }
 }
 
@@ -338,6 +342,7 @@ mod tests {
             &world,
             &view_at(pos, orient),
             UVec2::new(1920, 1080),
+            UVec2::new(1920, 1080),
             exposure0(),
             0,
             0.0,
@@ -367,6 +372,7 @@ mod tests {
             &world,
             &view_at(UniversePos::default(), orient),
             UVec2::new(2, 2),
+            UVec2::new(4, 4),
             exposure0(),
             7,
             0.016,
@@ -377,6 +383,7 @@ mod tests {
         assert!(dir.abs_diff_eq(fwd, 1e-5), "{dir} vs {fwd}");
         assert_eq!(ctx.frame_index, 7);
         assert_eq!(ctx.viewport, UVec2::new(2, 2));
+        assert_eq!(ctx.output_size, UVec2::new(4, 4));
         assert_eq!(ctx.lenses.len(), 1);
     }
 
@@ -387,36 +394,85 @@ mod tests {
             &world,
             &view_at(UniversePos::default(), DQuat::IDENTITY),
             UVec2::ZERO,
+            UVec2::ZERO,
             exposure0(),
             0,
             0.0,
         );
         assert_eq!(ctx.viewport, UVec2::ONE);
+        assert_eq!(ctx.output_size, UVec2::ONE);
         assert!(ctx.proj.is_finite());
     }
 
+    /// Review I6: the window renders at about 1080 lines at its own aspect, never above the
+    /// output's size, and the tonemap upscales.
     #[test]
-    fn lens_pass_runs_only_where_it_traces_or_blacks_out() {
-        assert!(lens_pass_runs(LensCoverage::Traced));
-        assert!(lens_pass_runs(LensCoverage::InsideHorizon));
-        assert!(!lens_pass_runs(LensCoverage::Unlensed));
-        assert!(!lens_pass_runs(LensCoverage::BeyondReach));
+    fn internal_size_is_about_1080_lines_at_the_output_aspect() {
+        // The M3 Air's Retina window at 1280×800 points.
+        assert_eq!(
+            internal_size(UVec2::new(2560, 1600)),
+            UVec2::new(1728, 1080)
+        );
+        assert_eq!(
+            internal_size(UVec2::new(3840, 2160)),
+            UVec2::new(1920, 1080)
+        );
+        // Smaller than 1080 lines: 1:1.
+        assert_eq!(internal_size(UVec2::new(1280, 800)), UVec2::new(1280, 800));
+        assert_eq!(
+            internal_size(UVec2::new(1920, 1080)),
+            UVec2::new(1920, 1080)
+        );
+        // Degenerate outputs stay valid.
+        assert_eq!(internal_size(UVec2::ZERO), UVec2::ONE);
+        assert_eq!(internal_size(UVec2::new(1, 5000)), UVec2::new(1, 1080));
+    }
+
+    /// Review m5: a typed EV outside the slider range cannot overflow 2^EV.
+    #[test]
+    fn exposure_is_clamped_to_finite_limits() {
+        let mut c = default_controls(1.0);
+        c.scene_ev100 = 1e30;
+        c.star_ev100 = f32::NEG_INFINITY;
+        let e = exposure(&c);
+        assert_eq!(e.scene_ev100, *EV100_LIMITS.end());
+        assert_eq!(e.star_ev100, *EV100_LIMITS.start());
+        let u = uni_gfx::ExposureUniform::from_exposure(e);
+        assert!(u.pre.iter().all(|x| x.is_finite() && *x >= 0.0), "{u:?}");
+        assert!(u.pre[0] > 0.0 && u.pre[1] > 0.0, "{u:?}");
+        c.scene_ev100 = f32::NAN;
+        c.star_ev100 = f32::NAN;
+        let e = exposure(&c);
+        assert_eq!(e.scene_ev100, DEFAULT_SCENE_EV100);
+        assert_eq!(e.star_ev100, uni_sky::DEFAULT_STAR_EV100);
+        // In range, untouched.
+        c.scene_ev100 = 12.5;
+        assert_eq!(exposure(&c).scene_ev100, 12.5);
     }
 
     #[test]
     fn near_the_hole_the_lens_runs_and_the_hud_shows_the_m0_labels() {
         let (world, ctx) = ctx_near_hole(30.0);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::Traced);
-        assert!(lens_pass_runs(uni_rel::lens_coverage(&ctx)));
+        assert!(uni_rel::debug_background_draws(uni_rel::lens_coverage(
+            &ctx
+        )));
         let perf = Perf {
             fps: 60.0,
             cpu_ms: 1.0,
-            gpu_ms: vec![("lens", 2.0)],
+            gpu_ms: vec![("lens", Some(2.0)), ("tonemap", None)],
+            gpu_frame_ms: Some(3.0),
             gpu_timing_available: true,
         };
         let data = hud_data(&world, &ctx, perf, 0.0, 9096, &["sky ok?".to_owned()]);
         assert_eq!(data.warnings, ["sky ok?"]);
         assert!(data.lens_on_screen);
+        assert_eq!(data.gpu_ms, [("lens", Some(2.0)), ("tonemap", None)]);
+        assert_eq!(data.gpu_frame_ms, Some(3.0));
+        assert_eq!(data.render_size, [1920, 1080]);
+        assert_eq!(data.output_size, [1920, 1080]);
+        // The default exposures differ (star EV −4, scene EV 0): the dual exposure is labelled.
+        assert!(data.eye_adapted_stars);
         assert_eq!(data.nearest_name, "TestBH-1");
         let m = gravitational_radius(10.0 * M_SUN);
         assert!((data.nearest_dist_m - 30.0 * m).abs() < 1.0);
@@ -428,7 +484,9 @@ mod tests {
     fn beyond_the_trace_reach_the_hud_warns_and_the_lens_does_not_run() {
         let (_, ctx) = ctx_near_hole(1e5);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::BeyondReach);
-        assert!(!lens_pass_runs(uni_rel::lens_coverage(&ctx)));
+        assert!(!uni_rel::debug_background_draws(uni_rel::lens_coverage(
+            &ctx
+        )));
         assert_eq!(lens_warnings(&ctx), [uni_rel::BEYOND_REACH_WARNING]);
     }
 
@@ -444,6 +502,7 @@ mod tests {
             let ctx = frame_ctx(
                 &world,
                 &view_at(UniversePos::default(), orient),
+                UVec2::new(1920, 1080),
                 UVec2::new(1920, 1080),
                 exposure0(),
                 0,
@@ -464,18 +523,48 @@ mod tests {
                 LensCoverage::InsideHorizon,
                 "r = {r} M"
             );
-            assert!(lens_pass_runs(uni_rel::lens_coverage(&ctx)));
             let perf = Perf {
                 fps: 0.0,
                 cpu_ms: 0.0,
                 gpu_ms: Vec::new(),
+                gpu_frame_ms: None,
                 gpu_timing_available: false,
             };
             let data = hud_data(&world, &ctx, perf, 0.0, 0, &[]);
             assert!(data.inside_horizon, "r = {r} M");
+            // All black: no grid, so no grid labels.
+            assert!(!data.lens_on_screen, "r = {r} M");
+            // Default exposure: the dual-exposure label is up.
+            assert!(data.eye_adapted_stars);
             assert!(data.warnings.is_empty(), "{:?}", data.warnings);
             assert!(data.nearest_dist_m.is_finite() && ctx.view_rot.is_finite());
         }
+    }
+
+    /// Review m7: the HUD's horizon and lens labels come from the same lens the lens pass
+    /// traces (the first), so they cannot disagree with the frame when there are two.
+    #[test]
+    fn hud_lens_state_follows_the_traced_lens() {
+        let (world, mut ctx) = ctx_near_hole(30.0);
+        let mut inside = ctx.lenses[0].clone();
+        inside.rel_pos_m = DVec3::ZERO; // the camera at a second hole's centre
+        ctx.lenses.push(inside);
+        let perf = || Perf {
+            fps: 0.0,
+            cpu_ms: 0.0,
+            gpu_ms: Vec::new(),
+            gpu_frame_ms: None,
+            gpu_timing_available: false,
+        };
+        let data = hud_data(&world, &ctx, perf(), 0.0, 0, &[]);
+        assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::Traced);
+        assert!(!data.inside_horizon);
+        assert!(data.lens_on_screen);
+        ctx.lenses.swap(0, 1);
+        let data = hud_data(&world, &ctx, perf(), 0.0, 0, &[]);
+        assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::InsideHorizon);
+        assert!(data.inside_horizon);
+        assert!(!data.lens_on_screen);
     }
 
     fn bookmark(view: CameraView) -> Bookmark {

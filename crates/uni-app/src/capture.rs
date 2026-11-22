@@ -2,8 +2,11 @@
 //!
 //! For each bookmark, `--frames` frames are rendered one at a time (each waits for the GPU),
 //! the last one is saved as `<out>/<name>.png`, and `<out>/<name>.json` records its size, the
-//! GPU time of each pass, the CPU time to update and encode it, the star count, the lens scale
-//! and the epoch (design §8, "Headless capture").
+//! GPU time of each pass and of the whole frame, the CPU time to update and encode it, the star
+//! count, the lens scale and the epoch (design §8, "Headless capture"). The internal render
+//! resolution equals `--size`, so the tonemap reads the HDR target 1:1. A GPU time the device
+//! did not measure validly is `null` in the JSON and "n/a" on the terminal, never 0 (review
+//! I5). Any uncaptured GPU error fails the run, so a broken frame is never published (m6).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +15,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use glam::UVec2;
 use uni_core::Epoch;
+use uni_data::CatalogStar;
 use uni_gfx::{CAPTURE_FORMAT, CaptureTarget, GpuContext};
 use uni_ui::Hud;
 
@@ -65,8 +69,12 @@ pub struct CaptureMetrics {
     pub name: String,
     pub width: u32,
     pub height: u32,
-    /// Pass name → GPU milliseconds; empty without timestamp queries (Review Focus 4).
-    pub gpu_ms: BTreeMap<String, f32>,
+    /// Pass name → GPU milliseconds, `null` where the device returned no valid measurement;
+    /// empty without timestamp queries (Review Focus 4).
+    pub gpu_ms: BTreeMap<String, Option<f32>>,
+    /// Whole-frame GPU milliseconds (between the timer's frame brackets), `null` if not
+    /// measured or invalid.
+    pub gpu_frame_ms: Option<f32>,
     /// CPU milliseconds to update and encode the captured frame.
     pub cpu_ms: f32,
     pub star_count: u32,
@@ -76,28 +84,56 @@ pub struct CaptureMetrics {
     pub epoch_utc: String,
 }
 
-/// Renders every bookmark in `args.bookmarks` into `args.out`.
-pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
-    let sky = sky_path();
-    let (stars, sky_warnings) = World::load_sky(&sky);
+/// The baked star catalogue, or [`CaptureError::MissingData`] (headless runs never render an
+/// empty sky silently).
+pub fn load_stars() -> Result<Vec<CatalogStar>, CaptureError> {
+    let (stars, sky_warnings) = World::load_sky(&sky_path());
     if !sky_warnings.is_empty() {
         return Err(CaptureError::MissingData(format!(
             "{} (bake it with `cargo run -p uni-bake -- bsc5 ...`, see data/manifest.toml)",
             sky_warnings.join("; ")
         )));
     }
+    Ok(stars)
+}
+
+/// A headless GPU that can render `size` (`flag` names the option in the error).
+pub fn headless_gpu(size: UVec2, flag: &str) -> anyhow::Result<GpuContext> {
+    let gpu = pollster::block_on(GpuContext::new_headless())?;
+    let max = gpu.device.limits().max_texture_dimension_2d;
+    anyhow::ensure!(
+        size.max_element() <= max,
+        "{flag} {size} exceeds the GPU's {max} px limit"
+    );
+    Ok(gpu)
+}
+
+/// Submits `cmds`, waits until the GPU has finished them, and fails on any uncaptured GPU
+/// error raised so far (review m6). `what` names the work in the error.
+pub fn submit_and_wait(
+    gpu: &GpuContext,
+    cmds: Vec<wgpu::CommandBuffer>,
+    what: &str,
+) -> anyhow::Result<()> {
+    gpu.queue.submit(cmds);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .with_context(|| format!("waiting for {what}"))?;
+    let errors = gpu.take_errors();
+    anyhow::ensure!(errors.is_empty(), "{what}: {}", errors.join("; "));
+    Ok(())
+}
+
+/// Renders every bookmark in `args.bookmarks` into `args.out`.
+pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
+    let stars = load_stars()?;
     let bookmarks = uni_nav::load_bookmarks(&args.bookmarks)?;
     check_names(&bookmarks)?;
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
-    let gpu = pollster::block_on(GpuContext::new_headless())?;
-    let max = gpu.device.limits().max_texture_dimension_2d;
-    if args.size.max_element() > max {
-        return Err(
-            anyhow::anyhow!("--size {} exceeds the GPU's {max} px limit", args.size).into(),
-        );
-    }
+    let gpu = headless_gpu(args.size, "--size")?;
+    // Internal resolution = output size: the tonemap reads the HDR target 1:1.
     let mut scene = Scene::new(&gpu, args.size, CAPTURE_FORMAT, &stars, CAPTURE_LENS_SCALE)?;
     drop(stars);
     let target = CaptureTarget::new(&gpu.device, args.size);
@@ -122,18 +158,15 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
                 &world,
                 &view,
                 size,
+                size,
                 exposure(&controls),
                 frame_index,
                 CAPTURE_DT_S,
             );
             let mut cmds = vec![scene.render(&gpu, &ctx, &target.view)];
             if let Some(hud) = hud.as_mut().filter(|_| f + 1 == args.frames) {
-                let perf = Perf {
-                    fps: 0.0,
-                    cpu_ms,
-                    gpu_ms: scene.renderer.gpu_ms(),
-                    gpu_timing_available: gpu.has_timestamps(),
-                };
+                // The previous frame's GPU timings (the captured frame's are not measured yet).
+                let perf = Perf::from_renderer(&scene.renderer, &gpu, 0.0, cpu_ms);
                 let data = hud_data(&world, &ctx, perf, 0.0, scene.star_count, &[]);
                 let mut enc = gpu
                     .device
@@ -151,32 +184,15 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
                 cmds.push(enc.finish());
             }
             cpu_ms = start.elapsed().as_secs_f32() * 1e3;
-            gpu.queue.submit(cmds);
-            // One frame at a time, so every frame's GPU timings are read back.
-            gpu.device
-                .poll(wgpu::PollType::wait_indefinitely())
-                .context("waiting for a capture frame")?;
+            // One frame at a time, so every frame's GPU timings are read back: after the wait,
+            // `poll_timings` resolves the finished frame's queries and makes its timings the
+            // latest (the captured frame's, after the last one).
+            submit_and_wait(&gpu, cmds, &format!("capture frame of {:?}", b.name))?;
+            scene.renderer.poll_timings(&gpu);
             frame_index += 1;
         }
         let png = args.out.join(format!("{}.png", b.name));
         target.save_png(&gpu, &png)?;
-
-        // GPU timings lag one render (uni-gfx PassTimer): render once more to collect the
-        // captured frame's.
-        let ctx = frame_ctx(
-            &world,
-            &view,
-            size,
-            exposure(&controls),
-            frame_index,
-            CAPTURE_DT_S,
-        );
-        gpu.queue
-            .submit(std::iter::once(scene.render(&gpu, &ctx, &target.view)));
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .context("waiting for the timing frame")?;
-        frame_index += 1;
 
         let metrics = CaptureMetrics {
             name: b.name.clone(),
@@ -188,6 +204,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
                 .into_iter()
                 .map(|(pass, ms)| (pass.to_owned(), ms))
                 .collect(),
+            gpu_frame_ms: scene.renderer.gpu_frame_ms(),
             cpu_ms,
             star_count: scene.star_count,
             lens_scale: controls.lens_scale,
@@ -236,17 +253,25 @@ fn write_metrics(path: &Path, metrics: &CaptureMetrics) -> anyhow::Result<()> {
     std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))
 }
 
+/// `ms` to two decimals, or "n/a" for no valid measurement (review I5: never 0.00).
+pub fn ms_or_na(ms: Option<f32>) -> String {
+    ms.map_or_else(|| "n/a".to_owned(), |ms| format!("{ms:.2}"))
+}
+
 /// One line per capture for the terminal.
 fn summary(png: &Path, m: &CaptureMetrics) -> String {
     let gpu = if m.gpu_ms.is_empty() {
         "GPU ms n/a".to_owned()
     } else {
-        m.gpu_ms
-            .iter()
-            .map(|(pass, ms)| format!("{pass} {ms:.2}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-            + " GPU ms"
+        format!(
+            "frame {}, {} GPU ms",
+            ms_or_na(m.gpu_frame_ms),
+            m.gpu_ms
+                .iter()
+                .map(|(pass, ms)| format!("{pass} {}", ms_or_na(*ms)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     format!(
         "captured {} ({}×{}): {gpu}; CPU {:.2} ms; {} stars; lens scale {}",
@@ -269,7 +294,12 @@ mod tests {
             name: "bh-shadow-30M".to_owned(),
             width: 1920,
             height: 1080,
-            gpu_ms: BTreeMap::from([("lens".to_owned(), 3.5), ("stars".to_owned(), 0.25)]),
+            gpu_ms: BTreeMap::from([
+                ("lens".to_owned(), Some(3.5)),
+                ("stars".to_owned(), Some(0.25)),
+                ("tonemap".to_owned(), None),
+            ]),
+            gpu_frame_ms: Some(4.0),
             cpu_ms: 1.5,
             star_count: 9096,
             lens_scale: 1.0,
@@ -283,6 +313,7 @@ mod tests {
             [
                 "cpu_ms",
                 "epoch_utc",
+                "gpu_frame_ms",
                 "gpu_ms",
                 "height",
                 "lens_scale",
@@ -293,6 +324,9 @@ mod tests {
         );
         assert_eq!(v["gpu_ms"]["lens"], 3.5);
         assert_eq!(v["gpu_ms"]["stars"], 0.25);
+        // Review I5: an invalid measurement is null, not 0.
+        assert_eq!(v["gpu_ms"]["tonemap"], serde_json::Value::Null);
+        assert_eq!(v["gpu_frame_ms"], 4.0);
         assert_eq!(v["width"], 1920);
         assert_eq!(v["epoch_utc"], "2026-11-20T00:00:00Z");
     }
@@ -308,6 +342,7 @@ mod tests {
             width: 2,
             height: 1,
             gpu_ms: BTreeMap::new(),
+            gpu_frame_ms: None,
             cpu_ms: 0.0,
             star_count: 0,
             lens_scale: 0.5,
@@ -318,6 +353,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["gpu_ms"], serde_json::json!({}));
+        assert_eq!(v["gpu_frame_ms"], serde_json::Value::Null);
         assert_eq!(v["lens_scale"], 0.5);
     }
 
@@ -344,6 +380,7 @@ mod tests {
             width: 4,
             height: 3,
             gpu_ms: BTreeMap::new(),
+            gpu_frame_ms: None,
             cpu_ms: 0.5,
             star_count: 7,
             lens_scale: 1.0,
@@ -352,5 +389,26 @@ mod tests {
         let line = summary(Path::new("out/x.png"), &m);
         assert!(line.contains("GPU ms n/a"), "{line}");
         assert!(line.contains("4×3"), "{line}");
+    }
+
+    #[test]
+    fn summary_shows_invalid_timings_as_na() {
+        let m = CaptureMetrics {
+            name: "x".to_owned(),
+            width: 4,
+            height: 3,
+            gpu_ms: BTreeMap::from([("lens".to_owned(), Some(2.5)), ("tonemap".to_owned(), None)]),
+            gpu_frame_ms: None,
+            cpu_ms: 0.5,
+            star_count: 7,
+            lens_scale: 1.0,
+            epoch_utc: String::new(),
+        };
+        let line = summary(Path::new("out/x.png"), &m);
+        assert!(
+            line.contains("frame n/a, lens 2.50, tonemap n/a GPU ms"),
+            "{line}"
+        );
+        assert!(!line.contains("0.00"), "{line}");
     }
 }

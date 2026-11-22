@@ -161,6 +161,12 @@ pub fn run() -> bool {
             }
         }
     }
+    // An uncaptured GPU error during the probes fails the run (review m6).
+    let errors = gpu.take_errors();
+    if !errors.is_empty() {
+        println!("FAIL gpu errors: {}", errors.join("; "));
+        all_pass = false;
+    }
     all_pass
 }
 
