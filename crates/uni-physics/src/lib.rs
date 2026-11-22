@@ -1,2 +1,30 @@
-//! uni-physics: Kepler/Standish/Meeus orbits and IAU rotation from M1; Galaxy potential,
-//! integrators and relativity calculators in M3-M4. Empty in M0.
+//! uni-physics: Kepler/Standish/Meeus orbits, IAU rotation and photometry from M1; Galaxy
+//! potential, integrators and relativity calculators in M3-M4.
+//!
+//! M1 modules (A0b stubs; bodies `todo!("<task>")` until the named task lands):
+//! - A1: [`bodies`], [`kepler`], [`frames`], [`standish`], [`pluto`], [`ssb`]
+//! - A2: [`moon`], [`galilean`], [`saturn_moons`], [`sat_elements`], [`rotation`], [`ephemeris`]
+//! - A3: [`photometry`], [`smallbody`], [`dust`], [`calc`]
+//!
+//! CPU maths is SI units in `f64`; positions are ICRS/J2000 axes (CLAUDE.md §3).
+
+pub mod bodies;
+pub mod calc;
+pub mod dust;
+pub mod ephemeris;
+pub mod frames;
+pub mod galilean;
+pub mod kepler;
+pub mod moon;
+pub mod photometry;
+pub mod pluto;
+pub mod rotation;
+pub mod sat_elements;
+pub mod saturn_moons;
+pub mod smallbody;
+pub mod ssb;
+pub mod standish;
+
+/// NAIF integer ID of a body or barycentre (SPICE convention: 0 SSB, 1–9 planetary-system
+/// barycentres, 10 Sun, 199 Mercury, 399 Earth, 301 Moon, 501 Io, 999 Pluto).
+pub type NaifId = i32;

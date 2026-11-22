@@ -5,3 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+uni-core.workspace = true
+glam.workspace = true
+
+[dev-dependencies]
+# Horizons goldens (`data/golden/horizons_spots.ron`, `sky_spots.ron`) and `body_facts.ron` in tests.
+uni-data.workspace = true

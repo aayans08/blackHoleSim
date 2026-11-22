@@ -6,7 +6,7 @@
 use std::f64::consts::FRAC_PI_2;
 
 use glam::{DQuat, DVec3};
-use uni_core::{C, CameraView};
+use uni_core::{C, CameraView, Epoch, FrameId, FrameTree, ROOT_FRAME, UniversePos};
 
 use crate::input::{Action, InputState};
 
@@ -31,16 +31,34 @@ pub struct FlyCamera {
     pub speed_log10: f64,
     /// Mouse-look turn per raw mouse-motion unit [rad].
     pub look_sensitivity: f64,
+    /// The frame the camera moves with (M1 Task A6).
+    pub anchor: FrameId,
+    /// Offset from the anchor frame's origin [m], root axes; [`FlyCamera::sync`] sets
+    /// `view.pos` from it. A0b added the field; until A6 lands, `update` moves `view.pos` only.
+    pub rel_m: DVec3,
 }
 
 impl FlyCamera {
-    /// Wraps `view`, starting at 1 km/s.
+    /// Wraps `view`, starting at 1 km/s, anchored to the root frame.
     pub fn new(view: CameraView) -> Self {
+        let rel_m = view.pos.delta_from(UniversePos::default());
         FlyCamera {
             view,
             speed_log10: INITIAL_SPEED_LOG10,
             look_sensitivity: DEFAULT_LOOK_SENSITIVITY,
+            anchor: ROOT_FRAME,
+            rel_m,
         }
+    }
+
+    /// Moves the camera into `new_anchor`, keeping its root position exactly (M1 Task A6).
+    pub fn reanchor(&mut self, _frames: &FrameTree, _t: Epoch, _new_anchor: FrameId) {
+        todo!("A6")
+    }
+
+    /// Sets `view.pos` = origin(anchor) + `rel_m` at `t` (M1 Task A6).
+    pub fn sync(&mut self, _frames: &FrameTree, _t: Epoch) {
+        todo!("A6")
     }
 
     /// Flight speed [m/s] = 10^speed_log10.

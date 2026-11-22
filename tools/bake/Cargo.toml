@@ -9,7 +9,18 @@ publish.workspace = true
 [dependencies]
 uni-core.workspace = true
 uni-data.workspace = true
+uni-physics.workspace = true
 flate2.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ron.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+# Bake-only crates (M1 lead rulings 2 and 3, round 2): BC7/BC4 encoding and parallel map bakes.
+rayon.workspace = true
+intel_tex_2.workspace = true
+# JPEG and TIFF decoding for the surface maps (ruling 2): enabled here only, never in a runtime crate.
+image = { workspace = true, features = ["png", "jpeg", "tiff"] }

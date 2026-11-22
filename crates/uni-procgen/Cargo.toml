@@ -5,3 +5,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+uni-core.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+# Validates `shaders/galaxy.wgsl` and its `GalaxyGpu` layout (no wgpu in this crate).
+naga.workspace = true

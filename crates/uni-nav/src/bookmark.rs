@@ -3,10 +3,15 @@
 //! A bookmark file is a RON list of [`Bookmark`]s. Hand-written files (such as the capture
 //! sheet `bookmarks/m0.ron`) may carry `//` comments and leave out the optional fields; a
 //! present one is written `Some(x)` unless the file starts with `#![enable(implicit_some)]`.
+//!
+//! Bookmark v2 (M1): the fields after `lens_scale` are optional too, so every M0 file loads
+//! unchanged. A0b added them; Task A6 resolves them (`anchor`, `look_at`, `up`) in
+//! [`crate::resolve_bookmark`], and the app applies the rest.
 
 use std::path::Path;
 
 use anyhow::Context;
+use glam::DVec3;
 use ron::ser::PrettyConfig;
 use uni_core::CameraView;
 
@@ -24,6 +29,54 @@ pub struct Bookmark {
     pub star_ev100: Option<f32>,
     /// Gravitational-lens scale (the HUD's lens-scale slider).
     pub lens_scale: Option<f32>,
+    /// Object whose centre `view.pos` is measured from (cell 0, metres, root axes).
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// Object to face; overrides `view.orient` (−Z toward it, +Y as close as possible to `up`).
+    #[serde(default)]
+    pub look_at: Option<String>,
+    /// Up hint for `look_at`, root axes; `None` → ICRS +Z.
+    #[serde(default)]
+    pub up: Option<DVec3>,
+    /// Simulation time rate [sim s per real s].
+    #[serde(default)]
+    pub time_rate: Option<f64>,
+    /// Auto or manual exposure.
+    #[serde(default)]
+    pub exposure: Option<ExposureChoice>,
+    /// Whether eye-adapted (dual-exposure) stars are on.
+    #[serde(default)]
+    pub eye_adapted: Option<bool>,
+    /// Object selected on load (its info card shows with `--hud`).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Environment seen through a lens; `None` → [`LensEnvChoice::Band`].
+    #[serde(default)]
+    pub lens_env: Option<LensEnvChoice>,
+    /// Whether cruise mode is on.
+    #[serde(default)]
+    pub cruise: Option<bool>,
+    /// Whether the "Highlight asteroid belt" toggle is on.
+    #[serde(default)]
+    pub highlight_belt: Option<bool>,
+}
+
+/// How the scene exposure is chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExposureChoice {
+    /// The histogram meter sets it (B6).
+    Auto,
+    /// The bookmark's or the HUD's EV100.
+    Manual,
+}
+
+/// What a traced lens shows behind the hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LensEnvChoice {
+    /// The Milky Way band environment.
+    Band,
+    /// The M0 debug grid (labelled; ruling 14).
+    DebugGrid,
 }
 
 /// Reads a RON list of bookmarks. Errors name the file.
@@ -81,6 +134,16 @@ mod tests {
                 scene_ev100: Some(3.0),
                 star_ev100: Some(-2.5),
                 lens_scale: Some(1.0),
+                anchor: None,
+                look_at: None,
+                up: None,
+                time_rate: None,
+                exposure: None,
+                eye_adapted: None,
+                target: None,
+                lens_env: None,
+                cruise: None,
+                highlight_belt: None,
             },
             Bookmark {
                 name: "far away".to_owned(),
@@ -94,6 +157,16 @@ mod tests {
                 scene_ev100: None,
                 star_ev100: None,
                 lens_scale: None,
+                anchor: None,
+                look_at: None,
+                up: None,
+                time_rate: None,
+                exposure: None,
+                eye_adapted: None,
+                target: None,
+                lens_env: None,
+                cruise: None,
+                highlight_belt: None,
             },
         ]
     }
@@ -137,6 +210,14 @@ mod tests {
         assert_eq!(loaded[0].epoch_utc, None);
         assert_eq!(loaded[0].scene_ev100, None);
         assert_eq!(loaded[0].lens_scale, Some(1.0));
+        // Bookmark v2 fields (M1) are all optional too, so M0 files load unchanged.
+        let b = &loaded[0];
+        assert_eq!(
+            (&b.anchor, &b.look_at, b.up, b.time_rate),
+            (&None, &None, None, None)
+        );
+        assert_eq!((b.exposure, b.eye_adapted, &b.target), (None, None, &None));
+        assert_eq!((b.lens_env, b.cruise, b.highlight_belt), (None, None, None));
     }
 
     #[test]

@@ -5,3 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[dependencies]
+uni-core.workspace = true
+uni-physics.workspace = true
+uni-data.workspace = true
+glam.workspace = true
+serde.workspace = true
+ron.workspace = true

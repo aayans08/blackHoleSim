@@ -584,6 +584,16 @@ mod tests {
             scene_ev100: None,
             star_ev100: None,
             lens_scale: None,
+            anchor: None,
+            look_at: None,
+            up: None,
+            time_rate: None,
+            exposure: None,
+            eye_adapted: None,
+            target: None,
+            lens_env: None,
+            cruise: None,
+            highlight_belt: None,
         }
     }
 

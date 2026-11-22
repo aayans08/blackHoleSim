@@ -37,3 +37,18 @@ license = "public (CDS V/50)"
 credit = "Hoffleit & Warren 1991, Yale Bright Star Catalogue 5th ed. via CDS"
 raw_path = "data/cache/bsc5/catalog.gz"
 baked_path = "data/baked/bsc5.bin"
+
+# M1 Wave A data sections (pre-split by Task A0b, review I8). Each Data task adds its [[entry]]
+# blocks only between its own markers.
+
+# --- A7 ---
+# AT-HYG v4.0 stars (V ≤ 10) and names, NASA Exoplanet Archive pscomppars (M1 Task A7).
+# --- end A7 ---
+
+# --- A8 ---
+# Solar System Scope 8k maps, NASA/USGS tier-B mosaics, Saturn's ring profile (M1 Task A8).
+# --- end A8 ---
+
+# --- A9 ---
+# JPL SBDB small bodies, JPL SSD satellites, NSSDCA facts, JPL Horizons goldens, fonts (M1 Task A9).
+# --- end A9 ---

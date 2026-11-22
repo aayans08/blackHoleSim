@@ -9,3 +9,10 @@ publish.workspace = true
 [dependencies]
 glam.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+ron.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+# Cross-checks of baked data against the body constants (A9 `facts_cover_major_bodies`).
+uni-physics.workspace = true

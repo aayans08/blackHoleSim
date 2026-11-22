@@ -457,6 +457,16 @@ fn save_view(
         scene_ev100: Some(controls.scene_ev100),
         star_ev100: Some(controls.star_ev100),
         lens_scale: None,
+        anchor: None,
+        look_at: None,
+        up: None,
+        time_rate: None,
+        exposure: None,
+        eye_adapted: None,
+        target: None,
+        lens_env: None,
+        cruise: None,
+        highlight_belt: None,
     };
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{name}.ron"));

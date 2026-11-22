@@ -3,6 +3,10 @@
 Every third-party data file, texture and published algorithm used by this project is credited here.
 Downloaded data files are also recorded, with URL and SHA-256, in `data/manifest.toml`.
 
+<!-- M1 Wave A sections (pre-split by Task A0b, review I8): each Data task writes only between its own
+`<!-- A7 -->` … `<!-- /A7 -->` markers (A7 and A9 under Data, A8 under Textures; A9 may open a Fonts
+heading inside its section). -->
+
 ## Data
 
 **Yale Bright Star Catalogue, 5th Revised Ed.** (`data/baked/bsc5.bin`). Hoffleit, D. & Warren Jr., W. H. 1991,
@@ -11,6 +15,12 @@ catalogue [V/50](https://cdsarc.cds.unistra.fr/viz-bin/cat/V/50), obtained via C
 public (CDS V/50). The baked file keeps, for 9096 of the 9110 entries, the J2000 direction, V magnitude and HR number,
 plus an effective temperature derived from B−V with Ballesteros (2012, EPL 97, 34008). The 14 entries without a
 position (novae and non-stellar objects) are omitted.
+
+<!-- A7 -->
+<!-- /A7 -->
+
+<!-- A9 -->
+<!-- /A9 -->
 
 ## Textures
 
@@ -31,6 +41,9 @@ against a fresh download of the original (`docs/research/2026-11-20-assets.md` �
 | `textures/moon.jpg` | `2k_moon.jpg` | `2764ba6535ea0481a062846ee033cc7a909dae05b31a8fd13f3e98f3a7fd92bd` |
 | `textures/sun.jpg` | `2k_sun.jpg` | `ff0f076ba65e03b5ab518451bc96699325be38e3ccbdd5869ee1c00f3a0c8816` |
 | `textures/stars_milky_way.jpg` | `2k_stars_milky_way.jpg` | `ec2240e6f3784d962ab81609b228bfd470e87c86d1fed5e99134d4cd3de24239` |
+
+<!-- A8 -->
+<!-- /A8 -->
 
 ## Algorithms
 
