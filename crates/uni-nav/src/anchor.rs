@@ -37,9 +37,9 @@ pub fn resolve_bookmark(
     world: &dyn ObjectLookup,
 ) -> anyhow::Result<(CameraView, FrameId)> {
     let find = |field: &str, name: &str| {
-        world.find_object(name).with_context(|| {
-            format!("bookmark \"{}\": unknown {field} object \"{name}\"", b.name)
-        })
+        world
+            .find_object(name)
+            .with_context(|| format!("bookmark \"{}\": unknown {field} object \"{name}\"", b.name))
     };
 
     let mut view = b.view.clone();
@@ -66,15 +66,24 @@ pub fn resolve_bookmark(
 /// spacing, 2^-11 m near a cell's edge. `UniversePos::offset` rounds `local + d` before
 /// normalising, which costs up to 2^-10 m once the sum passes the edge (Review Focus 5).
 pub(crate) fn add_m(origin: UniversePos, d: DVec3) -> UniversePos {
-    // Whole cells of `d` first; `normalized` is exact and leaves |d.local| ≤ CELL_SIZE_M / 2.
+    add_dd(origin, d, DVec3::ZERO)
+}
+
+/// `origin` + (`hi` + `lo`) [m], where `hi` + `lo` is an unevaluated (double-double) sum with
+/// |`lo`| at most half a spacing of `hi`. Like [`add_m`] it rounds once at the result's
+/// cell-local metres; `lo` joins the exact rounding error `err` of `origin.local` + `hi` first,
+/// which adds at most 2^-53 × (|`err`| + |`lo`|) ≤ 2^-53 × (2^-9 m + half a spacing of `hi`):
+/// about 2e-16 m for |`hi`| up to 1 pc.
+pub(crate) fn add_dd(origin: UniversePos, hi: DVec3, lo: DVec3) -> UniversePos {
+    // Whole cells of `hi` first; `normalized` is exact and leaves |d.local| ≤ CELL_SIZE_M / 2.
     let d = UniversePos {
         cell: origin.cell,
-        local: d,
+        local: hi,
     }
     .normalized();
     let (sum, err) = two_sum(origin.local, d.local);
-    // |sum| ≤ CELL_SIZE_M, so moving its whole cells out is exact too; `err` then goes in with
-    // the one rounding.
+    // |sum| ≤ CELL_SIZE_M, so moving its whole cells out is exact too; `err` and `lo` then go in
+    // with the one rounding.
     let p = UniversePos {
         cell: d.cell,
         local: sum,
@@ -82,23 +91,33 @@ pub(crate) fn add_m(origin: UniversePos, d: DVec3) -> UniversePos {
     .normalized();
     UniversePos {
         cell: p.cell,
-        local: p.local + err,
+        local: p.local + (err + lo),
     }
     .normalized()
 }
 
-/// `p` − `origin` [m], rounded at the result's own magnitude: once when the points are within
-/// half a cell (2^43 m, about 59 au) of each other along each axis, at most twice beyond.
-/// `UniversePos::delta_from` rounds the cell-local difference first, which costs up to 2^-10 m
-/// when the two points lie on either side of a cell's edge (Review Focus 5).
+/// `p` − `origin` [m], rounded once at the result's own magnitude (up to a 2^-53 relative
+/// rounding of the part below its spacing). `UniversePos::delta_from` rounds the cell-local
+/// difference first, which costs up to 2^-10 m when the two points lie on either side of a
+/// cell's edge (Review Focus 5).
 pub(crate) fn delta_m(p: UniversePos, origin: UniversePos) -> DVec3 {
+    delta_dd(p, origin).0
+}
+
+/// `p` − `origin` [m] as a double-double (`hi`, `lo`): `hi` = fl(`hi` + `lo`), and `hi` + `lo`
+/// is the exact difference up to a 2^-53 rounding of `lo`, while the points are fewer than
+/// 2^53 cells (about 1.6e29 m, beyond the observable universe) apart along each axis.
+pub(crate) fn delta_dd(p: UniversePos, origin: UniversePos) -> (DVec3, DVec3) {
     let (local, err) = two_sum(p.local, -origin.local);
-    ((p.cell - origin.cell).as_dvec3() * CELL_SIZE_M + local) + err
+    // Exact below 2^53 cells: the cell count converts exactly and CELL_SIZE_M is a power of two.
+    let cells = (p.cell - origin.cell).as_dvec3() * CELL_SIZE_M;
+    let (hi, err_hi) = two_sum(cells, local);
+    two_sum(hi, err_hi + err)
 }
 
 /// Per component, `s` = fl(a + b) and `e` = (a + b) − `s` exactly (TwoSum: Møller 1965, BIT 5,
 /// 37; Knuth, *The Art of Computer Programming* vol. 2, §4.2.2, Theorem B).
-fn two_sum(a: DVec3, b: DVec3) -> (DVec3, DVec3) {
+pub(crate) fn two_sum(a: DVec3, b: DVec3) -> (DVec3, DVec3) {
     let s = a + b;
     let b_virtual = s - a;
     let e = (a - (s - b_virtual)) + (b - b_virtual);
@@ -233,11 +252,7 @@ mod tests {
             // x and y cross the cell's edge (x outwards, y inwards); z stays inside.
             let o = UniversePos {
                 cell: I64Vec3::new(7, -3, 1_000_000_000),
-                local: DVec3::new(
-                    half - 1.0e6 * f - 0.1,
-                    -half + 3.3e5 * f + 0.7,
-                    1.0e12 * f,
-                ),
+                local: DVec3::new(half - 1.0e6 * f - 0.1, -half + 3.3e5 * f + 0.7, 1.0e12 * f),
             };
             let d = DVec3::new(2.0e6 * f + 1.3e5 + f, -7.0e5 * f - 0.3, 1.0e9 * f + 0.11);
             let p = add_m(o, d);
@@ -248,10 +263,24 @@ mod tests {
                 let exact =
                     i128::from(cells[k]) * cell_units + fixed(p.local[k]) - fixed(o.local[k]);
                 let add_err = (exact - fixed(d[k])).abs();
-                assert!(2 * add_err <= ulp(p.local[k]), "add, i = {i}, axis {k}: {p:?}");
+                assert!(
+                    2 * add_err <= ulp(p.local[k]),
+                    "add, i = {i}, axis {k}: {p:?}"
+                );
                 let delta_err = (fixed(r[k]) - exact).abs();
                 assert!(2 * delta_err <= ulp(r[k]), "delta, i = {i}, axis {k}: {r}");
             }
+            // The double-double offset is exact (here every part is a whole number of 2^-60 m
+            // under 2^-7 m, so even its tail adds without rounding), and adding it back to
+            // `o` lands on `p` itself.
+            let (hi, lo) = delta_dd(p, o);
+            assert_eq!(hi, r, "i = {i}");
+            for k in 0..3 {
+                let exact =
+                    i128::from(cells[k]) * cell_units + fixed(p.local[k]) - fixed(o.local[k]);
+                assert_eq!(fixed(hi[k]) + fixed(lo[k]), exact, "dd, i = {i}, axis {k}");
+            }
+            assert_eq!(add_dd(o, hi, lo), p, "dd round trip, i = {i}");
         }
     }
 
@@ -407,5 +436,44 @@ mod tests {
         // Anchored to the root frame, the saved position is the root position itself.
         cam.reanchor(&frames, t, ROOT_FRAME);
         assert_eq!(cam.anchored_view(), cam.view);
+    }
+
+    #[test]
+    fn bookmark_view_names_the_anchor() {
+        // F12 (review r0 I2): anchored to a named body, the anchored view and the body's name,
+        // which resolve back to the same place; anchored to ROOT (which asks for no name) or
+        // to a frame the world cannot name, the root view and no anchor.
+        let mut frames = FrameTree::new();
+        let mars = frames.add(
+            ROOT_FRAME,
+            "Mars",
+            FrameMotion::Fixed {
+                origin: mars_pos(),
+                rotation: DQuat::IDENTITY,
+            },
+        );
+        let t = Epoch::J2000;
+        let mut cam = FlyCamera::new(CameraView {
+            pos: mars_pos().offset(DVec3::new(1.0e7, -2.5e6, 0.125)),
+            orient: DQuat::from_rotation_y(0.4),
+            fov_y_rad: 0.7,
+            velocity_mps: DVec3::ZERO,
+        });
+
+        let root = cam.bookmark_view(|_| -> Option<String> { panic!("ROOT needs no name") });
+        assert_eq!(root, (cam.view.clone(), None));
+
+        cam.reanchor(&frames, t, mars);
+        cam.sync(&frames, t);
+        let (view, anchor) = cam.bookmark_view(|f| (f == mars).then(|| "Mars".to_owned()));
+        assert_eq!(view, cam.anchored_view());
+        assert_eq!(anchor.as_deref(), Some("Mars"));
+        let mut b = bookmark(DVec3::ZERO);
+        (b.view, b.anchor) = (view, anchor);
+        let world = FakeWorld(vec![("Mars", mars_pos(), mars)]);
+        let (resolved, frame) = resolve_bookmark(&b, &world).unwrap();
+        assert_eq!((resolved.pos, frame), (cam.view.pos, mars));
+
+        assert_eq!(cam.bookmark_view(|_| None), (cam.view.clone(), None));
     }
 }
