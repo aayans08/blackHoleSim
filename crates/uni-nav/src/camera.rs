@@ -1,13 +1,21 @@
-//! Quaternion 6-DoF free camera with logarithmic speed control (M0 Task 6).
+//! Quaternion 6-DoF free camera with logarithmic speed control (M0 Task 6), parented to a
+//! frame (M1 Task A6).
 //!
 //! Free flight ignores gravity and reaches 10^26 m/s, far above c. Speeds above c are
 //! non-physical, and [`FlyCamera::is_ftl`] tells the HUD to label them so.
+//!
+//! The camera rides with its anchor frame (design §5.2: it is parented to the nearest dominant
+//! frame). Each frame the app calls [`FlyCamera::update`] (input moves `rel_m` and `view.pos`
+//! together), advances time, calls [`FlyCamera::sync`] (`view.pos` = the anchor's origin now +
+//! `rel_m`), then [`FlyCamera::reanchor`] to the dominant frame. Time warp therefore carries
+//! the camera with its body.
 
 use std::f64::consts::FRAC_PI_2;
 
-use glam::{DQuat, DVec3};
+use glam::{DQuat, DVec3, I64Vec3};
 use uni_core::{C, CameraView, Epoch, FrameId, FrameTree, ROOT_FRAME, UniversePos};
 
+use crate::anchor::{add_m, delta_m};
 use crate::input::{Action, InputState};
 
 /// Lowest `speed_log10`: 10^−1 m/s.
@@ -31,10 +39,14 @@ pub struct FlyCamera {
     pub speed_log10: f64,
     /// Mouse-look turn per raw mouse-motion unit [rad].
     pub look_sensitivity: f64,
-    /// The frame the camera moves with (M1 Task A6).
+    /// The frame the camera moves with (M1 Task A6). Change it with [`FlyCamera::reanchor`].
     pub anchor: FrameId,
-    /// Offset from the anchor frame's origin [m], root axes; [`FlyCamera::sync`] sets
-    /// `view.pos` from it. A0b added the field; until A6 lands, `update` moves `view.pos` only.
+    /// Offset from the anchor frame's origin [m], root axes (so the camera follows the frame's
+    /// origin, not its spin); [`FlyCamera::sync`] sets `view.pos` from it.
+    ///
+    /// Anchored to [`ROOT_FRAME`], which never moves, `view.pos` is the camera's position and
+    /// `rel_m` only mirrors it in f64 metres from the SSB (4.3e9 m apart at 1 Gpc), so `sync`
+    /// keeps `view.pos` there instead of rebuilding it from `rel_m`.
     pub rel_m: DVec3,
 }
 
@@ -52,13 +64,57 @@ impl FlyCamera {
     }
 
     /// Moves the camera into `new_anchor`, keeping its root position exactly (M1 Task A6).
-    pub fn reanchor(&mut self, _frames: &FrameTree, _t: Epoch, _new_anchor: FrameId) {
-        todo!("A6")
+    ///
+    /// `view.pos` is taken as the camera's root position at `t` and left untouched; `rel_m`
+    /// becomes its offset from `new_anchor`'s origin at `t` in f64 metres (`UniversePos::
+    /// delta_from` with the cell-local difference kept exact, so a later `sync` lands within a
+    /// spacing of `rel_m` plus 2^-11 m even at a cell's edge). Call [`Self::sync`] first when
+    /// time has moved since the last one. To place the camera by hand, set `view.pos` and call
+    /// this.
+    ///
+    /// Reanchoring to the current anchor when `rel_m` already reproduces `view.pos` at `t`
+    /// (the app's every-frame call after `sync`) keeps `rel_m` bit for bit, so repeated calls
+    /// never walk the camera off its body by rounding.
+    ///
+    /// # Panics
+    /// If `new_anchor` is not a frame of `frames`.
+    pub fn reanchor(&mut self, frames: &FrameTree, t: Epoch, new_anchor: FrameId) {
+        let origin = frames.origin_in_root(new_anchor, t);
+        if new_anchor == self.anchor && add_m(origin, self.rel_m) == self.view.pos {
+            return;
+        }
+        self.anchor = new_anchor;
+        self.rel_m = delta_m(self.view.pos, origin);
     }
 
-    /// Sets `view.pos` = origin(anchor) + `rel_m` at `t` (M1 Task A6).
-    pub fn sync(&mut self, _frames: &FrameTree, _t: Epoch) {
-        todo!("A6")
+    /// Sets `view.pos` = origin(anchor) + `rel_m` at `t` (M1 Task A6), rounding once.
+    ///
+    /// For [`ROOT_FRAME`] (whose origin is the SSB at every epoch) `view.pos` is kept, since
+    /// rebuilding it from f64 metres would cost up to 2^-53 of the distance from the SSB, and
+    /// `rel_m` is refreshed from it.
+    ///
+    /// # Panics
+    /// If `anchor` is not a frame of `frames`.
+    pub fn sync(&mut self, frames: &FrameTree, t: Epoch) {
+        if self.anchor == ROOT_FRAME {
+            self.rel_m = self.view.pos.delta_from(UniversePos::default());
+        } else {
+            self.view.pos = add_m(frames.origin_in_root(self.anchor, t), self.rel_m);
+        }
+    }
+
+    /// The view as F12 saves it in a Bookmark v2 (M1 Task A6): with `anchor` = the anchor
+    /// body's name, `pos` is `rel_m` in cell 0 (metres from the body's centre, root axes); while
+    /// anchored to [`ROOT_FRAME`], it is the root position itself, saved without `anchor`.
+    pub fn anchored_view(&self) -> CameraView {
+        let mut view = self.view.clone();
+        if self.anchor != ROOT_FRAME {
+            view.pos = UniversePos {
+                cell: I64Vec3::ZERO,
+                local: self.rel_m,
+            };
+        }
+        view
     }
 
     /// Flight speed [m/s] = 10^speed_log10.
@@ -76,7 +132,8 @@ impl FlyCamera {
     /// Takes the wheel notches and speed presses (±0.1 in log10 each), then the mouse-look
     /// delta, then turns and moves. Rotations are about camera-local axes: yaw about +Y, pitch
     /// about +X, roll about −Z (the view direction). Movement is along camera-local axes at
-    /// [`Self::speed_mps`]; diagonal input is normalised, so it is no faster.
+    /// [`Self::speed_mps`]; diagonal input is normalised, so it is no faster. The step moves
+    /// `rel_m` and `view.pos` alike, so the camera is in place before the next [`Self::sync`].
     pub fn update(&mut self, input: &mut InputState, dt_s: f64) {
         // A NaN or negative frame time must not move the camera backwards or poison it.
         let dt = if dt_s.is_finite() { dt_s.max(0.0) } else { 0.0 };
@@ -118,6 +175,7 @@ impl FlyCamera {
         )
         .normalize_or_zero();
         let step = self.view.orient * dir_local * (self.speed_mps() * dt);
+        self.rel_m += step;
         self.view.pos = self.view.pos.offset(step);
     }
 }
@@ -131,7 +189,7 @@ fn axis(input: &InputState, pos: Action, neg: Action) -> f64 {
 mod tests {
     use super::*;
     use glam::DVec2;
-    use uni_core::{CELL_SIZE_M, UniversePos};
+    use uni_core::{AU, CELL_SIZE_M, FrameMotion, PC, UniversePos};
 
     fn camera_at_origin() -> FlyCamera {
         FlyCamera::new(CameraView {
@@ -330,6 +388,208 @@ mod tests {
         cam.speed_log10 = 8.0;
         assert!(!cam.is_ftl());
         assert!((cam.speed_mps() - 1e8).abs() < 1e-3);
+    }
+
+    /// A frame that moves along root +Y at `speed_mps` from `start` (root axes, as M1's body
+    /// frames are).
+    fn moving(start: UniversePos, speed_mps: f64) -> FrameMotion {
+        FrameMotion::Custom(Box::new(move |t: Epoch| {
+            let y = speed_mps * t.seconds_since(Epoch::J2000);
+            (start.offset(DVec3::new(0.0, y, 0.0)), DQuat::IDENTITY)
+        }))
+    }
+
+    fn fixed_at(origin: UniversePos) -> FrameMotion {
+        FrameMotion::Fixed {
+            origin,
+            rotation: DQuat::IDENTITY,
+        }
+    }
+
+    fn camera_at(pos: UniversePos) -> FlyCamera {
+        let mut cam = camera_at_origin();
+        cam.view.pos = pos;
+        cam.rel_m = pos.delta_from(UniversePos::default());
+        cam
+    }
+
+    #[test]
+    fn reanchor_preserves_root_position() {
+        // Review Focus 5. Two anchors 1 AU apart, first near the SSB, then inside a system frame
+        // 1 Gpc out; the camera sits 1.3e7 m from the first anchor.
+        let t = Epoch::J2000.add_seconds(1.0e7);
+        let far = UniversePos::from_meters(DVec3::new(1e9 * PC, -2e8 * PC, 3e8 * PC))
+            .offset(DVec3::new(0.375, 0.0, 0.0));
+        // The same 1 Gpc out, with the system frame placed so the camera and anchor b lie in
+        // different cells (x and y), where cell-local metres are 2^-10 m apart.
+        let half = CELL_SIZE_M / 2.0;
+        let edge = UniversePos {
+            cell: far.cell,
+            local: DVec3::new(
+                half - 0.8 * AU + 0.314_159_265_358_979_3,
+                half - 3.3e6 - 0.271_828_182_845_904_5,
+                -half + 4.0e6 + 0.577_215_664_901_532_9,
+            ),
+        };
+        for base in [UniversePos::default(), far, edge] {
+            let mut frames = FrameTree::new();
+            let system = frames.add(ROOT_FRAME, "system", fixed_at(base));
+            let a = frames.add(
+                system,
+                "a",
+                moving(UniversePos::from_meters(DVec3::new(0.3 * AU, 0.0, 0.0)), 30e3),
+            );
+            let b = frames.add(
+                system,
+                "b",
+                moving(UniversePos::from_meters(DVec3::new(1.3 * AU, 0.0, 0.0)), -20e3),
+            );
+            let offset = DVec3::new(
+                3.0e6 + 0.123_456_789_1,
+                -4.0e6 - 0.987_654_321,
+                1.2e7 + 0.333_333_333_333,
+            );
+            let mut cam = camera_at(frames.origin_in_root(a, t).offset(offset));
+            cam.reanchor(&frames, t, a);
+            assert_eq!(cam.anchor, a);
+            assert!((cam.rel_m - offset).length() < 1e-3, "{}", cam.rel_m);
+            cam.sync(&frames, t);
+            let before = cam.view.pos;
+
+            for (to, expected_rel) in [
+                (b, before.delta_from(frames.origin_in_root(b, t))),
+                (a, offset),
+                (system, before.delta_from(base)),
+                (ROOT_FRAME, before.delta_from(UniversePos::default())),
+                (a, offset),
+            ] {
+                let pos = cam.view.pos;
+                cam.reanchor(&frames, t, to);
+                assert_eq!(cam.anchor, to);
+                // The root position is kept exactly, and syncing at the same epoch moves it by
+                // at most a rounding of the cell-local metres (summed over every hop here).
+                assert_eq!(cam.view.pos, pos, "reanchor to {to}");
+                cam.sync(&frames, t);
+                let moved = cam.view.pos.delta_from(before).length();
+                assert!(moved < 1e-3, "reanchor to {to}: moved {moved} m");
+                let rel_err = (cam.rel_m - expected_rel).length();
+                assert!(rel_err <= 1e-3 + 1e-15 * expected_rel.length(), "{rel_err} m");
+            }
+        }
+    }
+
+    #[test]
+    fn reanchor_every_frame_does_not_drift() {
+        // The app reanchors to the dominant frame every frame (B9); with the same anchor that
+        // must leave `rel_m` bit-for-bit alone, or rounding would walk the camera off its body.
+        let mut frames = FrameTree::new();
+        let body = frames.add(
+            ROOT_FRAME,
+            "body",
+            moving(UniversePos::from_meters(DVec3::new(5.2 * AU, 0.0, 0.0)), 13e3),
+        );
+        let mut cam = camera_at(UniversePos::from_meters(DVec3::new(5.2 * AU, 0.0, 7.0e7)));
+        cam.reanchor(&frames, Epoch::J2000, body);
+        let rel = cam.rel_m;
+        for i in 1..=10_000 {
+            let t = Epoch::J2000.add_seconds(37.7 * f64::from(i));
+            cam.sync(&frames, t);
+            cam.reanchor(&frames, t, body);
+        }
+        assert_eq!(cam.rel_m, rel);
+
+        // A camera moved by hand (view.pos set directly) is re-measured instead.
+        let t = Epoch::J2000.add_seconds(377_000.0);
+        cam.sync(&frames, t);
+        cam.view.pos = cam.view.pos.offset(DVec3::new(1000.0, 0.0, 0.0));
+        cam.reanchor(&frames, t, body);
+        assert!((cam.rel_m - rel - DVec3::new(1000.0, 0.0, 0.0)).length() < 1e-3);
+    }
+
+    #[test]
+    fn anchored_camera_follows_moving_frame() {
+        // Review Focus 1: time warp carries the camera with its body. 30 km/s for 1e6 s, in
+        // 1000 frames of 1/60 s at a warp of 6e4.
+        let mut frames = FrameTree::new();
+        let body = frames.add(
+            ROOT_FRAME,
+            "body",
+            moving(UniversePos::from_meters(DVec3::new(AU, 0.0, 0.0)), 30e3),
+        );
+        let mut cam = camera_at(UniversePos::from_meters(DVec3::new(AU, 0.0, 1e7)));
+        cam.reanchor(&frames, Epoch::J2000, body);
+        cam.sync(&frames, Epoch::J2000);
+        let rel = cam.rel_m;
+        let start = cam.view.pos;
+        let mut input = InputState::new();
+        for i in 1..=1000 {
+            cam.update(&mut input, 1.0 / 60.0);
+            cam.sync(&frames, Epoch::J2000.add_seconds(1000.0 * f64::from(i)));
+        }
+        assert_eq!(cam.rel_m, rel);
+        let moved = cam.view.pos.delta_from(start);
+        assert!(
+            (moved - DVec3::new(0.0, 3e10, 0.0)).length() < 1e-3,
+            "{moved}"
+        );
+    }
+
+    #[test]
+    fn update_moves_rel_m_and_view_together() {
+        let mut frames = FrameTree::new();
+        let body = frames.add(
+            ROOT_FRAME,
+            "body",
+            moving(UniversePos::from_meters(DVec3::new(AU, 0.0, 0.0)), 30e3),
+        );
+        let t0 = Epoch::J2000;
+        let mut cam = camera_at(UniversePos::from_meters(DVec3::new(AU, 0.0, 1e7)));
+        cam.reanchor(&frames, t0, body);
+        cam.sync(&frames, t0);
+        let (rel0, pos0) = (cam.rel_m, cam.view.pos);
+
+        let mut input = InputState::new();
+        input.set_down(Action::Forward, true);
+        cam.update(&mut input, 1.0);
+        let step = cam.rel_m - rel0;
+        assert!((step - DVec3::new(0.0, 0.0, -1000.0)).length() < 1e-9, "{step}");
+        // Before the next sync, view.pos has moved by the same step, at the old epoch.
+        assert!((cam.view.pos.delta_from(pos0) - step).length() < 1e-3);
+        let t1 = t0.add_seconds(1.0);
+        cam.sync(&frames, t1);
+        let expected = frames.origin_in_root(body, t1).offset(cam.rel_m);
+        assert_eq!(cam.view.pos, expected);
+        let carried = cam.view.pos.delta_from(pos0) - step;
+        assert!((carried - DVec3::new(0.0, 30e3, 0.0)).length() < 1e-3, "{carried}");
+    }
+
+    #[test]
+    fn root_anchor_keeps_cell_precision_far_away() {
+        // Review Focus 5. 1 Gpc out, f64 metres from the SSB are 4.3e9 m apart; anchored to the
+        // root frame (which never moves), a 1 m step must survive `sync` all the same.
+        let frames = FrameTree::new();
+        let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0));
+        let mut cam = FlyCamera::new(CameraView {
+            pos: far,
+            orient: DQuat::IDENTITY,
+            fov_y_rad: 1.0,
+            velocity_mps: DVec3::ZERO,
+        });
+        assert_eq!(cam.anchor, ROOT_FRAME);
+        cam.speed_log10 = 0.0;
+        let mut input = InputState::new();
+        input.set_down(Action::Forward, true);
+        for i in 1..=10 {
+            cam.update(&mut input, 1.0);
+            cam.sync(&frames, Epoch::J2000.add_seconds(f64::from(i)));
+        }
+        let moved = cam.view.pos.delta_from(far);
+        assert!(
+            (moved - DVec3::new(0.0, 0.0, -10.0)).length() < 1e-3,
+            "{moved}"
+        );
+        // rel_m mirrors the root position as well as f64 metres can.
+        assert_eq!(cam.rel_m, cam.view.pos.delta_from(UniversePos::default()));
     }
 
     #[test]

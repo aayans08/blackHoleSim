@@ -6,7 +6,8 @@
 //!
 //! Bookmark v2 (M1): the fields after `lens_scale` are optional too, so every M0 file loads
 //! unchanged. A0b added them; Task A6 resolves them (`anchor`, `look_at`, `up`) in
-//! [`crate::resolve_bookmark`], and the app applies the rest.
+//! [`crate::resolve_bookmark`], and the app applies the rest. [`save_bookmarks`] leaves unset
+//! fields out, so a saved file (F12) lists only what it sets, like the hand-written ones.
 
 use std::path::Path;
 
@@ -22,42 +23,46 @@ pub struct Bookmark {
     pub name: String,
     pub view: CameraView,
     /// Simulation epoch, `"YYYY-MM-DDThh:mm:ss[.fff]Z"` (see `uni_core::Epoch::parse_iso_utc`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch_utc: Option<String>,
     /// Scene exposure [EV100].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_ev100: Option<f32>,
     /// Star-layer exposure [EV100].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_ev100: Option<f32>,
     /// Gravitational-lens scale (the HUD's lens-scale slider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lens_scale: Option<f32>,
     /// Object whose centre `view.pos` is measured from (cell 0, metres, root axes).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<String>,
     /// Object to face; overrides `view.orient` (−Z toward it, +Y as close as possible to `up`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub look_at: Option<String>,
     /// Up hint for `look_at`, root axes; `None` → ICRS +Z.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub up: Option<DVec3>,
     /// Simulation time rate [sim s per real s].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_rate: Option<f64>,
     /// Auto or manual exposure.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure: Option<ExposureChoice>,
     /// Whether eye-adapted (dual-exposure) stars are on.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eye_adapted: Option<bool>,
     /// Object selected on load (its info card shows with `--hud`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Environment seen through a lens; `None` → [`LensEnvChoice::Band`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lens_env: Option<LensEnvChoice>,
     /// Whether cruise mode is on.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cruise: Option<bool>,
     /// Whether the "Highlight asteroid belt" toggle is on.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight_belt: Option<bool>,
 }
 
@@ -218,6 +223,96 @@ mod tests {
         );
         assert_eq!((b.exposure, b.eye_adapted, &b.target), (None, None, &None));
         assert_eq!((b.lens_env, b.cruise, b.highlight_belt), (None, None, None));
+    }
+
+    /// A file in the workspace's `bookmarks/` directory.
+    fn workspace_bookmarks(file: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bookmarks")
+            .join(file)
+    }
+
+    #[test]
+    fn m0_bookmarks_still_parse() {
+        let marks = load_bookmarks(&workspace_bookmarks("m0.ron")).unwrap();
+        let names: Vec<&str> = marks.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "start",
+                "sky-orion",
+                "sky-galactic-center",
+                "sky-zoom-sirius",
+                "bh-shadow-30M",
+                "bh-oblique-15M"
+            ]
+        );
+        for b in &marks {
+            assert_eq!(
+                (&b.anchor, &b.look_at, b.up, b.time_rate),
+                (&None, &None, None, None),
+                "{}",
+                b.name
+            );
+            assert_eq!(
+                (b.exposure, b.eye_adapted, &b.target),
+                (None, None, &None),
+                "{}",
+                b.name
+            );
+            assert_eq!(
+                (b.lens_env, b.cruise, b.highlight_belt),
+                (None, None, None),
+                "{}",
+                b.name
+            );
+        }
+    }
+
+    #[test]
+    fn bookmark_v2_ron_roundtrip() {
+        // Every v2 field set, each enum variant used once.
+        let file = TempFile::new("bookmark_v2_ron_roundtrip");
+        let mut saved = sample_bookmarks();
+        let mars = &mut saved[0];
+        mars.anchor = Some("Mars".to_owned());
+        mars.look_at = Some("Phobos".to_owned());
+        mars.up = Some(DVec3::new(0.1, -0.2, 0.97));
+        mars.time_rate = Some(3600.0);
+        mars.exposure = Some(ExposureChoice::Manual);
+        mars.eye_adapted = Some(false);
+        mars.target = Some("Deimos".to_owned());
+        mars.lens_env = Some(LensEnvChoice::DebugGrid);
+        mars.cruise = Some(true);
+        mars.highlight_belt = Some(false);
+        let far = &mut saved[1];
+        far.anchor = Some("Sun".to_owned());
+        far.look_at = Some("TestBH-1".to_owned());
+        far.up = Some(DVec3::Y);
+        far.time_rate = Some(-1e12);
+        far.exposure = Some(ExposureChoice::Auto);
+        far.eye_adapted = Some(true);
+        far.target = Some("TestBH-1".to_owned());
+        far.lens_env = Some(LensEnvChoice::Band);
+        far.cruise = Some(false);
+        far.highlight_belt = Some(true);
+
+        save_bookmarks(&file.0, &saved).unwrap();
+        assert_eq!(load_bookmarks(&file.0).unwrap(), saved);
+    }
+
+    #[test]
+    fn saved_file_omits_unset_fields() {
+        // F12 leaves `lens_scale` out (review m2); a saved file lists only the fields that are
+        // set, so it reads like the hand-written capture sheets.
+        let file = TempFile::new("saved_file_omits_unset_fields");
+        let saved = vec![sample_bookmarks().remove(1)];
+        save_bookmarks(&file.0, &saved).unwrap();
+        let text = std::fs::read_to_string(&file.0).unwrap();
+        assert!(!text.contains("None"), "{text}");
+        assert!(!text.contains("lens_scale"), "{text}");
+        assert!(!text.contains("anchor"), "{text}");
+        assert_eq!(load_bookmarks(&file.0).unwrap(), saved);
     }
 
     #[test]

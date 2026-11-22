@@ -1,5 +1,5 @@
 //! uni-nav: camera and ship control. M0: quaternion 6-DoF camera, logarithmic speed, input, bookmarks.
-//! M1 (Task A6; A0b stubs): camera parenting to a frame, Bookmark v2 and anchor resolution.
+//! M1 (Task A6): camera parenting to a frame, Bookmark v2 and anchor resolution.
 
 pub mod anchor;
 pub mod bookmark;
