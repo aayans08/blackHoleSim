@@ -2048,6 +2048,11 @@ These rulings answer the open decisions above. Tasks follow them, not the "defau
 
 **Performance (riskiest part 1):** if `--bench` shows less than 60 FPS at 1080p internal in any Solar System bookmark at the Wave B gate, the lead dispatches perf-fix tasks before Wave C starts.
 
+**Owner feedback (2026-11-22, on look preview v2.2; binding for Waves B and C, supersedes the HUD artboards where they conflict):**
+- **Stars (B4) and band (B5):** the star field must read vivid and high-contrast, not static: a dense faint field, a few bright stars that pop with a soft PSF glow, clear colour variety (blue-white to orange), a Milky Way glow with dust lanes, visible clusters. Photometry stays physical. Any colour-saturation boost beyond Planck chromaticity is an option labelled "Vivid star colours · non-physical", on by default. Stars twinkle only under an atmosphere (scintillation, B3/B4); in space they move only by parallax and aberration.
+- **Navigation (C3):** spacecraft-style travel, no scene tabs. Destinations carry soft markers. Aiming the view within about 5° of one shows a ring that fills over about 1 s; when it completes, or on a click, an animated goto flies there (accelerate, cruise, decelerate, with parallax visible). Moving away or Esc cancels.
+- **HUD (C4/C5):** information is soft and collapsed by default: one muted line per target; a click (or I) expands the card. Honesty labels stay on screen but small and muted, expandable for detail.
+
 ## Riskiest parts
 
 1. **60 FPS on the fanless M3, sustained.** ~332 k star splats + up to 300 k asteroid points + four atmospheres + bloom; m0.1 measured the M0 star pass at 0.07–0.27 ms for 9 096 stars, which scales to 2.5–9.9 ms if linear, and the same lens view at 101–186 ms across one session as the M3 heated. Mitigation: the per-pass budget table (12.35 ms ≤ 13 ms), a written fallback ladder per expensive pass, the 60-s sustained bench with the gate on its last 10 s, perf-fix tasks before Wave C and before tagging.
