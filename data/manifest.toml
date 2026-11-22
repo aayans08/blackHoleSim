@@ -50,7 +50,10 @@ baked_path = "data/baked/bsc5.bin"
 # into data/baked/athyg_m10.bin (329,768 stars, 9,233,520 B) and data/baked/athyg_names.ron (3,505 named
 # stars, 445,882 B); `uni-bake exo` (below) then sets the exoplanet-host flag in athyg_m10.bin. Both outputs
 # are CC BY-SA 4.0 derived data (ShareAlike). The BSC5 catalogue (entry "bsc5" above) supplies Johnson V and
-# B−V for 23 of the brightest stars. Git LFS object: the repository file
+# B−V for 23 of the brightest stars. Re-baked on 2026-11-22 (Task A7 fix round 1) with the Tycho → Johnson
+# conversion of ESA Table 1.3.4 (entry "esa-sp1200-vol1") instead of a BT−VT clamp to [−0.2, 1.8], and red
+# dwarfs coloured by the dwarf sequence (entry "mamajek-dwarf-colours"); the same raw file (sha256 below),
+# and athyg_names.ron and exoplanets.ron came out byte-identical. Git LFS object: the repository file
 # https://codeberg.org/astronexus/athyg/src/branch/main/data/subsets/athyg_40_reduced_m10.csv.gz is an LFS
 # pointer (oid sha256:a9ec5d51…, size 27,587,896 B); the url below serves the object itself.
 # Documentation read for the column semantics (downloaded 2026-11-22, deleted with the cache):
@@ -72,8 +75,10 @@ raw_path = "data/cache/athyg-m10/athyg_40_reduced_m10.csv.gz"
 baked_path = "data/baked/athyg_m10.bin"
 
 # Mean dwarf colours by spectral type, used for the B−V of the 650 AT-HYG stars that have no colour index
-# but a spectral type. The integer-subtype B−V values are transcribed into tools/bake/src/athyg.rs
-# (`DWARF_BV`), so the file itself is not needed for a re-bake. Version 2022.04.16.
+# but a spectral type, and (columns Mv and B-V, K4V–M9V) for the B−V of the 354 red dwarfs whose Tycho
+# BT−VT is redder than ESA Table 1.3.4. The values are transcribed into tools/bake/src/athyg.rs
+# (`DWARF_BV`, `DWARF_MV_BV`), so the file itself is not needed for a re-bake. Version 2022.04.16;
+# re-downloaded for the fix round with the same sha256.
 [[entry]]
 id = "mamajek-dwarf-colours"
 url = "https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt"
@@ -82,6 +87,34 @@ license = "no licence stated; published scientific values (cite Pecaut & Mamajek
 credit = "Pecaut, M. J. & Mamajek, E. E. 2013, ApJS 208, 9, Table 5; E. Mamajek, A Modern Mean Dwarf Stellar Color and Effective Temperature Sequence, v2022.04.16"
 raw_path = "data/cache/athyg-m10/ref/EEM_dwarf_UBVIJHK_colors_Teff.txt"
 baked_path = "data/baked/athyg_m10.bin"
+
+# ESA 1997, The Hipparcos and Tycho Catalogues, ESA SP-1200 vol. 1 (11,456,841 B, downloaded 2026-11-22 for
+# Task A7 fix round 1). §1.3 Appendix 4 (p. 57), Table 1.3.4 "Transformation from the Tycho photometric
+# system to Johnson" is transcribed into tools/bake/src/athyg.rs (`TYCHO_TABLE_1_3_4`), so the PDF is not
+# needed for a re-bake. The same appendix says the linear transformation "should not be applied to M-type
+# stars", which is why red dwarfs take the dwarf sequence instead.
+[[entry]]
+id = "esa-sp1200-vol1"
+url = "https://www.cosmos.esa.int/documents/532822/552851/vol1_all.pdf"
+sha256 = "f6182096bf31bbdd2e37516da98619305de15cb06c9eecf713cdd3e8a9c6e1be"
+license = "no licence stated; published scientific values (cite ESA 1997, SP-1200)"
+credit = "ESA 1997, The Hipparcos and Tycho Catalogues, ESA SP-1200, vol. 1, §1.3 Appendix 4 (M. Grenon), Table 1.3.4"
+raw_path = "data/cache/athyg-m10/ref/vol1_all.pdf"
+baked_path = "data/baked/athyg_m10.bin"
+
+# Third Catalogue of Nearby Stars, preliminary version (CNS3, CDS V/70A; catalog.dat.gz 217,756 B, sha256
+# below; ReadMe sha256 ccd1e958e18e5ffd0b6ee2df4c399b6a24984e2264bbf6d5fc26e5f53da52032). Validation only:
+# Task A7 fix round 1 compared the red-dwarf colours with its Johnson B−V and V (matched on the AT-HYG `gl`
+# column; median CNS3 − baked B−V +0.021, MAD 0.023, 96 dwarfs). The bake does not read it. cdsarc timed
+# out, so the CfA VizieR mirror was used.
+[[entry]]
+id = "cns3"
+url = "https://vizier.cfa.harvard.edu/ftp/cats/V/70A/catalog.dat.gz"
+sha256 = "85e5587e35f29638d2bbbec5ef0daa9d375595668c5a1b4658cc4374667afe62"
+license = "no licence stated; CDS catalogue V/70A (cite Gliese & Jahreiss 1991)"
+credit = "Gliese, W. & Jahreiss, H. 1991, Preliminary Version of the Third Catalogue of Nearby Stars, CDS V/70A"
+raw_path = "data/cache/athyg-m10/ref/cns3/catalog.dat.gz"
+baked_path = "none (validation of the red-dwarf colours of data/baked/athyg_m10.bin; not read by the bake)"
 
 # NASA Exoplanet Archive, Planetary Systems Composite Parameters (pscomppars): one TAP query on 2026-11-22,
 # 6,473 planets around 4,865 hosts, 1,508,523 B. Baked by
@@ -417,4 +450,114 @@ license = "public JPL Solar System Dynamics data (no stated terms; cited as the 
 credit = "Giorgini, JD and JPL Solar System Dynamics Group, NASA/JPL Horizons On-Line Ephemeris System, https://ssd.jpl.nasa.gov/horizons/, data retrieved 2026-Nov-22; DE441 (Park et al. 2021, AJ 161, 105) and JPL satellite ephemerides"
 raw_path = "data/cache/horizons/0*-observer-*.json"
 baked_path = "data/golden/sky_spots.ron"
+
+# JPL SBDB asteroids (A9 Step 2), fetched 2026-11-22 17:29 UTC by
+# `cargo run -p uni-bake -- sbdb --out-dir data/baked` (SBDB Query API 1.0; GET with full-prec=1).
+# Counts first (limit=1, lead ruling 11): N(H < 14) = 33 414, N(H <= 14) = 33 681, N(H <= 14.5) = 53 047,
+# N(H <= 15) = 85 726; H <= 14 stands. The count answers (141 B each) are data/cache/sbdb-asteroids/count-*.json.
+# The full query below returned 33 681 rows, 6 374 822 B. Three rows were skipped as not closed and complete:
+# (2002 PD153) (e = 0, no mean anomaly), (A/2024 U2) and (A/2026 T3) (e > 1). Baked: 33 678 records,
+# asteroids.bin 2 694 256 B (16 + 80 x 33 678), sha256 f02c2c4824032c3e30111472e19253f22c3b250deedb949bbc0e19f167c7109d;
+# asteroid_names.txt 642 311 B, sha256 5bb9a2c885941684533fcf04e9de174afbfb296d7222a07a47eb88eef4cf69f6.
+# SBDB answers change as orbits are refit, so a later fetch differs; the baked files are the reproducible artefact.
+[[entry]]
+id = "sbdb-asteroids"
+url = "https://ssd-api.jpl.nasa.gov/sbdb_query.api?fields=spkid,full_name,a,e,i,om,w,ma,epoch,H,G,diameter,albedo&sb-kind=a&sb-cdata=%7B%22AND%22%3A%5B%22H%7CLE%7C14%22%5D%7D&full-prec=1"
+sha256 = "f11fc5e1887def0304b63b715cbfb13303660bf7b6acfd013746716626adbf8d"
+license = "public JPL Solar System Dynamics data (no stated terms)"
+credit = "JPL Small-Body Database, Solar System Dynamics Group, Jet Propulsion Laboratory / Caltech, under contract with NASA; SBDB Query API, data retrieved 2026-Nov-22"
+raw_path = "data/cache/sbdb-asteroids/asteroids-HLE14.json"
+baked_path = "data/baked/asteroids.bin"
+
+# JPL SBDB comets (A9 Step 2), same run: sb-kind=c sb-ns=n sb-xfrag=1 (numbered periodic, fragments
+# excluded; 506 rows, 92 156 B, sha256 c441591403917229a57b71f2e12d5a236e84ead1c366cbb7e04f4723bfdb533a) and
+# sb-kind=c sb-ns=u (3 479 rows, 526 267 B, sha256 686330c87ac52972ffaaa6dd0f72d2c4e88ae1e0c87660d7eaa5caf9b07c6299),
+# of which C/1995 O1, C/2020 F3, C/1996 B2, C/2006 P1, C/2023 A3 and C/2011 L4 are kept; fields
+# spkid,full_name,e,q,i,om,w,tp,epoch,M1,K1,diameter, full-prec=1. sha256 below: both answers concatenated in
+# that order (`cat data/cache/sbdb-comets/*.json | shasum -a 256`). With fragments, sb-ns=n gives 610 rows.
+# The comet answers are not byte-stable: consecutive fetches alternated between two byte-different answers with
+# identical parsed rows, so this sha256 identifies this fetch only. A complete re-bake 6 minutes later (scratch
+# directory) reproduced all five baked files byte for byte except their "fetched" header lines.
+# Baked: 512 comets, comets.ron 146 293 B, sha256 503ddcff10324ece0d46536fe86dbc1bc358ae21a86d90186498efedc3f6462a.
+[[entry]]
+id = "sbdb-comets"
+url = "https://ssd-api.jpl.nasa.gov/sbdb_query.api?fields=spkid,full_name,e,q,i,om,w,tp,epoch,M1,K1,diameter&sb-kind=c&sb-ns=n&sb-xfrag=1&full-prec=1"
+sha256 = "fd09a1d5a2e6673a31d2ea8e9bc92cb718c7ed1b639bccf0867b18e94cc49f23"
+license = "public JPL Solar System Dynamics data (no stated terms)"
+credit = "JPL Small-Body Database, Solar System Dynamics Group, Jet Propulsion Laboratory / Caltech, under contract with NASA; SBDB Query API, data retrieved 2026-Nov-22"
+raw_path = "data/cache/sbdb-comets/*.json"
+baked_path = "data/baked/comets.ron"
+
+# JPL SSD planetary-satellite mean elements (A9 Step 3), fetched 2026-11-22 by
+# `cargo run -p uni-bake -- sats --out data/baked/sat_elements.ron`: 582 924 B, 461 rows (Puck listed twice).
+# Baked together with jpl-sats-phys: 460 moons, sat_elements.ron 155 578 B,
+# sha256 1385b9586a9dfb360feaf91a3122cc64d5db90b1c5f872ce5a62ebf66071537e.
+[[entry]]
+id = "jpl-sats-elem"
+url = "https://ssd.jpl.nasa.gov/sats/elem/"
+sha256 = "52c7f383c284bc9300fd151758d1df80c43993e3d1b1a1143554430c80032ed5"
+license = "public JPL Solar System Dynamics data (no stated terms)"
+credit = "Planetary Satellite Mean Elements, JPL Solar System Dynamics Group, https://ssd.jpl.nasa.gov/sats/elem/, retrieved 2026-Nov-22"
+raw_path = "data/cache/jpl-sats/elem.html"
+baked_path = "data/baked/sat_elements.ron"
+
+# JPL SSD planetary-satellite physical parameters (A9 Step 3), same run: 96 641 B, 46 moons (GM for 43; three are
+# upper limits only).
+[[entry]]
+id = "jpl-sats-phys"
+url = "https://ssd.jpl.nasa.gov/sats/phys_par/"
+sha256 = "9a9c004d950923ea368a8c4815d813c9c232c332d1586402a23b15d9581370d1"
+license = "public JPL Solar System Dynamics data (no stated terms)"
+credit = "Planetary Satellite Physical Parameters, JPL Solar System Dynamics Group, https://ssd.jpl.nasa.gov/sats/phys_par/, retrieved 2026-Nov-22"
+raw_path = "data/cache/jpl-sats/phys_par.html"
+baked_path = "data/baked/sat_elements.ron"
+
+# NASA NSSDCA fact sheets (A9 Step 3), fetched 2026-11-22 by
+# `cargo run -p uni-bake -- facts --out data/baked/body_facts.ron`, which checks every hand-transcribed number
+# against its sheet: the planetary fact table (the directory index, url below), galileanfact_table.html and
+# sun, mercury, venus, earth, moon, mars, jupiter, saturn, uranus, neptune, pluto, joviansat, saturniansat,
+# uraniansat and neptuniansat `fact.html`: 17 pages, 225 397 B. sha256 below: the pages concatenated in file-name
+# order (`cat data/cache/facts/*.html | shasum -a 256`, the index saved as index.html). Baked: 32 bodies,
+# body_facts.ron 23 831 B, sha256 97fd80a8196bb9d085b10fb3d3eb3fd4b0f09a45c8306eff48b72dc63d164d91.
+[[entry]]
+id = "nssdca-facts"
+url = "https://nssdc.gsfc.nasa.gov/planetary/factsheet/"
+sha256 = "af58043733f22d6fc751a75e3c1bb0d1e1b865ac05682b7b61a8419f4a343975"
+license = "public NASA data (US Government work)"
+credit = "Williams, D. R., Planetary Fact Sheets, NASA Space Science Data Coordinated Archive, NASA Goddard Space Flight Center, retrieved 2026-Nov-22"
+raw_path = "data/cache/facts/*.html"
+baked_path = "data/baked/body_facts.ron"
+
+# Inter 4.1 (A9 Step 4). The release zip is 33 707 794 B, more than 25 % above the plan's "<= 15 MB (confirm)",
+# so it was not downloaded whole: its central directory (last 65 536 B) and the five members below were read
+# with HTTP range requests (877 074 B in all), and each inflated member matched the zip's CRC32 and size. The
+# zip itself: Last-Modified Sat, 16 Nov 2024 00:27:05 GMT, ETag "0x8DD05D5660F819E". Members, unmodified:
+#   extras/ttf/Inter-Light.ttf    412 844 B  sha256 164414f0aacbe98a7e64addc43f7b3bfd2e32f7b90e101feeab227f14c371bda
+#   extras/ttf/Inter-Regular.ttf  411 640 B  sha256 40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82
+#   extras/ttf/Inter-Medium.ttf   417 300 B  sha256 97ad806f526e41546d46365bb3a393145f75b7b1568913db74549ad8b8dba872
+#   extras/ttf/Inter-SemiBold.ttf 419 744 B  sha256 78a843fade9d4612a5567302fb595b56976eb5fcebf4fea5a5912d638bafcde3
+#   LICENSE.txt -> OFL-Inter.txt    4 380 B  sha256 262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a
+# sha256 below: the five members concatenated in the order Light, Medium, Regular, SemiBold, LICENSE.txt.
+[[entry]]
+id = "fonts-inter"
+url = "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip"
+sha256 = "603995d50300e12f27f64591ca76c9f1c2c2c793e333e5322427657a58c43efc"
+license = "SIL Open Font License 1.1"
+credit = "Inter, copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)"
+raw_path = "data/cache/fonts/inter/"
+baked_path = "data/fonts/Inter-*.ttf"
+
+# IBM Plex Mono 2.5.0 (A9 Step 4): release `@ibm/plex-mono@2.5.0`, ibm-plex-mono.zip, 6 940 652 B. Kept, unmodified:
+#   fonts/complete/ttf/IBMPlexMono-Light.ttf    172 560 B  sha256 feca3787130b6e71a0edb1cfc17c2ae7780443888554207a8981de43ef755d36
+#   fonts/complete/ttf/IBMPlexMono-Regular.ttf  173 052 B  sha256 7c6fbddca4b700be918f5f6183d9bd4464fa427fe435f0b480d77fe2bb8c5a43
+#   fonts/complete/ttf/IBMPlexMono-Medium.ttf   174 008 B  sha256 98fbd727aae340b236955879dabed4d991aac9e8e90b3b2a67ce4a59221cc97c
+#   LICENSE.txt -> OFL-IBMPlexMono.txt            4 456 B  sha256 7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da
+[[entry]]
+id = "fonts-ibm-plex-mono"
+url = "https://github.com/IBM/plex/releases/download/%40ibm%2Fplex-mono%402.5.0/ibm-plex-mono.zip"
+sha256 = "6d23f01257663d8cc49a0d64c22ced630b79e0e2a0ac08a0da86e9a38bbc481c"
+license = "SIL Open Font License 1.1"
+credit = "IBM Plex Mono, copyright 2017 IBM Corp., with Reserved Font Name \"Plex\" (https://github.com/IBM/plex)"
+raw_path = "data/cache/fonts/plex/ibm-plex-mono.zip"
+baked_path = "data/fonts/IBMPlexMono-*.ttf"
 # --- end A9 ---

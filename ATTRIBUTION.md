@@ -24,7 +24,8 @@ Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons
 **`athyg_m10.bin` and `athyg_names.ron` are derived data and are themselves licensed CC BY-SA 4.0** (ShareAlike): anyone
 who redistributes them, or data derived from them, must do so under the same licence with this credit. Changes made
 by `uni-bake athyg`: rows without a usable distance and the Sun are dropped; positions are recomputed from RA, Dec and
-distance; Tycho magnitudes are converted to Johnson V and B−V; 23 of the brightest stars take their Johnson V and B−V
+distance; Tycho magnitudes are converted to Johnson V and B−V (red dwarfs take the B−V of the main-sequence dwarf
+sequence at their absolute magnitude); 23 of the brightest stars take their Johnson V and B−V
 from the Yale Bright Star Catalogue (credited above); stars without a colour index get a B−V from their spectral type;
 velocities and colours are stored as 16-bit floats; names are reformatted (Greek Bayer letters).
 
@@ -48,10 +49,15 @@ Archive's overview paper, which replaces Akeson et al. 2013). Each planet's para
 archive cites for it.
 
 Published values used by the star bake (`tools/bake/src/athyg.rs`):
-- Tycho → Johnson photometry, V = VT − 0.090 (BT−VT) and B−V = 0.850 (BT−VT), valid for −0.2 < BT−VT < 1.8: ESA 1997,
-  *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §2.2, eqs. 2.2.1–2.2.2 (simple form of §1.3 Appendix 4).
-- Mean main-sequence B−V by spectral type: Pecaut, M. J. & Mamajek, E. E. 2013, ApJS 208, 9, Table 5, in E. Mamajek's
+- Tycho → Johnson photometry, ESA 1997, *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §1.3 Appendix 4
+  (M. Grenon), Table 1.3.4, interpolated between its nodes and extrapolated with its end values as ESA prescribes
+  (the simple form V = VT − 0.090 (BT−VT), B−V = 0.850 (BT−VT) is eq. 1.3.20 and §2.2 eqs. 2.2.1–2.2.2).
+- Mean main-sequence B−V by spectral type, and B−V against absolute magnitude for the red dwarfs that ESA's
+  transformation does not cover: Pecaut, M. J. & Mamajek, E. E. 2013, ApJS 208, 9, Table 5, in E. Mamajek's
   version 2022.04.16 ([EEM_dwarf_UBVIJHK_colors_Teff.txt](https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt)).
+
+Used to check the red-dwarf colours, not read by the bake: Gliese, W. & Jahreiss, H. 1991, *Preliminary Version of
+the Third Catalogue of Nearby Stars* (CNS3), CDS catalogue V/70A.
 <!-- /A7 -->
 
 <!-- A9 -->
@@ -66,6 +72,45 @@ NASA. The underlying ephemerides, as each answer names them: DE441 for the Sun, 
 and DE441", AJ 161, 105); the JPL satellite ephemerides mar099, jup365, sat441, ura184, nep098 and plu060 for the
 other moons; the JPL small-body orbit solutions JPL#75 (1P/Halley), JPL#48 (1 Ceres) and JPL#31 (C/2020 F3).
 Licence: public JPL Solar System Dynamics data; the Horizons manual states no terms beyond the citation.
+
+**JPL Small-Body Database** (`data/baked/asteroids.bin`, `data/baked/asteroid_names.txt`: every asteroid with
+H ≤ 14 whose orbit is closed and complete, 33 678 objects; `data/baked/comets.ron`: 506 numbered periodic comets
+without fragments, plus C/1995 O1, C/2020 F3, C/1996 B2, C/2006 P1, C/2023 A3 and C/2011 L4). Osculating
+orbital elements and physical parameters retrieved through the SBDB Query API
+(<https://ssd-api.jpl.nasa.gov/sbdb_query.api>) on 2026-11-22. Credit: JPL Small-Body Database, Solar System
+Dynamics Group, Jet Propulsion Laboratory, California Institute of Technology, under contract with NASA
+(<https://ssd.jpl.nasa.gov/tools/sbdb_query.html>). The orbit solutions are JPL's and the Minor Planet Center's, as
+SBDB records per object. Licence: public JPL Solar System Dynamics data (no stated terms).
+
+**JPL planetary-satellite mean elements and physical parameters** (`data/baked/sat_elements.ron`, 460 moons).
+"Planetary Satellite Mean Elements" (<https://ssd.jpl.nasa.gov/sats/elem/>) and "Planetary Satellite Physical
+Parameters" (<https://ssd.jpl.nasa.gov/sats/phys_par/>), JPL Solar System Dynamics Group, retrieved 2026-11-22.
+They are fitted to the JPL satellite ephemerides that each row names (MAR099, JUP365, JUP347–349, SAT415–480,
+URA117/182/184, NEP098/104/105, PLU060; DE405/LE405 for the Moon) and cite, among others, Jacobson (2009, AJ 137,
+4322), Brozović & Jacobson (2009, AJ 137, 3834; 2024, AJ 167, 256), Jacobson et al. (2012, AJ 144, 132), Nimmo et
+al. (2017, Icarus 287, 12) and Archinal et al. (2018, CMDA 130:22). The reference-plane poles that JPL does not
+tabulate are the IAU WGCCRE 2015 planet poles (Archinal et al. 2018, via NAIF `pck00011.tpc`) and the J2000
+ecliptic pole with the IAU 1976 obliquity 84381.448″ (Lieske et al. 1977, A&A 58, 1). Licence: public JPL Solar
+System Dynamics data (no stated terms).
+
+**NASA NSSDCA fact sheets** (`data/baked/body_facts.ron`: the Sun, the planets, Pluto, the Moon and 21 moons,
+hand-curated). Williams, D. R., Planetary Fact Sheets, NASA Space Science Data Coordinated Archive (NSSDCA), NASA
+Goddard Space Flight Center, <https://nssdc.gsfc.nasa.gov/planetary/factsheet/>, retrieved 2026-11-22: the
+planetary fact table, the Small Worlds table and the sheets for the Sun, each planet, the Moon, Pluto and the
+Jovian, Saturnian, Uranian and Neptunian satellites. Each entry's `source` lists its sheets. Licence: public NASA
+data (US Government work).
+
+### Fonts
+
+**Inter 4.1** (`data/fonts/Inter-Light.ttf`, `Inter-Regular.ttf`, `Inter-Medium.ttf`, `Inter-SemiBold.ttf`),
+copyright 2016 The Inter Project Authors (<https://github.com/rsms/inter>), from the release archive
+`Inter-4.1.zip` (`extras/ttf/`), unmodified. Licence: SIL Open Font License 1.1, full text in
+`data/fonts/OFL-Inter.txt`.
+
+**IBM Plex Mono 2.5.0** (`data/fonts/IBMPlexMono-Light.ttf`, `IBMPlexMono-Regular.ttf`, `IBMPlexMono-Medium.ttf`),
+copyright 2017 IBM Corp., with Reserved Font Name "Plex" (<https://github.com/IBM/plex>), from the release archive
+`ibm-plex-mono.zip` of `@ibm/plex-mono@2.5.0` (`fonts/complete/ttf/`), unmodified. Licence: SIL Open Font License
+1.1, full text in `data/fonts/OFL-IBMPlexMono.txt`.
 <!-- /A9 -->
 
 ## Textures
