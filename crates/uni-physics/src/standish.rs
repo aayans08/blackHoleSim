@@ -384,49 +384,89 @@ mod tests {
         [400.0, 15.0, 4_000_000.0],
     ];
 
-    /// How the tests read the page's "nominal errors" (A1 fix round 1, review I1). The page
-    /// does not say whether they are maxima or RMS values. Against the DE441 goldens every
-    /// planet's RMS error over the spots is within its nominal value (one exception below),
-    /// while single spots exceed it by up to 1.71×. So the tests read a nominal error as an
-    /// RMS figure and assert, for every planet and quantity:
-    /// - RMS over the spots ≤ nominal;
-    /// - every spot ≤ nominal where it measures so, and ≤ 2 × nominal (a peak bound for an
-    ///   RMS figure: a sinusoid peaks at √2 × its RMS) for the entries in the `PEAK_*` lists,
-    ///   each with its measured worst.
+    /// An error-table entry that the DE441 goldens exceed: (planet, quantity: 0 = λ, 1 = φ,
+    /// 2 = ρ, ceiling in the table's unit).
+    type Over = (Planet, usize, f64);
+    const QUANTITY: [&str; 3] = ["λ [″]", "φ [″]", "ρ [km]"];
+
+    /// How the error-table tests assert the page (A1 fix round 2, review r1 I1).
     ///
-    /// 1800–2050, single spots over the nominal (worst / nominal): Mercury λ 17.40″ / 15″,
-    /// φ 1.04″ / 1″, ρ 1 212 / 1 000 km; Mars λ 58.77″ / 40″; Saturn ρ 1.87e6 / 1.5e6 km;
-    /// Uranus λ 79.04″ / 50″, φ 2.23″ / 2″, ρ 1.34e6 / 1e6 km; Neptune ρ 2.42e5 / 2e5 km (read
-    /// about the SSB; see the module doc).
-    const PEAK_1800_2050: [(Planet, usize); 9] = [
-        (Planet::Mercury, 0),
-        (Planet::Mercury, 1),
-        (Planet::Mercury, 2),
-        (Planet::Mars, 0),
-        (Planet::Saturn, 2),
-        (Planet::Uranus, 0),
-        (Planet::Uranus, 1),
-        (Planet::Uranus, 2),
-        (Planet::Neptune, 2),
+    /// The brief's bound: every spot within the page's nominal error. The tests assert exactly
+    /// that for every planet and quantity, except the entries in an `*_OVER_*` list. The
+    /// goldens (DE441) exceed the page there. Reading the fit about another origin (the SSB, or
+    /// the planet's Jacobi centre) does not remove them: `fit_origin_against_horizons` shows
+    /// that Mercury, Mars λ, Uranus λ and Neptune ρ stay over under every reading. About the
+    /// SSB, Saturn ρ and Uranus φ and ρ would come within the page, while Uranus λ grows from
+    /// 79″ to 114″. For each listed entry the test asserts:
+    /// - that it is over its nominal, so each list holds exactly the entries the goldens
+    ///   exceed: an entry back within the page fails the test until it is taken off the list;
+    /// - that it is at or below its ceiling: the measured value × 1.1, rounded up to three
+    ///   significant figures. That is a regression guard, not a published figure; whether
+    ///   these exceedances are accepted is the lead's ruling (fix round 2, concern 1).
+    ///
+    /// The page says "nominal errors" and does not say whether they are maxima or RMS values
+    /// (re-read 2026-11-22). The tests therefore also assert RMS over the spots ≤ nominal,
+    /// with its own exact list. This is evidence for the RMS reading, which the page neither
+    /// states nor rules out: every 1800–2050 RMS is within the page.
+    ///
+    /// 1800–2050, spots over the nominal (measured worst / nominal → ceiling): Mercury λ
+    /// 17.40″ / 15″ → 19.2″ (2026-11-20), φ 1.043″ / 1″ → 1.15″ (1950), ρ 1 212 / 1 000 km →
+    /// 1 340 km (1950); Mars λ 58.77″ / 40″ → 64.7″ (2050); Saturn ρ 1.874e6 / 1.5e6 km →
+    /// 2.07e6 km (1900); Uranus λ 79.04″ / 50″ → 87.0″ (2050), φ 2.226″ / 2″ → 2.45″ (1900),
+    /// ρ 1.341e6 / 1e6 km → 1.48e6 km (1800); Neptune ρ 2.419e5 / 2e5 km → 2.67e5 km (2000;
+    /// read about the SSB, see the module doc).
+    const PEAK_OVER_1800_2050: [Over; 9] = [
+        (Planet::Mercury, 0, 19.2),
+        (Planet::Mercury, 1, 1.15),
+        (Planet::Mercury, 2, 1_340.0),
+        (Planet::Mars, 0, 64.7),
+        (Planet::Saturn, 2, 2_070_000.0),
+        (Planet::Uranus, 0, 87.0),
+        (Planet::Uranus, 1, 2.45),
+        (Planet::Uranus, 2, 1_480_000.0),
+        (Planet::Neptune, 2, 267_000.0),
     ];
-    /// 3000 BC – AD 3000 (spots AD 1000 and AD 2500), single spots over the nominal: Mercury
-    /// ρ 1 127 / 1 000 km (AD 1000); Mars ρ 51 372 / 30 000 km (AD 2500).
-    const PEAK_3000BC_3000AD: [(Planet, usize); 2] = [(Planet::Mercury, 2), (Planet::Mars, 2)];
-    /// The one RMS over its nominal: Mars ρ over the two Table 2 spots, 39 100 km against
-    /// 30 000 km (20 626 km at AD 1000, 51 372 km at AD 2500). Two spots do not sample a
-    /// 6 000-year window; it is asserted at its measured value + 10 % pending the lead's
-    /// ruling (fix round 1, concern 1).
-    const RMS_OVER_3000BC_3000AD: [(Planet, usize, f64); 1] = [(Planet::Mars, 2, 43_000.0)];
+    /// 3000 BC – AD 3000 (spots AD 1000 and AD 2500), spots over the nominal: Mercury ρ
+    /// 1 127.4 / 1 000 km → 1 250 km (AD 1000); Mars ρ 51 372 / 30 000 km → 56 600 km (AD 2500).
+    const PEAK_OVER_3000BC_3000AD: [Over; 2] =
+        [(Planet::Mercury, 2, 1_250.0), (Planet::Mars, 2, 56_600.0)];
+    /// The one RMS over its nominal: Mars ρ over the two Table 2 spots, 39 144 km against
+    /// 30 000 km → 43 100 km (20 626 km at AD 1000, 51 372 km at AD 2500). Two spots do not
+    /// sample a 6 000-year window.
+    const RMS_OVER_3000BC_3000AD: [Over; 1] = [(Planet::Mars, 2, 43_100.0)];
+
+    /// Asserts one measured `value` (a planet's worst or RMS error in quantity `q`) as
+    /// described at [`PEAK_OVER_1800_2050`]: ≤ `nominal`, or, for an entry in `over`, above
+    /// `nominal` and ≤ its ceiling.
+    fn assert_entry(what: &str, p: Planet, q: usize, value: f64, nominal: f64, over: &[Over]) {
+        let quantity = QUANTITY[q];
+        match over.iter().find(|&&(pp, qq, _)| (pp, qq) == (p, q)) {
+            None => assert!(
+                value <= nominal,
+                "{p:?} {quantity}: {what} {value} > the page's {nominal}"
+            ),
+            Some(&(_, _, ceiling)) => {
+                assert!(
+                    value > nominal,
+                    "{p:?} {quantity}: {what} {value} is within the page's {nominal} again; take it off the over-nominal list"
+                );
+                assert!(
+                    value <= ceiling,
+                    "{p:?} {quantity}: {what} {value} > its ceiling {ceiling} (page: {nominal})"
+                );
+            }
+        }
+    }
 
     /// Compares every Horizons spot of each barycentre (1..=8 @ 10) whose JD passes `keep`
     /// with Standish, prints the per-spot, worst and RMS errors next to the JPL table, and
-    /// asserts the expected `table` and the bounds described at [`PEAK_1800_2050`].
+    /// asserts the expected `table` and the bounds described at [`PEAK_OVER_1800_2050`].
     fn check_against_horizons(
         keep: impl Fn(f64) -> bool,
         table: Validity,
         jpl: &[[f64; 3]; 8],
-        peak: &[(Planet, usize)],
-        rms_over: &[(Planet, usize, f64)],
+        peak_over: &[Over],
+        rms_over: &[Over],
     ) {
         let mut worst = [[0.0f64; 3]; 8];
         let mut sum_sq = [[0.0f64; 3]; 8];
@@ -486,25 +526,8 @@ mod tests {
         println!("worst |Δv|/|v| {worst_dv:.2e}");
         for (k, p) in Planet::ALL.into_iter().enumerate() {
             for q in 0..3 {
-                let rms_bound = rms_over
-                    .iter()
-                    .find(|&&(pp, qq, _)| (pp, qq) == (p, q))
-                    .map_or(jpl[k][q], |&(_, _, bound)| bound);
-                assert!(
-                    rms(k, q) <= rms_bound,
-                    "{p:?} quantity {q}: RMS {} > {rms_bound}",
-                    rms(k, q)
-                );
-                let peak_bound = if peak.contains(&(p, q)) {
-                    2.0 * jpl[k][q]
-                } else {
-                    jpl[k][q]
-                };
-                assert!(
-                    worst[k][q] <= peak_bound,
-                    "{p:?} quantity {q}: worst {} > {peak_bound}",
-                    worst[k][q]
-                );
+                assert_entry("worst", p, q, worst[k][q], jpl[k][q], peak_over);
+                assert_entry("RMS", p, q, rms(k, q), jpl[k][q], rms_over);
             }
         }
         // Velocities: derivative of the mean ellipse, so within the position error's order.
@@ -512,14 +535,15 @@ mod tests {
     }
 
     /// Every Horizons barycentre spot in AD 1800–2050 against the JPL 1800–2050 error table,
-    /// read as described at [`PEAK_1800_2050`]. Target 399 is not the EMB and is not used.
+    /// asserted as described at [`PEAK_OVER_1800_2050`]. Target 399 is not the EMB and is not
+    /// used.
     #[test]
     fn standish_within_error_table() {
         check_against_horizons(
             |jd| (2_378_495.0..=2_469_807.5).contains(&jd),
             Validity::Table1,
             &JPL_1800_2050,
-            &PEAK_1800_2050,
+            &PEAK_OVER_1800_2050,
             &[],
         );
     }
@@ -532,7 +556,7 @@ mod tests {
             |jd| jd == 2_086_307.5 || jd == 2_634_166.5,
             Validity::Table2,
             &JPL_3000BC_3000AD,
-            &PEAK_3000BC_3000AD,
+            &PEAK_OVER_3000BC_3000AD,
             &RMS_OVER_3000BC_3000AD,
         );
     }
@@ -544,7 +568,9 @@ mod tests {
     /// 43 km). That construction matches Horizons 10@0 to ≤ 126 km at 1950, 2000 and 2026 (it
     /// leaves out the asteroids). Asserted, as measured (ratio of the RMS position errors,
     /// about the Sun / about the SSB): Neptune 4.83, so it reads about the SSB; Jupiter 0.65;
-    /// Saturn 1.02 and Uranus 1.10, too close to leave the page's heliocentric reading.
+    /// Saturn 1.02 and Uranus 1.10, too close to leave the page's heliocentric reading. Also
+    /// asserted: which page entries each planet exceeds about the Sun, the SSB and its Jacobi
+    /// centre (fix round 2; see the comment at `expected_over`).
     #[test]
     fn fit_origin_against_horizons() {
         use crate::bodies::{GM_SUN_DE440_M3S2, system_gm_m3s2};
@@ -616,6 +642,68 @@ mod tests {
             );
             assert!(expected.contains(&ratio), "{p:?}: ratio {ratio}");
             assert_eq!(ssb_fitted(p), ratio > 2.0, "{p:?}");
+        }
+        // A1 fix round 2 (review r1 I1): which of the page's 1800–2050 entries the spots exceed
+        // when the page's state is read about each candidate origin: the Sun, the SSB, and the
+        // planet's Jacobi centre (the barycentre of the Sun and the planets inside its orbit,
+        // from the same Horizons states and DE440 GMs; for Mercury it is the Sun). Asserted as
+        // measured, one string per reading (Sun, SSB, Jacobi) of the quantities over the page.
+        // No single origin, and no per-planet choice, brings every entry within the page:
+        // Mercury's three and Mars λ are over about the Sun and the Jacobi centre (≤ 750 km
+        // from the Sun for Mars) and far over about the SSB; Uranus λ is over under all three
+        // (79″, 114″, 127″ against 50″); Neptune ρ under all three. Saturn meets the page about
+        // the SSB (λ 588″ of 600″, ρ 0.91 × 10⁶ of 1.5 × 10⁶ km) and not about the Sun (ρ
+        // 1.87 × 10⁶ km). Both stay heliocentric (the page's word; RMS ratios 1.02 and 1.10
+        // above, and Uranus λ is worse about the SSB); that is the lead's call (fix round 2,
+        // concern 1).
+        let expected_over: [[&str; 3]; 8] = [
+            ["λφρ", "λφρ", "λφρ"], // Mercury
+            ["", "λφρ", ""],       // Venus
+            ["", "λφρ", ""],       // EM Bary
+            ["λ", "λφρ", "λ"],     // Mars
+            ["", "ρ", ""],         // Jupiter
+            ["ρ", "", "λ"],        // Saturn
+            ["λφρ", "λ", "λρ"],    // Uranus
+            ["λφρ", "ρ", "ρ"],     // Neptune
+        ];
+        for (k, p) in Planet::ALL.into_iter().enumerate() {
+            let mut worst = [[0.0f64; 3]; 3]; // [reading][quantity]
+            for (j, &jd) in jds.iter().enumerate() {
+                assert_eq!(spots[k][j].jd_tdb, jd);
+                let (mut moment, mut total) = (DVec3::ZERO, GM_SUN_DE440_M3S2);
+                for (inner, body) in spots.iter().enumerate().take(k) {
+                    assert_eq!(body[j].jd_tdb, jd);
+                    moment += gm(inner as i32 + 1) * pos_m(&body[j]);
+                    total += gm(inner as i32 + 1);
+                }
+                let (fitted, _) = fitted_state_icrs(p, epoch_of(jd));
+                let origins = [DVec3::ZERO, ssb_from_sun[j], moment / total];
+                for (reading, origin) in origins.into_iter().enumerate() {
+                    let err = ecliptic_errors(fitted, pos_m(&spots[k][j]) - origin);
+                    for q in 0..3 {
+                        worst[reading][q] = worst[reading][q].max(err[q].abs());
+                    }
+                }
+            }
+            let over: Vec<String> = worst
+                .iter()
+                .map(|w| {
+                    (0..3)
+                        .filter(|&q| w[q] > JPL_1800_2050[k][q])
+                        .map(|q| ["λ", "φ", "ρ"][q])
+                        .collect()
+                })
+                .collect();
+            for (reading, w) in ["Sun", "SSB", "Jacobi"].iter().zip(worst) {
+                println!(
+                    "{p:?} about the {reading}: worst λ {:.2}″ φ {:.2}″ ρ {:.0} km",
+                    w[0], w[1], w[2]
+                );
+            }
+            assert_eq!(
+                over, expected_over[k],
+                "{p:?}: over the page (Sun, SSB, Jacobi)"
+            );
         }
     }
 

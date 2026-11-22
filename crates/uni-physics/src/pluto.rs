@@ -217,20 +217,37 @@ mod tests {
         assert!((r / AU - 29.711111).abs() < 1e-6, "{}", r / AU);
     }
 
-    /// Against Horizons 9@10 (DE441), with the accuracy figures quoted in the module doc.
+    /// Against Horizons 9@10 (DE441). The brief's bound is the accuracy Meeus states for
+    /// ch. 37, as quoted in the module doc (A1 fix round 2, review r1 I2):
     /// - λ, φ: Meeus's 0.6″ / 0.2″ at every spot.
-    /// - Position: SLALIB's RMS against DE200, 36 400 km, bounds the RMS of |Δr| over the
-    ///   spots up to 2026 (its comparison spans 1960–2025), and twice it (a peak bound for an
-    ///   RMS figure, as in the Standish error tables) bounds every spot. Meeus states no
-    ///   radius figure.
+    /// - Position: the quote gives no radius figure. SLALIB's RMS position error of the series
+    ///   against DE200, 36 400 km over 1960–2025, bounds the RMS of |Δr| over the four spots
+    ///   1900–2026. Only the 2000 spot lies inside 1960–2025; the wider span is on purpose,
+    ///   because the 1900 spot has the largest |Δr| of the four (37 452 km), so including it
+    ///   makes the check stricter. Every spot's |Δr| is bounded by √2 × 36 400 = 51 477 km, the
+    ///   peak of a sinusoid with that RMS: the test's reading of an RMS figure, not a
+    ///   published bound.
     ///
-    /// Four values exceed those bounds against DE441 and are asserted at their measured value
-    /// rounded up (A1 fix round 1, concern 2, pending the lead's ruling): λ 1.266″ (bound 1.4″)
-    /// and φ 0.311″ (bound 0.35″) at 2050; λ 2.832″ (bound 3.1″) and |Δr| 104 032 km (bound
-    /// 115 000 km) at 2090.
+    /// The spot values over those bounds are listed in `OVER`, under the same rules as the
+    /// Standish error tables (`standish::tests::PEAK_OVER_1800_2050`). Each is asserted to be
+    /// over its bound, so the list holds exactly the exceedances, and at or below a ceiling:
+    /// the measured value × 1.1, rounded up to three significant figures. The ceiling is a
+    /// regression guard pending the lead's ruling (fix round 2, concern 2). Measured → ceiling:
+    /// 2050 λ 1.266″ → 1.40″ and φ 0.3106″ → 0.342″; 2090 λ 2.832″ → 3.12″ and |Δr| 104 032 km →
+    /// 115 000 km. Every other spot value is within Meeus's and SLALIB's figures.
     #[test]
     fn pluto_vs_horizons() {
         const SLALIB_RMS_KM: f64 = 36_400.0;
+        // Per spot: |dλ| ["], |dφ| ["], |Δr| [km].
+        const BOUNDS: [f64; 3] = [0.6, 0.2, std::f64::consts::SQRT_2 * SLALIB_RMS_KM];
+        const QUANTITY: [&str; 3] = ["|dλ| [″]", "|dφ| [″]", "|Δr| [km]"];
+        // (JD TDB, quantity index into BOUNDS, ceiling).
+        const OVER: [(f64, usize, f64); 4] = [
+            (2_469_807.5, 0, 1.40),
+            (2_469_807.5, 1, 0.342),
+            (2_484_417.5, 0, 3.12),
+            (2_484_417.5, 2, 115_000.0),
+        ];
         let jds = [
             2_415_020.5,
             2_433_282.5,
@@ -239,6 +256,7 @@ mod tests {
             2_469_807.5,
             2_484_417.5,
         ];
+        assert!(OVER.iter().all(|&(jd, _, _)| jds.contains(&jd)));
         let spots = horizons_spots(9, 10);
         assert_eq!(spots.len(), jds.len());
         let (mut sum_sq_km, mut count) = (0.0, 0);
@@ -254,17 +272,32 @@ mod tests {
                 count += 1;
             }
             println!(
-                "Pluto JD {:.4}: dλ {dl:+.3}″ dφ {db:+.3}″ dρ {dr:+.0} km |Δr| {miss_km:.0} km",
+                "Pluto JD {:.4}: dλ {dl:+.4}″ dφ {db:+.4}″ dρ {dr:+.0} km |Δr| {miss_km:.0} km",
                 s.jd_tdb
             );
-            let (bound_l, bound_b, bound_km) = match s.jd_tdb {
-                2_469_807.5 => (1.4, 0.35, 2.0 * SLALIB_RMS_KM),
-                2_484_417.5 => (3.1, 0.2, 115_000.0),
-                _ => (0.6, 0.2, 2.0 * SLALIB_RMS_KM),
-            };
-            assert!(dl.abs() <= bound_l, "JD {}: dλ {dl}″", s.jd_tdb);
-            assert!(db.abs() <= bound_b, "JD {}: dφ {db}″", s.jd_tdb);
-            assert!(miss_km <= bound_km, "JD {}: |Δr| {miss_km} km", s.jd_tdb);
+            let measured = [dl.abs(), db.abs(), miss_km];
+            for q in 0..3 {
+                let (value, bound, quantity) = (measured[q], BOUNDS[q], QUANTITY[q]);
+                match OVER.iter().find(|&&(jd, qq, _)| (jd, qq) == (s.jd_tdb, q)) {
+                    None => assert!(
+                        value <= bound,
+                        "JD {}: {quantity} {value} > its bound {bound}",
+                        s.jd_tdb
+                    ),
+                    Some(&(_, _, ceiling)) => {
+                        assert!(
+                            value > bound,
+                            "JD {}: {quantity} {value} is within its bound {bound} again; take it off OVER",
+                            s.jd_tdb
+                        );
+                        assert!(
+                            value <= ceiling,
+                            "JD {}: {quantity} {value} > its ceiling {ceiling} (bound {bound})",
+                            s.jd_tdb
+                        );
+                    }
+                }
+            }
         }
         assert_eq!(count, 4);
         let rms_km = (sum_sq_km / count as f64).sqrt();
