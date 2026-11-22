@@ -1,10 +1,11 @@
 //! uni-gfx: the wgpu 30 platform layer (Metal backend).
 //!
 //! Device and surface setup ([`GpuContext`]), per-frame render targets ([`FrameTargets`]),
-//! the fixed-order pass scheduler ([`Renderer`] + [`RenderFeature`]), GPU pass timing
-//! ([`PassTimer`]), the WGSL `#import` preprocessor ([`ShaderLib`]) and headless
-//! capture ([`CaptureTarget`]). GPU data is f32 and camera-relative; depth is
-//! reversed-Z with an infinite far plane.
+//! the fixed-order pass scheduler ([`Renderer`] + [`RenderFeature`], with the shared group 0
+//! in [`FrameBindings`]), GPU pass timing ([`PassTimer`]), the WGSL `#import` preprocessor
+//! ([`ShaderLib`]) and headless capture ([`CaptureTarget`]). GPU data is f32 and
+//! camera-relative; depth is reversed-Z with an infinite far plane; the HDR target is
+//! pre-exposed and at the internal render resolution (see [`targets`] for the pass contract).
 
 pub mod capture;
 pub mod context;
@@ -17,9 +18,9 @@ pub mod timer;
 
 pub use capture::{CAPTURE_FORMAT, CaptureTarget};
 pub use context::{GpuContext, SurfaceState};
-pub use frame::{CameraUniform, Exposure, FrameCtx, LensView};
+pub use frame::{CameraUniform, Exposure, ExposureUniform, FrameCtx, LensView, exposure_scale};
 pub use proj::reversed_z_infinite_proj;
-pub use renderer::{RenderFeature, Renderer};
+pub use renderer::{FrameBindings, RenderFeature, Renderer};
 pub use shader::{ShaderError, ShaderLib, validate_wgsl};
-pub use targets::{DEPTH_FORMAT, FrameTargets, HDR_FORMAT, LENS_MASK_FORMAT};
-pub use timer::PassTimer;
+pub use targets::{DEPTH_FORMAT, FrameTargets, HDR_FORMAT, HDR_MAX, LENS_MASK_FORMAT};
+pub use timer::{GpuTimings, PassTimer};

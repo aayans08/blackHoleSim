@@ -175,6 +175,8 @@ mod tests {
         };
         assert!(has_fn("common/camera.wgsl", "pixel_dir"));
         assert!(has_fn("common/camera.wgsl", "exposure_scale"));
+        assert!(has_fn("common/camera.wgsl", "scene_pre"));
+        assert!(has_fn("common/camera.wgsl", "star_pre"));
         assert!(has_fn("common/hash.wgsl", "pcg3d"));
         assert!(has_fn("common/color.wgsl", "luminance"));
         assert!(has_fn("common/color.wgsl", "linear_to_srgb"));
@@ -206,7 +208,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dir = pixel_dir(vec2<f32>(gid.xy));
     let h = pcg3d(vec3<u32>(gid.xy, 7u));
     let n = f32(h.x) / 4294967296.0 * TAU / PI;
-    let c = linear_to_srgb(abs(dir) * exposure_scale(camera.exposure.x) * n);
+    let c = linear_to_srgb(abs(dir) * scene_pre() * star_pre() * n);
     textureStore(out_tex, gid.xy, vec4<f32>(c, luminance(c)));
 }
 "#,

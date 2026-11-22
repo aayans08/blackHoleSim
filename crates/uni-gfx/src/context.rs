@@ -1,6 +1,12 @@
 //! GPU device, queue and (optional) window surface setup.
+//!
+//! Error policy (review m6). wgpu's default uncaptured-error handler panics, which would kill
+//! the window app on any per-frame validation error. [`GpuContext`] installs a handler that logs
+//! the error and keeps it for [`GpuContext::take_errors`], and a device-lost callback that does
+//! the same. The window shows them on the HUD; `--capture`, `--bench` and `--selftest` fail on
+//! them, so a broken frame is never published as a measurement.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 
@@ -18,6 +24,50 @@ pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: Option<SurfaceState>,
+    /// Uncaptured GPU errors and device loss since the last [`GpuContext::take_errors`].
+    errors: GpuErrors,
+}
+
+/// Most errors kept between two [`GpuContext::take_errors`] calls; a per-frame error repeats
+/// every frame, and the first ones say what went wrong.
+const MAX_KEPT_ERRORS: usize = 16;
+
+/// Shared between the device's error callbacks and the context.
+#[derive(Clone, Default)]
+struct GpuErrors(Arc<Mutex<Vec<String>>>);
+
+impl GpuErrors {
+    fn push(&self, msg: String) {
+        log::error!("{msg}");
+        // A poisoned lock only means another thread panicked mid-push; keep going.
+        let mut v = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if v.len() < MAX_KEPT_ERRORS {
+            v.push(msg);
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        let mut v = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *v)
+    }
+
+    /// Routes the device's uncaptured errors and its loss into `self`.
+    fn install(&self, device: &wgpu::Device) {
+        let errors = self.clone();
+        device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
+            errors.push(format!("GPU error: {e}"));
+        }));
+        let errors = self.clone();
+        device.set_device_lost_callback(move |reason, msg| {
+            errors.push(format!("GPU device lost ({reason:?}): {msg}"));
+        });
+    }
 }
 
 /// The surface's storage format. Tonemapping renders through the sRGB view
@@ -78,12 +128,15 @@ impl GpuContext {
         };
         surface.configure(&device, &config);
 
+        let errors = GpuErrors::default();
+        errors.install(&device);
         Ok(Self {
             instance,
             adapter,
             device,
             queue,
             surface: Some(SurfaceState { surface, config }),
+            errors,
         })
     }
 
@@ -102,12 +155,15 @@ impl GpuContext {
             .await
             .context("no Metal adapter available")?;
         let (device, queue) = request_device(&adapter).await?;
+        let errors = GpuErrors::default();
+        errors.install(&device);
         Ok(Self {
             instance,
             adapter,
             device,
             queue,
             surface: None,
+            errors,
         })
     }
 
@@ -121,6 +177,12 @@ impl GpuContext {
             s.config.height = h;
             s.surface.configure(&self.device, &s.config);
         }
+    }
+
+    /// Uncaptured GPU errors (and device loss) since the last call, oldest first, at most 16.
+    /// Each was also logged at error level when it happened.
+    pub fn take_errors(&self) -> Vec<String> {
+        self.errors.take()
     }
 
     /// True when the device was created with `TIMESTAMP_QUERY`.
@@ -145,4 +207,21 @@ async fn request_device(adapter: &wgpu::Adapter) -> anyhow::Result<(wgpu::Device
         })
         .await
         .context("requesting the GPU device")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_are_kept_bounded_and_taken_once() {
+        let e = GpuErrors::default();
+        for i in 0..40 {
+            e.push(format!("e{i}"));
+        }
+        let got = e.take();
+        assert_eq!(got.len(), MAX_KEPT_ERRORS);
+        assert_eq!(got[0], "e0");
+        assert!(e.take().is_empty());
+    }
 }

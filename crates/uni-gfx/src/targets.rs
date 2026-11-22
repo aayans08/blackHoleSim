@@ -1,25 +1,52 @@
-//! Per-frame render targets: HDR colour, reversed-Z depth and the lens-capture mask.
+//! Per-frame render targets: HDR colour, reversed-Z depth and the lens-capture mask, all at
+//! the internal render resolution.
+//!
+//! # The background / lens / star contract (design §5.3)
+//!
+//! Features run in a fixed order, and each knows which pixels it owns:
+//! 1. **Background** (no depth): writes every pixel it covers, pre-exposed (see `hdr`). In M0
+//!    that is uni-rel's debug grid, drawn only while a lens is traced; elsewhere the cleared
+//!    black is space. M1's Milky Way band goes here.
+//! 2. **Opaque** geometry (target, M1+).
+//! 3. **Lens pass** (compute): overwrites `hdr` and writes `lens_mask` **only on the pixels it
+//!    traces** (its screen rectangle; the whole frame from inside a horizon). Its escaped rays
+//!    must show the same environment the background draws, so the seam at the rectangle's edge
+//!    is invisible: in M0 both draw the debug grid. Pixels outside the rectangle keep the
+//!    background untouched.
+//! 4. **Stars** (additive): multiply by `1 − lens_mask`, so no star shines through a shadow.
+//!    Any background-like feature that must run after the lens does the same.
+//! 5. **Tonemap** (and post): reads `hdr`, writes the output view.
 
 use glam::UVec2;
 
-/// Scene-linear HDR colour.
+/// Pre-exposed scene-linear HDR colour (Rec. 709 primaries): light × exposure, see
+/// `shaders/common/camera.wgsl`. The tonemap applies AgX to it with no further exposure.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// Reversed-Z depth (near = 1, far = 0; compare `Greater`).
+/// Reversed-Z depth (near = 1, far = 0; compare `Greater`, or `GreaterEqual` for things drawn
+/// exactly on the far plane, such as stars).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-/// Lens mask: 1.0 where the ray was captured by a black hole.
+/// Lens mask, `r` channel: the fraction of the pixel whose light from behind the lens is
+/// captured by a black hole (1 = inside the shadow, 0 = escaped or not traced). Written only by
+/// the lens pass, only on its traced pixels; cleared to 0 every frame. Target (M3): per-pixel
+/// magnification for the star pass (design §5.3 item 6) needs a second channel, so this
+/// format widens then.
 pub const LENS_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-/// The textures every feature renders into.
+/// Largest value any feature writes into `hdr` (below f16's largest finite value, 65504).
+/// Twin of `HDR_MAX` in `shaders/common/camera.wgsl`.
+pub const HDR_MAX: f32 = 60000.0;
+
+/// The textures every feature renders into, at the internal render resolution.
 pub struct FrameTargets {
-    /// Never 0 in either axis.
+    /// Internal render resolution. Never 0 in either axis.
     pub size: UVec2,
-    /// `STORAGE_BINDING | TEXTURE_BINDING | RENDER_ATTACHMENT`.
+    /// Pre-exposed HDR colour. `STORAGE_BINDING | TEXTURE_BINDING | RENDER_ATTACHMENT`.
     pub hdr: wgpu::Texture,
     pub hdr_view: wgpu::TextureView,
     /// `RENDER_ATTACHMENT | TEXTURE_BINDING`; cleared to 0.0 (infinitely far) every frame.
     pub depth: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
-    /// 1.0 = ray captured. `STORAGE_BINDING | TEXTURE_BINDING | RENDER_ATTACHMENT`.
+    /// See [`LENS_MASK_FORMAT`]. `STORAGE_BINDING | TEXTURE_BINDING | RENDER_ATTACHMENT`.
     pub lens_mask: wgpu::Texture,
     pub lens_mask_view: wgpu::TextureView,
 }
@@ -29,8 +56,7 @@ impl FrameTargets {
     /// device's `max_texture_dimension_2d`, so a minimised window or an oversized Retina
     /// surface never produces an invalid texture.
     pub fn new(device: &wgpu::Device, size: UVec2) -> Self {
-        let max = device.limits().max_texture_dimension_2d.max(1);
-        let size = Self::clamp_size(size).min(UVec2::splat(max));
+        let size = Self::fit(device, size);
         let target = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -73,6 +99,13 @@ impl FrameTargets {
 }
 
 impl FrameTargets {
+    /// The size [`FrameTargets::new`] allocates for a request of `size` on `device`: each axis
+    /// clamped to 1..=`max_texture_dimension_2d`.
+    pub fn fit(device: &wgpu::Device, size: UVec2) -> UVec2 {
+        let max = device.limits().max_texture_dimension_2d.max(1);
+        Self::clamp_size(size).min(UVec2::splat(max))
+    }
+
     /// Clamps each axis to at least 1 texel, so a minimised (0×0) window still gets valid targets.
     pub(crate) fn clamp_size(size: UVec2) -> UVec2 {
         size.max(UVec2::ONE)
