@@ -1,0 +1,31 @@
+// JPL Horizons observer tables: test goldens (review I4).
+// Written by `uni-bake horizons --plan m1` (M1 Task A9 Step 1) from the JPL Horizons API
+// https://ssd.jpl.nasa.gov/api/horizons.api (NASA/JPL Horizons API 1.2), fetched Sun Nov 22 08:46:38 2026 Pasadena, USA (Horizons' stamp).
+// Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id "horizons").
+//
+// Query: EPHEM_TYPE=OBSERVER CENTER=500@399 (geocentre) REF_SYSTEM=ICRF TIME_TYPE=UT TLIST_TYPE=JD
+// ANG_FORMAT=DEG CAL_FORMAT=JD EXTRA_PREC=YES CSV_FORMAT=YES; airless, no refraction.
+// target: NAIF id or SBDB designation; observer: NAIF id; jd_utc: Julian Date (UTC) asked for.
+// ra_deg, dec_deg: astrometric ICRF (quantity 1); delta_au: Δ (20); apmag: APmag (9); r_au: r (19);
+// phase_deg: Sun-target-observer angle (24); None where the quantity was not asked for.
+// Jupiter's spot of the plan's quantities '1,20' is the 599 row below (same target, observer and time).
+//
+// Target, quantities and ephemeris source (target [source] from observer [source]):
+//   199        quantities 1,9,19,20,24  Mercury (199) [DE441] from Earth (399) [DE441]
+//   299        quantities 1,9,19,20,24  Venus (299) [DE441] from Earth (399) [DE441]
+//   499        quantities 1,9,19,20,24  Mars (499) [mar099] from Earth (399) [DE441]
+//   599        quantities 1,9,19,20,24  Jupiter (599) [jup365_merged] from Earth (399) [jup365_merged]
+//   699        quantities 1,9,19,20,24  Saturn (699) [sat441l] from Earth (399) [DE441]
+//   799        quantities 1,9,19,20,24  Uranus (799) [ura184_merged] from Earth (399) [ura184_merged]
+//   899        quantities 1,9,19,20,24  Neptune (899) [nep098_merged] from Earth (399) [nep098_merged]
+//   C/2020 F3  quantities 1,20          NEOWISE (C/2020 F3) [JPL#31] from Earth (399) [DE441]
+[
+    (target: "199", observer: 399, jd_utc: 2461364.5, ra_deg: 216.289925074, dec_deg: -11.864964717, delta_au: 0.97535336993455, apmag: Some(-0.431), r_au: Some(0.334088478699), phase_deg: Some(82.3894)),
+    (target: "299", observer: 399, jd_utc: 2461364.5, ra_deg: 201.314712942, dec_deg: -9.352392935, delta_au: 0.3574129277129, apmag: Some(-4.871), r_au: Some(0.720739378016), phase_deg: Some(129.739)),
+    (target: "499", observer: 399, jd_utc: 2461364.5, ra_deg: 150.067042028, dec_deg: 14.36812812, delta_au: 1.27301585999281, apmag: Some(0.651), r_au: Some(1.613672614208), phase_deg: Some(37.7674)),
+    (target: "599", observer: 399, jd_utc: 2461364.5, ra_deg: 148.317737769, dec_deg: 13.632858357, delta_au: 5.20455016157982, apmag: Some(-2.116), r_au: Some(5.322880597412), phase_deg: Some(10.6982)),
+    (target: "699", observer: 399, jd_utc: 2461364.5, ra_deg: 8.331486146, dec_deg: 0.734877993, delta_au: 8.74653339379041, apmag: Some(0.555), r_au: Some(9.419475012161), phase_deg: Some(4.5638)),
+    (target: "799", observer: 399, jd_utc: 2461364.5, ra_deg: 61.553110667, dec_deg: 20.712074736, delta_au: 18.4495727509513, apmag: Some(5.6), r_au: Some(19.43221948175), phase_deg: Some(0.3239)),
+    (target: "899", observer: 399, jd_utc: 2461364.5, ra_deg: 1.824931732, dec_deg: -0.740823361, delta_au: 29.3120541081252, apmag: Some(7.712), r_au: Some(29.87686883459), phase_deg: Some(1.5658)),
+    (target: "C/2020 F3", observer: 399, jd_utc: 2459045.625, ra_deg: 115.934519652, dec_deg: 46.76396745, delta_au: 0.78434409858666, apmag: None, r_au: None, phase_deg: None),
+]
