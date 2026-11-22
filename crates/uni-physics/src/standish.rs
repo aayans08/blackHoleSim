@@ -394,10 +394,10 @@ mod tests {
     /// The brief's bound: every spot within the page's nominal error. The tests assert exactly
     /// that for every planet and quantity, except the entries in an `*_OVER_*` list. The
     /// goldens (DE441) exceed the page there. Reading the fit about another origin (the SSB, or
-    /// the planet's Jacobi centre) does not remove them: `fit_origin_against_horizons` shows
-    /// that Mercury, Mars λ, Uranus λ and Neptune ρ stay over under every reading. About the
-    /// SSB, Saturn ρ and Uranus φ and ρ would come within the page, while Uranus λ grows from
-    /// 79″ to 114″. For each listed entry the test asserts:
+    /// the planet's Jacobi centre) does not remove all of them: `fit_origin_against_horizons`
+    /// shows that Mercury, Mars λ, Uranus λ and Neptune ρ stay over under every reading. About
+    /// the SSB, Saturn ρ and Uranus φ and ρ would come within the page, while Uranus λ grows
+    /// from 79″ to 114″. For each listed entry the test asserts:
     /// - that it is over its nominal, so each list holds exactly the entries the goldens
     ///   exceed: an entry back within the page fails the test until it is taken off the list;
     /// - that it is at or below its ceiling: the measured value × 1.1, rounded up to three
