@@ -3,8 +3,9 @@
 //!
 //! # The M1 frame contract
 //!
-//! Every render feature follows it. `Renderer::render` clears `hdr` and `lens_mask` to 0 and
-//! `depth` to 0.0 (infinitely far) every frame, then runs the features in push order.
+//! It binds every M1 render feature; CLAUDE.md §2 lists which parts are built so far and which
+//! are still targets. `Renderer::render` clears `hdr` and `lens_mask` to 0 and `depth` to 0.0
+//! (infinitely far) every frame, then runs the features in push order.
 //!
 //! ## Exposure split (pre-exposed HDR)
 //!
@@ -15,13 +16,23 @@
 //!   asteroids drawn as points): luminance × `star_pre()`. With "Eye-adapted stars" in effect
 //!   `star_pre` comes from a fixed dark-adapted EV, otherwise `star_pre == scene_pre`: design §7
 //!   item 4's dual exposure, extended to every unresolved source so a planet and a star of equal
-//!   magnitude look equally bright (ruling 5). It is in effect when `eye_adapted && !daylight`
-//!   (the camera inside an atmosphere with the Sun above the horizon hides the stars), and the
-//!   HUD's amber label follows exactly that condition.
-//! - A body between 1.5 px and 4 px in radius blends its factor from `star_pre` to `scene_pre`,
-//!   so the point → disk handover never pops.
-//! - Auto-exposure meters world light only: the meter runs before any sky light or point
-//!   source is written.
+//!   magnitude look equally bright (ruling 5).
+//! - "Eye-adapted stars" is in effect when `ExposureSettings.eye_adapted &&
+//!   !ExposureSettings.daylight`. The app sets `daylight` while the camera is inside an
+//!   atmosphere shell with the Sun above its local horizon, because a real daytime sky hides the
+//!   stars (review m12). The HUD's amber label follows exactly this condition, not
+//!   `FrameCtx.exposure` (review m13).
+//! - A resolved body whose projected radius is between `POINT_LOD_PX` (1.5 px) and
+//!   `BLEND_LOD_PX` (4 px) blends its exposure factor from `star_pre` to `scene_pre` (CPU twin
+//!   `uni_planet::lod_exposure_mix`, B0), so the point → disk handover never pops. The blend is
+//!   labelled as part of "Eye-adapted stars".
+//! - Auto-exposure meters world light only: the meter (pass 9) runs before any sky light or
+//!   point source is written.
+//! - Star brightness against the band depends on the field of view, deliberately (review m26):
+//!   stars are written as E/Ω_pixel and the band as a surface brightness, so at fov 20° a star's
+//!   pixels are (tan 30°/tan 10°)² = 10.7× (+3.42 EV) brighter relative to the band than at
+//!   60°. That is what a camera does when it zooms (point sources gain contrast over extended
+//!   light), so it stays; it is not a bug to fix.
 //! - Every feature clamps what it writes to [`HDR_MAX`].
 //!
 //! ## `lens_mask` channels ([`LENS_MASK_FORMAT`])
@@ -50,24 +61,25 @@
 //!
 //! ## Pass order (push order in `uni-app/src/scene.rs`)
 //!
-//! | # | Feature | Writes | Depth |
-//! |---|---|---|---|
-//! | 1 | `exposure` (auto-exposure resolve; imports `common/exposure.wgsl`, never group 0) | exposure buffer (storage) | — |
-//! | 2 | `band-update` (one environment cube face per frame, when needed) | environment cubemap | — |
-//! | 3 | `background` (the M0 debug grid; only with the debug lens environment and a traced lens) | hdr | — |
-//! | 4 | `sun` (star surfaces) | hdr (world), g | write, `Greater` |
-//! | 5 | `bodies` | hdr (world), g | write, `Greater` |
-//! | 6 | `rings` | hdr (world), g | test only |
-//! | 7 | `comets` | hdr (world), g (nucleus) | nucleus write; coma and tails test only |
-//! | 8 | `atmosphere` (reads `depth`) | hdr, g | none attached |
-//! | 9 | `histogram` (the exposure meter) | meter state | — |
-//! | 10 | `lens` (reads `depth`; skips pixels with depth ≠ 0) | hdr (sky, star exposure), r, g = 0, b | — |
-//! | 11 | `band` | hdr (sky) × (1 − r)(1 − g)(1 − b) | test `GreaterEqual` at depth 0 |
-//! | 12 | `stars` | hdr (sky) × (1 − r)(1 − g) | test `GreaterEqual` at depth 0 |
-//! | 13 | `points` (bodies, the Sun and near stars as points) | hdr (sky) × (1 − r) | test `Greater` at true depth |
-//! | 14 | `asteroids` | hdr (sky) × (1 − r) | test `Greater` at true depth |
-//! | 15 | `bloom` (input clamped) | hdr | — |
-//! | 16 | `tonemap` (upscale + AgX + dither) | output view | — |
+//! | # | Feature | Crate | Writes | Depth |
+//! |---|---|---|---|---|
+//! | 1 | `exposure` (auto-exposure resolve; own bind group: imports `common/exposure.wgsl`, never group 0) | uni-post | exposure buffer (storage) | — |
+//! | 2 | `band-update` (one environment cube face per frame, when needed) | uni-sky | environment cubemap | — |
+//! | 3 | `background` (the M0 debug grid; only with `LensEnv::DebugGrid` and a traced lens; display-referred, so the app runs Manual exposure whenever `DebugGrid` is selected) | uni-rel | hdr | — |
+//! | 4 | `sun` (star surfaces) | uni-planet | hdr (world), g | write, `Greater` |
+//! | 5 | `bodies` | uni-planet | hdr (world), g | write, `Greater` |
+//! | 6 | `rings` | uni-planet | hdr (world), g | test only |
+//! | 7 | `comets` (Wave C) | uni-planet | hdr (world), g (nucleus) | nucleus write; coma and tails test only |
+//! | 8 | `atmosphere` (reads `depth`; dual-source variant: two pipelines, grey-transmittance variant: one) | uni-atmo | hdr, g | none attached |
+//! | 9 | `histogram` (the exposure meter) | uni-post | meter state | — |
+//! | 10 | `lens` (reads `depth`; skips pixels with depth ≠ 0) | uni-rel | hdr (sky, star exposure), r, g = 0, b | — |
+//! | 11 | `band` | uni-sky | hdr (sky) × (1 − r)(1 − g)(1 − b) | test `GreaterEqual` at depth 0 (ruling 4) |
+//! | 12 | `stars` | uni-sky | hdr (sky) × (1 − r)(1 − g) | test `GreaterEqual` at depth 0 |
+//! | 13 | `points` (bodies, the Sun and near stars as points) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
+//! | 14 | `asteroids` (Wave C) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
+//! | 15 | `bloom` (input clamped to `BLOOM_INPUT_MAX`) | uni-post | hdr | — |
+//! | 16 | `tonemap` (upscale + AgX + dither) | uni-post | output view | — |
+//! | — | HUD and overlays (egui) | uni-ui | output view | — |
 //!
 //! **The band is drawn after the opaque passes and the meter** (ruling 4, a deliberate deviation
 //! from design §5.3, where the background comes first). The band is sky light at star exposure,

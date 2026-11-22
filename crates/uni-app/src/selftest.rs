@@ -9,7 +9,9 @@
 //! - then every `gpu_probes` of the M1 render crates (`uni_gfx::probe::ProbeResult`), so far
 //!   uni-gfx's `cube_dir` (`common/cube.wgsl` vs `uni_gfx::env::cube_dir`).
 //!
-//! Probe buffers sit in bind group 2: `post/tonemap.wgsl` claims groups 0 and 1.
+//! Every check runs through `uni_gfx::probe::run_compute`, the same runner the crates'
+//! `gpu_probes` use. The three probes' buffers sit in bind group 2 (`post/tonemap.wgsl` claims
+//! groups 0 and 1); `run_compute` finds that group from the shader.
 
 use std::f64::consts::PI;
 
@@ -19,10 +21,7 @@ use glam::{DVec3, UVec3, Vec3, Vec4};
 use uni_core::{pcg3d, splitmix64};
 use uni_gfx::{GpuContext, ShaderLib};
 use uni_rel::binet::{self, RayEnd};
-use wgpu::util::DeviceExt as _;
 
-/// Bind group of every probe's input (binding 0) and output (binding 1) storage buffers.
-const PROBE_GROUP: u32 = 2;
 /// `@workgroup_size` of every probe's `cs_main`.
 const PROBE_WORKGROUP: u32 = 64;
 
@@ -423,123 +422,28 @@ fn binet_cases() -> Vec<BinetCase> {
     cases
 }
 
-/// Uploads `input` to binding 0 of group [`PROBE_GROUP`], runs the probe's `cs_main` once per
-/// element and reads back binding 1, which holds one `O` per input. Validation errors come back
-/// as `Err`.
+/// Runs the probe's `cs_main` once per element of `input` through
+/// [`uni_gfx::probe::run_compute`] and returns binding 1, which holds one `O` per input.
+/// Validation errors come back as `Err`, naming the probe.
 fn run_probe<I: Pod, O: Pod>(
     gpu: &GpuContext,
     lib: &ShaderLib,
     probe: &str,
     input: &[I],
 ) -> anyhow::Result<Vec<O>> {
-    let device = &gpu.device;
-    let module = lib.module(device, probe)?;
+    let src = lib.compose(probe)?;
     let n = u32::try_from(input.len()).context("too many probe inputs")?;
     let out_size = (input.len() * size_of::<O>()) as u64;
-
-    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("selftest probe bgl"),
-        entries: &[storage(0, true), storage(1, false)],
-    });
-    // Groups below PROBE_GROUP are left empty: the probe binds nothing there.
-    let mut groups: Vec<Option<&wgpu::BindGroupLayout>> = vec![None; PROBE_GROUP as usize];
-    groups.push(Some(&bgl));
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("selftest probe layout"),
-        bind_group_layouts: &groups,
-        immediate_size: 0,
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(probe),
-        layout: Some(&layout),
-        module: &module,
-        entry_point: Some("cs_main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("selftest input"),
-        contents: bytemuck::cast_slice(input),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let buffer = |label: &str, usage: wgpu::BufferUsages| {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: out_size,
-            usage,
-            mapped_at_creation: false,
-        })
-    };
-    let output_buffer = buffer(
-        "selftest output",
-        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    );
-    let readback = buffer(
-        "selftest read-back",
-        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-    );
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("selftest probe bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: input_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output_buffer.as_entire_binding(),
-            },
-        ],
-    });
-    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("selftest"),
-    });
-    {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(probe),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(PROBE_GROUP, &bind_group, &[]);
-        pass.dispatch_workgroups(n.div_ceil(PROBE_WORKGROUP), 1, 1);
-    }
-    enc.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, out_size);
-    gpu.queue.submit(std::iter::once(enc.finish()));
-    if let Some(err) = pollster::block_on(scope.pop()) {
-        anyhow::bail!("{probe}: {err}");
-    }
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    readback.map_async(wgpu::MapMode::Read, .., move |r| {
-        // The receiver outlives the wait below; a send error cannot be acted on here.
-        let _ = tx.send(r);
-    });
-    device
-        .poll(wgpu::PollType::wait_indefinitely())
-        .context("waiting for the probe")?;
-    rx.try_recv()
-        .context("probe read-back callback did not run")?
-        .context("mapping the probe output")?;
-    let out = {
-        let view = readback
-            .get_mapped_range(..)
-            .context("reading the probe output")?;
-        bytemuck::pod_collect_to_vec(&view)
-    };
-    readback.unmap();
-    Ok(out)
+    let bytes = uni_gfx::probe::run_compute(
+        gpu,
+        &src,
+        "cs_main",
+        bytemuck::cast_slice(input),
+        out_size,
+        [n.div_ceil(PROBE_WORKGROUP), 1, 1],
+    )
+    .with_context(|| format!("selftest probe {probe}"))?;
+    Ok(bytemuck::pod_collect_to_vec(&bytes))
 }
 
 #[cfg(test)]
@@ -548,6 +452,10 @@ mod tests {
     use core::mem::offset_of;
     use uni_gfx::validate_wgsl;
     use wgpu::naga;
+
+    /// Bind group of every probe's input (binding 0) and output (binding 1) storage buffers.
+    /// `run_compute` finds it from the shader; group 2 because `post/tonemap.wgsl` claims 0 and 1.
+    const PROBE_GROUP: u32 = 2;
 
     fn probe_module(probe: &str) -> naga::Module {
         let src = probe_lib().compose(probe).unwrap();
@@ -576,15 +484,19 @@ mod tests {
                 .enumerate()
                 .find(|(_, e)| e.name == "cs_main")
                 .unwrap();
-            let used: Vec<naga::ResourceBinding> = module
+            let used: Vec<(naga::ResourceBinding, naga::AddressSpace)> = module
                 .global_variables
                 .iter()
                 .filter(|(h, _)| !info.get_entry_point(ep_index)[*h].is_empty())
-                .filter_map(|(_, v)| v.binding)
+                .filter_map(|(_, v)| Some((v.binding?, v.space)))
                 .collect();
-            let expected = [0, 1].map(|binding| naga::ResourceBinding {
-                group: PROBE_GROUP,
-                binding,
+            // What `uni_gfx::probe::run_compute` binds and nothing else: a read-only input at
+            // binding 0 and a writable output at binding 1 of one group.
+            let (load, store) = (naga::StorageAccess::LOAD, naga::StorageAccess::STORE);
+            let expected = [(0, load), (1, load | store)].map(|(binding, access)| {
+                let group = PROBE_GROUP;
+                let space = naga::AddressSpace::Storage { access };
+                (naga::ResourceBinding { group, binding }, space)
             });
             assert_eq!(used, expected, "{probe}");
         }

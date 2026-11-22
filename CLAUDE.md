@@ -98,13 +98,21 @@ doc comment; every feature follows it)**
 - *Pre-exposed HDR.* `hdr` (Rgba16Float) holds light × exposure, and the tonemap applies AgX with no exposure
   of its own. World light (bodies, the Sun's disk, rings, atmospheres, comets) writes luminance [cd/m²] ×
   `scene_pre()`. Sky light and point sources (catalogue stars, the band, planets/Sun/asteroids drawn as points)
-  write luminance × `star_pre()` (ruling 5). `star_pre == scene_pre` unless "Eye-adapted stars" is in effect
-  (`eye_adapted && !daylight`, which the HUD label follows). A body 1.5–4 px in radius blends from `star_pre` to
-  `scene_pre`. Each factor is `exposure_scale(EV) = 1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 <
-  f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4 at scene EV 15. The exposure buffer is also `STORAGE`,
-  so the auto-exposure resolve can write it on the GPU; the meter reads world light only, before any sky light
-  or point source is written. Environment cubemap texels hold absolute luminance in units of `ENV_UNIT_CD_M2`
-  (1e-4 cd/m²), not pre-exposed.
+  write luminance × `star_pre()` (ruling 5). `star_pre == scene_pre` unless "Eye-adapted stars" is in effect:
+  `ExposureSettings.eye_adapted && !ExposureSettings.daylight`, where the app sets `daylight` while the camera is
+  inside an atmosphere shell with the Sun above its local horizon (a daytime sky hides the stars, review m12). The
+  HUD's amber label follows exactly this condition, not `FrameCtx.exposure` (review m13). A resolved body whose
+  projected radius is between `POINT_LOD_PX` (1.5 px) and `BLEND_LOD_PX` (4 px) blends its exposure factor from
+  `star_pre` to `scene_pre` (CPU twin `uni_planet::lod_exposure_mix`, B0), so the point → disk handover never
+  pops; the blend is labelled as part of "Eye-adapted stars". Each factor is `exposure_scale(EV) =
+  1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 < f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4
+  at scene EV 15. The exposure buffer is also `STORAGE`, so the auto-exposure resolve can write it on the GPU;
+  the meter reads world light only, before any sky light or point source is written. Environment cubemap texels
+  hold absolute luminance in units of `ENV_UNIT_CD_M2` (1e-4 cd/m²), not pre-exposed.
+- *Field-of-view dependence (deliberate, review m26).* Star brightness against the band depends on the field of
+  view: stars are written as E/Ω_pixel, the band as a surface brightness, so at fov 20° a star's pixels are
+  (tan 30°/tan 10°)² = 10.7× (+3.42 EV) brighter relative to the band than at 60°. That is what a camera does
+  when it zooms (point sources gain contrast over extended light), so it stays; it is not a bug to fix.
 - *Lens mask.* `lens_mask` is Rgba16Float (since A0a; m0.1 had R32Float), cleared to 0 every frame. `r`: the
   captured fraction of a traced pixel (1 = shadow). `g`: sky occlusion, 1 − transmittance toward the
   background, written with `BlendOperation::Max` on green only (bodies and comet nuclei their coverage, rings
@@ -113,13 +121,17 @@ doc comment; every feature follows it)**
   what they add by (1 − r)(1 − g), the band also by (1 − b); point sprites and asteroids by (1 − r) only. Built
   at A0a: the lens pass writes (captured, 0, 1, 0) on its traced pixels and the star pass multiplies by (1 − r);
   nothing writes `g` yet.
-- *Pass order.* M1 target: exposure resolve → band-update → background (M0 debug grid, only with the debug lens
-  environment and a traced lens) → sun → bodies → rings → comets → atmosphere → histogram (meter) → lens → band
-  → stars → points → asteroids → bloom → tonemap, then the HUD. Built at A0a: background → lens → stars →
-  tonemap. The lens pass writes `hdr` and `lens_mask` only on the pixels it traces (its screen rectangle, or the
-  whole frame from inside a horizon), and its escaped rays show the same environment as the sky drawn around
-  them (M0: both draw the debug grid). Target (B7): it reads depth and leaves pixels with depth ≠ 0 (a body in
-  front) untouched.
+- *Pass order* (push order in `uni-app/src/scene.rs`; full table with writes and depth in `targets.rs`). M1
+  target, by owning crate: exposure resolve (uni-post; own bind group, never group 0) → band-update (uni-sky) →
+  background (uni-rel: the M0 debug grid, only with `LensEnv::DebugGrid` and a traced lens; it is
+  display-referred, so the app runs Manual exposure whenever `DebugGrid` is selected) → sun → bodies → rings →
+  comets (uni-planet) → atmosphere (uni-atmo; dual-source variant: two pipelines, grey-transmittance variant:
+  one) → histogram meter (uni-post) → lens (uni-rel) → band → stars → points → asteroids (uni-sky) → bloom
+  (input clamped to `BLOOM_INPUT_MAX`) → tonemap (uni-post), then the HUD and overlays (uni-ui). Built at A0a:
+  background → lens → stars → tonemap. The lens pass writes `hdr` and `lens_mask` only on the pixels it traces
+  (its screen rectangle, or the whole frame from inside a horizon), and its escaped rays show the same
+  environment as the sky drawn around them (M0: both draw the debug grid). Target (B7): it reads depth and
+  leaves pixels with depth ≠ 0 (a body in front) untouched.
 - *Band-order deviation (ruling 4).* The band is drawn after the opaque passes and the meter, not first as the
   design (§5.3) puts the background. The band is sky light at star exposure, so it must not be metered, and
   drawing it after the bodies with (1 − g) composites it correctly behind partly transparent atmospheres and

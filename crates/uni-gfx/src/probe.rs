@@ -4,7 +4,8 @@
 //! Each render crate exports `gpu_probes(gpu, lib) -> Vec<ProbeResult>`, and `universe
 //! --selftest` runs them all on the GPU; `cargo test` cannot reach the GPU. A probe is a compute
 //! shader with a read-only storage input at binding 0 and a storage output at binding 1 of one
-//! bind group, run by [`run_compute`].
+//! bind group, run by [`run_compute`]. `--selftest`'s M0 checks (`pcg3d`, `agx`, `binet`) run
+//! through it too, so there is one GPU read-back path to fix.
 
 use anyhow::{Context as _, anyhow};
 use glam::{Vec2, Vec3};
