@@ -47,9 +47,13 @@ const JD_2500: f64 = 2_634_166.5; // AD 2500-01-01 0h
 const JD_HALLEY: f64 = 2_446_502.5; // 1986-03-13 0h
 const JD_NEOWISE_UTC: f64 = 2_459_045.625; // 2020-07-15 03:00 UTC
 
-/// SBDB SPK-IDs (NAIF small-body ids) written as the target of the small-body spots.
-const HALLEY_SPKID: i32 = 1_000_036;
-const CERES_SPKID: i32 = 2_000_001;
+/// NAIF ids written as the target of the small-body spots: 1P/Halley's comet code (also its SBDB
+/// SPK-ID) and (1) Ceres's original-schema asteroid id, 2 000 000 + number, which NAIF's name
+/// table uses. SBDB's SPK-ID for Ceres is the extended-schema 20000001 (NAIF "NAIF Integer ID
+/// codes" Required Reading, §Asteroids); `uni_data::smallbody::asteroid_spkid_from_naif` maps one
+/// to the other (A9 review r0 I1).
+const HALLEY_NAIF: i32 = 1_000_036;
+const CERES_NAIF: i32 = 2_000_001;
 
 /// The moons with Horizons spots, each with the planet whose body centre is the centre.
 const MOONS: [(i32, i32); 19] = [
@@ -215,7 +219,8 @@ pub fn run(options: &[OsString]) -> anyhow::Result<()> {
         String::new(),
         "Query: EPHEM_TYPE=VECTORS REF_SYSTEM=ICRF REF_PLANE=FRAME VEC_CORR=NONE (geometric) OUT_UNITS=KM-S".to_owned(),
         "TIME_TYPE=TDB TLIST_TYPE=JD VEC_TABLE=2 CSV_FORMAT=YES; CENTER=500@<center> (its body centre).".to_owned(),
-        "target, center: NAIF ids (small bodies: SBDB SPK-ID, 1000036 = 1P/Halley with CAP<1987, 2000001 = Ceres).".to_owned(),
+        "target, center: NAIF ids. Small bodies: 1000036 = 1P/Halley with CAP<1987 (also its SBDB SPK-ID); 2000001 = Ceres,".to_owned(),
+        "NAIF's original asteroid id 2000000 + number (SBDB and asteroids.bin: extended SPK-ID 20000001).".to_owned(),
         "jd_tdb: the Julian Date (TDB) asked for; pos_km, vel_km_s: target minus centre, ICRF axes.".to_owned(),
         String::new(),
         "Ephemeris source of each answer, as its header names it (target [source] from centre [source]).".to_owned(),
@@ -348,14 +353,14 @@ fn m1_plan() -> Plan {
     );
     vectors.push(VectorRequest {
         command: "DES=1P;CAP<1987;".to_owned(),
-        target: HALLEY_SPKID,
+        target: HALLEY_NAIF,
         center: 10,
         target_names: vec!["1P/Halley".to_owned()],
         jds: vec![JD_HALLEY],
     });
     vectors.push(VectorRequest {
         command: "DES=2000001;".to_owned(),
-        target: CERES_SPKID,
+        target: CERES_NAIF,
         center: 10,
         target_names: vec!["1 Ceres (A801 AA)".to_owned()],
         jds: vec![JD_2026_TDB],
@@ -824,9 +829,17 @@ $$EOE
         sky.sort_unstable();
         sky.dedup();
         assert_eq!(sky.len(), 8, "an observer spot is asked twice");
-        // Small bodies are stored under their SBDB SPK-IDs.
+        // Small bodies are stored under their NAIF ids: Halley's comet code is its SBDB SPK-ID;
+        // Ceres's original-schema id maps to the SBDB SPK-ID that asteroids.bin holds (review r0 I1).
         let ids: Vec<i32> = plan.vectors.iter().map(|r| r.target).collect();
-        assert!(ids.contains(&HALLEY_SPKID) && ids.contains(&CERES_SPKID));
+        assert!(ids.contains(&HALLEY_NAIF) && ids.contains(&CERES_NAIF));
+        use uni_data::smallbody::asteroid_spkid_from_naif;
+        assert_eq!(asteroid_spkid_from_naif(CERES_NAIF), Some(20_000_001));
+        assert_eq!(
+            asteroid_spkid_from_naif(HALLEY_NAIF),
+            None,
+            "a comet, not an asteroid"
+        );
     }
 
     #[test]
@@ -873,8 +886,8 @@ $$EOE
                 .expect("planned");
             param(&vector_params(request), "COMMAND").to_owned()
         };
-        assert_eq!(command(HALLEY_SPKID), "'DES=1P;CAP<1987;'");
-        assert_eq!(command(CERES_SPKID), "'DES=2000001;'");
+        assert_eq!(command(HALLEY_NAIF), "'DES=1P;CAP<1987;'");
+        assert_eq!(command(CERES_NAIF), "'DES=2000001;'");
         assert_eq!(command(901), "'901'");
     }
 

@@ -14,7 +14,11 @@ use crate::DataError;
 /// One geometric state vector (Horizons `VEC_CORR=NONE`), ICRF axes, `REF_PLANE=FRAME`.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EphemSpot {
-    /// Horizons target (NAIF id; small bodies use their SBDB SPK-ID, e.g. 2000001 for Ceres).
+    /// Horizons target (NAIF id). Small bodies: 1000036 is 1P/Halley (NAIF's comet code, which is
+    /// also its SBDB SPK-ID); 2000001 is (1) Ceres in NAIF's original asteroid schema
+    /// (2 000 000 + number), while SBDB and `asteroids.bin` key it by the extended-schema SPK-ID
+    /// 20000001. Join asteroid spots to the catalogue through
+    /// [`crate::smallbody::asteroid_spkid_from_naif`] (A9 review r0 I1).
     pub target: i32,
     /// Horizons centre (NAIF id), the body or barycentre the vector is measured from.
     pub center: i32,
@@ -133,7 +137,8 @@ mod tests {
     const JD_HALLEY: f64 = 2_446_502.5; // 1986-03-13 0h
     const JD_NEOWISE_UTC: f64 = 2_459_045.625; // 2020-07-15 03:00 UTC
 
-    /// SBDB SPK-IDs (NAIF small-body ids) of 1P/Halley and (1) Ceres.
+    /// NAIF ids of 1P/Halley (its comet code, also its SBDB SPK-ID) and (1) Ceres (the original
+    /// asteroid schema; its SBDB SPK-ID is 20000001, see `smallbody::asteroid_spkid_from_naif`).
     const HALLEY: i32 = 1_000_036;
     const CERES: i32 = 2_000_001;
 

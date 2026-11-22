@@ -142,7 +142,8 @@ baked_path = "data/baked/exoplanets.ron"
 # Downloaded 2026-11-22 with `curl -L --fail`; baked by `uni-bake map` / `uni-bake rings` into
 # data/baked/maps/*.big (git-ignored) plus the committed data/baked/maps/index.ron and
 # data/baked/saturn_rings.ron; raw files deleted after baking. Decoded pixel sizes are recorded in
-# index.ron's `source` strings (8k_jupiter.jpg and 8k_saturn.jpg decode at 4096×2048, not 8k).
+# index.ron's `width`/`height` and `source` strings (8k_jupiter.jpg and 8k_saturn.jpg decode at
+# 4096×2048, not 8k). Re-downloaded 2026-11-22 for A8 fix round 1 (same SHA-256), re-baked, deleted.
 # Solar System Scope: https://www.solarsystemscope.com/textures/ ("Distributed under Attribution
 # 4.0 International license", based on NASA elevation and imagery data).
 
@@ -290,7 +291,7 @@ credit = "USGS Astrogeology Science Center"
 raw_path = "data/cache/maps-tier-b/europa_voyager_galileossi_global_mosaic_500m.lbl"
 baked_path = "none (projection label: lon0_deg of data/baked/maps/europa_albedo.big)"
 
-# ganymede_voyager_galileo_simple_cylindrical (8271×4135, box-filtered to 8192×4096)
+# ganymede_voyager_galileo_simple_cylindrical (8271×4135, area-resampled to 8192×4096)
 [[entry]]
 id = "usgs-ganymede-simp-2km"
 url = "https://astrogeology.usgs.gov/ckan/dataset/b2d0bf2c-1335-424b-a952-da3d8374723b/resource/040b2daf-62d2-4cbc-be5e-1a2fda0808d5/download/gany_simp_2km.jpg"
@@ -396,7 +397,7 @@ credit = "USGS Astrogeology Science Center"
 raw_path = "data/cache/maps-tier-b/charon_newhorizons_global_mosaic_300m_jul2017_8bit.lbl"
 baked_path = "none (projection label: lon0_deg of data/baked/maps/charon_albedo.big)"
 
-# ceres_dawn_fc_global_mosaic_400m (7383×3691 at 20.5076 px/deg, box-filtered to 4096×2048)
+# ceres_dawn_fc_global_mosaic_400m (7383×3691 at 20.5076 px/deg, area-resampled up to 8192×4096)
 [[entry]]
 id = "usgs-ceres-dawn-fc-400m"
 url = "https://planetarymaps.usgs.gov/mosaic/Ceres_Dawn_FC_DLR_global_20ppd_Oct2015.tif"
@@ -428,8 +429,9 @@ baked_path = "none (projection label: lon0_deg of data/baked/maps/ceres_albedo.b
 # answers concatenated in file-name order (`cat data/cache/horizons/0*-vectors-*.json | shasum -a 256`).
 # An independent fetch 2.5 minutes earlier gave bit-identical values for all 159 spots.
 # Query parameters, epochs and each answer's ephemeris source are in the baked files' headers.
-# Vectors: 31 answers, 182 320 B raw. Baked: 151 spots, 32 195 B,
-# sha256 20b8acfd269c0114d92ac31961e153e2ffaa9df8e0a984921979caecf77a9eb4.
+# Vectors: 31 answers, 182 320 B raw. Baked: 151 spots, 32 304 B,
+# sha256 f6b49b79b1c10bd8db3b532b486ab67758bbd5e4d8aebf70be8e88dca776173c (A9 review r0 I1: header
+# line on the Ceres id corrected by hand to what `uni-bake horizons` now writes; the spots are unchanged).
 [[entry]]
 id = "horizons"
 url = "https://ssd.jpl.nasa.gov/api/horizons.api"

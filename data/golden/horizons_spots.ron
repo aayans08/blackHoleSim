@@ -5,7 +5,8 @@
 //
 // Query: EPHEM_TYPE=VECTORS REF_SYSTEM=ICRF REF_PLANE=FRAME VEC_CORR=NONE (geometric) OUT_UNITS=KM-S
 // TIME_TYPE=TDB TLIST_TYPE=JD VEC_TABLE=2 CSV_FORMAT=YES; CENTER=500@<center> (its body centre).
-// target, center: NAIF ids (small bodies: SBDB SPK-ID, 1000036 = 1P/Halley with CAP<1987, 2000001 = Ceres).
+// target, center: NAIF ids. Small bodies: 1000036 = 1P/Halley with CAP<1987 (also its SBDB SPK-ID); 2000001 = Ceres,
+// NAIF's original asteroid id 2000000 + number (SBDB and asteroids.bin: extended SPK-ID 20000001).
 // jd_tdb: the Julian Date (TDB) asked for; pos_km, vel_km_s: target minus centre, ICRF axes.
 //
 // Ephemeris source of each answer, as its header names it (target [source] from centre [source]).

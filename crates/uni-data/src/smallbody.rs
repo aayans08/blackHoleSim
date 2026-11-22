@@ -13,6 +13,12 @@
 //! - `asteroid_names.txt`: UTF-8, one name per line (SBDB `full_name`, trimmed). A record's
 //!   `name_index` is its line, counted from 0.
 //!
+//! **Asteroid ids.** `asteroids.bin` keys asteroids by SBDB's primary SPK-ID, which is NAIF's
+//! extended schema ((1) Ceres = 20000001). NAIF-keyed tables (the Horizons goldens, the map
+//! index) name numbered asteroids by NAIF's original schema (Ceres = 2000001). Both ids name the
+//! same body; [`asteroid_spkid_from_naif`] and [`asteroid_naif_id`] are the one mapping between
+//! them (A9 review r0 I1).
+//!
 //! This file ends with a `#[cfg(test)] mod tests` that holds `asteroid_record_is_80_bytes` (lead
 //! ruling, review I2) and A9's tests.
 
@@ -118,11 +124,73 @@ pub struct AsteroidRecord {
     pub diameter_km: f32,
     /// V-band geometric albedo. NaN when unknown.
     pub albedo: f32,
-    /// SBDB primary SPK-ID. Numbered asteroids are 20 000 000 + their number, so (1) Ceres is
-    /// 20000001; the Horizons goldens name Ceres by its older SPK-ID, 2000001.
+    /// SBDB primary SPK-ID, in NAIF's extended schema: numbered asteroids are 20 000 000 + their
+    /// number, so (1) Ceres is 20000001; unnumbered ones are 50 000 000 + their provisional
+    /// number. The Horizons goldens and the map index name Ceres by its original-schema NAIF id,
+    /// 2000001: join them to this field through [`asteroid_spkid_from_naif`], never by equality.
     pub spkid: u32,
     /// Line of the name in `asteroid_names.txt`.
     pub name_index: u32,
+}
+
+// NAIF integer id ranges of asteroids (NAIF, "NAIF Integer ID codes" Required Reading,
+// §Asteroids, https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/naif_ids.html). In 2019 SSD
+// and NAIF extended the original schema "with the original 7-digit IDs still allowed to be used";
+// its example: asteroid 2956 Yeomans is 2002956 (original) and 20002956 (extended).
+/// Original schema, numbered: 2 000 000 + number (NAIF's name table lists 2000001 'CERES').
+const NAIF_NUMBERED_ORIGINAL: std::ops::RangeInclusive<i32> = 2_000_001..=2_999_999;
+/// Extended schema, numbered: 20 000 000 + number. SBDB's primary SPK-ID uses it.
+const NAIF_NUMBERED_EXTENDED: std::ops::RangeInclusive<i32> = 20_000_001..=49_999_999;
+/// Extended schema, provisional (unnumbered): 50 000 000 + provisional number.
+const NAIF_PROVISIONAL_EXTENDED: std::ops::RangeInclusive<i32> = 50_000_001..=99_999_999;
+/// Extended minus original id of one numbered asteroid: 20 000 000 − 2 000 000.
+const ORIGINAL_TO_EXTENDED: i32 = 18_000_000;
+
+/// The SBDB SPK-ID ([`AsteroidRecord::spkid`]) of the asteroid that a NAIF id names, or `None`
+/// when `naif` is not an asteroid id that SBDB's SPK-IDs can hold.
+///
+/// NAIF gives every numbered asteroid two ids that name the same body: the original schema,
+/// 2 000 000 + number, which NAIF's own name table, the Horizons goldens (`EphemSpot::target`)
+/// and the map index (`MapInfo::naif`) use for (1) Ceres (2000001), and the extended schema,
+/// 20 000 000 + number, which SBDB returns as the primary SPK-ID and `asteroids.bin` stores
+/// (20000001). This function and [`asteroid_naif_id`] are the one mapping between them (A9 review
+/// r0 I1, source in the range constants above); join NAIF-keyed data to the catalogue through
+/// them, never by comparing the two ids.
+///
+/// - 2 000 001 – 2 999 999 (original, numbered): + 18 000 000.
+/// - 20 000 001 – 99 999 999 (extended, numbered or provisional): unchanged.
+/// - Anything else is `None`: planets and moons, comets (1 000 001 and up; [`Comet::spkid`]
+///   needs no mapping, 1P/Halley is 1000036 in SBDB and the goldens alike), and original-schema
+///   provisional ids (3 000 001 – 3 999 999), which this mapping does not translate: SBDB serves
+///   extended-schema SPK-IDs only (every SPK-ID in `asteroids.bin` is one; tested).
+pub fn asteroid_spkid_from_naif(naif: i32) -> Option<u32> {
+    let extended = if NAIF_NUMBERED_ORIGINAL.contains(&naif) {
+        naif + ORIGINAL_TO_EXTENDED
+    } else if NAIF_NUMBERED_EXTENDED.contains(&naif) || NAIF_PROVISIONAL_EXTENDED.contains(&naif) {
+        naif
+    } else {
+        return None;
+    };
+    u32::try_from(extended).ok()
+}
+
+/// The NAIF id that NAIF-keyed data uses for the asteroid with SBDB SPK-ID `spkid`, or `None`
+/// when `spkid` is not an extended-schema asteroid id.
+///
+/// A numbered asteroid below 1 000 000 gets its original-schema id, 2 000 000 + number (20000001
+/// → 2000001, (1) Ceres), as in NAIF's name table, the Horizons goldens and the map index. Any
+/// other asteroid has no original-schema id and keeps its SPK-ID. The inverse of
+/// [`asteroid_spkid_from_naif`] on every SPK-ID it accepts.
+pub fn asteroid_naif_id(spkid: u32) -> Option<i32> {
+    let id = i32::try_from(spkid).ok()?;
+    let original = id - ORIGINAL_TO_EXTENDED;
+    if NAIF_NUMBERED_EXTENDED.contains(&id) && NAIF_NUMBERED_ORIGINAL.contains(&original) {
+        Some(original)
+    } else if NAIF_NUMBERED_EXTENDED.contains(&id) || NAIF_PROVISIONAL_EXTENDED.contains(&id) {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 const MAGIC: [u8; 8] = *b"UNIAST1\0";
@@ -573,6 +641,133 @@ mod tests {
         assert!((ceres.a_au - 2.77).abs() <= 0.01, "a = {}", ceres.a_au);
         assert!((ceres.h - 3.3).abs() <= 0.2, "H = {}", ceres.h);
         assert!(ceres.diameter_km > 900.0 && ceres.albedo > 0.0, "{ceres:?}");
+    }
+
+    /// The one NAIF ↔ SBDB mapping (review r0 I1), against NAIF's "NAIF Integer ID codes"
+    /// Required Reading: Ceres 2000001 / 20000001 and its Yeomans example 2002956 / 20002956.
+    #[test]
+    fn asteroid_ids_map_between_naif_schemas() {
+        for (naif, spkid) in [
+            (2_000_001, 20_000_001), // (1) Ceres
+            (2_002_956, 20_002_956), // (2956) Yeomans, NAIF's example
+            (2_999_999, 20_999_999), // the last number the original schema holds
+        ] {
+            assert_eq!(asteroid_spkid_from_naif(naif), Some(spkid), "{naif}");
+            assert_eq!(
+                asteroid_spkid_from_naif(spkid as i32),
+                Some(spkid),
+                "{spkid}"
+            );
+            assert_eq!(asteroid_naif_id(spkid), Some(naif), "{spkid}");
+        }
+        // No original-schema id: numbers from 1 000 000 up and provisional asteroids.
+        for spkid in [
+            21_000_000_u32,
+            49_999_999,
+            50_000_001,
+            54_512_605,
+            99_999_999,
+        ] {
+            assert_eq!(asteroid_naif_id(spkid), Some(spkid as i32), "{spkid}");
+            assert_eq!(
+                asteroid_spkid_from_naif(spkid as i32),
+                Some(spkid),
+                "{spkid}"
+            );
+        }
+        // Not asteroid ids: the Sun, a planet, a moon, 1P/Halley, an original-schema provisional
+        // id, the unused 0th numbers, the gap between the schemas, past the extended schema.
+        for naif in [
+            10,
+            599,
+            301,
+            1_000_036,
+            2_000_000,
+            3_000_001,
+            3_999_999,
+            19_999_999,
+            20_000_000,
+            50_000_000,
+            100_000_000,
+            -2_000_001,
+        ] {
+            assert_eq!(asteroid_spkid_from_naif(naif), None, "{naif}");
+        }
+        for spkid in [
+            0_u32,
+            1_000_036,
+            2_000_001,
+            20_000_000,
+            100_000_000,
+            u32::MAX,
+        ] {
+            assert_eq!(asteroid_naif_id(spkid), None, "{spkid}");
+        }
+    }
+
+    /// Review r0 I1: NAIF-keyed data (the Horizons golden spot of Ceres, the map index) finds Ceres
+    /// in `asteroids.bin` through the mapping, and every baked SPK-ID maps both ways.
+    #[test]
+    fn naif_keyed_data_joins_the_asteroid_catalogue() {
+        let (records, names) = baked_asteroids();
+        for r in &records {
+            let naif = asteroid_naif_id(r.spkid)
+                .unwrap_or_else(|| panic!("SPK-ID {} is not extended-schema", r.spkid));
+            assert_eq!(asteroid_spkid_from_naif(naif), Some(r.spkid));
+        }
+        let find = |naif: i32| {
+            let spkid = asteroid_spkid_from_naif(naif)
+                .unwrap_or_else(|| panic!("{naif} is not an asteroid id"));
+            let found: Vec<_> = records.iter().filter(|r| r.spkid == spkid).collect();
+            assert_eq!(found.len(), 1, "NAIF {naif}: {} records", found.len());
+            *found[0]
+        };
+
+        // The Horizons golden of Ceres (A9 Step 1), heliocentric at 2026-11-20 0h UTC (TDB JD
+        // 2461364.5008), lies on the orbit the joined record gives: two-body r = a(1 − e cos E),
+        // n = k / a^1.5 with the Gaussian constant k = 0.01720209895 rad/d (IAU 1976 System of
+        // Astronomical Constants); the 164 days from the record's epoch keep perturbations
+        // far below 0.005 au.
+        const AU_KM: f64 = 1.495_978_707e8; // IAU 2012 Resolution B2
+        const GAUSS_K: f64 = 0.017_202_098_95;
+        let spots = crate::golden::load_ephem_spots(
+            &crate::data_dir().join("golden").join("horizons_spots.ron"),
+        )
+        .unwrap_or_else(|err| panic!("Horizons goldens missing or unreadable: {err}"));
+        let golden: Vec<_> = spots
+            .iter()
+            .filter(|s| asteroid_spkid_from_naif(s.target).is_some())
+            .collect();
+        assert_eq!(golden.len(), 1, "one asteroid spot (Ceres) in the goldens");
+        let spot = golden[0];
+        assert_eq!(
+            spot.target, 2_000_001,
+            "the golden keys Ceres by NAIF's original schema"
+        );
+        let ceres = find(spot.target);
+        assert_eq!(names[ceres.name_index as usize], "1 Ceres (A801 AA)");
+        assert_eq!(spot.center, 10, "heliocentric");
+        let mean = ceres.m0_deg.to_radians()
+            + GAUSS_K / ceres.a_au.powf(1.5) * (spot.jd_tdb - ceres.epoch_jd_tdb);
+        let mut ecc = mean;
+        for _ in 0..20 {
+            ecc -= (ecc - ceres.e * ecc.sin() - mean) / (1.0 - ceres.e * ecc.cos());
+        }
+        let r_orbit = ceres.a_au * (1.0 - ceres.e * ecc.cos());
+        let r_golden = spot.pos_km.iter().map(|c| c * c).sum::<f64>().sqrt() / AU_KM;
+        assert!(
+            (r_golden - r_orbit).abs() < 0.005,
+            "Ceres: golden r = {r_golden} au, record's orbit r = {r_orbit} au"
+        );
+
+        // The map index (A8) keys Ceres's albedo map by the same original-schema id.
+        let maps = crate::load_map_index(&crate::data_dir().join("baked/maps/index.ron"))
+            .unwrap_or_else(|err| panic!("map index missing or unreadable: {err}"));
+        let ceres_maps: Vec<_> = maps.iter().filter(|m| m.body == "Ceres").collect();
+        assert!(!ceres_maps.is_empty(), "the map index has a Ceres map");
+        for map in ceres_maps {
+            assert_eq!(find(map.naif).spkid, ceres.spkid, "{map:?}");
+        }
     }
 
     #[test]
