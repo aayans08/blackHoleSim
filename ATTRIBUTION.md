@@ -89,6 +89,43 @@ against a fresh download of the original (`docs/research/2026-11-20-assets.md` �
 | `textures/stars_milky_way.jpg` | `2k_stars_milky_way.jpg` | `ec2240e6f3784d962ab81609b228bfd470e87c86d1fed5e99134d4cd3de24239` |
 
 <!-- A8 -->
+### Baked surface maps and Saturn's rings (M1)
+
+**Solar System Scope, 8k/4k/2k texture maps** → `data/baked/maps/*.big` (git-ignored, rebuilt by `uni-bake map`;
+the committed `data/baked/maps/index.ron` lists them) and `data/baked/saturn_rings.ron`. Licence:
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Credit: "Solar System Scope"
+([solarsystemscope.com/textures](https://www.solarsystemscope.com/textures/)), based on NASA elevation and imagery
+data. Changes made: decoded, box-filtered into mip chains in linear light, block-compressed (BC7/BC4) plus 2k
+uncompressed copies; the ring PNG reduced to one radial row of 1024 samples with fitted radii. Files used:
+`8k_earth_daymap.jpg`, `8k_earth_clouds.jpg`, `8k_moon.jpg`, `8k_mars.jpg`, `8k_mercury.jpg`,
+`4k_venus_atmosphere.jpg`, `8k_jupiter.jpg` (decodes at 4096×2048), `8k_saturn.jpg` (decodes at 4096×2048),
+`8k_saturn_ring_alpha.png`, `2k_uranus.jpg`, `2k_neptune.jpg`. URLs and SHA-256 are in `data/manifest.toml` (A8).
+
+**NASA/USGS global mosaics (public domain)**, baked the same way (URLs, SHA-256 and catalogue pages in
+`data/manifest.toml`), from the USGS Astrogeology Science Center
+([astrogeology.usgs.gov](https://astrogeology.usgs.gov/)):
+- Io: Io Voyager–Galileo SSI Global Mosaic 1 km (1024-px browse). NASA/JPL Galileo SSI and Voyager 1; USGS.
+- Europa: Europa Voyager–Galileo SSI Global Mosaic 500 m (1024-px browse). NASA/JPL Galileo and Voyager; USGS.
+- Ganymede: Ganymede Voyager/Galileo Simple Cylindrical, 2 km/px. NASA/JPL Galileo SSI and Voyager 1 and 2; USGS.
+- Callisto: Callisto Voyager–Galileo SSI Global Mosaic 1 km (1024-px browse). NASA/JPL Galileo and Voyager; USGS.
+- Pluto and Charon: New Horizons LORRI–MVIC Global Mosaics 300 m, July 2017 (1024-px browses).
+  NASA/Johns Hopkins University Applied Physics Laboratory/Southwest Research Institute; USGS.
+- Ceres: Ceres Dawn FC Global Mosaic 400 m (20 px/deg, October 2015). NASA/JPL-Caltech/UCLA/MPS/DLR/IDA; mosaic by
+  DLR (T. Roatsch, Dawn Team); distributed by USGS.
+
+Unimaged areas of these mosaics (Pluto's and Charon's southern polar night, polar gaps elsewhere) are filled with the
+mean albedo of the imaged area; the index's `source` string says how much.
+
+**Geometric albedos** that set each map's `albedo_scale`: NASA NSSDCA planetary fact sheets
+([nssdc.gsfc.nasa.gov/planetary/factsheet](https://nssdc.gsfc.nasa.gov/planetary/factsheet/): Mercury, Venus, Earth,
+Moon, Mars, Jupiter, Saturn, Uranus, Neptune, Pluto and Charon) and the Jovian satellite fact sheet (Io, Europa,
+Ganymede, Callisto); Ceres from the JPL Small-Body Database (Li et al. 2006, Icarus 182, 143). **Ring radii** for the
+fit and its checks: NSSDCA Saturnian Rings Fact Sheet.
+
+**Algorithms in the bake:** Intel ISPC Texture Compressor through the `intel_tex_2` crate (MIT OR Apache-2.0) for
+BC7 and BC4; sRGB transfer function per IEC 61966-2-1:1999; BC4 block layout per Microsoft's Direct3D 11
+block-compression reference (bake-side test decoder); lunar-Lambert photometric function (McEwen 1991, Icarus 92,
+298).
 <!-- /A8 -->
 
 ## Algorithms
