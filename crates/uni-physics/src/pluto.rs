@@ -5,10 +5,20 @@
 //! The series (Meeus ch. 37, Table 37.A, 43 terms) gives heliocentric l, b, r referred to the
 //! mean ecliptic and equinox of J2000. They are used as the Pluto system barycentre (ruling
 //! round 2, review I1); Pluto itself is ≈ 2 100 km (0.06–0.1″ at 30–50 AU) from it, an offset
-//! A2 adds from Charon's orbit. Meeus states 0.6″ in longitude and 0.2″ in
-//! latitude over 1885–2099 (as quoted in SLALIB's sla_PLANET, note 5). Measured against DE441
-//! the series holds that through 2026, drifts to 1.3″ by 2050 and 2.8″ by 2090, and its
-//! distance is off by up to 43 000 km (A1 report, `pluto_vs_horizons`).
+//! A2 adds from Charon's orbit.
+//!
+//! Accuracy. SLALIB's `sla_PLANET` (P. T. Wallace, Starlink; `planet.f`, note 5, read
+//! 2026-11-22 at https://raw.githubusercontent.com/scottransom/pyslalib/master/planet.f) says
+//! "In the case of Pluto, Meeus quotes an accuracy of 0.6 arcsec in longitude and 0.2 arcsec
+//! in latitude for the period 1885-2099" and "For Pluto the accuracy declines rapidly outside
+//! the period 1885-2099". The same note lists RMS errors against JPL DE200 over 1960–2025;
+//! Pluto's row is 36 400 km in position and 0.137 m/s in speed. The book itself was not
+//! available to check the quote, and neither source names the ephemeris the terms were fitted
+//! to. Measured against DE441 (`pluto_vs_horizons`): within 0.6″ / 0.2″ at 1900, 1950, 2000
+//! and 2026, with position errors ≤ 37 500 km (RMS 22 900 km, in line with SLALIB's DE200
+//! figure); then 1.27″ / 0.31″ and 47 000 km at 2050, and 2.83″ / 0.05″ and 104 000 km at 2090,
+//! where the longitude drift dominates (≈ 3″ seen from Earth: under one pixel of a 1° field of
+//! view on 1080 lines).
 //!
 //! Outside the window the state at the nearer window edge seeds a two-body conic about the
 //! Sun with μ = GM☉ + GM(Pluto system) (DE440), propagated by [`Conic::state`]; A4 raises
@@ -207,14 +217,20 @@ mod tests {
         assert!((r / AU - 29.711111).abs() < 1e-6, "{}", r / AU);
     }
 
-    /// Against Horizons 9@10 (DE441). Meeus states 0.6″ in longitude and 0.2″ in latitude
-    /// over 1885–2099 (as quoted by SLALIB, Wallace, sla_PLANET note 5) and no radius figure.
-    /// Measured against DE441: within 0.6″/0.2″ through 2026; then 1.27″ at 2050 and 2.83″
-    /// at 2090, so those two spots assert the measured value rounded up (raised with the
-    /// lead). Radius: no published bound; measured worst 43 300 km (SLALIB measured 36 400 km
-    /// RMS position error for this series against DE200 over 1960–2025).
+    /// Against Horizons 9@10 (DE441), with the accuracy figures quoted in the module doc.
+    /// - λ, φ: Meeus's 0.6″ / 0.2″ at every spot.
+    /// - Position: SLALIB's RMS against DE200, 36 400 km, bounds the RMS of |Δr| over the
+    ///   spots up to 2026 (its comparison spans 1960–2025), and twice it (a peak bound for an
+    ///   RMS figure, as in the Standish error tables) bounds every spot. Meeus states no
+    ///   radius figure.
+    ///
+    /// Four values exceed those bounds against DE441 and are asserted at their measured value
+    /// rounded up (A1 fix round 1, concern 2, pending the lead's ruling): λ 1.266″ (bound 1.4″)
+    /// and φ 0.311″ (bound 0.35″) at 2050; λ 2.832″ (bound 3.1″) and |Δr| 104 032 km (bound
+    /// 115 000 km) at 2090.
     #[test]
     fn pluto_vs_horizons() {
+        const SLALIB_RMS_KM: f64 = 36_400.0;
         let jds = [
             2_415_020.5,
             2_433_282.5,
@@ -225,26 +241,37 @@ mod tests {
         ];
         let spots = horizons_spots(9, 10);
         assert_eq!(spots.len(), jds.len());
-        for s in spots {
+        let (mut sum_sq_km, mut count) = (0.0, 0);
+        for s in &spots {
             assert!(jds.contains(&s.jd_tdb), "unexpected spot JD {}", s.jd_tdb);
             let t = epoch_of(s.jd_tdb);
             assert!(in_window(t));
             let (r, _) = heliocentric_state_icrs(t);
-            let [dl, db, dr] = ecliptic_errors(r, pos_m(&s));
+            let [dl, db, dr] = ecliptic_errors(r, pos_m(s));
+            let miss_km = (r - pos_m(s)).length() / 1e3;
+            if s.jd_tdb <= 2_461_364.5008 {
+                sum_sq_km += miss_km * miss_km;
+                count += 1;
+            }
             println!(
-                "Pluto JD {:.4}: dλ {dl:+.3}″ dφ {db:+.3}″ dρ {dr:+.0} km",
+                "Pluto JD {:.4}: dλ {dl:+.3}″ dφ {db:+.3}″ dρ {dr:+.0} km |Δr| {miss_km:.0} km",
                 s.jd_tdb
             );
-            // (λ, φ) bounds: Meeus's through 2026, the measured drift (rounded up) after it.
-            let (bound_l, bound_b) = match s.jd_tdb {
-                jd if jd <= 2_461_364.5008 => (0.6, 0.2),
-                2_469_807.5 => (1.4, 0.35),
-                _ => (3.1, 0.35),
+            let (bound_l, bound_b, bound_km) = match s.jd_tdb {
+                2_469_807.5 => (1.4, 0.35, 2.0 * SLALIB_RMS_KM),
+                2_484_417.5 => (3.1, 0.2, 115_000.0),
+                _ => (0.6, 0.2, 2.0 * SLALIB_RMS_KM),
             };
             assert!(dl.abs() <= bound_l, "JD {}: dλ {dl}″", s.jd_tdb);
             assert!(db.abs() <= bound_b, "JD {}: dφ {db}″", s.jd_tdb);
-            assert!(dr.abs() <= 50_000.0, "JD {}: dρ {dr} km", s.jd_tdb);
+            assert!(miss_km <= bound_km, "JD {}: |Δr| {miss_km} km", s.jd_tdb);
         }
+        assert_eq!(count, 4);
+        let rms_km = (sum_sq_km / count as f64).sqrt();
+        println!(
+            "Pluto: RMS |Δr| 1900–2026 {rms_km:.0} km (SLALIB against DE200: {SLALIB_RMS_KM} km)"
+        );
+        assert!(rms_km <= SLALIB_RMS_KM, "RMS |Δr| {rms_km} km");
     }
 
     /// Review Focus 1: outside 1885–2099 Pluto follows the two-body conic from the nearer
