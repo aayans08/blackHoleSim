@@ -17,7 +17,8 @@
 //! temperature per component.
 //!
 //! **Dust** [A_V mag/pc]: an exponential layer that follows the arms (3× denser at an arm centre),
-//! 1 mag/kpc in the plane at the Sun's position, 120 pc thick there and flaring outward.
+//! 1 mag/kpc in its midplane below the Sun, 80 pc thick there and flaring outward. Its midplane is
+//! the gas layer's, z_d = 19.5 pc, 5.5 pc below the Sun, not the stellar disk's z = 0.
 //!
 //! **Band** [cd/m², linear Rec.709]: the light of stars fainter than the catalogue limit, summed
 //! along the ray through the dust (see [`GalaxyModel::band_radiance`]).
@@ -25,9 +26,10 @@
 //! v0 approximations, all on purpose and labelled on screen as "galaxy model v0": every component
 //! uses the local mean V luminosity per star (local M/L_V = 0.043 / 0.0519 = 0.83), so the old
 //! thick disk, halo and bar, which lack the local young bright stars, are too bright per star;
-//! extinction is grey (no reddening) and ignored in the faint-star cut; the arms are smooth log
-//! spirals with no Local (Orion) arm; the stellar disks have no warp or flare, and there is no
-//! nuclear star cluster.
+//! extinction is grey (no reddening) and ignored in the faint-star cut; the dust is a smooth
+//! layer, with none of the discrete local clouds that shape the real band (see `DUST_Z_MID_PC`);
+//! the arms are smooth log spirals with no Local (Orion) arm; the stellar disks have no warp or
+//! flare, and there is no nuclear star cluster.
 
 use std::f64::consts::{LN_10, PI, TAU};
 
@@ -41,8 +43,8 @@ use crate::lf;
 /// R₀, the Sun's distance from Sgr A* [pc] (GRAVITY Collaboration 2022, A&A 657, L12:
 /// 8277 ± 9 pc).
 const R0_PC: f64 = 8277.0;
-/// z☉, the Sun's height above the Galactic plane [pc] (Jurić et al. 2008, ApJ 673, 864, Table 10,
-/// Z₀).
+/// z☉, the Sun's height above the Galactic plane [pc], the midplane of the stellar disk (Jurić et
+/// al. 2008, ApJ 673, 864, Table 10, Z₀). The dust midplane lies lower, at `DUST_Z_MID_PC`.
 const Z_SUN_PC: f64 = 25.0;
 
 // ---- Disks and halo: Jurić et al. 2008, ApJ 673, 864, Table 10 -------------------------------
@@ -129,28 +131,51 @@ const ARM_DUST_CONTRAST: f64 = 2.0;
 const ARM_TAPER_PC: [f64; 2] = [3000.0, 4000.0];
 
 // ---- Dust ---------------------------------------------------------------------------------------
-// κ(R, z) = κ₀ e^{−(R−R₀)/h_r − |z|/h_z(R)} (1 + 2 A), A = the arm strength.
+// κ(R, z) = κ₀ e^{−(R−R₀)/h_r − |z − z_d|/h_z(R)} (1 + 2 A), A = the arm strength. The midplane
+// z_d and h_z(R₀) = 80 pc are the lead's ruling on A5 review I1 (task A5r), which also ratifies
+// A5's radial profile, h_r and the flare (A5 decision D4).
 
-/// A_V per unit length in the plane at the Sun's position [mag/pc]: 1 mag/kpc (brief value).
-/// Checked against Drimmel & Spergel 2001, ApJ 556, 181: their axisymmetric dust disk alone gives
-/// κ_V ρ_d(R☉) = 0.0180 × 1098 e^{−1/0.28} = 0.56 mag/kpc (Table 1, Eq. 13), with the Sun in a gap
-/// of their Local arm; mean values in the plane over kpc paths are quoted from 0.7 to 1.8 mag/kpc.
-/// With h_z = 120 pc this gives A_V = 0.097 mag from the Sun to the north Galactic pole, about
-/// twice the 0.12 mag Melchior, Combes & Gould 2007 (arXiv:astro-ph/0610884) give for the whole
-/// disk thickness: v0 keeps the in-plane rate and accepts the thicker pole column.
+/// A_V per unit length in the dust midplane directly below the Sun [mag/pc]: 1 mag/kpc (brief
+/// value; κ₀ is set so the rate at (x☉, y☉, z_d) is this, arms included). Checked against Drimmel
+/// & Spergel 2001, ApJ 556, 181: their axisymmetric dust disk alone gives κ_V ρ_d(R☉) = 0.0180 ×
+/// 1098 e^{−1/0.28} = 0.56 mag/kpc (Table 1, Eq. 13), with the Sun in a gap of their Local arm;
+/// mean values in the plane over kpc paths are quoted from 0.7 to 1.8 mag/kpc. With h_z = 80 pc
+/// the layer's full thickness at the Sun's radius holds 2 κ₀ h_z = 0.16 mag, against the 0.12 mag
+/// Melchior, Combes & Gould 2007 (arXiv:astro-ph/0610884, footnote 3) give for the total disc
+/// thickness; the column from the Sun to the north Galactic pole is 0.075 mag. v0 keeps the
+/// in-plane rate and accepts a full column 1.3× theirs.
 const DUST_A_V_SUN_MAG_PER_PC: f64 = 1.0e-3;
-/// Dust scale height at the Sun's radius [pc] (brief value; Misiriotis et al. 2006, A&A 459, 113,
-/// Table 2, fit 100 pc for the cold dust; Drimmel & Spergel 2001 a sech² layer of 188 pc there).
-const DUST_H_Z_PC: f64 = 120.0;
+/// Z☉, the Sun's height above the plane of high-mass star-forming regions [pc] (Reid et al. 2019,
+/// ApJ 885, 131: 5.5 ± 5.8 pc). Those regions trace the gas and dust layer; `Z_SUN_PC` (Jurić et
+/// al. 2008) is the Sun's height above the stellar disk.
+const Z_SUN_ABOVE_GAS_PC: f64 = 5.5;
+/// Height of the dust midplane z_d in this frame [pc]: z☉ − Z☉ = 25 − 5.5 = 19.5 pc (lead ruling
+/// A5r), parallel to the stellar disk (v0: no tilt or warp). With the midplane at z = 0, 25 pc
+/// below the Sun, a ray at b = −5° stayed 50 pc closer to it than its mirror at b = +5° beyond
+/// ~570 pc: toward l = 0° it crossed A_V = 3.39 mag against 2.16 (to 10 kpc), and the band at
+/// (0°, −5°) was 0.44× that at (0°, +5°). With z_d (and h_z = 80 pc) the columns are 1.75 and
+/// 1.51 mag and the band ratio is 0.97. The real sky is brighter to the south; that extra
+/// southern brightness also comes from discrete local clouds north of the plane (Ophiuchus, the
+/// Pipe Nebula, the Aquila Rift, at ~120–250 pc), which a smooth v0 layer cannot model. The
+/// on-screen "galaxy model v0" label covers it; a 3-D dust map is M4.
+const DUST_Z_MID_PC: f64 = Z_SUN_PC - Z_SUN_ABOVE_GAS_PC;
+/// Dust scale height at the Sun's radius [pc]: 80 pc (lead ruling A5r; the A5 brief's 120 pc put
+/// A_V = 4.6 mag in Baade's window). Misiriotis et al. 2006, A&A 459, 113, Table 2, fit 100 pc for
+/// the cold dust; Drimmel & Spergel 2001 a sech² layer of 188 pc there. With z_d, 80 pc gives
+/// A_V = 2.4 mag in Baade's window, (l, b) = (1°, −3.9°), where Stanek 1996 (ApJ 460, L37)
+/// measures 1.26–2.79 mag across the field.
+const DUST_H_Z_PC: f64 = 80.0;
 /// Dust scale length [pc] (Misiriotis et al. 2006, Table 2: cold dust h_c = 5.0 kpc, about twice
-/// the stars'). Drimmel & Spergel 2001's 2.26 kpc, with their flat core inside 4 kpc, put
-/// A_V = 48 mag in the plane between the Sun and Sgr A* (this model: 23 mag) and 7 mag in front
-/// of the bulge at (l, b) = (0°, −5°), which hid the bulge.
+/// the stars'; A5 decision D4, ratified in the lead's A5r ruling). Measured in A5 with a 120 pc
+/// layer at z = 0: Drimmel & Spergel 2001's 2.26 kpc, with their flat core inside 4 kpc, put
+/// A_V = 48 mag in the plane between the Sun and Sgr A* (5 kpc: 23 mag) and 7 mag in front of the
+/// bulge at (l, b) = (0°, −5°) (5 kpc: 3.4 mag), which hid the bulge.
 const DUST_H_R_PC: f64 = 5000.0;
 /// The dust layer flares (Drimmel & Spergel 2001, Table 1): h(R) = h₀ + h₁ (R − r_f) beyond
 /// r_f = 4.40 kpc, with h₀ = 134.4 pc and h₁ = 14.8 pc/kpc, 188 pc at their R☉ = 8 kpc. v0 keeps
-/// that shape and scales it to `DUST_H_Z_PC` at R₀: h_z(R) = 120 pc · h(R) / h(R₀), 84 pc inside
-/// r_f, so the layer in front of the bulge is thinner than at the Sun.
+/// that shape and scales it to `DUST_H_Z_PC` at R₀ (A5 decision D4, ratified in the lead's A5r
+/// ruling): h_z(R) = 80 pc · h(R) / h(R₀), 56 pc inside r_f, so the layer in front of the bulge is
+/// thinner than at the Sun.
 const DUST_FLARE_H0_PC: f64 = 134.4;
 const DUST_FLARE_H1: f64 = 14.8e-3;
 const DUST_FLARE_R_PC: f64 = 4400.0;
@@ -221,7 +246,8 @@ pub struct GalaxyGpu {
     pub arm_taper: [f32; 4],
     /// Per arm: β_ref [rad], ln(R_ref / 1 pc), 1 / tan ψ, sin ψ.
     pub arms: [[f32; 4]; ARM_COUNT],
-    /// κ₀ [A_V mag/pc in the plane at R₀ between the arms], h_r, h_z at R₀, 0.
+    /// κ₀ [A_V mag/pc in the dust midplane at R₀ between the arms], h_r, h_z at R₀, z_d (height
+    /// of the dust midplane).
     pub dust: [f32; 4],
     /// Flare h(R) = h₀ + h₁ max(R − r_f, 0): h₀, h₁ [pc/pc], r_f, h(R₀); h_z(R) = h_z(R₀) h(R)/h(R₀).
     pub dust_flare: [f32; 4],
@@ -284,7 +310,7 @@ impl GalaxyModel {
                 ]
             }),
             // κ₀ is set below, once the arm strength at the Sun is known.
-            dust: [1.0, DUST_H_R_PC, DUST_H_Z_PC, 0.0],
+            dust: [1.0, DUST_H_R_PC, DUST_H_Z_PC, DUST_Z_MID_PC],
             dust_flare: [
                 DUST_FLARE_H0_PC,
                 DUST_FLARE_H1,
@@ -302,8 +328,8 @@ impl GalaxyModel {
         // Total star density at the Sun = the luminosity function's count.
         let sun_shape = g.components(g.sun, g.arm_strength(g.sun));
         g.norm[2] = (n_sun - sun_shape[3]) / (sun_shape[0] + sun_shape[1] + sun_shape[2]);
-        // A_V rate in the plane directly below the Sun = DUST_A_V_SUN_MAG_PER_PC.
-        let plane = DVec3::new(g.sun.x, g.sun.y, 0.0);
+        // A_V rate in the dust midplane directly below the Sun = DUST_A_V_SUN_MAG_PER_PC.
+        let plane = DVec3::new(g.sun.x, g.sun.y, DUST_Z_MID_PC);
         g.dust[0] = DUST_A_V_SUN_MAG_PER_PC / g.extinction(plane, g.arm_strength(plane));
         g
     }
@@ -453,12 +479,13 @@ impl GalaxyModel {
 
     /// Dust extinction [A_V mag/pc] given the arm strength at `p`.
     fn extinction(&self, p: DVec3, arms: f64) -> f64 {
-        let [kappa0, h_r, h_z_sun, _] = self.dust;
+        let [kappa0, h_r, h_z_sun, z_mid] = self.dust;
         let [h0, h1, r_flare, h_sun] = self.dust_flare;
         let [_, _, dust_contrast, _] = self.arm_shape;
         let r = p.truncate().length();
         let h_z = h_z_sun * (h0 + h1 * (r - r_flare).max(0.0)) / h_sun;
-        kappa0 * (-(r - self.norm[0]) / h_r - p.z.abs() / h_z).exp() * (1.0 + dust_contrast * arms)
+        let z = (p.z - z_mid).abs();
+        kappa0 * (-(r - self.norm[0]) / h_r - z / h_z).exp() * (1.0 + dust_contrast * arms)
     }
 }
 
@@ -556,6 +583,48 @@ mod tests {
             "centre {centre} anticentre {anticentre}"
         );
         assert!(anticentre > 2.0 * ngp, "anticentre {anticentre} NGP {ngp}");
+    }
+
+    /// Lead ruling A5r: the band 5° south of the Galactic Centre is not dimmer than 5° north. The
+    /// real sky is brighter to the south (Baade's window, the Sagittarius star cloud); a dust
+    /// midplane at z = 0, 25 pc below the Sun, made the south 0.44× the north.
+    #[test]
+    fn band_south_not_dimmer() {
+        let g = GalaxyModel::milky_way();
+        let sun = g.sun_galactocentric_pc();
+        let band = |dir: DVec3| luminance(g.band_radiance(sun, dir, 10.0));
+        let south = band(lb_dir(0.0, -5.0));
+        let north = band(lb_dir(0.0, 5.0));
+        assert!(south >= 0.9 * north, "south {south} north {north}");
+    }
+
+    /// Baade's window, (l, b) = (1°, −3.9°): A_V varies from 1.26 to 2.79 mag across the field
+    /// (Stanek 1996, ApJ 460, L37). Summed to 10 kpc, past the bulge.
+    #[test]
+    fn baades_window_extinction() {
+        let g = GalaxyModel::milky_way();
+        let a_v = a_v_from_sun(&g, lb_dir(1.0, -3.9), 10_000.0);
+        assert!((1.0..=3.0).contains(&a_v), "A_V in Baade's window {a_v}");
+    }
+
+    /// The dust layer is symmetric about its midplane z_d = 19.5 pc (not z = 0), the rate in that
+    /// midplane below the Sun is the 1 mag/kpc the brief pins, and z_d reaches the GPU in
+    /// `GalaxyGpu::dust.w`, which `gal_extinction_at` reads.
+    #[test]
+    fn dust_midplane_at_gas_layer() {
+        let g = GalaxyModel::milky_way();
+        let sun = g.sun_galactocentric_pc();
+        let z_d = 19.5;
+        assert_eq!(g.gpu().dust[3], z_d as f32);
+        let rate = |z: f64| g.extinction_v_per_pc(DVec3::new(sun.x, sun.y, z));
+        assert!((rate(z_d) / 1e-3 - 1.0).abs() < 1e-12, "{}", rate(z_d));
+        for dz in [5.5, 80.0, 300.0] {
+            let (above, below) = (rate(z_d + dz), rate(z_d - dz));
+            assert!(
+                (above / below - 1.0).abs() < 1e-12,
+                "±{dz} pc: {above} {below}"
+            );
+        }
     }
 
     /// Every position and direction gives a finite, non-negative band, including a camera at

@@ -34,7 +34,8 @@ struct GalaxyGpu {
     arm_taper: vec4<f32>,
     // Per arm: β_ref [rad], ln(R_ref / 1 pc), 1 / tan ψ, sin ψ.
     arms: array<vec4<f32>, 4>,
-    // κ0 [A_V mag/pc in the plane at R0 between the arms], h_r, h_z at R0, 0.
+    // κ0 [A_V mag/pc in the dust midplane at R0 between the arms], h_r, h_z at R0, z_d (height of
+    // the dust midplane: 19.5 pc, the gas layer's, not the stellar disk's z = 0).
     dust: vec4<f32>,
     // Flare h(R) = h0 + h1 max(R − r_f, 0): h0, h1 [pc/pc], r_f, h(R0); h_z(R) = h_z(R0) h(R)/h(R0).
     dust_flare: vec4<f32>,
@@ -116,7 +117,8 @@ fn gal_extinction_at(p: vec3<f32>, arms: f32) -> f32 {
     let flare = galaxy.dust_flare;
     let r = length(p.xy);
     let h_z = galaxy.dust.z * (flare.x + flare.y * max(r - flare.z, 0.0)) / flare.w;
-    return galaxy.dust.x * exp(-(r - galaxy.norm.x) / galaxy.dust.y - abs(p.z) / h_z)
+    let z = abs(p.z - galaxy.dust.w);
+    return galaxy.dust.x * exp(-(r - galaxy.norm.x) / galaxy.dust.y - z / h_z)
         * (1.0 + galaxy.arm_shape.z * arms);
 }
 
