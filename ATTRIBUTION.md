@@ -140,8 +140,10 @@ against a fresh download of the original (`docs/research/2026-11-20-assets.md` �
 the committed `data/baked/maps/index.ron` lists them) and `data/baked/saturn_rings.ron`. Licence:
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Credit: "Solar System Scope"
 ([solarsystemscope.com/textures](https://www.solarsystemscope.com/textures/)), based on NASA elevation and imagery
-data. Changes made: decoded, box-filtered into mip chains in linear light, block-compressed (BC7/BC4) plus 2k
-uncompressed copies; the ring PNG reduced to one radial row of 1024 samples with fitted radii. Files used:
+data. Changes made: decoded; brightness scaled to each body's geometric albedo with every channel capped at
+reflectance 1 (the index's `source` string gives the scale); box-filtered into mip chains in linear light,
+block-compressed (BC7/BC4) plus 2k uncompressed copies; the ring PNG reduced to one radial row of 1024 samples with
+fitted radii. Files used:
 `8k_earth_daymap.jpg`, `8k_earth_clouds.jpg`, `8k_moon.jpg`, `8k_mars.jpg`, `8k_mercury.jpg`,
 `4k_venus_atmosphere.jpg`, `8k_jupiter.jpg` (decodes at 4096×2048), `8k_saturn.jpg` (decodes at 4096×2048),
 `8k_saturn_ring_alpha.png`, `2k_uranus.jpg`, `2k_neptune.jpg`. URLs and SHA-256 are in `data/manifest.toml` (A8).
@@ -159,7 +161,8 @@ uncompressed copies; the ring PNG reduced to one radial row of 1024 samples with
   DLR (T. Roatsch, Dawn Team); distributed by USGS.
 
 Unimaged areas of these mosaics (Pluto's and Charon's southern polar night, polar gaps elsewhere) are filled with the
-mean albedo of the imaged area; the index's `source` string says how much.
+mean albedo of the imaged area; the index's `source` string says how much. Ganymede (8271×4135) and Ceres
+(7383×3691) are area-resampled to 8192×4096, the nearest 2:1 power of two; brightness is scaled as above.
 
 **Geometric albedos** that set each map's `albedo_scale`: NASA NSSDCA planetary fact sheets
 ([nssdc.gsfc.nasa.gov/planetary/factsheet](https://nssdc.gsfc.nasa.gov/planetary/factsheet/): Mercury, Venus, Earth,

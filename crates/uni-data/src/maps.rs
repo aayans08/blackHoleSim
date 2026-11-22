@@ -7,14 +7,45 @@
 //! mip 0 when the map is no wider) and the rest of its chain, uncompressed (`Rgba8UnormSrgb` or
 //! `R8Unorm`), for GPUs without `TEXTURE_COMPRESSION_BC`.
 //!
+//! **Sizes.** `width`/`height` record the source's decoded size. The files hold mip 0 at
+//! [`baked_size`]`(width)`: the decoded size itself for a 2:1 power of two (every Solar System
+//! Scope map), otherwise the nearest 2:1 power of two, so every mip stays block-aligned (Ganymede
+//! 8271×4135 and Ceres 7383×3691 are stored at 8192×4096). A loaded [`crate::TexFile`] carries
+//! its stored size.
+//!
+//! **Reflectance ≤ 1.** The reflectance of a texel is `albedo_scale` × its decoded linear value,
+//! per channel, and it never exceeds 1 (energy conservation; the M1 plan's "ρ is capped at 1",
+//! review I4). The bake solves `albedo_scale` with that cap inside the disk average. When the
+//! geometric albedo needs texels brighter than 1, the file stores the capped reflectance itself,
+//! min(1, s · decoded), and `albedo_scale` is 1; the solved s is in `source`. The renderer
+//! multiplies by `albedo_scale` and needs no clamp of its own.
+//!
 //! **Earth's clouds** (`Clouds`, one channel c ∈ [0, 1], stored linear) are composited over the
 //! ground map as white clouds of coverage c, and both entries carry the same `albedo_scale` s:
-//! ρ = s · [(1 − c) · ρ_ground + c]. The bake solves s with the clouds composited, so the
-//! composite's disk average matches Earth's geometric albedo (review I4).
+//! ρ = s · [(1 − c) · ρ_ground + c]. The cloud layer's reflectance s is at most 1 like every
+//! other texel's. The bake solves s with the clouds composited, so the composite's disk average
+//! matches Earth's geometric albedo (review I4).
 
 use std::path::Path;
 
 use crate::DataError;
+
+/// The size `uni-bake map` stores a 2:1 map of decoded width `width` at: the 2:1 power of two
+/// whose width is nearest `width` on a log scale, so the resample factor stays within 2^±½ and
+/// every mip is block-aligned down to 4 texels high. A decoded 2:1 power of two keeps its size.
+pub fn baked_size(width: u32) -> (u32, u32) {
+    if width < 2 {
+        return (2, 1);
+    }
+    let below = 1_u32 << (31 - width.leading_zeros());
+    // Round up past below·√2, i.e. when width² > 2·below².
+    let up = u64::from(width).pow(2) > 2 * u64::from(below).pow(2);
+    let w = match below.checked_mul(2) {
+        Some(above) if up => above,
+        _ => below,
+    };
+    (w, w / 2)
+}
 
 /// What a map holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -34,9 +65,7 @@ pub struct MapInfo {
     pub file: String,
     /// The 2k uncompressed copy, relative to the index.
     pub fallback_file: String,
-    /// Size of mip 0 of `file` [texels]: the decoded size of the source (every Solar System
-    /// Scope map). A source that is not a 2:1 power-of-two size is box-filtered down to the
-    /// largest one that fits, and `source` then gives its decoded size.
+    /// Decoded size of the source [texels].
     pub width: u32,
     pub height: u32,
     /// Planetocentric east longitude at u = 0 (left edge) [deg].
@@ -186,9 +215,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The committed index: every entry names its files, and every map baked on this machine
-    /// (the `.big` files are git-ignored) loads with the index's size, the 2k fallback and the
-    /// formats the renderer expects.
+    #[test]
+    fn baked_size_is_the_nearest_power_of_two() {
+        // 2:1 powers of two keep their size (every Solar System Scope map).
+        for w in [8, 1024, 2048, 4096, 8192] {
+            assert_eq!(baked_size(w), (w, w / 2));
+        }
+        // Ganymede rounds down by 1 %, Ceres up by 11 % (review r0 Important 2).
+        assert_eq!(baked_size(8271), (8192, 4096));
+        assert_eq!(baked_size(7383), (8192, 4096));
+        // The switch is at 4096·√2 = 5792.6.
+        assert_eq!(baked_size(5792), (4096, 2048));
+        assert_eq!(baked_size(5793), (8192, 4096));
+        assert_eq!(baked_size(200), (256, 128));
+        assert_eq!(baked_size(u32::MAX), (1 << 31, 1 << 30));
+    }
+
+    /// IEC 61966-2-1 (sRGB) decoding of an 8-bit code.
+    fn srgb_to_linear(code: u8) -> f64 {
+        let c = f64::from(code) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// The committed index: every entry names its files, no reflectance exceeds 1, and every map
+    /// baked on this machine (the `.big` files are git-ignored) loads at the size the bake stores
+    /// for the recorded decoded size, with the 2k fallback and the formats the renderer expects.
     #[test]
     fn baked_index_maps_load() {
         let dir = crate::data_dir().join("baked/maps");
@@ -197,6 +252,11 @@ mod tests {
         let mut baked = 0;
         for map in &maps {
             assert!((-360.0..=360.0).contains(&map.lon0_deg), "{map:?}");
+            // Clouds are white: their reflectance at full cover is the scale itself (review r0
+            // Important 1: it was 2.33).
+            if map.kind == MapKind::Clouds {
+                assert!(map.albedo_scale <= 1.0, "{map:?}");
+            }
             let bc = match load_tex(&dir.join(&map.file)) {
                 Ok(tex) => tex,
                 Err(DataError::NotFound(_)) => continue, // not baked on this machine
@@ -212,12 +272,28 @@ mod tests {
             assert_eq!((bc.format, fallback.format), (bc_format, fallback_format));
             assert_eq!(
                 (bc.width, bc.height),
-                (map.width, map.height),
-                "{}",
-                map.file
+                baked_size(map.width),
+                "{}: decoded {}×{}",
+                map.file,
+                map.width,
+                map.height
             );
-            assert_eq!(map.width, 2 * map.height, "{}", map.file);
-            assert_eq!(fallback.width, map.width.min(2048), "{}", map.fallback_file);
+            assert!(map.width.abs_diff(2 * map.height) <= 2, "{}", map.file);
+            assert_eq!(fallback.width, bc.width.min(2048), "{}", map.fallback_file);
+            // The fallback's texels are averages of mip 0's, so none may exceed 1 once scaled.
+            if fallback.format == TexFormat::Rgba8UnormSrgb {
+                let brightest = fallback.mips[0]
+                    .chunks(4)
+                    .flat_map(|t| t[..3].iter().copied())
+                    .max()
+                    .unwrap_or(0);
+                let rho = f64::from(map.albedo_scale) * srgb_to_linear(brightest);
+                assert!(
+                    rho <= 1.0 + 1e-6,
+                    "{}: brightest ρ {rho}",
+                    map.fallback_file
+                );
+            }
             assert_eq!(2 * fallback.height, fallback.width, "{}", map.fallback_file);
             assert_eq!(
                 bc.mip_size(bc.mips.len() - 1).1,
