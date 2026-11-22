@@ -14,7 +14,7 @@ use glam::{Mat4, Vec2, Vec3};
 use uni_core::{blackbody_linear_srgb, star_illuminance_lux};
 use uni_data::CatalogStar;
 use uni_gfx::{
-    CameraUniform, DEPTH_FORMAT, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer,
+    DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer,
     RenderFeature, ShaderLib,
 };
 use wgpu::util::DeviceExt as _;
@@ -26,8 +26,11 @@ pub const STARS_SHADER: &str = "sky/stars.wgsl";
 /// exposure of design §7 item 4. The HUD exposes it as the star EV slider.
 ///
 /// On screen, a star's pixels are E·w/(Ω(θ)·1.2·2^star_ev100), where w is the PSF weight and
-/// Ω(θ) = Ω_c·cos³θ the solid angle of a pixel θ off the optical axis. That is the shader's
-/// E/Ω(θ)·2^(scene − star) times the tonemap's exposure_scale(scene), and the scene EV cancels.
+/// Ω(θ) = Ω_c·cos³θ the solid angle of a pixel θ off the optical axis. The shader writes exactly
+/// that into the pre-exposed HDR target (E/Ω(θ) × exposure_scale(star_ev100), uni-gfx
+/// `camera.wgsl`), and the tonemap applies AgX to it with no further exposure, so the scene EV
+/// never touches a star. The HDR values are display values: Sirius's peak, 35.36 here, stays far
+/// inside f16 at any scene EV (`star_hdr_values_ignore_the_scene_ev_and_fit_f16`).
 /// Calibrated on the optical axis at 1920×1080 with fov_y = 60° against uni-post's AgX, which
 /// clamps log2 of the exposed value to [−12.47393, 4.026069]: black is 2^−12.47393 =
 /// 0.18·2^−10 ≈ 1.76e-4 and white 2^4.026069 = 0.18·2^6.5 ≈ 16.3. The peaks listed are core
@@ -137,10 +140,11 @@ pub fn star_display_energy(lux: f32, fov_y: f32, height_px: f32, star_ev100: f32
 }
 
 /// A star's display-normalised energy θ off the optical axis (`cos_theta` = cos θ): the sum of
-/// its pixel values after the tonemap's exposure, E/(Ω(θ)·1.2·2^star_ev100) with
-/// Ω(θ) = [`pixel_solid_angle_off_axis`]. It equals E/Ω(θ)·2^(scene − star) times
-/// exposure_scale(scene), where exposure_scale(ev) = 1/(1.2·2^ev) (uni-gfx `camera.wgsl`;
-/// Lagarde & de Rousiers 2014 §4.1.1), so the scene EV cancels.
+/// its pre-exposed HDR pixel values, E/(Ω(θ)·1.2·2^star_ev100) with
+/// Ω(θ) = [`pixel_solid_angle_off_axis`]. That is E/Ω(θ) times the star pre-exposure
+/// exposure_scale(star_ev100) = 1/(1.2·2^star_ev100) (uni-gfx `exposure_scale`; Lagarde & de
+/// Rousiers 2014 §4.1.1). The tonemap applies no further exposure, and the scene EV plays no
+/// part.
 ///
 /// Dividing by the pixel's own solid angle keeps a star consistent with the sky radiance in the
 /// same pixels: off-axis pixels subtend less solid angle, so the star's energy is 1/cos³θ larger
@@ -152,7 +156,9 @@ pub fn star_display_energy_off_axis(
     star_ev100: f32,
     cos_theta: f32,
 ) -> f32 {
-    lux / (pixel_solid_angle_off_axis(fov_y, height_px, cos_theta) * 1.2 * star_ev100.exp2())
+    // Same order of operations as the shader: lux · star_pre() / Ω(θ).
+    lux * uni_gfx::exposure_scale(star_ev100)
+        / pixel_solid_angle_off_axis(fov_y, height_px, cos_theta)
 }
 
 /// Framebuffer position [px] of the star in direction `dir` (root axes), or `None` when the star
@@ -178,15 +184,14 @@ pub fn project_star(view_proj: Mat4, dir: Vec3, size_px: Vec2) -> Option<Vec2> {
 
 /// The star field render feature (`name() == "stars"`).
 ///
-/// It owns a copy of the camera uniform, written in `prepare`, because [`RenderFeature::encode`]
-/// is not handed the renderer's camera bind group. Group 1 holds the instance buffer and the lens
-/// mask. It is rebuilt in `resize`, because the targets are recreated then.
+/// Group 0 is the renderer's (camera and exposure, [`FrameBindings::camera`]). Group 1 holds the
+/// instance buffer and the lens mask. It is rebuilt in `resize`, because the targets are
+/// recreated then. The pass runs after the lens pass and multiplies by `1 − lens_mask`
+/// (uni-gfx `targets` pass contract).
 pub struct StarField {
     pipeline: wgpu::RenderPipeline,
     star_bgl: wgpu::BindGroupLayout,
     instance_buffer: wgpu::Buffer,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     /// Group 1 for the current targets. `None` until the first `prepare` or `resize`.
     star_bind_group: Option<wgpu::BindGroup>,
     count: u32,
@@ -228,20 +233,6 @@ impl StarField {
             label: Some("star instances"),
             contents: bytes,
             usage: wgpu::BufferUsages::STORAGE,
-        });
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stars camera uniform"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("stars camera bg"),
-            layout: camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
         });
         let star_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("stars bgl"),
@@ -320,8 +311,6 @@ impl StarField {
             pipeline,
             star_bgl,
             instance_buffer,
-            camera_buffer,
-            camera_bind_group,
             star_bind_group: None,
             count,
         })
@@ -357,12 +346,7 @@ impl RenderFeature for StarField {
         "stars"
     }
 
-    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
-        gpu.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
-        );
+    fn prepare(&mut self, gpu: &GpuContext, _ctx: &FrameCtx, targets: &FrameTargets) {
         if self.star_bind_group.is_none() {
             self.bind_targets(gpu, targets);
         }
@@ -372,6 +356,7 @@ impl RenderFeature for StarField {
         &mut self,
         gpu: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
+        frame: &FrameBindings<'_>,
         targets: &FrameTargets,
         _output: &wgpu::TextureView,
         timer: &mut PassTimer,
@@ -407,7 +392,7 @@ impl RenderFeature for StarField {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(0, frame.camera, &[]);
         pass.set_bind_group(1, star_bind_group, &[]);
         pass.draw(0..6, 0..self.count);
     }
@@ -768,6 +753,39 @@ mod tests {
         }
     }
 
+    /// Review I2: stars are pre-exposed with the star EV only. The scene EV never scales a star's
+    /// HDR value (at M0 it pushed Sirius past f16 above scene EV ≈ 10.5 and so dimmed it), and
+    /// even the slider's brightest star exposure keeps Sirius inside f16.
+    #[test]
+    fn star_hdr_values_ignore_the_scene_ev_and_fit_f16() {
+        let (fov_y, h) = (60f32.to_radians(), 1080.0);
+        let centre = psf_weights(Vec2::splat(0.5), CORE_SIGMA_PX, 3)[24];
+        let sirius = star_illuminance_lux(-1.46) as f32;
+        // The pre-exposed peak is a display value: 35.36 at the default star EV.
+        let peak = |star_ev: f32| star_display_energy(sirius, fov_y, h, star_ev) * centre;
+        assert!((peak(DEFAULT_STAR_EV100) / 35.36 - 1.0).abs() < 1e-3);
+        // EV100 −10 is the HUD slider's brightest star exposure: 64× the default.
+        assert!(peak(-10.0) < uni_gfx::HDR_MAX, "{}", peak(-10.0));
+        assert!(peak(-10.0) > 1000.0);
+        // The shader's vertex stage reads the star pre-exposure and never the scene's.
+        let m = stars_module();
+        let func = |name: &str| {
+            m.functions
+                .iter()
+                .find(|(_, f)| f.name.as_deref() == Some(name))
+                .map(|(h, _)| h)
+                .unwrap_or_else(|| panic!("no fn {name}"))
+        };
+        let vs = &m
+            .entry_points
+            .iter()
+            .find(|e| e.name == "vs_main")
+            .expect("vs_main")
+            .function;
+        assert!(calls(&vs.body, func("star_pre")));
+        assert!(!calls(&vs.body, func("scene_pre")));
+    }
+
     /// The camera → root rotation used by the off-axis tests: yawed and pitched, so no axis is
     /// trivial.
     fn tilted_camera() -> Quat {
@@ -815,11 +833,13 @@ mod tests {
         let cos_rotated = off_axis_cos(view, cam_to_root * Vec3::NEG_Z);
         for v_mag in [-1.46, 0.0, 6.5] {
             let lux = star_illuminance_lux(v_mag) as f32;
-            // The energy formula before the off-axis fix: E/(Ω_c·1.2·2^star_ev100).
+            // The energy formula before the off-axis fix: E/(Ω_c·1.2·2^star_ev100). The
+            // pre-exposed form multiplies by 1/(1.2·2^ev) first, so it agrees to f32 rounding.
             let old = lux / (omega_c * 1.2 * ev.exp2());
-            assert_eq!(star_display_energy(lux, fov_y, h, ev), old);
+            let on_axis = star_display_energy(lux, fov_y, h, ev);
+            assert!((on_axis / old - 1.0).abs() < 1e-6, "{on_axis} vs {old}");
             let e = star_display_energy_off_axis(lux, fov_y, h, ev, cos_unrotated);
-            assert_eq!(e, old);
+            assert_eq!(e, on_axis);
             let e = star_display_energy_off_axis(lux, fov_y, h, ev, cos_rotated);
             assert!((e / old - 1.0).abs() < 1e-6, "V = {v_mag}: {e} vs {old}");
         }

@@ -9,15 +9,17 @@
 //   PSF = (1 − h)·Gaussian core (σ = CORE_SIGMA_PX) + h·Moffat glare halo,
 //   h = HALO_ENERGY_FRACTION above HALO_MIN_LUX, else 0.
 //
-//   pixel luminance [cd/m²] = E / Ω(θ) × exp2(scene_ev100 − star_ev100) × (1 − lens_mask)
-//                             × PSF weight
+//   hdr value = E / Ω(θ) × star_pre() × (1 − lens_mask) × PSF weight
 //
-// E is the star's illuminance at the observer [lux]. Ω(θ) = Ω_c·cos³θ is the solid angle [sr] of
-// a pixel θ off the optical axis, where Ω_c = (2·tan(fov_y/2) / H)² is the value at the centre.
+// E is the star's illuminance at the observer [lux]; E/Ω(θ) is its radiance [cd/m²] spread over
+// the pixel. Ω(θ) = Ω_c·cos³θ is the solid angle [sr] of a pixel θ off the optical axis, where
+// Ω_c = (2·tan(fov_y/2) / H)² is the value at the centre and H the internal resolution's height.
 // Dividing by the pixel's own solid angle keeps a star consistent with the sky radiance in the
-// same pixels. The tonemap then multiplies by exposure_scale(scene_ev100), so on screen a star is
-// exposed at star_ev100 whatever the scene exposure is. That is the "Eye-adapted stars" dual
-// exposure of design §7 item 4.
+// same pixels. The hdr target is pre-exposed (uni-gfx common/camera.wgsl): star_pre() =
+// exposure_scale(star_ev100), and the tonemap applies no further exposure, so on screen a star
+// is exposed at star_ev100 whatever the scene exposure is, and its hdr value does not grow with
+// the scene EV. When star_ev100 ≠ scene_ev100 that is the "Eye-adapted stars" dual exposure of
+// design §7 item 4, which the HUD labels.
 //
 // Blending is additive into `hdr`. Depth is tested (GreaterEqual, no writes) at the far plane.
 // The CPU twins are in crates/uni-sky/src/psf.rs and stars.rs. `shader_constants_match_cpu`
@@ -55,9 +57,6 @@ const VISIBILITY_CUTOFF: f32 = 3.0e-5;
 // Stars whose clip-space w is at most this are behind the camera or on its plane. Directions
 // are unit vectors, so on-screen stars have w ≥ cos(fov/2) ≫ this.
 const MIN_CLIP_W: f32 = 1.0e-6;
-// Upper bound for one splat's colour, below the largest finite f16 (65504), so a splat can never
-// write infinity into the Rgba16Float target.
-const HDR_MAX: f32 = 60000.0;
 // Clip position for culled vertices. All six vertices coincide (zero area), and it lies outside
 // the clip volume (z > w), so nothing is rasterised.
 const CULLED: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
@@ -146,8 +145,8 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     // Star centre in framebuffer pixels: x right, y down, and pixel k spans [k, k + 1].
     @location(0) @interpolate(flat) centre_px: vec2<f32>,
-    // Pixel luminance [cd/m²] per unit PSF weight, before the lens mask:
-    // colour · E/Ω(θ) · 2^(scene_ev100 − star_ev100).
+    // Pre-exposed hdr value per unit PSF weight, before the lens mask:
+    // colour · E/Ω(θ) · star_pre().
     @location(1) @interpolate(flat) radiance: vec3<f32>,
     // x: halo share h; y: footprint radius R [px].
     @location(2) @interpolate(flat) halo: vec2<f32>,
@@ -183,13 +182,11 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // cos θ off the optical axis: −z_view/|dir_view| (= clip.w/|dir_view|, since the projection's
     // w row is (0, 0, −1, 0)). It is positive, because clip.w > MIN_CLIP_W.
     let cos_theta = -view_dir.z / length(view_dir);
-    // lux → pixel luminance [cd/m²] per unit PSF weight: 2^(scene_ev100 − star_ev100) / Ω(θ).
     let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
-    let to_luminance = exp2(camera.exposure.x - camera.exposure.y) / omega;
-    // Display-normalised energy (the footprint's sum after the tonemap's exposure). It sizes the
-    // quad: E/(Ω(θ)·1.2·2^star_ev100), whatever the scene exposure is. Twin of
+    // Display-normalised energy: the footprint's sum of pre-exposed hdr values,
+    // E/(Ω(θ)·1.2·2^star_ev100), whatever the scene exposure is. It sizes the quad. Twin of
     // `uni_sky::stars::star_display_energy_off_axis`.
-    let energy = lux * to_luminance * exposure_scale(camera.exposure.x);
+    let energy = lux * star_pre() / omega;
     let h = select(0.0, HALO_ENERGY_FRACTION, lux > HALO_MIN_LUX);
     let radius = footprint_radius_px(energy, h);
 
@@ -206,7 +203,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // off.
     out.pos = vec4<f32>(ndc + quad_corner(vi) * (radius + 0.5) * 2.0 / size, 0.0, 1.0);
     out.centre_px = centre;
-    out.radiance = star.color.rgb * (lux * to_luminance);
+    out.radiance = star.color.rgb * energy;
     out.halo = vec2<f32>(h, radius);
     return out;
 }
