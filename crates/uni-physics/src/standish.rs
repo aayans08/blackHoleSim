@@ -24,6 +24,14 @@
 //! SSB, but worst longitude 79″ against 114″). Read about the SSB, the inner planets would be
 //! off by 800–2 700″. `fit_origin_against_horizons` measures and pins all of this.
 //!
+//! Table 1 ↔ 2 handover (A1b; a lead ruling, not from Standish). Over the last 20 Julian years
+//! inside each end of Table 1's window (T ∈ [−2, −1.8] and [0.3, 0.5]) the state is
+//! (1 − w)·Table 2 + w·Table 1, with w a C¹ smoothstep of the depth inside the window: Table 2
+//! at the window edge, Table 1 from 20 years inside. The hard cut jumped up to 1.28e7 km
+//! (Uranus at 1800), a visible pop under time warp. The cost: near the window edges the state
+//! carries Table 2's error, e.g. Uranus λ 1 018″ at 1800-01-01, where Table 1 alone is 50″
+//! off, and Saturn ρ 4.24e6 km at 2050-01-01 (Table 1: 0.76e6 km).
+//!
 //! Outside 3000 BC – AD 3000 (review C1) a, e, I, ϖ and Ω are frozen at the nearer window edge
 //! (T_e = clamp(T, −50, 10)), the Table 2b terms are evaluated at T_e, and only L advances at
 //! its Table 2a rate: the linear rates would push e past 1 and I to tens of degrees.
@@ -77,7 +85,8 @@ impl Planet {
 /// Which table an epoch uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Validity {
-    /// Table 1: AD 1800–2050.
+    /// Table 1: AD 1800–2050; in its last 20 years at each end the state blends into Table 2
+    /// (A1b, see the module doc).
     Table1,
     /// Tables 2a + 2b: 3000 BC – AD 3000.
     Table2,
@@ -94,6 +103,10 @@ pub const TABLE2_T_MAX: f64 = 10.0;
 /// T = −2 is 1799-12-30 12h TDB and T = 0.5 is 2050-01-01 0h TDB.
 const TABLE1_T_MIN: f64 = -2.0;
 const TABLE1_T_MAX: f64 = 0.5;
+
+/// Width of each Table 1 ↔ 2 handover band inside the ends of Table 1's window [Julian
+/// centuries]: 20 Julian years (A1b, lead ruling).
+const HANDOVER_BAND_CY: f64 = 0.2;
 
 /// One Julian century [s] (36 525 days, IAU 1976).
 const JULIAN_CENTURY_S: f64 = 36_525.0 * DAY;
@@ -168,7 +181,7 @@ const TABLE_2B: [[f64; 4]; 4] = [
     [-0.00041348,  0.68346318, -0.10162547,  7.67025000],
 ];
 
-/// The table used at `t`.
+/// The table whose window holds `t` (Table 1 also across its handover bands).
 pub fn validity(t: Epoch) -> Validity {
     validity_at(t.julian_centuries())
 }
@@ -207,9 +220,48 @@ pub(crate) const fn ssb_fitted(p: Planet) -> bool {
 }
 
 /// The page's state of `p` [m, m/s], ICRS axes, about the origin its elements fit: the Sun,
-/// or the SSB where [`ssb_fitted`].
+/// or the SSB where [`ssb_fitted`]. In the last [`HANDOVER_BAND_CY`] inside each end of
+/// Table 1's window it is the blend of Tables 1 and 2 (A1b); [`crate::ssb`]'s Sun offset, and
+/// so Neptune's heliocentric state, are built from these blended states.
 pub(crate) fn fitted_state_icrs(p: Planet, t: Epoch) -> (DVec3, DVec3) {
-    let el = mean_elements(p, t.julian_centuries());
+    let t_cy = t.julian_centuries();
+    let (r1, v1) = elements_state_icrs(&mean_elements(p, t_cy));
+    let Some((w, w_rate_per_cy)) = handover_weight(t_cy) else {
+        return (r1, v1);
+    };
+    // Lead ruling (A1b), not from Standish: avoids a discontinuity at the table handover;
+    // both tables are within their stated validity across the band. State = (1 − w)·Table 2
+    // + w·Table 1, and its exact time derivative v = (1 − w)·v₂ + w·v₁ + (dw/dt)·(p₁ − p₂).
+    let (r2, v2) = elements_state_icrs(&table_elements(p, t_cy, Validity::Table2));
+    let w_dot = w_rate_per_cy / JULIAN_CENTURY_S;
+    (
+        r2 * (1.0 - w) + r1 * w,
+        v2 * (1.0 - w) + v1 * w + (r1 - r2) * w_dot,
+    )
+}
+
+/// Table 1's weight w in the handover blend at `t_cy` and its rate dw/dT [1/century], or
+/// `None` where one table stands alone: outside Table 1's window, and deeper inside it than
+/// [`HANDOVER_BAND_CY`]. With x the depth inside the window from its nearer end in units of
+/// the band, w = 3x² − 2x³ (the C¹ smoothstep): 0 at the window edge, 1 at the band's inner
+/// edge, with zero slope at both, so position and velocity are continuous.
+fn handover_weight(t_cy: f64) -> Option<(f64, f64)> {
+    let (depth_cy, depth_rate) = if t_cy - TABLE1_T_MIN <= TABLE1_T_MAX - t_cy {
+        (t_cy - TABLE1_T_MIN, 1.0)
+    } else {
+        (TABLE1_T_MAX - t_cy, -1.0)
+    };
+    if !(0.0..HANDOVER_BAND_CY).contains(&depth_cy) {
+        return None;
+    }
+    let x = depth_cy / HANDOVER_BAND_CY;
+    let w = x * x * (3.0 - 2.0 * x);
+    let w_rate = 6.0 * x * (1.0 - x) * depth_rate / HANDOVER_BAND_CY;
+    Some((w, w_rate))
+}
+
+/// The state [m, m/s], ICRS axes, of the orbit `el` describes: the page's steps 4–6.
+fn elements_state_icrs(el: &MeanElements) -> (DVec3, DVec3) {
     let (a, e) = (el.a_au * AU, el.e);
     let per_s = 1.0 / JULIAN_CENTURY_S;
     let n = el.m_rate_deg_per_cy.to_radians() * per_s;
@@ -257,9 +309,14 @@ struct MeanElements {
     drift_per_cy: [f64; 5],
 }
 
-/// The elements of `p` at `t_cy` Julian centuries from J2000, by the page's steps 1–4.
+/// The elements of `p` at `t_cy` Julian centuries from J2000 from the table in force there.
 fn mean_elements(p: Planet, t_cy: f64) -> MeanElements {
-    let validity = validity_at(t_cy);
+    table_elements(p, t_cy, validity_at(t_cy))
+}
+
+/// The elements of `p` at `t_cy` Julian centuries from J2000 from the table of `validity`,
+/// by the page's steps 1–4.
+fn table_elements(p: Planet, t_cy: f64, validity: Validity) -> MeanElements {
     let k = p as usize;
     let (table, t_el) = match validity {
         Validity::Table1 => (&TABLE_1[k], t_cy),
@@ -458,12 +515,41 @@ mod tests {
         }
     }
 
+    /// The heliocentric state [m, m/s] from the elements of `table` alone, with no handover
+    /// blend (A1b): the page's table itself, which its error tables describe. For Neptune
+    /// (SSB-fitted) the Sun's SSB offset is built from the same table's states by the closed
+    /// form of [`crate::ssb`], repeated here; with the table in force at `t` this is A1's state
+    /// bit for bit, and outside the bands it equals [`heliocentric_state_icrs`].
+    fn table_heliocentric_state_icrs(p: Planet, t: Epoch, table: Validity) -> (DVec3, DVec3) {
+        use crate::bodies::{GM_SUN_DE440_M3S2, system_gm_m3s2};
+        let state =
+            |q: Planet| elements_state_icrs(&table_elements(q, t.julian_centuries(), table));
+        let (r, v) = state(p);
+        if !ssb_fitted(p) {
+            return (r, v);
+        }
+        let (mut total, mut moment, mut moment_rate) =
+            (GM_SUN_DE440_M3S2, DVec3::ZERO, DVec3::ZERO);
+        for q in Planet::ALL {
+            let gm = system_gm_m3s2(q.barycentre_id()).expect("system GM");
+            let (rq, vq) = state(q);
+            moment += gm * rq;
+            moment_rate += gm * vq;
+            if !ssb_fitted(q) {
+                total += gm;
+            }
+        }
+        let (sun_r, sun_v) = (-moment / total, -moment_rate / total);
+        (r - sun_r, v - sun_v)
+    }
+
     /// Compares every Horizons spot of each barycentre (1..=8 @ 10) whose JD passes `keep`
-    /// with Standish, prints the per-spot, worst and RMS errors next to the JPL table, and
+    /// with `state`, prints the per-spot, worst and RMS errors next to the JPL table, and
     /// asserts the expected `table` and the bounds described at [`PEAK_OVER_1800_2050`].
     fn check_against_horizons(
         keep: impl Fn(f64) -> bool,
         table: Validity,
+        state: impl Fn(Planet, Epoch) -> (DVec3, DVec3),
         jpl: &[[f64; 3]; 8],
         peak_over: &[Over],
         rms_over: &[Over],
@@ -481,7 +567,7 @@ mod tests {
             for s in spots {
                 let t = epoch_of(s.jd_tdb);
                 assert_eq!(validity(t), table, "{p:?} at JD {}", s.jd_tdb);
-                let (r, v) = heliocentric_state_icrs(p, t);
+                let (r, v) = state(p, t);
                 let err = ecliptic_errors(r, pos_m(&s));
                 let dv = (v - vel_m_s(&s)).length() / vel_m_s(&s).length();
                 worst_dv = worst_dv.max(dv);
@@ -536,12 +622,14 @@ mod tests {
 
     /// Every Horizons barycentre spot in AD 1800–2050 against the JPL 1800–2050 error table,
     /// asserted as described at [`PEAK_OVER_1800_2050`]. Target 399 is not the EMB and is not
-    /// used.
+    /// used. The state is Table 1's alone (A1b): the spots at 1800-01-01 and 2050-01-01 lie in
+    /// the handover bands, where the app's state is Table 2's ([`handover_bounds_hold`]).
     #[test]
     fn standish_within_error_table() {
         check_against_horizons(
             |jd| (2_378_495.0..=2_469_807.5).contains(&jd),
             Validity::Table1,
+            |p, t| table_heliocentric_state_icrs(p, t, Validity::Table1),
             &JPL_1800_2050,
             &PEAK_OVER_1800_2050,
             &[],
@@ -555,6 +643,7 @@ mod tests {
         check_against_horizons(
             |jd| jd == 2_086_307.5 || jd == 2_634_166.5,
             Validity::Table2,
+            |p, t| table_heliocentric_state_icrs(p, t, Validity::Table2),
             &JPL_3000BC_3000AD,
             &PEAK_OVER_3000BC_3000AD,
             &RMS_OVER_3000BC_3000AD,
@@ -570,11 +659,15 @@ mod tests {
     /// about the Sun / about the SSB): Neptune 4.83, so it reads about the SSB; Jupiter 0.65;
     /// Saturn 1.02 and Uranus 1.10, too close to leave the page's heliocentric reading. Also
     /// asserted: which page entries each planet exceeds about the Sun, the SSB and its Jacobi
-    /// centre (fix round 2; see the comment at `expected_over`).
+    /// centre (fix round 2; see the comment at `expected_over`). The page's state is Table 1's
+    /// alone at every spot (A1b: 1800-01-01 and 2050-01-01 lie in the handover bands).
     #[test]
     fn fit_origin_against_horizons() {
         use crate::bodies::{GM_SUN_DE440_M3S2, system_gm_m3s2};
         let gm = |id: i32| system_gm_m3s2(id).expect("system GM");
+        let table1_fitted_state = |p: Planet, t: Epoch| {
+            elements_state_icrs(&table_elements(p, t.julian_centuries(), Validity::Table1))
+        };
         let in_table1 = |jd: f64| (2_378_495.0..=2_469_807.5).contains(&jd);
         let spots: Vec<Vec<_>> = (1..=9)
             .map(|id| {
@@ -624,7 +717,7 @@ mod tests {
             for (k, &jd) in jds.iter().enumerate() {
                 let truth = pos_m(&spots[p as usize][k]);
                 assert_eq!(spots[p as usize][k].jd_tdb, jd);
-                let (fitted, _) = fitted_state_icrs(p, epoch_of(jd));
+                let (fitted, _) = table1_fitted_state(p, epoch_of(jd));
                 let (about_sun, about_ssb) = (
                     (fitted - truth).length() / 1e3,
                     (fitted - (truth - ssb_from_sun[k])).length() / 1e3,
@@ -676,7 +769,7 @@ mod tests {
                     moment += gm(inner as i32 + 1) * pos_m(&body[j]);
                     total += gm(inner as i32 + 1);
                 }
-                let (fitted, _) = fitted_state_icrs(p, epoch_of(jd));
+                let (fitted, _) = table1_fitted_state(p, epoch_of(jd));
                 let origins = [DVec3::ZERO, ssb_from_sun[j], moment / total];
                 for (reading, origin) in origins.into_iter().enumerate() {
                     let err = ecliptic_errors(fitted, pos_m(&spots[k][j]) - origin);
@@ -809,7 +902,8 @@ mod tests {
     }
 
     /// Table 1 covers T ∈ [−2, 0.5] (1799-12-30 12h … 2050-01-01 0h TDB) inclusive, Table 2
-    /// T ∈ [−50, 10]. Prints the position jump each planet makes where the tables switch.
+    /// T ∈ [−50, 10]. Prints how far each planet moves in 1 ms across the window edges: since
+    /// A1b's blend, its motion in 1 ms (the hard cut jumped up to 1.28e7 km, A1 report).
     #[test]
     fn validity_windows_and_switch_jumps() {
         let at_t = |t_cy: f64| Epoch::from_days_since_j2000(t_cy * 36_525.0);
@@ -837,11 +931,143 @@ mod tests {
             for p in Planet::ALL {
                 let (r1, _) = heliocentric_state_icrs(p, t);
                 let (r2, _) = heliocentric_state_icrs(p, t.add_seconds(outside));
-                let jump_km = (r2 - r1).length() / 1e3;
-                assert!(jump_km.is_finite());
-                println!("Table 1 ↔ 2 switch at {label}: {p:?} jumps {jump_km:.0} km");
+                let jump_m = (r2 - r1).length();
+                assert!(jump_m.is_finite());
+                println!("Table 1 ↔ 2 switch at {label}: {p:?} moves {jump_m:.3} m in 1 ms");
             }
         }
+    }
+
+    /// The handover bands of A1b's brief: the last 20 Julian years (0.2 cy) inside each end of
+    /// Table 1's window, pinned here as the brief states it.
+    const BAND_CY: f64 = 0.2;
+
+    /// The epoch `t_cy` Julian centuries from J2000.
+    fn at_cy(t_cy: f64) -> Epoch {
+        Epoch::from_days_since_j2000(t_cy * 36_525.0)
+    }
+
+    /// A1b: no jump where the tables hand over. At both ends of Table 1's window and at each
+    /// band's inner edge, for every planet (heliocentric, so Neptune's SSB path is in it), the
+    /// position one second either side of the edge is within |v|·1 s + 1 m of the position at
+    /// the edge. The hard cut jumped 1 260 km (Mercury) to 1.28e7 km (Uranus) (A1 report).
+    #[test]
+    fn handover_is_continuous() {
+        let edges = [
+            TABLE1_T_MIN,
+            TABLE1_T_MIN + BAND_CY,
+            TABLE1_T_MAX - BAND_CY,
+            TABLE1_T_MAX,
+        ];
+        let mut worst_excess_m = f64::NEG_INFINITY;
+        for t_cy in edges {
+            let t = at_cy(t_cy);
+            for p in Planet::ALL {
+                let (r, v) = heliocentric_state_icrs(p, t);
+                let bound_m = v.length() * 1.0 + 1.0;
+                for side_s in [-1.0, 1.0] {
+                    let (r_side, _) = heliocentric_state_icrs(p, t.add_seconds(side_s));
+                    let step_m = (r_side - r).length();
+                    worst_excess_m = worst_excess_m.max(step_m - v.length());
+                    assert!(
+                        step_m < bound_m,
+                        "{p:?} at T {t_cy} ({side_s:+} s): moved {step_m:.3} m, bound {bound_m:.3} m"
+                    );
+                }
+            }
+        }
+        println!("worst |Δr| − |v|·1 s over the handover edges: {worst_excess_m:.2e} m");
+    }
+
+    /// A1b: inside the bands the velocity is the time derivative of the blended position,
+    /// including the blend's own term (dw/dt)·(p₁ − p₂). Central differences over ±60 s agree
+    /// to 1e-6 relative, for every planet, at the bands' quarter points and 30 s inside each
+    /// band end, so the outermost samples straddle the window edge and the band's inner edge.
+    #[test]
+    fn handover_velocity_is_derivative() {
+        let half_step_s = 60.0;
+        let near_cy = 30.0 / JULIAN_CENTURY_S;
+        let mut worst_rel = 0.0f64;
+        for (edge, inward) in [(TABLE1_T_MIN, 1.0), (TABLE1_T_MAX, -1.0)] {
+            for depth_cy in [
+                near_cy,
+                0.25 * BAND_CY,
+                0.5 * BAND_CY,
+                0.75 * BAND_CY,
+                BAND_CY - near_cy,
+            ] {
+                let t = at_cy(edge + inward * depth_cy);
+                for p in Planet::ALL {
+                    let (_, v) = heliocentric_state_icrs(p, t);
+                    let (r_minus, _) = heliocentric_state_icrs(p, t.add_seconds(-half_step_s));
+                    let (r_plus, _) = heliocentric_state_icrs(p, t.add_seconds(half_step_s));
+                    let numeric = (r_plus - r_minus) / (2.0 * half_step_s);
+                    let rel = (v - numeric).length() / v.length();
+                    worst_rel = worst_rel.max(rel);
+                    assert!(
+                        rel < 1e-6,
+                        "{p:?} at T {:.9}: |v − Δr/Δt|/|v| {rel:e}",
+                        edge + inward * depth_cy
+                    );
+                }
+            }
+        }
+        println!("worst |v − Δr/Δt|/|v| in the bands: {worst_rel:.2e}");
+    }
+
+    /// The handover bands' Horizons spots (1800-01-01, w ≈ 1.3e-7; 2050-01-01, w = 0) carry
+    /// Table 2's state. Against the page's 3000 BC – AD 3000 entries (Table 2's), read as
+    /// described at [`PEAK_OVER_1800_2050`], the one entry over is Saturn ρ, at 2050: 4.236e6 /
+    /// 4e6 km → 4.67e6 km. Its RMS over the two spots, 3.0e6 km, is within the page.
+    const PEAK_OVER_IN_BANDS: [Over; 1] = [(Planet::Saturn, 2, 4_670_000.0)];
+
+    /// A1b: the blend keeps the page's bounds. Across both bands (41 epochs each, ends
+    /// included) every planet's blended heliocentric position lies on the segment between
+    /// Table 1's and Table 2's (|p − p₁| + |p − p₂| − |p₁ − p₂| < 1 m; Neptune too, as the
+    /// Sun's SSB offset is linear in the states), so its error against any truth is at most
+    /// the worse table's. The Horizons spots in the bands are asserted with the blended state
+    /// as described at [`PEAK_OVER_IN_BANDS`]. Table 1's 1800–2050 entries hold for Table 1
+    /// alone at those spots ([`standish_within_error_table`]).
+    #[test]
+    fn handover_bounds_hold() {
+        let mut worst_off_m = 0.0f64;
+        for (edge, inward) in [(TABLE1_T_MIN, 1.0), (TABLE1_T_MAX, -1.0)] {
+            for k in 0..=40 {
+                let t_cy = edge + inward * BAND_CY * f64::from(k) / 40.0;
+                let t = at_cy(t_cy);
+                for p in Planet::ALL {
+                    let (r, _) = heliocentric_state_icrs(p, t);
+                    let (r1, _) = table_heliocentric_state_icrs(p, t, Validity::Table1);
+                    let (r2, _) = table_heliocentric_state_icrs(p, t, Validity::Table2);
+                    let off_m = (r - r1).length() + (r - r2).length() - (r1 - r2).length();
+                    worst_off_m = worst_off_m.max(off_m);
+                    assert!(
+                        off_m < 1.0,
+                        "{p:?} at T {t_cy}: {off_m} m off the Table 1–2 segment"
+                    );
+                }
+            }
+        }
+        println!("worst |p − p₁| + |p − p₂| − |p₁ − p₂| in the bands: {worst_off_m:.2e} m");
+        let in_band = |jd: f64| {
+            let t_cy = epoch_of(jd).julian_centuries();
+            (TABLE1_T_MIN..TABLE1_T_MIN + BAND_CY).contains(&t_cy)
+                || (TABLE1_T_MAX - BAND_CY..=TABLE1_T_MAX).contains(&t_cy)
+        };
+        let jds: Vec<f64> = horizons_spots(Planet::Mercury.barycentre_id(), 10)
+            .iter()
+            .map(|s| s.jd_tdb)
+            .filter(|&jd| in_band(jd))
+            .collect();
+        assert_eq!(jds, [2_378_496.5, 2_469_807.5]);
+        check_against_horizons(
+            in_band,
+            Validity::Table1,
+            heliocentric_state_icrs,
+            &JPL_3000BC_3000AD,
+            &PEAK_OVER_IN_BANDS,
+            &[],
+        );
     }
 
     #[test]
