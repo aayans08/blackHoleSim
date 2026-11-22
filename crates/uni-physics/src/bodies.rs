@@ -3,11 +3,11 @@
 //! Radii: IAU WGCCRE 2015 (Archinal et al. 2018, CMDA 130:22). GM: DE440 (Park et al. 2021,
 //! AJ 161, 105) and the JPL satellite physical parameters.
 //!
-//! **Implemented by the lead's A0b (fix round 2, review I3) ahead of A1**, because A9's
-//! `facts_cover_major_bodies` (uni-data) reads this table while A1 runs in parallel. A1 still owns
-//! this module: check every row against the sources below, add its `radii_order_and_flattening`
-//! test, and put its tests inside the existing `mod tests` at the end of this file (a second
-//! `mod tests` does not compile).
+//! The table was written by the lead's A0b (fix round 2, review I3) ahead of A1, because A9's
+//! `facts_cover_major_bodies` (uni-data) reads it. A1 checked every GM and radius against both
+//! files below on 2026-11-22: all 29 rows match (Charon's 606 km is `pck00011.tpc`'s current
+//! value; the 605 km printed above it there is the 2009 report's). A1 added the DE440 Sun and
+//! system-barycentre GMs.
 //!
 //! Transcription sources, read 2026-11-22:
 //! - Radii: NAIF `pck00011.tpc` (https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/pck00011.tpc),
@@ -57,11 +57,40 @@ const fn row(
 
 const SUN: Option<NaifId> = Some(10);
 
+/// GM of the Sun [m³/s²], DE440 (`BODY10_GM` in `gm_de440.tpc`). uni-physics uses this value
+/// throughout; `uni_core::GM_SUN` (frozen) differs from it by 2e-12 relative.
+pub const GM_SUN_DE440_M3S2: f64 = 1.3271244004127942e20;
+
+/// DE440 `BODY1_GM` … `BODY9_GM` (`gm_de440.tpc`, read 2026-11-22), km³/s² × 1e9.
+const SYSTEM_GM_M3S2: [f64; 9] = [
+    2.2031868551400003e13, // 1 Mercury
+    3.2485859200000000e14, // 2 Venus
+    4.0350323562548019e14, // 3 Earth–Moon barycentre
+    4.2828375815756102e13, // 4 Mars system
+    1.2671276409999998e17, // 5 Jupiter system
+    3.7940584841799997e16, // 6 Saturn system
+    5.7945563999999985e15, // 7 Uranus system
+    6.8365271005803989e15, // 8 Neptune system
+    9.7550000000000000e11, // 9 Pluto system
+];
+
+/// GM of the planetary-system barycentres 1..=9 [m³/s²]: the planet plus its moons, DE440
+/// (`BODY1_GM` … `BODY9_GM` in `gm_de440.tpc`, km³/s² with the exponent raised by 9).
+/// Mercury and Venus have no moons, so theirs equal `BODY199_GM` and `BODY299_GM`. `None`
+/// for any other id.
+pub const fn system_gm_m3s2(barycentre: NaifId) -> Option<f64> {
+    if barycentre >= 1 && barycentre <= 9 {
+        Some(SYSTEM_GM_M3S2[(barycentre - 1) as usize])
+    } else {
+        None
+    }
+}
+
 /// The contract's list, in its order. Columns: name, NAIF id, parent, GM [m³/s²] (`gm_de440.tpc`),
 /// radii a, b, c [m] (`pck00011.tpc`, WGCCRE 2015).
 #[rustfmt::skip]
 static MAJOR_BODIES: [BodyConst; 29] = [
-    row("Sun", 10, None, 1.3271244004127942e20, 695_700.0e3, 695_700.0e3, 695_700.0e3),
+    row("Sun", 10, None, GM_SUN_DE440_M3S2, 695_700.0e3, 695_700.0e3, 695_700.0e3),
     row("Mercury", 199, SUN, 2.2031868551400003e13, 2_440.53e3, 2_440.53e3, 2_438.26e3),
     row("Venus", 299, SUN, 3.2485859200000000e14, 6_051.8e3, 6_051.8e3, 6_051.8e3),
     row("Earth", 399, SUN, 3.9860043550702266e14, 6_378.1366e3, 6_378.1366e3, 6_356.7519e3),
@@ -194,5 +223,55 @@ mod tests {
         // Earth + Moon = DE440's Earth–Moon barycentre GM 403 503.235 625 km³/s² (to 1e-9).
         let emb = b(399).gm_m3s2 + b(301).gm_m3s2;
         assert!((emb / 4.0350323562548019e14 - 1.0).abs() < 1e-9, "{emb}");
+    }
+
+    /// Flattening from the WGCCRE 2015 radii: Saturn c/a = 54 364/60 268 (polar/equatorial),
+    /// Jupiter 66 854/71 492; every body has a ≥ b ≥ c > 0.
+    #[test]
+    fn radii_order_and_flattening() {
+        let c_over_a = |id| {
+            let r = by_naif(id).expect("present").radii_m;
+            r.z / r.x
+        };
+        assert!((c_over_a(699) - 54_364.0 / 60_268.0).abs() < 1e-5);
+        assert!((c_over_a(599) - 66_854.0 / 71_492.0).abs() < 1e-5);
+        for body in major_bodies() {
+            let r = body.radii_m;
+            assert!(
+                r.x >= r.y && r.y >= r.z && r.z > 0.0,
+                "{}: {r:?}",
+                body.name
+            );
+        }
+    }
+
+    /// The system GMs are DE440's `BODYn_GM`, the Sun's is `BODY10_GM`, and each system is its
+    /// planet plus the moons in the table to 1e-4 (Uranus lacks Miranda, Ariel and Umbriel;
+    /// Neptune's planet and Triton solutions sum 7e-7 above DE440's system value).
+    #[test]
+    fn system_gm_matches_de440_and_bodies() {
+        assert_eq!(system_gm_m3s2(9), Some(9.755e11));
+        assert_eq!(system_gm_m3s2(5), Some(1.2671276409999998e17));
+        assert_eq!(system_gm_m3s2(3), Some(4.0350323562548019e14));
+        assert_eq!(by_naif(10).map(|s| s.gm_m3s2), Some(GM_SUN_DE440_M3S2));
+        for id in [0, 10, 399, -1] {
+            assert_eq!(system_gm_m3s2(id), None, "{id}");
+        }
+        for bary in 1..=9 {
+            let system = system_gm_m3s2(bary).expect("barycentre 1..=9");
+            let planet = bary * 100 + 99;
+            let members: f64 = major_bodies()
+                .iter()
+                .filter(|b| b.naif == planet || b.parent == Some(planet))
+                .map(|b| b.gm_m3s2)
+                .sum();
+            assert!(
+                (members / system - 1.0).abs() < 1e-4,
+                "{bary}: {members} vs {system}"
+            );
+            if bary <= 2 {
+                assert_eq!(system, by_naif(planet).expect("planet").gm_m3s2);
+            }
+        }
     }
 }
