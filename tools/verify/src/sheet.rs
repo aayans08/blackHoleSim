@@ -7,10 +7,12 @@
 //! captures move together.
 //!
 //! Task 11 writes `<name>.png` with `<name>.json` beside it:
-//! `{name, width, height, gpu_ms: {pass: ms}, cpu_ms, star_count, lens_scale, epoch_utc}`.
-//! The JSON is read tolerantly: a missing, null or empty value shows as "—", a value of an
-//! unexpected type is shown as it is, and unknown keys get rows of their own after the known
-//! ones. A missing or unparsable JSON file gives a note and a table of dashes.
+//! `{name, width, height, gpu_ms: {pass: ms | null}, gpu_frame_ms: ms | null, cpu_ms,
+//! star_count, lens_scale, epoch_utc}`. A GPU time of `null` is a pass the device did not
+//! measure validly and shows as "n/a" (review I5: never as 0). Otherwise the JSON is read
+//! tolerantly: a missing, null or empty value shows as "—", a value of an unexpected type is
+//! shown as it is, and unknown keys get rows of their own after the known ones. A missing or
+//! unparsable JSON file gives a note and a table of dashes.
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -33,8 +35,12 @@ struct Metrics {
     name: Option<Value>,
     width: Option<Value>,
     height: Option<Value>,
-    /// GPU time per render pass [ms], keyed by pass name.
+    /// GPU time per render pass [ms], keyed by pass name; `null` for an invalid measurement.
     gpu_ms: Option<Value>,
+    /// Whole-frame GPU time [ms]; `null` when not measured validly (kept as
+    /// `Some(Value::Null)`, unlike a missing key).
+    #[serde(default, deserialize_with = "present")]
+    gpu_frame_ms: Option<Value>,
     cpu_ms: Option<Value>,
     star_count: Option<Value>,
     lens_scale: Option<Value>,
@@ -42,6 +48,12 @@ struct Metrics {
     /// Keys the capture format does not (yet) document.
     #[serde(flatten)]
     extra: Map<String, Value>,
+}
+
+/// Deserialises a present key as `Some`, even when its value is `null`; a missing key falls back
+/// to `None` through `#[serde(default)]`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 /// What the sheet shows for one capture.
@@ -87,7 +99,7 @@ fn canonical(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// The `*.png` files directly in `dir` (extension in any case), sorted by file name.
-fn list_pngs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn list_pngs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let read_error = || format!("cannot read {}", dir.display());
     let mut pngs = Vec::new();
     for entry in fs::read_dir(dir).with_context(read_error)? {
@@ -159,6 +171,18 @@ fn text(value: Option<&Value>) -> String {
     }
 }
 
+/// Shown for a GPU time the device did not measure validly (JSON `null`).
+const NOT_MEASURED: &str = "n/a";
+
+/// A GPU time [ms] to 3 decimals, "n/a" for `null` (an invalid measurement), "—" when the key
+/// is missing.
+fn gpu_millis(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::Null) => NOT_MEASURED.to_owned(),
+        other => millis(other),
+    }
+}
+
 /// A duration [ms] to 3 decimals, or the value as it is if it is not a number.
 fn millis(value: Option<&Value>) -> String {
     match value.and_then(Value::as_f64) {
@@ -180,12 +204,16 @@ fn metric_rows(m: &Metrics) -> Vec<(String, String)> {
     match &m.gpu_ms {
         Some(Value::Object(passes)) if !passes.is_empty() => {
             for (pass, ms) in passes {
-                rows.push((format!("gpu_ms · {pass}"), millis(Some(ms))));
+                rows.push((format!("gpu_ms · {pass}"), gpu_millis(Some(ms))));
             }
         }
         Some(Value::Object(_)) => rows.push(("gpu_ms".to_owned(), MISSING.to_owned())),
         other => rows.push(("gpu_ms".to_owned(), text(other.as_ref()))),
     }
+    rows.push((
+        "gpu_frame_ms".to_owned(),
+        gpu_millis(m.gpu_frame_ms.as_ref()),
+    ));
     rows.extend([
         ("cpu_ms".to_owned(), millis(m.cpu_ms.as_ref())),
         ("star_count".to_owned(), text(m.star_count.as_ref())),
@@ -390,6 +418,20 @@ mod tests {
         assert_eq!(row(&rows, "star_count"), "9096");
         assert_eq!(row(&rows, "lens_scale"), "1.0");
         assert_eq!(row(&rows, "epoch_utc"), "2026-11-20T00:00:00Z");
+        // Written before the whole-frame time existed: a dash.
+        assert_eq!(row(&rows, "gpu_frame_ms"), MISSING);
+    }
+
+    /// Review I5: a GPU time the device did not measure validly is `null` in the JSON and
+    /// "n/a" on the sheet, never 0.
+    #[test]
+    fn null_gpu_times_show_as_na() {
+        let rows = rows_of(r#"{"gpu_ms": {"lens": 140.5, "tonemap": null}, "gpu_frame_ms": null}"#);
+        assert_eq!(row(&rows, "gpu_ms · lens"), "140.500 ms");
+        assert_eq!(row(&rows, "gpu_ms · tonemap"), "n/a");
+        assert_eq!(row(&rows, "gpu_frame_ms"), "n/a");
+        let rows = rows_of(r#"{"gpu_frame_ms": 16.25}"#);
+        assert_eq!(row(&rows, "gpu_frame_ms"), "16.250 ms");
     }
 
     #[test]

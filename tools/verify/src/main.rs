@@ -1,7 +1,10 @@
-//! uni-verify: checks headless captures (contact sheet, shadow-radius measurement).
+//! uni-verify: checks headless captures (contact sheets, shadow-radius measurement).
 //!
 //! - `uni-verify sheet --captures <dir> --out <dir>/index.html` writes an HTML contact sheet
 //!   of every PNG in `<dir>` with its JSON metrics (see `sheet`).
+//! - `uni-verify contact --captures <dir> --out <png> [--width 2400]` tiles every PNG in
+//!   `<dir>` into one downscaled grid PNG, each tile labelled with its position in file-name
+//!   order, and prints the legend (see `contact`).
 //! - `uni-verify shadow --png <file> --expected-px <f64> --tol <f64>` measures the
 //!   black-hole shadow radius in a capture and prints `measured=<r> expected=<e> PASS|FAIL`
 //!   (see `shadow`).
@@ -9,6 +12,7 @@
 //! Exit codes: 0 on success or PASS, 1 on FAIL, 2 on a bad command line or an I/O or
 //! decode error (the error goes to stderr).
 
+mod contact;
 mod shadow;
 mod sheet;
 
@@ -19,6 +23,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   uni-verify sheet --captures <dir> --out <dir>/index.html
+  uni-verify contact --captures <dir> --out <png> [--width 2400]
   uni-verify shadow --png <file> --expected-px <f64> --tol <f64>";
 
 /// Exit code when the shadow radius is out of tolerance.
@@ -32,6 +37,11 @@ enum Command {
     Sheet {
         captures: PathBuf,
         out: PathBuf,
+    },
+    Contact {
+        captures: PathBuf,
+        out: PathBuf,
+        width: u32,
     },
     Shadow {
         png: PathBuf,
@@ -51,6 +61,22 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Command> {
             captures: PathBuf::from(captures),
             out: PathBuf::from(out),
         })
+    } else if command == "contact" {
+        let ([captures, out], [width]) =
+            flag_values_opt(options, ["--captures", "--out"], ["--width"])?;
+        let width = match width {
+            None => contact::DEFAULT_WIDTH,
+            Some(w) => w
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&w| (64..=16384).contains(&w))
+                .with_context(|| format!("--width needs 64..=16384 pixels, not {w:?}\n{USAGE}"))?,
+        };
+        Ok(Command::Contact {
+            captures: PathBuf::from(captures),
+            out: PathBuf::from(out),
+            width,
+        })
     } else if command == "shadow" {
         let [png, expected_px, tol] = flag_values(options, ["--png", "--expected-px", "--tol"])?;
         Ok(Command::Shadow {
@@ -69,23 +95,37 @@ fn flag_values<const N: usize>(
     options: &[OsString],
     names: [&str; N],
 ) -> anyhow::Result<[OsString; N]> {
+    flag_values_opt(options, names, []).map(|(required, [])| required)
+}
+
+/// Like [`flag_values`], plus `optional` flags that may be given at most once each.
+fn flag_values_opt<const N: usize, const M: usize>(
+    options: &[OsString],
+    required: [&str; N],
+    optional: [&str; M],
+) -> anyhow::Result<([OsString; N], [Option<OsString>; M])> {
     let mut values: [Option<OsString>; N] = std::array::from_fn(|_| None);
+    let mut extra: [Option<OsString>; M] = std::array::from_fn(|_| None);
     let mut options = options.iter();
     while let Some(flag) = options.next() {
-        let Some(slot) = names.iter().position(|name| flag == *name) else {
+        let slot = if let Some(i) = required.iter().position(|name| flag == *name) {
+            &mut values[i]
+        } else if let Some(i) = optional.iter().position(|name| flag == *name) {
+            &mut extra[i]
+        } else {
             bail!("unknown option {flag:?}\n{USAGE}");
         };
         let value = options
             .next()
             .with_context(|| format!("{flag:?} needs a value\n{USAGE}"))?;
-        if values[slot].replace(value.clone()).is_some() {
+        if slot.replace(value.clone()).is_some() {
             bail!("{flag:?} given twice\n{USAGE}");
         }
     }
     if let Some(missing) = values.iter().position(Option::is_none) {
-        bail!("missing {}\n{USAGE}", names[missing]);
+        bail!("missing {}\n{USAGE}", required[missing]);
     }
-    Ok(values.map(Option::unwrap_or_default))
+    Ok((values.map(Option::unwrap_or_default), extra))
 }
 
 /// A finite, non-negative number [px].
@@ -103,6 +143,18 @@ fn run(command: Command) -> anyhow::Result<ExitCode> {
         Command::Sheet { captures, out } => {
             let count = sheet::write_sheet(&captures, &out)?;
             println!("sheet: {count} captures -> {}", out.display());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Contact {
+            captures,
+            out,
+            width,
+        } => {
+            let legend = contact::write_contact(&captures, &out, width)?;
+            println!("contact: {} captures -> {}", legend.len(), out.display());
+            for (n, name) in legend {
+                println!("  {n} {name}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Shadow {
@@ -178,6 +230,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_contact_command() {
+        let c = parse_args(&args(&[
+            "contact",
+            "--captures",
+            "captures/m0",
+            "--out",
+            "/tmp/m0.png",
+        ]));
+        assert_eq!(
+            c.expect("valid contact command"),
+            Command::Contact {
+                captures: PathBuf::from("captures/m0"),
+                out: PathBuf::from("/tmp/m0.png"),
+                width: contact::DEFAULT_WIDTH,
+            }
+        );
+        let c = parse_args(&args(&[
+            "contact",
+            "--width",
+            "1200",
+            "--out",
+            "o.png",
+            "--captures",
+            "c",
+        ]));
+        assert_eq!(
+            c.expect("valid contact command"),
+            Command::Contact {
+                captures: PathBuf::from("c"),
+                out: PathBuf::from("o.png"),
+                width: 1200,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_bad_arguments() {
         let bad: &[&[&str]] = &[
             &[],
@@ -207,6 +295,29 @@ mod tests {
                 "inf",
             ],
             &["shadow", "--png", "p", "--expected-px", "158"],
+            &["contact", "--captures", "c"],
+            &["contact", "--captures", "c", "--out", "o", "--width", "0"],
+            &[
+                "contact",
+                "--captures",
+                "c",
+                "--out",
+                "o",
+                "--width",
+                "wide",
+            ],
+            &[
+                "contact",
+                "--captures",
+                "c",
+                "--out",
+                "o",
+                "--width",
+                "1",
+                "--width",
+                "2",
+            ],
+            &["sheet", "--captures", "c", "--out", "o", "--width", "100"],
         ];
         for list in bad {
             assert!(parse_args(&args(list)).is_err(), "accepted {list:?}");
