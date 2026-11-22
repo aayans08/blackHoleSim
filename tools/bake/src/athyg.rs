@@ -27,16 +27,37 @@
 //!
 //! Photometry (`mag`, `absmag`, `ci`, `mag_src`):
 //! - `mag_src = T`, `ci` present: `mag` is Tycho VT and `ci` is BT−VT. Converted to Johnson
-//!   with ESA (1997), *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §2.2 eqs.
-//!   2.2.1–2.2.2 (the simple form of §1.3 Appendix 4, also quoted in the Tycho-2 ReadMe, CDS
-//!   I/259, note 7): V = VT − 0.090 (BT−VT), B−V = 0.850 (BT−VT). ESA states its errors (≤ 0.015
-//!   in V, ≤ 0.05 in B−V for unreddened main-sequence stars) only for −0.2 < BT−VT < 1.8, so
-//!   BT−VT is clamped to that interval and the clamped stars are counted. M_V = absmag + (V − VT).
-//!   Exception: stars with an HR number whose BSC5 V is brighter than [`TYCHO_SATURATED_V`]
-//!   take BSC5's Johnson V and B−V (same identity check as below), because there Tycho
-//!   photometry is biased: measured on v4.0 against BSC5, the 8 such stars (Canopus, Rigel,
-//!   Altair, Aldebaran, Antares, Spica, Achernar, Betelgeuse) come out 0.06–0.17 mag too faint
-//!   (median +0.13), against a median of −0.001 ± 0.015 for V ≥ 4.
+//!   with ESA (1997), *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §1.3 Appendix 4,
+//!   Table 1.3.4 ([`tycho_to_johnson`]): the "more accurate transformation" that ESA used for
+//!   the Tycho Catalogue's own B−V (field T37), linear between the table's nodes at BT−VT −0.2,
+//!   0.1, 0.5, 1.4 and 1.8, and beyond the end nodes "the values tabulated at the ends of the
+//!   given interval are used for extrapolation". (The simple form V = VT − 0.090 (BT−VT),
+//!   B−V = 0.850 (BT−VT) of §1.3 eq. 1.3.20 and §2.2 eqs. 2.2.1–2.2.2 is the table without its
+//!   corrections of up to 0.046 mag.) M_V = absmag + (V − VT). Measured on v4.0 against BSC5
+//!   Johnson B−V (the bake enforces |median| ≤ [`BSC5_BV_CHECK_MAX`]): inside the table's
+//!   interval the median of BSC5 − converted is +0.001 (7,740 HR stars); redder than 1.8 it is
+//!   +0.005 (724 stars to BT−VT 2.6) and −0.18 for the 21 beyond 2.6 (17 of them carbon stars).
+//!   Clamping BT−VT to 1.8, as this bake first did, made those stars 0.07 and 1.07 too blue.
+//!   Exceptions:
+//!   - Red dwarfs. ESA: the transformations "ignore variations due to luminosity class. They
+//!     should not be applied to M-type stars". A row redder than the last node (BT−VT > 1.8)
+//!     whose `absmag` is [`DWARF_MIN_ABS_MAG`] or fainter is a K/M dwarf. These stars are faint
+//!     in BT, so their Tycho colour is noisy (the Tycho Catalogue's median BT−VT error is 0.12
+//!     mag at VT 10–11 and 0.20 mag beyond, ESA SP-1200 vol. 1 §2.2; Ross 128, VT 11.45, has
+//!     BT−VT 4.0, where CNS3 gives B−V 1.75). They take the B−V of
+//!     the Pecaut & Mamajek (2013) dwarf sequence at their M_V ([`dwarf_bv_from_abs_mag`]) and
+//!     V from Table 1.3.4 at its last node. Measured against the Johnson B−V of the Gliese–
+//!     Jahreiss CNS3 (CDS V/70A) for 96 of them (CNS3 − baked): median +0.021, rms 0.042, largest
+//!     0.11, against median −0.14, rms 0.37, largest 1.6 for the extrapolated table and median
+//!     −0.03, rms 0.08, largest 0.22 for the clamp.
+//!   - A B−V bluer than any star: a BT−VT bluer than [`BLUEST_BT_VT`] would convert to a B−V
+//!     bluer than O3V (−0.33, Pecaut & Mamajek 2013), and is raised to it. In v4.0 these are
+//!     5 faint (VT 12.7–13.2) white dwarfs or untyped stars with BT−VT down to −0.955.
+//!   - Stars with an HR number whose BSC5 V is brighter than [`TYCHO_SATURATED_V`] take BSC5's
+//!     Johnson V and B−V (same identity check as below), because there Tycho photometry is
+//!     biased: measured on v4.0 against BSC5, the 8 such stars (Canopus, Rigel, Altair,
+//!     Aldebaran, Antares, Spica, Achernar, Betelgeuse) come out 0.06–0.17 mag too faint
+//!     (median +0.13), against a median of −0.001 ± 0.015 for V ≥ 4.
 //! - `mag_src = T`, `ci` empty: a Tycho-2 supplement-1 star whose "VT" is the Hipparcos Hp, or
 //!   one with only VT (Tycho-2 ReadMe notes 3–4). When it has an HR number and its `mag` is
 //!   within [`BSC5_MATCH_MAX_MAG`] of BSC5's V, BSC5's Johnson V and B−V are used (Hoffleit &
@@ -68,13 +89,47 @@ const USAGE: &str = "usage: uni-bake athyg --input <athyg_40_reduced_m10.csv.gz>
 /// AT-HYG `data/subsets/README.md`).
 const SUBSET_ROWS: usize = 332_178;
 
-/// Tycho → Johnson coefficients, ESA SP-1200 vol. 1 §2.2 eqs. 2.2.1–2.2.2:
-/// V = VT − 0.090 (BT−VT), B−V = 0.850 (BT−VT).
+/// Tycho → Johnson slopes, ESA SP-1200 vol. 1 §1.3 Appendix 4 eq. 1.3.20 (= §2.2 eqs.
+/// 2.2.1–2.2.2): V = VT − 0.090 (BT−VT), B−V = 0.850 (BT−VT). Table 1.3.4 tabulates the
+/// corrections to these.
 const TYCHO_V_PER_BT_VT: f64 = 0.090;
 const TYCHO_BV_PER_BT_VT: f64 = 0.850;
-/// The BT−VT interval over which ESA SP-1200 vol. 1 §2.2 bounds the transformation's errors.
-const TYCHO_BT_VT_MIN: f64 = -0.2;
-const TYCHO_BT_VT_MAX: f64 = 1.8;
+/// ESA SP-1200 vol. 1 §1.3 Appendix 4, Table 1.3.4 ("Transformation from the Tycho photometric
+/// system to Johnson. The points given can be used in a linear interpolation"), one node per
+/// column: (BT−VT, V − VT + 0.090 (BT−VT), B−V − 0.85 (BT−VT)). The table's first and last
+/// columns read "≤ −0.2" and "≥ 1.8": the end values hold beyond them (its G factor, the local
+/// slope of B−V against BT−VT, is 0.85 on both sides).
+const TYCHO_TABLE_1_3_4: [(f64, f64, f64); 5] = [
+    (-0.2, 0.014, -0.006),
+    (0.1, 0.000, 0.000),
+    (0.5, -0.005, 0.046),
+    (1.4, -0.005, -0.008),
+    (1.8, -0.015, -0.032),
+];
+/// The reddest node of Table 1.3.4 [mag].
+const TYCHO_TABLE_REDDEST: f64 = TYCHO_TABLE_1_3_4[4].0;
+
+/// The bluest B−V of a star: O3V, the first entry of the Pecaut & Mamajek (2013) dwarf
+/// sequence ([`DWARF_BV`]). The hottest white dwarfs are no bluer (G191-B2B, −0.33).
+const BLUEST_BV: f64 = -0.330;
+/// The BT−VT that Table 1.3.4 maps to [`BLUEST_BV`] (−0.381); bluer Tycho colours are raised
+/// to it.
+const BLUEST_BT_VT: f64 = (BLUEST_BV - TYCHO_TABLE_1_3_4[0].2) / TYCHO_BV_PER_BT_VT;
+
+/// AT-HYG `absmag` (M_VT) [mag] from which a star redder than [`TYCHO_TABLE_REDDEST`] is taken
+/// to be a main-sequence dwarf. At that colour (B−V ≳ 1.5) dwarfs are K7V or later, M_V ≥ 8.16
+/// (Pecaut & Mamajek 2013, Mamajek v2022.04.16), and giants are far brighter. Measured on
+/// v4.0: of the 25,819 rows redder than 1.8, 25,465 have M_VT < 5, 354 have M_VT ≥ 7 and
+/// none lie between, so any limit from 5 to 7 gives the same split.
+const DWARF_MIN_ABS_MAG: f64 = 6.0;
+
+/// Largest accepted |median| [mag] of BSC5 B−V − converted Tycho B−V, checked by the bake
+/// separately inside and redder than Table 1.3.4's interval: ESA's stated B−V error of the
+/// transformation (SP-1200 vol. 1 §1.3 Appendix 4: "errors generally below 0.015 mag in V_J
+/// and below 0.05 mag in (B−V)_J").
+const BSC5_BV_CHECK_MAX: f64 = 0.05;
+/// Fewest BSC5 comparison stars that make that check meaningful.
+const BSC5_BV_CHECK_MIN_STARS: usize = 100;
 
 /// BSC5 V [mag] brighter than which a Tycho-converted HR star takes BSC5's Johnson photometry
 /// instead (Tycho photometry of the brightest stars is biased faint; module doc).
@@ -179,6 +234,24 @@ fn bake(options: &Options) -> anyhow::Result<Summary> {
         summary.sun,
         summary.rows
     );
+    for (residuals, which) in [
+        (
+            &summary.bsc5_bv_residuals_tabulated,
+            "inside ESA Table 1.3.4",
+        ),
+        (
+            &summary.bsc5_bv_residuals_red,
+            "redder than ESA Table 1.3.4",
+        ),
+    ] {
+        let mid = median(residuals);
+        ensure!(
+            residuals.len() >= BSC5_BV_CHECK_MIN_STARS && mid.abs() <= BSC5_BV_CHECK_MAX,
+            "Tycho → Johnson B−V {which}: median BSC5 − converted {mid:+.4} over {} stars \
+             (need ≥ {BSC5_BV_CHECK_MIN_STARS} stars within ±{BSC5_BV_CHECK_MAX})",
+            residuals.len()
+        );
+    }
 
     uni_data::write_athyg(&options.out, &stars)
         .with_context(|| format!("writing {}", options.out.display()))?;
@@ -264,13 +337,29 @@ pub(crate) fn split_csv(line: &str) -> Vec<String> {
     fields
 }
 
+/// Where a Tycho colour lies relative to ESA Table 1.3.4.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TychoColour {
+    /// Inside the table's nodes, −0.2 ≤ BT−VT ≤ 1.8: interpolated.
+    Tabulated,
+    /// Redder than 1.8 (not a dwarf): the table's end values, as ESA prescribes.
+    RedExtrapolated,
+    /// Bluer than −0.2: the table's end values.
+    BlueExtrapolated,
+    /// Bluer than [`BLUEST_BT_VT`]: raised to it, B−V = [`BLUEST_BV`].
+    BluestStar,
+}
+
 /// How a star's V and B−V were obtained.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Photometry {
     /// Johnson V and B−V as catalogued (Gliese, Hipparcos).
     Johnson,
-    /// Tycho VT, BT−VT converted to Johnson; `clamped` when BT−VT was outside [−0.2, 1.8].
-    Tycho { clamped: bool },
+    /// Tycho VT, BT−VT converted to Johnson with ESA Table 1.3.4.
+    Tycho { colour: TychoColour },
+    /// Tycho BT−VT redder than Table 1.3.4's last node on a main-sequence dwarf: B−V from the
+    /// dwarf sequence at M_V, V from the table at its last node.
+    TychoRedDwarf,
     /// BSC5's Johnson V and B−V, for a row without colour (Hp or VT only) or a Tycho star
     /// brighter than [`TYCHO_SATURATED_V`].
     Bsc5 { hr: u32 },
@@ -291,6 +380,8 @@ struct ParsedStar {
     v_mag: f64,
     /// |(x0, y0, z0) − position from ra, dec, dist| [pc].
     pos_dev_pc: f64,
+    /// For a Tycho-converted (not dwarf) row that is a BSC5 star: BSC5 B−V − converted B−V.
+    bsc5_bv_residual: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -438,21 +529,20 @@ fn parse_row(
         let johnson = bsc5.get(&hr)?;
         ((johnson.v - v).abs() <= BSC5_MATCH_MAX_MAG).then_some((hr, *johnson))
     };
+    let mut bsc5_bv_residual = None;
     let (v_mag, bv, photometry) = match (get(cols.mag_src), ci) {
         ("T" | "TYC", Some(bt_vt)) => {
-            let clamped_bt_vt = bt_vt.clamp(TYCHO_BT_VT_MIN, TYCHO_BT_VT_MAX);
-            let v = mag - TYCHO_V_PER_BT_VT * clamped_bt_vt;
+            let (v, bv, photometry) = tycho_photometry(mag, bt_vt, absmag);
             match bsc5_star(v) {
                 Some((hr, johnson)) if johnson.v < TYCHO_SATURATED_V => {
                     (johnson.v, johnson.bv, Photometry::Bsc5 { hr })
                 }
-                _ => (
-                    v,
-                    TYCHO_BV_PER_BT_VT * clamped_bt_vt,
-                    Photometry::Tycho {
-                        clamped: clamped_bt_vt != bt_vt,
-                    },
-                ),
+                bsc5 => {
+                    if let (Some((_, johnson)), Photometry::Tycho { .. }) = (bsc5, photometry) {
+                        bsc5_bv_residual = Some(johnson.bv - bv);
+                    }
+                    (v, bv, photometry)
+                }
             }
         }
         ("T" | "TYC", None) => match bsc5_star(mag) {
@@ -519,7 +609,48 @@ fn parse_row(
         photometry,
         v_mag,
         pos_dev_pc,
+        bsc5_bv_residual,
     })))
+}
+
+/// Johnson (V, B−V) from Tycho VT and BT−VT by ESA SP-1200 vol. 1 §1.3 Appendix 4,
+/// Table 1.3.4: linear interpolation between the nodes; outside them the end node's values.
+fn tycho_to_johnson(vt: f64, bt_vt: f64) -> (f64, f64) {
+    let table = &TYCHO_TABLE_1_3_4;
+    let (dv, dbv) = match table.iter().position(|&(node, _, _)| bt_vt < node) {
+        Some(0) => (table[0].1, table[0].2),
+        None => (table[4].1, table[4].2),
+        Some(i) => {
+            let ((x0, v0, b0), (x1, v1, b1)) = (table[i - 1], table[i]);
+            let t = (bt_vt - x0) / (x1 - x0);
+            (v0 + (v1 - v0) * t, b0 + (b1 - b0) * t)
+        }
+    };
+    (
+        vt - TYCHO_V_PER_BT_VT * bt_vt + dv,
+        TYCHO_BV_PER_BT_VT * bt_vt + dbv,
+    )
+}
+
+/// Johnson V, B−V and their provenance for a Tycho row with VT `vt`, colour `bt_vt` and
+/// AT-HYG `absmag` (M_VT); see the module doc.
+fn tycho_photometry(vt: f64, bt_vt: f64, absmag: f64) -> (f64, f64, Photometry) {
+    if bt_vt > TYCHO_TABLE_REDDEST && absmag >= DWARF_MIN_ABS_MAG {
+        let (v, _) = tycho_to_johnson(vt, TYCHO_TABLE_REDDEST);
+        let bv = dwarf_bv_from_abs_mag(absmag + (v - vt));
+        return (v, bv, Photometry::TychoRedDwarf);
+    }
+    let colour = if bt_vt > TYCHO_TABLE_REDDEST {
+        TychoColour::RedExtrapolated
+    } else if bt_vt < BLUEST_BT_VT {
+        TychoColour::BluestStar
+    } else if bt_vt < TYCHO_TABLE_1_3_4[0].0 {
+        TychoColour::BlueExtrapolated
+    } else {
+        TychoColour::Tabulated
+    };
+    let (v, bv) = tycho_to_johnson(vt, bt_vt.max(BLUEST_BT_VT));
+    (v, bv, Photometry::Tycho { colour })
 }
 
 /// V as catalogued and B−V from the spectral type, or the placeholder.
@@ -542,12 +673,42 @@ struct Summary {
     no_rv: usize,
     named: usize,
     johnson: usize,
-    tycho_converted: usize,
-    tycho_clamped: usize,
+    /// Tycho rows converted with ESA Table 1.3.4, by [`TychoColour`].
+    tycho_tabulated: usize,
+    tycho_red_extrapolated: usize,
+    tycho_blue_extrapolated: usize,
+    tycho_bluest_star: usize,
+    /// Tycho rows redder than the table on main-sequence dwarfs.
+    tycho_red_dwarf: usize,
     bsc5_override: usize,
     spectral_colour: usize,
     placeholder_colour: usize,
     max_pos_dev_pc: f64,
+    /// BSC5 B−V − converted B−V of the Tycho-converted BSC5 stars with −0.2 ≤ BT−VT ≤ 1.8.
+    bsc5_bv_residuals_tabulated: Vec<f64>,
+    /// The same for those redder than 1.8 (giants; dwarfs are not converted).
+    bsc5_bv_residuals_red: Vec<f64>,
+}
+
+impl Summary {
+    fn tycho_converted(&self) -> usize {
+        self.tycho_tabulated
+            + self.tycho_red_extrapolated
+            + self.tycho_blue_extrapolated
+            + self.tycho_bluest_star
+            + self.tycho_red_dwarf
+    }
+}
+
+/// Median of `values`, or NaN when empty.
+fn median(values: &[f64]) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    match sorted.len() {
+        0 => f64::NAN,
+        n if n % 2 == 1 => sorted[n / 2],
+        n => 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]),
+    }
 }
 
 impl fmt::Display for Summary {
@@ -557,8 +718,12 @@ impl fmt::Display for Summary {
             "{} rows: {} stars written, {} NULL-distance rows skipped, \
              {} placeholder-distance (≥ {PLACEHOLDER_DIST_PC} pc) rows skipped, {} Sun row skipped; \
              {} named; {} without velocity (FLAG_NO_VELOCITY), {} without radial velocity (FLAG_NO_RV); \
-             photometry: {} Tycho converted to Johnson ({} with BT−VT clamped to [{TYCHO_BT_VT_MIN}, {TYCHO_BT_VT_MAX}]), \
+             photometry: {} Tycho converted to Johnson by ESA Table 1.3.4 ({} inside its nodes, \
+             {} redder than {TYCHO_TABLE_REDDEST} extrapolated, {} bluer than {} extrapolated, \
+             {} bluer than {BLUEST_BT_VT:.3} raised to B−V {BLUEST_BV}, {} red dwarfs (M_VT ≥ {DWARF_MIN_ABS_MAG}) \
+             with B−V from the dwarf sequence at M_V), \
              {} Johnson as catalogued, {} from BSC5, {} B−V from spectral type, {} B−V placeholder {PLACEHOLDER_BV}; \
+             BSC5 − converted B−V: median {:+.4} over {} stars inside the table, {:+.4} over {} redder; \
              x0/y0/z0 agree with ra/dec/dist to {:.2e} pc",
             self.rows,
             self.written,
@@ -568,12 +733,21 @@ impl fmt::Display for Summary {
             self.named,
             self.no_velocity,
             self.no_rv,
-            self.tycho_converted,
-            self.tycho_clamped,
+            self.tycho_converted(),
+            self.tycho_tabulated,
+            self.tycho_red_extrapolated,
+            self.tycho_blue_extrapolated,
+            TYCHO_TABLE_1_3_4[0].0,
+            self.tycho_bluest_star,
+            self.tycho_red_dwarf,
             self.johnson,
             self.bsc5_override,
             self.spectral_colour,
             self.placeholder_colour,
+            median(&self.bsc5_bv_residuals_tabulated),
+            self.bsc5_bv_residuals_tabulated.len(),
+            median(&self.bsc5_bv_residuals_red),
+            self.bsc5_bv_residuals_red.len(),
             self.max_pos_dev_pc,
         )
     }
@@ -610,6 +784,7 @@ fn parse_catalog(reader: impl BufRead, bsc5: &HashMap<u32, Johnson>) -> anyhow::
                     photometry,
                     v_mag,
                     pos_dev_pc,
+                    bsc5_bv_residual,
                 } = *parsed;
                 ensure!(
                     pos_dev_pc <= POS_CHECK_TOL_PC,
@@ -619,10 +794,27 @@ fn parse_catalog(reader: impl BufRead, bsc5: &HashMap<u32, Johnson>) -> anyhow::
                 summary.max_pos_dev_pc = summary.max_pos_dev_pc.max(pos_dev_pc);
                 match photometry {
                     Photometry::Johnson => summary.johnson += 1,
-                    Photometry::Tycho { clamped } => {
-                        summary.tycho_converted += 1;
-                        summary.tycho_clamped += usize::from(clamped);
+                    Photometry::Tycho { colour } => {
+                        let (count, residuals) = match colour {
+                            TychoColour::Tabulated => (
+                                &mut summary.tycho_tabulated,
+                                Some(&mut summary.bsc5_bv_residuals_tabulated),
+                            ),
+                            TychoColour::RedExtrapolated => (
+                                &mut summary.tycho_red_extrapolated,
+                                Some(&mut summary.bsc5_bv_residuals_red),
+                            ),
+                            TychoColour::BlueExtrapolated => {
+                                (&mut summary.tycho_blue_extrapolated, None)
+                            }
+                            TychoColour::BluestStar => (&mut summary.tycho_bluest_star, None),
+                        };
+                        *count += 1;
+                        if let (Some(residuals), Some(residual)) = (residuals, bsc5_bv_residual) {
+                            residuals.push(residual);
+                        }
                     }
+                    Photometry::TychoRedDwarf => summary.tycho_red_dwarf += 1,
                     Photometry::Bsc5 { hr } => {
                         log::info!(
                             "AT-HYG id {}: V {v_mag:.2} and B−V {:.2} from BSC5 HR {hr}",
@@ -681,6 +873,51 @@ const DWARF_BV: [[f64; 10]; 7] = [
     ], // M
 ];
 const CLASSES: &str = "OBAFGKM";
+
+/// (M_V, B−V) of the main-sequence dwarf sequence from K4V to M9V, in steps of the table's
+/// subtypes: E. Mamajek, "A Modern Mean Dwarf Stellar Color and Effective Temperature
+/// Sequence", version 2022.04.16, columns `Mv` and `B-V` (Pecaut & Mamajek 2013, ApJS 208, 9).
+const DWARF_MV_BV: [(f64, f64); 25] = [
+    (6.98, 1.090),  // K4V
+    (7.28, 1.150),  // K5V
+    (7.64, 1.240),  // K6V
+    (8.16, 1.340),  // K7V
+    (8.43, 1.363),  // K8V
+    (8.56, 1.400),  // K9V
+    (8.80, 1.420),  // M0V
+    (9.20, 1.445),  // M0.5V
+    (9.64, 1.485),  // M1V
+    (9.85, 1.495),  // M1.5V
+    (10.21, 1.505), // M2V
+    (10.61, 1.522), // M2.5V
+    (11.15, 1.530), // M3V
+    (12.10, 1.600), // M3.5V
+    (12.61, 1.650), // M4V
+    (13.58, 1.690), // M4.5V
+    (14.15, 1.830), // M5V
+    (15.30, 1.940), // M5.5V
+    (16.32, 2.010), // M6V
+    (17.10, 2.070), // M6.5V
+    (17.70, 2.120), // M7V
+    (18.16, 2.140), // M7.5V
+    (18.60, 2.150), // M8V
+    (19.20, 2.160), // M8.5V
+    (19.40, 2.170), // M9V
+];
+
+/// B−V of a main-sequence dwarf of absolute magnitude `abs_mag_v`, interpolated linearly in
+/// [`DWARF_MV_BV`]; brighter than K4V gives K4V's, fainter than M9V gives M9V's.
+fn dwarf_bv_from_abs_mag(abs_mag_v: f64) -> f64 {
+    let table = &DWARF_MV_BV;
+    match table.iter().position(|&(mv, _)| abs_mag_v < mv) {
+        Some(0) => table[0].1,
+        None => table[table.len() - 1].1,
+        Some(i) => {
+            let ((m0, b0), (m1, b1)) = (table[i - 1], table[i]);
+            b0 + (b1 - b0) * (abs_mag_v - m0) / (m1 - m0)
+        }
+    }
+}
 
 /// B−V from a spectral type string, read as a dwarf of its class and subtype: the first
 /// upper-case O, B, A, F, G, K or M (so luminosity prefixes such as "dM4", "sdM4", "gK0" and
@@ -838,10 +1075,29 @@ dist_src,mag,absmag,ci,mag_src,rv,rv_src,pmra,pmdec,pm_src,vx,vy,vz,spect,spect_
     const HAMAL: &str = "160733,1758-2416-1,,9861,9884,12929,617,84.3,Alp,13,Ari,Hamal,2.119555,23.462423,\
 HIP_X,20.1776,15.7321,9.7518,8.0336,H,2.125,0.601,1.362,T,-14.412,G_R2,188.55,-148.08,HIP,-15.95,11.33,-18.73,\
 K2III,HYG";
-    /// Barnard's Star: BT−VT 1.907, outside the transformation's validity range.
+    /// Barnard's Star (Gl 699, sdM4): BT−VT 1.907, redder than ESA Table 1.3.4; M_VT 13.466.
     const BARNARD: &str = "1794252,425-2502-1,4472832130942575872,87665,87937,,,699,,,Oph,Barnard's Star,\
 17.96347159,4.69327996,T,1.8282,-0.0174,-1.822,0.1496,G_R3,9.776,13.466,1.907,T,-110.468,G_R3,-801.55,\
 10362.39,G_R3,-5.82,117.51,80.47,sdM4,HYG";
+    /// Ross 128 (Gl 447, M4.5V): BT−VT 4.006 at VT 11.45, near Tycho's BT limit.
+    const ROSS_128: &str = "1219330,272-1051-1,3796072592206250624,57375,57548,,,447,,,Vir,Ross 128,\
+11.795666,0.804563,HIP_X,3.3749,-3.3697,0.1804,0.0474,G_R3,11.451,13.81,4.006,T,-31.1,HYG,607.3,-1223.03,\
+G_R3,30.26,-11.35,-20.0,M4.5V,HYG";
+    /// Proxima Centauri (Gl 551, M5Ve): BT−VT 2.099, M_VT 15.614.
+    const PROXIMA: &str = "1440825,9010-4949-1,5853498713190525696,70666,70890,,,551,,,Cen,Proxima Centauri,\
+14.495985,-62.679485,HIP_X,1.302,-0.4745,-0.3633,-1.1567,G_R3,11.187,15.614,2.099,T,-21.943,G_R3,-3781.74,\
+769.47,G_R3,-9.54,22.09,21.67,M5Ve,HYG";
+    /// Menkar (α Cet, HR 911, M1.5 IIIa): BT−VT 1.971, a red giant beyond Table 1.3.4.
+    const MENKAR: &str = "227696,58-1618-1,,14100,14135,18884,911,,Alp,92,Cet,Menkar,3.03799228,4.08973824,T,\
+76.3942,53.3427,54.4145,5.4483,H,2.716,-1.699,1.971,T,-25.47,OTHER,-10.41,-76.85,HIP,-13.7,-19.36,-29.58,\
+M2 III,T";
+    /// Mirach (β And, HR 337, M0 IIIa): BT−VT 1.911.
+    const MIRACH: &str = "89288,2286-1329-1,,5436,5447,6860,337,53.3,Bet,43,And,Mirach,1.16220082,35.62055764,\
+T,60.5327,46.9464,14.7418,35.2551,H,2.244,-1.666,1.911,T,0.609,OTHER,175.9,-112.2,HIP,3.24,53.92,-25.82,M0III,T";
+    /// A DA white dwarf (Gl 838.4) with BT−VT −0.955 at VT 13.2: bluer than any star.
+    const BLUE_WHITE_DWARF: &str = "2367353,548-105-1,2693940725141960192,107625,107968,,,838.4,,,Peg,,\
+21.87371626,2.38878597,T,22.5603,19.1376,-11.9095,0.9403,G_R3,13.198,11.431,-0.955,T,0.0,HYG,15.32,-300.53,\
+G_R3,2.0,0.68,-32.11,DA:,HYG";
     /// Canopus (α Car, HR 2326): Tycho VT −0.608, BT−VT 0.191, so converted V −0.625; BSC5 has
     /// V −0.72 (Tycho photometry of the brightest stars is biased faint).
     const CANOPUS: &str = "532909,8534-2277-1,,30365,30438,45348,2326,,Alp,,Car,Canopus,6.39919184,-52.69571799,\
@@ -855,10 +1111,12 @@ K2/3 III + F/G,T";
     const KAP_TUC_COMPANION: &str = "96489,9136-1759-1,4692263904164105856,5884,5896,7788,377,55.3A,Kap,,Tuc,,\
 1.26248899,-68.8750854,T,20.9864,7.1541,2.4546,-19.576,G_R3,7.743,6.133,,T,7.84,G_R3,386.26,82.07,G_R3,-2.59,\
 39.74,-4.37,F6IV,HYG";
-    /// Real BSC5 lines (CDS V/50 `catalog`) for HR 377, 617, 2326 and 2491.
+    /// Real BSC5 lines (CDS V/50 `catalog`) for HR 337, 377, 617, 911, 2326 and 2491.
     const BSC5_LINES: &str = concat!(
+        " 337 43Bet AndBD+34  198   6860 54471  42I    949    414    010407.8+350526010943.9+353714127.10-27.10 2.06  +1.58 +1.96 +1.00   M0+IIIa           e+0.178-0.114 +.049+003V         10.1  80.4AD   5*\n",
         " 377   Kap TucCP-69   45   7788248346      W     A   454    011222.7-692426011546.1-685234299.66-48.10 4.86  +0.47 +0.03 +0.22   F6IV               +0.399+0.107 +.061+009      111  2.2   5.2AB   4*\n",
         " 617 13Alp AriBD+22  306  12929 75151  74I           725    020132.0+225923020710.4+232745144.57-36.20 2.00  +1.15 +1.12 +0.62   K2-IIICa-1         +0.190-0.148 +.049-014SB   < 17                 *\n",
+        " 911 92Alp CetBD+03  419  18884110920 107I         Alp Cet  025703.0+034151030216.8+040523173.32-45.59 2.53  +1.64 +1.94 +1.16   M1.5IIIa          v-0.009-0.078 +.009-026V                         *\n",
         "2326   Alp CarCP-52  914  45348234480 245I                  062143.9-523827062357.1-524145261.21-25.29-0.72  +0.15 +0.10 +0.18   F0II               +0.022+0.021 +.028+021        0                 *\n",
         "2491  9Alp CMaBD-16 1591  48915151881 257I   5423           064044.6-163444064508.9-164258227.22-08.88-1.46   0.00 -0.05 -0.03   A1Vm               -0.553-1.205 +.375-008SBO    13 10.3  11.2AB   4*\n",
     );
@@ -896,7 +1154,9 @@ K2/3 III + F/G,T";
     #[test]
     fn bsc5_johnson_columns() {
         let table = bsc5();
-        assert_eq!(table.len(), 4);
+        assert_eq!(table.len(), 6);
+        assert_eq!(table[&337], Johnson { v: 2.06, bv: 1.58 });
+        assert_eq!(table[&911], Johnson { v: 2.53, bv: 1.64 });
         assert_eq!(table[&2326], Johnson { v: -0.72, bv: 0.15 });
         assert_eq!(table[&2491], Johnson { v: -1.46, bv: 0.0 });
         assert_eq!(table[&617], Johnson { v: 2.00, bv: 1.15 });
@@ -947,7 +1207,12 @@ K2/3 III + F/G,T";
         // Hamal (α Ari, HR 617, K2 III). Catalogued Johnson photometry: V = 2.00, B−V = +1.15
         // (Hoffleit & Warren 1991, BSC5). Unconverted, V would be 2.125 and B−V 1.362.
         let parsed = parse_star(HAMAL);
-        assert_eq!(parsed.photometry, Photometry::Tycho { clamped: false });
+        assert_eq!(
+            parsed.photometry,
+            Photometry::Tycho {
+                colour: TychoColour::Tabulated
+            }
+        );
         let star = parsed.star;
         assert!((star.bv() - 1.15).abs() < 0.05, "B−V {}", star.bv());
         assert!(
@@ -955,9 +1220,182 @@ K2/3 III + F/G,T";
             "V {}",
             apparent_v(&star)
         );
-        // ESA 1997: V = VT − 0.090 (BT−VT) = 2.00242; M_V = absmag + (V − VT).
-        assert!((parsed.v_mag - 2.00242).abs() < 1e-9);
-        assert!((star.abs_mag_v - (0.601 - 0.090 * 1.362) as f32).abs() < 1e-5);
+        // ESA 1997 Table 1.3.4, BT−VT 1.362 between the nodes 0.5 and 1.4:
+        // V = VT − 0.090 (BT−VT) − 0.005 = 1.99742; B−V = 0.85 (BT−VT) + 0.046 − 0.054 t.
+        let t = (1.362 - 0.5) / 0.9;
+        assert!((parsed.v_mag - 1.99742).abs() < 1e-9);
+        let bv = 0.85 * 1.362 + 0.046 + (-0.008 - 0.046) * t;
+        assert!(
+            (f64::from(star.bv()) - bv).abs() < 1e-3,
+            "B−V {}",
+            star.bv()
+        );
+        // M_V = absmag + (V − VT).
+        assert!((star.abs_mag_v - (0.601 + 1.99742 - 2.125) as f32).abs() < 1e-5);
+        // A BSC5 star converted from Tycho: its residual feeds the bake's B−V check.
+        let residual = parsed.bsc5_bv_residual.expect("Hamal is HR 617");
+        assert!((residual - (1.15 - f64::from(star.bv()))).abs() < 1e-3);
+    }
+
+    #[test]
+    fn table_1_3_4_nodes_interpolation_and_extrapolation() {
+        // ESA SP-1200 vol. 1 §1.3 Appendix 4, Table 1.3.4, read as (BT−VT, V − VT, B−V).
+        let check = |bt_vt: f64, dv: f64, bv: f64| {
+            let (v, got_bv) = tycho_to_johnson(10.0, bt_vt);
+            assert!(
+                (v - (10.0 + dv)).abs() < 1e-12,
+                "{bt_vt}: V − VT {}",
+                v - 10.0
+            );
+            assert!((got_bv - bv).abs() < 1e-12, "{bt_vt}: B−V {got_bv} vs {bv}");
+        };
+        check(-0.2, 0.018 + 0.014, -0.17 - 0.006);
+        check(0.1, -0.009, 0.085);
+        check(0.5, -0.045 - 0.005, 0.425 + 0.046);
+        check(1.4, -0.126 - 0.005, 1.19 - 0.008);
+        check(1.8, -0.162 - 0.015, 1.53 - 0.032);
+        // Halfway between 0.1 and 0.5: half of each correction.
+        check(0.3, -0.027 - 0.0025, 0.255 + 0.023);
+        // Beyond the end nodes, the end values (slope 0.85 continues).
+        check(2.2, -0.198 - 0.015, 1.87 - 0.032);
+        check(-0.3, 0.027 + 0.014, -0.255 - 0.006);
+        // Continuous at every node.
+        for (node, _, _) in TYCHO_TABLE_1_3_4 {
+            let (a, b) = (
+                tycho_to_johnson(5.0, node - 1e-9),
+                tycho_to_johnson(5.0, node + 1e-9),
+            );
+            assert!(
+                (a.0 - b.0).abs() < 1e-8 && (a.1 - b.1).abs() < 1e-8,
+                "{node}"
+            );
+        }
+    }
+
+    #[test]
+    fn red_giant_tycho_colour_extrapolated_per_esa() {
+        // Redder than the table's last node (1.8): ESA extrapolates with the end values. Clamping
+        // BT−VT to 1.8 would give both B−V 1.53, 0.11 and 0.05 too blue.
+        for (row, hr, v_bsc5, bv_bsc5, bt_vt, vt) in [
+            (MENKAR, 911, 2.53, 1.64, 1.971, 2.716),
+            (MIRACH, 337, 2.06, 1.58, 1.911, 2.244),
+        ] {
+            let parsed = parse_star(row);
+            assert_eq!(
+                parsed.photometry,
+                Photometry::Tycho {
+                    colour: TychoColour::RedExtrapolated
+                },
+                "HR {hr}"
+            );
+            let bv = f64::from(parsed.star.bv());
+            assert!(
+                (bv - (0.85 * bt_vt - 0.032)).abs() < 1e-3,
+                "HR {hr}: B−V {bv}"
+            );
+            assert!(
+                (bv - bv_bsc5).abs() < 0.02,
+                "HR {hr}: B−V {bv} vs BSC5 {bv_bsc5}"
+            );
+            assert!((parsed.v_mag - (vt - 0.090 * bt_vt - 0.015)).abs() < 1e-9);
+            assert!(
+                (parsed.v_mag - v_bsc5).abs() < 0.02,
+                "HR {hr}: V {} vs BSC5 {v_bsc5}",
+                parsed.v_mag
+            );
+            assert!(parsed.bsc5_bv_residual.is_some(), "HR {hr}");
+        }
+    }
+
+    #[test]
+    fn red_dwarf_colour_from_dwarf_sequence() {
+        // M dwarfs redder than Table 1.3.4 take the Pecaut & Mamajek dwarf B−V at their M_V,
+        // with V from the table's last node (V = VT − 0.177). Catalogued Johnson B−V: CNS3
+        // (Gliese & Jahreiss 1991, CDS V/70A) Gl 699 +1.74, Gl 447 +1.75, Gl 551 +1.83:.
+        for (name, row, vt, absmag, cns3_bv, tolerance) in [
+            ("Barnard's Star", BARNARD, 9.776, 13.466, 1.74, 0.07),
+            ("Ross 128", ROSS_128, 11.451, 13.81, 1.75, 0.05),
+            ("Proxima", PROXIMA, 11.187, 15.614, 1.83, 0.13),
+        ] {
+            let parsed = parse_star(row);
+            assert_eq!(parsed.photometry, Photometry::TychoRedDwarf, "{name}");
+            let v = vt - 0.090 * 1.8 - 0.015;
+            assert!((parsed.v_mag - v).abs() < 1e-9);
+            let abs_mag_v = absmag + (v - vt);
+            assert!((f64::from(parsed.star.abs_mag_v) - abs_mag_v).abs() < 1e-5);
+            let bv = f64::from(parsed.star.bv());
+            assert!((bv - dwarf_bv_from_abs_mag(abs_mag_v)).abs() < 1e-3);
+            assert!(
+                (bv - cns3_bv).abs() < tolerance,
+                "{name}: B−V {bv} vs CNS3 {cns3_bv}"
+            );
+            assert_eq!(parsed.bsc5_bv_residual, None);
+        }
+        // Ross 128's BT−VT 4.006 would give B−V 3.37 by the table and 1.53 by the old clamp.
+        let ross = f64::from(parse_star(ROSS_128).star.bv());
+        assert!((ross - 1.703).abs() < 2e-3, "Ross 128 B−V {ross}");
+    }
+
+    #[test]
+    fn dwarf_sequence_by_absolute_magnitude() {
+        // Mamajek v2022.04.16: M0V M_V 8.80 B−V 1.420, M4V 12.61 1.65, M4.5V 13.58 1.69.
+        assert!((dwarf_bv_from_abs_mag(8.80) - 1.420).abs() < 1e-12);
+        assert!((dwarf_bv_from_abs_mag(12.61) - 1.650).abs() < 1e-12);
+        assert!((dwarf_bv_from_abs_mag(13.095) - 1.670).abs() < 1e-12);
+        // Outside the table: its end values.
+        assert!((dwarf_bv_from_abs_mag(5.0) - 1.090).abs() < 1e-12);
+        assert!((dwarf_bv_from_abs_mag(25.0) - 2.170).abs() < 1e-12);
+        // Monotonic: redder as dwarfs get fainter.
+        for pair in DWARF_MV_BV.windows(2) {
+            assert!(pair[1].0 > pair[0].0 && pair[1].1 >= pair[0].1, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn colour_bluer_than_any_star_is_raised_to_o3v() {
+        let parsed = parse_star(BLUE_WHITE_DWARF);
+        assert_eq!(
+            parsed.photometry,
+            Photometry::Tycho {
+                colour: TychoColour::BluestStar
+            }
+        );
+        assert!((f64::from(parsed.star.bv()) - BLUEST_BV).abs() < 1e-3);
+        assert!((BLUEST_BT_VT - -0.381_176).abs() < 1e-6);
+        assert!((parsed.v_mag - (13.198 - 0.090 * BLUEST_BT_VT + 0.014)).abs() < 1e-9);
+        // Between the floor and the first node: extrapolated, not raised.
+        let (_, _, photometry) = tycho_photometry(10.0, -0.3, 1.0);
+        assert_eq!(
+            photometry,
+            Photometry::Tycho {
+                colour: TychoColour::BlueExtrapolated
+            }
+        );
+    }
+
+    #[test]
+    fn bsc5_residuals_are_collected_by_colour() {
+        let csv = format!("{HEADER}\n{HAMAL}\n{MENKAR}\n{BARNARD}\n{CANOPUS}\n");
+        let baked = parse_catalog(csv.as_bytes(), &bsc5()).expect("parse");
+        let summary = &baked.summary;
+        assert_eq!(
+            (
+                summary.tycho_tabulated,
+                summary.tycho_red_extrapolated,
+                summary.tycho_red_dwarf,
+                summary.bsc5_override,
+                summary.tycho_converted()
+            ),
+            (1, 1, 1, 1, 3)
+        );
+        // Hamal (HR 617) inside the table; Menkar (HR 911) redder; Barnard's Star has no HR and
+        // Canopus takes BSC5's photometry, so neither is compared.
+        assert_eq!(summary.bsc5_bv_residuals_tabulated.len(), 1);
+        assert_eq!(summary.bsc5_bv_residuals_red.len(), 1);
+        assert!(summary.bsc5_bv_residuals_red[0].abs() < 0.02);
+        assert!((median(&[3.0, 1.0, 2.0]) - 2.0).abs() < 1e-12);
+        assert!((median(&[4.0, 1.0, 2.0, 3.0]) - 2.5).abs() < 1e-12);
+        assert!(median(&[]).is_nan());
     }
 
     #[test]
@@ -975,8 +1413,11 @@ K2/3 III + F/G,T";
         // Hamal (BSC5 V 2.00) is fainter than the saturation limit and keeps the conversion.
         assert_eq!(
             parse_star(HAMAL).photometry,
-            Photometry::Tycho { clamped: false }
+            Photometry::Tycho {
+                colour: TychoColour::Tabulated
+            }
         );
+        assert_eq!(parsed.bsc5_bv_residual, None);
     }
 
     #[test]
@@ -1002,21 +1443,6 @@ K2/3 III + F/G,T";
         let cols = Columns::from_header(HEADER).expect("header");
         let line = HAMAL.replace(",-15.95,11.33,-18.73,", ",-15.95,70000.0,-18.73,");
         assert!(parse_row(&cols, &split_csv(&line), &bsc5()).is_err());
-    }
-
-    #[test]
-    fn tycho_colour_clamped_to_validity_range() {
-        // Barnard's Star: BT−VT 1.907 > 1.8, the top of the range where ESA 1997 states the
-        // transformation's errors; clamped to 1.8, B−V = 1.53 and V = VT − 0.162.
-        let parsed = parse_star(BARNARD);
-        assert_eq!(parsed.photometry, Photometry::Tycho { clamped: true });
-        assert!(
-            (parsed.star.bv() - 1.53).abs() < 1e-3,
-            "B−V {}",
-            parsed.star.bv()
-        );
-        assert!((parsed.v_mag - (9.776 - 0.162)).abs() < 1e-9);
-        assert!((apparent_v(&parsed.star) - parsed.v_mag).abs() < 1e-3);
     }
 
     #[test]
