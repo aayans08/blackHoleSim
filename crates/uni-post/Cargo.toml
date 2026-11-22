@@ -1,6 +1,6 @@
 [package]
 name = "uni-post"
-description = "Post-processing: exposure, AgX tonemap and dither (bloom, auto-exposure and TAA later)."
+description = "Post-processing: upscale, AgX tonemap and dither of the pre-exposed HDR (bloom, auto-exposure and TAA later)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -49,8 +49,9 @@ const AGX_LOG_FLOOR: f32 = 1e-10;
 
 /// AgX "base" with the default contrast look.
 ///
-/// Input: scene-linear Rec. 709 RGB, already multiplied by the exposure scale (middle grey
-/// at 0.18). Output: display-linear RGB in [0, 1]; the sRGB render target does the encoding.
+/// Input: pre-exposed scene-linear Rec. 709 RGB, i.e. the HDR target's values (light ×
+/// exposure, uni-gfx `camera.wgsl`; middle grey at 0.18). Output: display-linear RGB in
+/// [0, 1]; the sRGB render target does the encoding.
 /// Zero, negative and infinite inputs give finite results.
 pub fn agx(rgb_linear: Vec3) -> Vec3 {
     // 1. Inset.

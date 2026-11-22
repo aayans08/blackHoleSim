@@ -1,14 +1,21 @@
 // post/tonemap.wgsl: the M0 display transform, as one fullscreen-triangle pass.
 //
-//   hdr (scene-linear Rec. 709, cd/m²) × exposure_scale(scene_ev100) → agx → display-linear
-//   → sRGB code space + triangular dither of ±0.5/255 → display-linear → output
+//   hdr (pre-exposed scene-linear Rec. 709, internal resolution) → upscale to the output
+//   → agx → display-linear → sRGB code space + triangular dither of ±0.5/255
+//   → display-linear → output
+//
+// The hdr target is pre-exposed (common/camera.wgsl: features write light × exposure), so this
+// pass applies no exposure of its own. When the output is the internal resolution (captures,
+// --bench) every output pixel reads its own hdr texel with textureLoad, exactly; when it is
+// larger (the window), the hdr is sampled bilinearly at the output pixel's centre. Upscaling
+// happens before AgX, in the linear HDR domain (TAAU takes this slot in M7).
 //
 // The output view is sRGB (Bgra8UnormSrgb for the window, Rgba8UnormSrgb for captures), so
 // the fragment writes display-LINEAR values and the hardware applies the sRGB encoding.
 //
-// Bindings: group 0 = `camera` (common/camera.wgsl); group 1 binding 0 = `hdr_tex`, read with
-// textureLoad (1:1 pixels, no sampler). A shader that imports this file only for `agx` must
-// keep its own bindings clear of (0, 0) and (1, 0).
+// Bindings: group 0 = `camera`, `exposure` (common/camera.wgsl); group 1 binding 0 = `hdr_tex`,
+// binding 1 = `hdr_sampler` (linear, clamp to edge). A shader that imports this file only for
+// `agx` must keep its own bindings clear of groups 0 and 1.
 //
 // `agx` has a CPU twin, `uni_post::agx` (crates/uni-post/src/agx.rs). Keep the constants and
 // the order of operations identical; `universe --selftest` compares the two within 1e-3 and
@@ -110,6 +117,7 @@ fn uniform_to_triangular(u: f32) -> f32 {
 // ---- Pass ------------------------------------------------------------------------------
 
 @group(1) @binding(0) var hdr_tex: texture_2d<f32>;
+@group(1) @binding(1) var hdr_sampler: sampler;
 
 // Fullscreen triangle: vertices (−1, 1), (3, 1), (−1, −3) in clip space cover the viewport.
 @vertex
@@ -119,16 +127,24 @@ fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     return vec4<f32>(2.0 * x - 1.0, 1.0 - 2.0 * y, 0.0, 1.0);
 }
 
+// The pre-exposed hdr colour for the output pixel whose centre is `position` (output pixels).
+// Same size: the pixel's own texel, read exactly. Otherwise: bilinear at the same relative
+// position, (position / output size) in uv.
+fn hdr_at(position: vec2<f32>) -> vec3<f32> {
+    let dims = textureDimensions(hdr_tex);
+    if (all(vec2<f32>(dims) == camera.output.xy)) {
+        // Clamped so a pixel can never read out of bounds.
+        let last = vec2<i32>(dims) - vec2<i32>(1);
+        return textureLoad(hdr_tex, clamp(vec2<i32>(floor(position)), vec2<i32>(0), last), 0).rgb;
+    }
+    return textureSampleLevel(hdr_tex, hdr_sampler, position * camera.output.zw, 0.0).rgb;
+}
+
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    // Integer pixel index; @builtin(position) is at the pixel centre (x + 0.5, y + 0.5).
+    // Integer output-pixel index; @builtin(position) is at the pixel centre (x + 0.5, y + 0.5).
     let pix = floor(position.xy);
-    // Clamped so an output larger than the HDR target repeats the edge instead of reading
-    // out of bounds.
-    let last = vec2<i32>(textureDimensions(hdr_tex)) - vec2<i32>(1);
-    let hdr = textureLoad(hdr_tex, clamp(vec2<i32>(pix), vec2<i32>(0), last), 0).rgb;
-
-    let display = agx(hdr * exposure_scale(camera.exposure.x));
+    let display = agx(hdr_at(position.xy));
 
     // Dither in sRGB code space (the space the 8-bit target quantises in), then back to
     // display-linear for the sRGB view. The same noise on all channels keeps it achromatic.

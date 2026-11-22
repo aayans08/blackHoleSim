@@ -1,13 +1,15 @@
-//! Tonemap render feature: exposure, AgX and dither from the HDR target to the output view (M0 Task 5).
+//! Tonemap render feature: upscale, AgX and dither from the HDR target to the output view
+//! (M0 Task 5; pre-exposure and upscaling from the M0 final review, I2 and I6).
 //!
-//! One fullscreen-triangle render pass (`shaders/tonemap.wgsl`): it reads `targets.hdr` 1:1
-//! with `textureLoad`, multiplies by `exposure_scale(scene_ev100)`, applies [`crate::agx`],
-//! adds a triangular-PDF interleaved-gradient-noise dither of ±0.5/255 in sRGB code space and
-//! writes display-linear colour to the output view, which must be an sRGB view.
+//! One fullscreen-triangle render pass (`shaders/tonemap.wgsl`). The HDR target is pre-exposed
+//! (uni-gfx `camera.wgsl`), so the pass applies no exposure. It reads `targets.hdr` 1:1 with
+//! `textureLoad` when the output has the internal resolution, and bilinearly otherwise; applies
+//! [`crate::agx`]; adds a triangular-PDF interleaved-gradient-noise dither of ±0.5/255 in sRGB
+//! code space; and writes display-linear colour to the output view, which must be an sRGB view.
 
 use anyhow::Context as _;
 use uni_gfx::{
-    CameraUniform, FrameCtx, FrameTargets, GpuContext, PassTimer, RenderFeature, ShaderLib,
+    FrameBindings, FrameCtx, FrameTargets, GpuContext, PassTimer, RenderFeature, ShaderLib,
 };
 
 /// Path of `shaders/tonemap.wgsl` in the [`ShaderLib`]. Another shader can
@@ -17,8 +19,8 @@ pub const TONEMAP_SHADER: &str = "post/tonemap.wgsl";
 /// Feature name, also the GPU timing label.
 const NAME: &str = "tonemap";
 
-/// Bind group indices: the camera (`camera` in common/camera.wgsl) and the HDR input
-/// (`hdr_tex`, binding 0).
+/// Bind group indices: the renderer's group 0 (`camera`, `exposure` in common/camera.wgsl) and
+/// the HDR input (`hdr_tex`, binding 0; `hdr_sampler`, binding 1).
 const CAMERA_GROUP: u32 = 0;
 const HDR_GROUP: u32 = 1;
 
@@ -39,16 +41,13 @@ fn check_output_format(format: wgpu::TextureFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Exposure, AgX tonemap and dither from `targets.hdr` to the output view.
+/// Upscale, AgX tonemap and dither from `targets.hdr` to the output view.
 pub struct TonemapFeature {
     pipeline: wgpu::RenderPipeline,
     /// Layout of the HDR input group ([`HDR_GROUP`]).
     hdr_layout: wgpu::BindGroupLayout,
-    /// This feature's copy of the camera uniform, bound at [`CAMERA_GROUP`].
-    /// `RenderFeature::encode` does not receive the `Renderer`'s camera bind group, so the
-    /// feature writes `CameraUniform::from_ctx` (the same value) into its own buffer.
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    /// Linear, clamp-to-edge: the upscale filter.
+    sampler: wgpu::Sampler,
     /// Bind group for the current `targets.hdr_view`; `None` until the first `encode` and
     /// after a resize.
     hdr_binding: Option<HdrBinding>,
@@ -82,17 +81,14 @@ impl TonemapFeature {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let hdr_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tonemap hdr bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                // Read with textureLoad only, so no filtering is required.
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
+            entries: &hdr_layout_entries(),
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tonemap upscale"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // ClampToEdge (the default) in u, v, w: the edge texels extend outwards.
+            ..Default::default()
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tonemap layout"),
@@ -125,20 +121,6 @@ impl TonemapFeature {
             multiview_mask: None,
             cache: None,
         });
-        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tonemap camera uniform"),
-            size: std::mem::size_of::<CameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tonemap camera bg"),
-            layout: camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
         if let Some(err) = pollster::block_on(scope.pop()) {
             anyhow::bail!("creating the tonemap pipeline: {err}");
         }
@@ -146,11 +128,33 @@ impl TonemapFeature {
         Ok(Self {
             pipeline,
             hdr_layout,
-            camera_buffer,
-            camera_bind_group,
+            sampler,
             hdr_binding: None,
         })
     }
+}
+
+/// Group 1: the HDR texture (binding 0; Rgba16Float is filterable) and the linear sampler
+/// (binding 1).
+fn hdr_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+    ]
 }
 
 /// The bind group for `targets.hdr_view`, rebuilt if `binding` was made for another view.
@@ -158,6 +162,7 @@ impl TonemapFeature {
 fn hdr_bind_group<'a>(
     binding: &'a mut Option<HdrBinding>,
     layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
     device: &wgpu::Device,
     targets: &FrameTargets,
 ) -> &'a wgpu::BindGroup {
@@ -169,10 +174,16 @@ fn hdr_bind_group<'a>(
         bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tonemap hdr bg"),
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
         }),
     });
     &b.bind_group
@@ -183,20 +194,15 @@ impl RenderFeature for TonemapFeature {
         NAME
     }
 
-    /// Uploads the camera uniform (the pass reads `camera.exposure.x` = scene EV100).
-    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, _targets: &FrameTargets) {
-        gpu.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
-        );
-    }
+    /// Nothing to upload: the pass reads only the renderer's group 0 and the HDR target.
+    fn prepare(&mut self, _gpu: &GpuContext, _ctx: &FrameCtx, _targets: &FrameTargets) {}
 
     /// One fullscreen triangle into `output`, which covers every pixel (cleared first).
     fn encode(
         &mut self,
         gpu: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
+        frame: &FrameBindings<'_>,
         targets: &FrameTargets,
         output: &wgpu::TextureView,
         timer: &mut PassTimer,
@@ -204,6 +210,7 @@ impl RenderFeature for TonemapFeature {
         let hdr_bg = hdr_bind_group(
             &mut self.hdr_binding,
             &self.hdr_layout,
+            &self.sampler,
             &gpu.device,
             targets,
         );
@@ -224,7 +231,7 @@ impl RenderFeature for TonemapFeature {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(CAMERA_GROUP, &self.camera_bind_group, &[]);
+        pass.set_bind_group(CAMERA_GROUP, frame.camera, &[]);
         pass.set_bind_group(HDR_GROUP, hdr_bg, &[]);
         pass.draw(0..3, 0..1);
     }
@@ -320,6 +327,60 @@ mod tests {
                     multi: false
                 },
             }
+        );
+        let (sampler, sampler_ty) = binding_of("hdr_sampler");
+        assert_eq!(
+            sampler,
+            Some(naga::ResourceBinding {
+                group: HDR_GROUP,
+                binding: 1
+            })
+        );
+        assert_eq!(sampler_ty, naga::TypeInner::Sampler { comparison: false });
+        // The Rust layout has exactly these two bindings, a filterable texture and a filtering
+        // sampler.
+        let entries = hdr_layout_entries();
+        assert_eq!(entries.map(|e| e.binding), [0, 1]);
+        assert!(matches!(
+            entries[0].ty,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                ..
+            }
+        ));
+        assert!(matches!(
+            entries[1].ty,
+            wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+        ));
+    }
+
+    /// Review I2: the tonemap applies no exposure of its own (the HDR is pre-exposed), so the
+    /// fragment never reads the exposure uniform.
+    #[test]
+    fn tonemap_reads_no_exposure() {
+        let m = tonemap_module();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
+        )
+        .validate(&m)
+        .unwrap();
+        let (fs, _) = m
+            .entry_points
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.name == "fs_main")
+            .unwrap();
+        let used: Vec<&str> = m
+            .global_variables
+            .iter()
+            .filter(|(h, _)| !info.get_entry_point(fs)[*h].is_empty())
+            .filter_map(|(_, v)| v.name.as_deref())
+            .collect();
+        assert!(!used.contains(&"exposure"), "{used:?}");
+        assert!(
+            used.contains(&"hdr_tex") && used.contains(&"camera"),
+            "{used:?}"
         );
     }
 
