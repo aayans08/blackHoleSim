@@ -43,6 +43,65 @@ baked_path = "data/baked/bsc5.bin"
 
 # --- A7 ---
 # AT-HYG v4.0 stars (V ≤ 10) and names, NASA Exoplanet Archive pscomppars (M1 Task A7).
+#
+# AT-HYG v4.0 subset "to magnitude 10" (332,178 rows), baked on 2026-11-22 by
+#   uni-bake athyg --input data/cache/athyg-m10/athyg_40_reduced_m10.csv.gz --out data/baked/athyg_m10.bin
+#     --names data/baked/athyg_names.ron --bsc5 data/cache/bsc5/catalog.gz
+# into data/baked/athyg_m10.bin (329,768 stars, 9,233,520 B) and data/baked/athyg_names.ron (3,505 named
+# stars, 445,882 B); `uni-bake exo` (below) then sets the exoplanet-host flag in athyg_m10.bin. Both outputs
+# are CC BY-SA 4.0 derived data (ShareAlike). The BSC5 catalogue (entry "bsc5" above) supplies Johnson V and
+# B−V for 23 of the brightest stars. Git LFS object: the repository file
+# https://codeberg.org/astronexus/athyg/src/branch/main/data/subsets/athyg_40_reduced_m10.csv.gz is an LFS
+# pointer (oid sha256:a9ec5d51…, size 27,587,896 B); the url below serves the object itself.
+# Documentation read for the column semantics (downloaded 2026-11-22, deleted with the cache):
+#   https://codeberg.org/astronexus/athyg/raw/branch/main/README.md                 sha256 ebfb5fdc49c6e94510379de10e6f94b97a5ba45cab87f87e00d7324bfe83dba7
+#   https://codeberg.org/astronexus/athyg/raw/branch/main/version-info.md           sha256 0626dc07c4eaf439b73543879ccfabaed622005a297f5e37fa7a2c158bc06806
+#   https://codeberg.org/astronexus/athyg/raw/branch/main/data/subsets/README.md    sha256 2f8f4c1fff6a846a96af2da77ff9e28e22beed3a6e0cca4f66464791f8519abe
+#   https://codeberg.org/astronexus/hyg/raw/branch/main/data/hyg/README.md          sha256 bb0196ad0791b5cec1cc59b16100c64ff80afb829c770284ca99c999916f4039
+#     (field 9: dist ≥ 100000 pc is HYG's "missing or dubious parallax" placeholder; 92 such rows are skipped)
+#   Tycho-2 ReadMe (CDS I/259; cdsarc.cds.unistra.fr timed out, so the CfA VizieR mirror):
+#   https://vizier.cfa.harvard.edu/ftp/cats/I/259/ReadMe                            sha256 4c0bf3114eb0f4666acd6e5d20bc0cefa21bdc8279084de25973745874e29548
+#     (notes 3, 4, 7: "VT" is Hp for some Hipparcos stars; approximate Johnson transformation)
+[[entry]]
+id = "athyg-m10"
+url = "https://codeberg.org/astronexus/athyg/media/branch/main/data/subsets/athyg_40_reduced_m10.csv.gz"
+sha256 = "a9ec5d515d1222d5bf86e8e84e762cbd325938cc6bd4b0d8760327386fa7c151"
+license = "CC BY-SA 4.0"
+credit = "AT-HYG database v4.0, D. Nash (astronexus), https://codeberg.org/astronexus/athyg; built from ESA Gaia DR3 (Gaia/DPAC), Tycho-2 and Hipparcos (ESA), the Yale Bright Star and Gliese-Jahreiss catalogues and HYG"
+raw_path = "data/cache/athyg-m10/athyg_40_reduced_m10.csv.gz"
+baked_path = "data/baked/athyg_m10.bin"
+
+# Mean dwarf colours by spectral type, used for the B−V of the 650 AT-HYG stars that have no colour index
+# but a spectral type. The integer-subtype B−V values are transcribed into tools/bake/src/athyg.rs
+# (`DWARF_BV`), so the file itself is not needed for a re-bake. Version 2022.04.16.
+[[entry]]
+id = "mamajek-dwarf-colours"
+url = "https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt"
+sha256 = "1de2edeec17bb3346e0e4e70b999de5ee29947df38474e64cddb7cfacc164b7f"
+license = "no licence stated; published scientific values (cite Pecaut & Mamajek 2013)"
+credit = "Pecaut, M. J. & Mamajek, E. E. 2013, ApJS 208, 9, Table 5; E. Mamajek, A Modern Mean Dwarf Stellar Color and Effective Temperature Sequence, v2022.04.16"
+raw_path = "data/cache/athyg-m10/ref/EEM_dwarf_UBVIJHK_colors_Teff.txt"
+baked_path = "data/baked/athyg_m10.bin"
+
+# NASA Exoplanet Archive, Planetary Systems Composite Parameters (pscomppars): one TAP query on 2026-11-22,
+# 6,473 planets around 4,865 hosts, 1,508,523 B. Baked by
+#   uni-bake exo --input data/cache/exoplanets/pscomppars.csv --stars data/baked/athyg_m10.bin
+#     --athyg data/cache/athyg-m10/athyg_40_reduced_m10.csv.gz --out data/baked/exoplanets.ron
+# into data/baked/exoplanets.ron (4,839 systems, 6,447 planets, 2,621,833 B). pl_tranmid_systemref is fetched
+# beyond the plan's column list, to record the time standard of pl_tranmid.
+# Column definitions: https://exoplanetarchive.ipac.caltech.edu/docs/API_PS_columns.html
+#   sha256 20c13ec5493887f3d901a1f62c264ab0dcc95135e1f417b79374fdd737b9c222 (pl_orblper: "as-reported for each
+#   publication", either the planet's or the star's argument of periastron)
+# Acknowledgement text: https://exoplanetarchive.ipac.caltech.edu/docs/acknowledge.html
+#   sha256 93e26a9a52e75d81aefd656c3a82f294dcd81a2538fe75cae73e5842abe0bc4b
+[[entry]]
+id = "exoplanets"
+url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=select+pl_name,hostname,hip_name,hd_name,gaia_dr3_id,ra,dec,sy_dist,sy_vmag,st_teff,st_rad,pl_orbsmax,pl_orbeccen,pl_orbincl,pl_orblper,pl_orbper,pl_tranmid,pl_tranmid_systemref,pl_bmassj,pl_radj,pl_eqt,discoverymethod,disc_year+from+pscomppars&format=csv"
+sha256 = "b1d2baadf8d60830d34cb6ec0c21fba5b84fb8dc8f0470ba6ff20dfb3cf0ac80"
+license = "public (NASA Exoplanet Archive; acknowledgement requested)"
+credit = "This research has made use of the NASA Exoplanet Archive, which is operated by the California Institute of Technology, under contract with the National Aeronautics and Space Administration under the Exoplanet Exploration Program."
+raw_path = "data/cache/exoplanets/pscomppars.csv"
+baked_path = "data/baked/exoplanets.ron"
 # --- end A7 ---
 
 # --- A8 ---

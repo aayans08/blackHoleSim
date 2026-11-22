@@ -17,6 +17,41 @@ plus an effective temperature derived from B−V with Ballesteros (2012, EPL 97,
 position (novae and non-stellar objects) are omitted.
 
 <!-- A7 -->
+**AT-HYG v4.0** (`data/baked/athyg_m10.bin`, `data/baked/athyg_names.ron`). The Augmented Tycho-HYG star catalogue, version
+4.0, subset `athyg_40_reduced_m10` (stars to V/VT 10 plus all stars within 100 light years), by David Nash
+(astronexus), [codeberg.org/astronexus/athyg](https://codeberg.org/astronexus/athyg). Licence: [Creative Commons
+Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+**`athyg_m10.bin` and `athyg_names.ron` are derived data and are themselves licensed CC BY-SA 4.0** (ShareAlike): anyone
+who redistributes them, or data derived from them, must do so under the same licence with this credit. Changes made
+by `uni-bake athyg`: rows without a usable distance and the Sun are dropped; positions are recomputed from RA, Dec and
+distance; Tycho magnitudes are converted to Johnson V and B−V; 23 of the brightest stars take their Johnson V and B−V
+from the Yale Bright Star Catalogue (credited above); stars without a colour index get a B−V from their spectral type;
+velocities and colours are stored as 16-bit floats; names are reformatted (Greek Bayer letters).
+
+AT-HYG is built from these catalogues, which are credited as its sources:
+- ESA Gaia DR3: this work has made use of data from the European Space Agency (ESA) mission
+  *Gaia* ([cosmos.esa.int/gaia](https://www.cosmos.esa.int/gaia)), processed by the *Gaia* Data Processing and Analysis
+  Consortium (DPAC, [cosmos.esa.int/web/gaia/dpac/consortium](https://www.cosmos.esa.int/web/gaia/dpac/consortium)).
+  Funding for the DPAC has been provided by national institutions, in particular the institutions participating in the
+  *Gaia* Multilateral Agreement.
+- Tycho-2: Høg, E. et al. 2000, A&A 355, L27 (CDS I/259). Hipparcos and Tycho: ESA 1997, *The Hipparcos and Tycho
+  Catalogues*, ESA SP-1200.
+- The Yale Bright Star Catalogue, the Gliese-Jahreiss catalogue of nearby stars, and the HYG database
+  ([codeberg.org/astronexus/hyg](https://codeberg.org/astronexus/hyg), CC BY-SA 4.0), whose proper names follow the IAU
+  Working Group on Star Names.
+
+**NASA Exoplanet Archive** (`data/baked/exoplanets.ron`), Planetary Systems Composite Parameters table (`pscomppars`),
+queried 2026-11-22. This research has made use of the NASA Exoplanet Archive, which is operated by the California
+Institute of Technology, under contract with the National Aeronautics and Space Administration under the Exoplanet
+Exploration Program. Archive paper: Christiansen et al. (2025), *The Planetary Science Journal* (the NASA Exoplanet
+Archive's overview paper, which replaces Akeson et al. 2013). Each planet's parameters come from the publication the
+archive cites for it.
+
+Published values used by the star bake (`tools/bake/src/athyg.rs`):
+- Tycho → Johnson photometry, V = VT − 0.090 (BT−VT) and B−V = 0.850 (BT−VT), valid for −0.2 < BT−VT < 1.8: ESA 1997,
+  *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §2.2, eqs. 2.2.1–2.2.2 (simple form of §1.3 Appendix 4).
+- Mean main-sequence B−V by spectral type: Pecaut, M. J. & Mamajek, E. E. 2013, ApJS 208, 9, Table 5, in E. Mamajek's
+  version 2022.04.16 ([EEM_dwarf_UBVIJHK_colors_Teff.txt](https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt)).
 <!-- /A7 -->
 
 <!-- A9 -->
