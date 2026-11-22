@@ -51,4 +51,36 @@ baked_path = "data/baked/bsc5.bin"
 
 # --- A9 ---
 # JPL SBDB small bodies, JPL SSD satellites, NSSDCA facts, JPL Horizons goldens, fonts (M1 Task A9).
+
+# JPL Horizons spot values (A9 Step 1, dispatch A9.1): test goldens, never drawn. Fetched
+# 2026-11-22 16:49 UTC (Horizons' stamp: Sun Nov 22 08:49:08 2026 Pasadena) by
+# `cargo run -p uni-bake -- horizons --plan m1 --out data/golden/horizons_spots.ron --sky data/golden/sky_spots.ron`:
+# one GET of the Horizons API (version 1.2) per request, 39 in all, each raw JSON answer saved as
+# data/cache/horizons/NNN-<kind>-<target>@<centre>.json and deleted after the bake. Every answer
+# embeds its query time, so the raw bytes cannot be reproduced; sha256 below is of this fetch's
+# answers concatenated in file-name order (`cat data/cache/horizons/0*-vectors-*.json | shasum -a 256`).
+# An independent fetch 2.5 minutes earlier gave bit-identical values for all 159 spots.
+# Query parameters, epochs and each answer's ephemeris source are in the baked files' headers.
+# Vectors: 31 answers, 182 320 B raw. Baked: 151 spots, 32 195 B,
+# sha256 20b8acfd269c0114d92ac31961e153e2ffaa9df8e0a984921979caecf77a9eb4.
+[[entry]]
+id = "horizons"
+url = "https://ssd.jpl.nasa.gov/api/horizons.api"
+sha256 = "1d5db1ce468cf9eb872d9961483afba4034a57b91f73e3c0be77e28403ed67a6"
+license = "public JPL Solar System Dynamics data (no stated terms; cited as the Horizons manual asks)"
+credit = "Giorgini, JD and JPL Solar System Dynamics Group, NASA/JPL Horizons On-Line Ephemeris System, https://ssd.jpl.nasa.gov/horizons/, data retrieved 2026-Nov-22; DE441 (Park et al. 2021, AJ 161, 105) and JPL satellite ephemerides"
+raw_path = "data/cache/horizons/0*-vectors-*.json"
+baked_path = "data/golden/horizons_spots.ron"
+
+# Observer tables (geocentric, quantities 1,9,19,20,24 for the planets and 1,20 for C/2020 F3):
+# 8 answers, 60 831 B raw, sha256 as above over `0*-observer-*.json`. Baked: 8 rows, 3 413 B,
+# sha256 e347789f2c459a27554419909e6b8170017f5735338f7fd6a655a45d67cc1d80.
+[[entry]]
+id = "horizons-sky"
+url = "https://ssd.jpl.nasa.gov/api/horizons.api"
+sha256 = "517f635a57f73dbaf6f25fe2a55bb549de386aed77a789fd5612340fa042d30a"
+license = "public JPL Solar System Dynamics data (no stated terms; cited as the Horizons manual asks)"
+credit = "Giorgini, JD and JPL Solar System Dynamics Group, NASA/JPL Horizons On-Line Ephemeris System, https://ssd.jpl.nasa.gov/horizons/, data retrieved 2026-Nov-22; DE441 (Park et al. 2021, AJ 161, 105) and JPL satellite ephemerides"
+raw_path = "data/cache/horizons/0*-observer-*.json"
+baked_path = "data/golden/sky_spots.ron"
 # --- end A9 ---

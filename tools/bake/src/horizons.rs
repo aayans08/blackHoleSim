@@ -201,14 +201,16 @@ pub fn run(options: &[OsString]) -> anyhow::Result<()> {
         .flatten()
         .unwrap_or_else(|| "unknown time".to_owned());
     let api_version = api_version.unwrap_or_default();
-    let provenance = [
-        "Written by `uni-bake horizons --plan m1` (M1 Task A9 Step 1) from the JPL Horizons API".to_owned(),
-        format!("{API_URL} (NASA/JPL Horizons API {api_version}), fetched {fetched} (Horizons' stamp)."),
-        "Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id \"horizons\").".to_owned(),
-    ];
+    let provenance = |manifest_id: &str| {
+        [
+            "Written by `uni-bake horizons --plan m1` (M1 Task A9 Step 1) from the JPL Horizons API".to_owned(),
+            format!("{API_URL} (NASA/JPL Horizons API {api_version}), fetched {fetched} (Horizons' stamp)."),
+            format!("Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id \"{manifest_id}\")."),
+        ]
+    };
     let mut header =
         vec!["JPL Horizons geometric state vectors: test goldens (review I9).".to_owned()];
-    header.extend(provenance.iter().cloned());
+    header.extend(provenance("horizons"));
     header.extend([
         String::new(),
         "Query: EPHEM_TYPE=VECTORS REF_SYSTEM=ICRF REF_PLANE=FRAME VEC_CORR=NONE (geometric) OUT_UNITS=KM-S".to_owned(),
@@ -223,7 +225,7 @@ pub fn run(options: &[OsString]) -> anyhow::Result<()> {
     write_ron(&options.out, &header, &ephem)?;
 
     let mut header = vec!["JPL Horizons observer tables: test goldens (review I4).".to_owned()];
-    header.extend(provenance);
+    header.extend(provenance("horizons-sky"));
     header.extend([
         String::new(),
         "Query: EPHEM_TYPE=OBSERVER CENTER=500@399 (geocentre) REF_SYSTEM=ICRF TIME_TYPE=UT TLIST_TYPE=JD".to_owned(),

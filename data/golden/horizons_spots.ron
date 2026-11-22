@@ -1,6 +1,6 @@
 // JPL Horizons geometric state vectors: test goldens (review I9).
 // Written by `uni-bake horizons --plan m1` (M1 Task A9 Step 1) from the JPL Horizons API
-// https://ssd.jpl.nasa.gov/api/horizons.api (NASA/JPL Horizons API 1.2), fetched Sun Nov 22 08:46:38 2026 Pasadena, USA (Horizons' stamp).
+// https://ssd.jpl.nasa.gov/api/horizons.api (NASA/JPL Horizons API 1.2), fetched Sun Nov 22 08:49:08 2026 Pasadena, USA (Horizons' stamp).
 // Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id "horizons").
 //
 // Query: EPHEM_TYPE=VECTORS REF_SYSTEM=ICRF REF_PLANE=FRAME VEC_CORR=NONE (geometric) OUT_UNITS=KM-S

@@ -1,7 +1,7 @@
 // JPL Horizons observer tables: test goldens (review I4).
 // Written by `uni-bake horizons --plan m1` (M1 Task A9 Step 1) from the JPL Horizons API
-// https://ssd.jpl.nasa.gov/api/horizons.api (NASA/JPL Horizons API 1.2), fetched Sun Nov 22 08:46:38 2026 Pasadena, USA (Horizons' stamp).
-// Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id "horizons").
+// https://ssd.jpl.nasa.gov/api/horizons.api (NASA/JPL Horizons API 1.2), fetched Sun Nov 22 08:49:08 2026 Pasadena, USA (Horizons' stamp).
+// Public JPL Solar System Dynamics data; see ATTRIBUTION.md and data/manifest.toml (id "horizons-sky").
 //
 // Query: EPHEM_TYPE=OBSERVER CENTER=500@399 (geocentre) REF_SYSTEM=ICRF TIME_TYPE=UT TLIST_TYPE=JD
 // ANG_FORMAT=DEG CAL_FORMAT=JD EXTRA_PREC=YES CSV_FORMAT=YES; airless, no refraction.

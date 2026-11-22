@@ -20,6 +20,17 @@ position (novae and non-stellar objects) are omitted.
 <!-- /A7 -->
 
 <!-- A9 -->
+**JPL Horizons spot values** (`data/golden/horizons_spots.ron`, `data/golden/sky_spots.ron`; test goldens only,
+never drawn). Geometric state vectors and geocentric observer tables, retrieved through the Horizons API on
+2026-11-22. Citation, as the Horizons manual asks: Giorgini, JD and JPL Solar System Dynamics Group, NASA/JPL
+Horizons On-Line Ephemeris System, <https://ssd.jpl.nasa.gov/horizons/>, data retrieved 2026-Nov-22 (system
+described in Giorgini et al. 1996, "JPL's On-Line Solar System Data Service", BAAS 28(3), 1158). Developed by the
+Jet Propulsion Laboratory (Solar System Dynamics Group), California Institute of Technology, under contract with
+NASA. The underlying ephemerides, as each answer names them: DE441 for the Sun, the planets, Pluto and the Moon
+(Park, R. S., Folkner, W. M., Williams, J. G. & Boggs, D. H. 2021, "The JPL Planetary and Lunar Ephemerides DE440
+and DE441", AJ 161, 105); the JPL satellite ephemerides mar099, jup365, sat441, ura184, nep098 and plu060 for the
+other moons; the JPL small-body orbit solutions JPL#75 (1P/Halley), JPL#48 (1 Ceres) and JPL#31 (C/2020 F3).
+Licence: public JPL Solar System Dynamics data; the Horizons manual states no terms beyond the citation.
 <!-- /A9 -->
 
 ## Textures
