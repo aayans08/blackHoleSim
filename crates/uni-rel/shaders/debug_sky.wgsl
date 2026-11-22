@@ -1,8 +1,11 @@
-// rel/debug_sky.wgsl: the M0 lens background, a celestial grid every 15° in ICRS.
+// rel/debug_sky.wgsl: the M0 lens environment, a celestial grid every 15° in ICRS.
 //
-// NOT a real sky: the HUD labels it "Lens background: M0 debug grid". The base is
-// 0.05 × white and the lines 0.4 × white, both after exposure at the scene EV, so the sky is
-// never pure black and the black-hole shadow is the only black region.
+// NOT a real sky: the HUD labels it "Lens background: M0 debug grid". It is display-referred:
+// debug_sky returns the pre-exposed hdr value itself (uni-gfx common/camera.wgsl), 0.05 for the
+// base and 0.4 for the lines, whatever the scene exposure, so the sky is never pure black and the
+// black-hole shadow is the only black region. Both the background pass (DebugSkyBackground, the
+// unlensed grid) and the lens pass (its escaped rays) draw it, so they match at the edge of the
+// lens rectangle.
 //
 // Directions are in root axes = ICRS/J2000 equatorial: +x toward RA 0h Dec 0°, +z toward the
 // north celestial pole (IAU 1997 Resolution B2 / Global Constraints).
@@ -11,7 +14,7 @@
 
 // Grid spacing: 15° (one hour of RA) in radians.
 const SKY_GRID_SPACING: f32 = 0.2617993877991494;
-// Base and line levels as fractions of white after exposure.
+// Base and line levels: pre-exposed hdr values (fractions of white after exposure).
 const SKY_BASE: f32 = 0.05;
 const SKY_LINE: f32 = 0.4;
 // A line is one footprint wide, but never wider than this fraction of the spacing, so a
@@ -32,9 +35,9 @@ fn grid_line_coverage(u: f32, w: f32, f: f32) -> f32 {
     return clamp((ia - ib) / ff, 0.0, 1.0);
 }
 
-// Scene-linear colour of the debug sky in direction `dir` (root axes, any length), for a pixel
-// whose footprint on the sky is `footprint` radians across, at scene exposure `ev100`.
-fn debug_sky(dir: vec3<f32>, footprint: f32, ev100: f32) -> vec3<f32> {
+// Pre-exposed hdr colour of the debug sky in direction `dir` (root axes, any length), for a
+// pixel whose footprint on the sky is `footprint` radians across.
+fn debug_sky(dir: vec3<f32>, footprint: f32) -> vec3<f32> {
     let d = normalize(dir);
     let dec = asin(clamp(d.z, -1.0, 1.0));
     let ra = atan2(d.y, d.x);
@@ -47,8 +50,12 @@ fn debug_sky(dir: vec3<f32>, footprint: f32, ev100: f32) -> vec3<f32> {
     let ra_unit = SKY_GRID_SPACING * cos_dec;
     let c_ra = grid_line_coverage(ra / SKY_GRID_SPACING, width / ra_unit, fp / ra_unit);
     let c = 1.0 - (1.0 - c_dec) * (1.0 - c_ra);
-    // Divide by the exposure scale so the tonemapper's × exposure_scale(ev100) yields 0.05 / 0.4.
-    // Capped at the hdr target's largest finite value (IEEE 754 binary16: 65504), which the
-    // lines would pass above scene EV ≈ 17.
-    return vec3<f32>(min(mix(SKY_BASE, SKY_LINE, c) / exposure_scale(ev100), 65504.0));
+    return vec3<f32>(mix(SKY_BASE, SKY_LINE, c));
+}
+
+// Unlensed angular size [rad] of internal-resolution pixel `p`, whose direction is `d`.
+fn pixel_footprint(p: vec2<f32>, d: vec3<f32>) -> f32 {
+    let dx = length(pixel_dir(p + vec2<f32>(1.0, 0.0)) - d);
+    let dy = length(pixel_dir(p + vec2<f32>(0.0, 1.0)) - d);
+    return max(dx, dy);
 }

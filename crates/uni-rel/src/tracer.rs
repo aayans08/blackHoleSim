@@ -3,8 +3,10 @@
 //! For the first lens in [`FrameCtx::lenses`] (only one in M0), [`LensTracer`] works out the
 //! screen rectangle where light is bent by at least half a pixel, traces one Binet geodesic
 //! per sample there (at the resolution scale) and upsamples the result bilinearly into `hdr`
-//! and `lens_mask`. Outside the rectangle it draws the unlensed M0 debug sky. The shaders are
-//! `shaders/lens_trace.wgsl` (passes), `binet.wgsl` (integrator) and `debug_sky.wgsl`.
+//! and `lens_mask`. It writes nothing outside the rectangle (uni-gfx `targets` pass contract):
+//! the background drawn before it stays there, and in M0 that background is the same debug grid
+//! ([`crate::DebugSkyBackground`]). The shaders are `shaders/lens_trace.wgsl` (passes),
+//! `binet.wgsl` (integrator) and `debug_sky.wgsl`.
 //!
 //! The brute-force step budget only reaches the hole from cameras within [`TRACE_REACH`]
 //! (5000 M). Farther out, nothing is traced and the frame shows the unlensed sky with no
@@ -14,15 +16,18 @@
 //! The lens is treated as a static Schwarzschild hole seen by a static camera; `LensView::spin`
 //! is ignored in M0 (Kerr comes in M3, design §5.5).
 //!
-//! The feature writes every `hdr` pixel, so it must run before features that add to `hdr`
-//! (Task 11's order: lens, stars, tonemap).
+//! Order: after the background, before the stars (which multiply by `1 − lens_mask`) and the
+//! tonemap. When nothing is traced and the camera is outside every horizon, the pass encodes
+//! nothing at all.
 
 use std::f64::consts::FRAC_PI_2;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::Context as _;
 use glam::{DVec3, Mat4, UVec2};
 use uni_gfx::{
-    CameraUniform, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT, LensView,
+    FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT, LensView,
     PassTimer, RenderFeature, ShaderLib,
 };
 
@@ -52,9 +57,37 @@ pub const TRACE_REACH: f64 = 5000.0;
 pub const BEYOND_REACH_WARNING: &str = "Lens not traced (camera > 5000 M): unlensed, no shadow";
 
 /// Interactive default resolution scale; captures set 1.0.
-const DEFAULT_RESOLUTION_SCALE: f32 = 0.5;
+pub const DEFAULT_RESOLUTION_SCALE: f32 = 0.5;
 const MIN_RESOLUTION_SCALE: f32 = 0.25;
 const MAX_RESOLUTION_SCALE: f32 = 1.0;
+
+/// A shared handle to the lens tracer's resolution scale (the fraction of the internal
+/// resolution at which rays are traced), clamped to 0.25..=1.0.
+///
+/// The `Renderer` owns its features, so the app keeps a clone of this handle to steer the
+/// tracer (and the debug background, whose unlensed lines match the traced width). `set` takes
+/// effect from the next frame's `prepare`.
+#[derive(Clone, Debug)]
+pub struct LensScale(Arc<AtomicU32>);
+
+impl LensScale {
+    /// A handle at `s`, clamped to 0.25..=1.0 (NaN gives the interactive default 0.5).
+    pub fn new(s: f32) -> Self {
+        let s = clamp_resolution_scale(s, DEFAULT_RESOLUTION_SCALE);
+        Self(Arc::new(AtomicU32::new(s.to_bits())))
+    }
+
+    /// Sets the scale, clamped to 0.25..=1.0; NaN is ignored.
+    pub fn set(&self, s: f32) {
+        let s = clamp_resolution_scale(s, self.get());
+        self.0.store(s.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The current scale, in 0.25..=1.0.
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
 /// Ray samples: exit direction (xyz) and capture flag (w). f32, because f16's ~5e-4 rad
 /// direction error is half a pixel at 1080p with a 60° field of view.
 const SAMPLES_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
@@ -68,13 +101,23 @@ const WORKGROUP: u32 = 8;
 struct LensParams {
     /// xyz: camera position relative to the hole [M], root axes; w: r_cam [M].
     cam: [f32; 4],
-    /// Traced rectangle in full-resolution pixels: min x, min y, width, height.
+    /// Traced rectangle in full-resolution pixels: min x, min y, width, height (the whole
+    /// frame when the camera is inside the horizon).
     rect: [u32; 4],
     /// Samples across the rectangle (x, y; 0 = nothing traced), max steps,
     /// camera inside the horizon (1 = the whole frame is black).
     grid: [u32; 4],
     /// Full-resolution pixels per sample (x, y), r_far [M], 1 / resolution scale.
     scale: [f32; 4],
+}
+
+impl LensParams {
+    /// Whether the pass writes anything: rays to trace, or a frame to black out.
+    fn writes_pixels(&self) -> bool {
+        let traced = self.grid[0] > 0 && self.grid[1] > 0;
+        let inside = self.grid[3] != 0;
+        (traced || inside) && self.rect[2] > 0 && self.rect[3] > 0
+    }
 }
 
 /// A rectangle of full-resolution pixels, `[min, min + size)`.
@@ -236,7 +279,8 @@ fn gpu_r_far(r_cam: f64) -> f64 {
 /// - [`LensCoverage::Unlensed`]: there is no lens (or its mass is not positive and finite),
 ///   its cone is under half a pixel, or its rectangle is off screen. Nothing is traced, and the
 ///   resolve pass draws only the unlensed sky.
-/// - [`LensCoverage::InsideHorizon`]: sets the black-frame flag.
+/// - [`LensCoverage::InsideHorizon`]: sets the black-frame flag, with the whole frame as the
+///   rectangle.
 /// - [`LensCoverage::BeyondReach`]: the rectangle is on screen but r_cam > [`TRACE_REACH`].
 ///   Nothing is traced, as for `Unlensed`.
 /// - [`LensCoverage::Traced`]: the rectangle is traced.
@@ -267,6 +311,7 @@ fn frame_params(
     }
     if r_cam < binet::CAPTURE_RADIUS {
         p.grid[3] = 1;
+        p.rect = [0, 0, size.x, size.y];
         return (LensCoverage::InsideHorizon, p);
     }
     let (proj_x, proj_y) = (f64::from(proj.x_axis.x), f64::from(proj.y_axis.y));
@@ -379,20 +424,16 @@ fn compute_pipeline(
     })
 }
 
-/// The brute-force Schwarzschild lens pass (`RenderFeature` named "lens").
+/// The brute-force Schwarzschild lens pass (`RenderFeature` named "lens"). Group 0 is the
+/// renderer's ([`FrameBindings::camera`]); group 1 holds the parameters and textures.
 pub struct LensTracer {
     trace_pipeline: wgpu::ComputePipeline,
     resolve_pipeline: wgpu::ComputePipeline,
     trace_bgl: wgpu::BindGroupLayout,
     resolve_bgl: wgpu::BindGroupLayout,
-    /// This feature's own copy of the camera uniform: `RenderFeature::encode` is not handed
-    /// the renderer's camera bind group, so the feature binds its own buffer with the shared
-    /// layout at group 0 and writes `CameraUniform::from_ctx` into it in `prepare`.
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
     params: LensParams,
-    resolution_scale: f32,
+    resolution_scale: LensScale,
     /// Size-dependent resources; `prepare` rebuilds them after a resize or a scale change.
     frame: Option<FrameResources>,
 }
@@ -409,12 +450,14 @@ struct FrameResources {
 
 impl LensTracer {
     /// Registers the uni-rel shaders in `lib`, compiles the lens pass and creates its
-    /// pipelines and uniforms. `camera_bgl` is `Renderer::camera_bind_group_layout()`.
-    /// Shader or pipeline validation errors are returned, not raised on the device.
+    /// pipelines and uniforms. `camera_bgl` is `Renderer::camera_bind_group_layout()`; `scale`
+    /// is the resolution-scale handle the app steers. Shader or pipeline validation errors are
+    /// returned, not raised on the device.
     pub fn new(
         gpu: &GpuContext,
         lib: &mut ShaderLib,
         camera_bgl: &wgpu::BindGroupLayout,
+        scale: LensScale,
     ) -> anyhow::Result<Self> {
         crate::register_shaders(lib);
         let device = &gpu.device;
@@ -446,23 +489,11 @@ impl LensTracer {
             "cs_resolve",
             [camera_bgl, &resolve_bgl],
         );
-        let uniform = |label: &str, size: usize| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: size as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        let camera_buffer = uniform("lens camera uniform", size_of::<CameraUniform>());
-        let params_buffer = uniform("lens params", size_of::<LensParams>());
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lens camera bg"),
-            layout: camera_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lens params"),
+            size: size_of::<LensParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         if let Some(err) = pollster::block_on(scope.pop()) {
             anyhow::bail!("creating the lens pipelines: {err}");
@@ -473,19 +504,18 @@ impl LensTracer {
             resolve_pipeline,
             trace_bgl,
             resolve_bgl,
-            camera_buffer,
-            camera_bind_group,
             params_buffer,
             params: bytemuck::Zeroable::zeroed(),
-            resolution_scale: DEFAULT_RESOLUTION_SCALE,
+            resolution_scale: scale,
             frame: None,
         })
     }
 
     /// Fraction of full resolution at which rays are traced, clamped to 0.25..=1.0 (NaN is
     /// ignored). Default 0.5 for interactive use; captures use 1.0. Applies from the next frame.
+    /// The same as `set` on the [`LensScale`] handle the tracer was made with.
     pub fn set_resolution_scale(&mut self, s: f32) {
-        self.resolution_scale = clamp_resolution_scale(s, self.resolution_scale);
+        self.resolution_scale.set(s);
     }
 
     fn frame_resources(
@@ -559,22 +589,21 @@ impl RenderFeature for LensTracer {
     }
 
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
-        gpu.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
-        );
+        let scale = self.resolution_scale.get();
         (_, self.params) = frame_params(
             ctx.lenses.first(),
             ctx.view_rot,
             ctx.proj,
             targets.size,
-            self.resolution_scale,
+            scale,
         );
+        if !self.params.writes_pixels() {
+            return; // encode records nothing this frame
+        }
         gpu.queue
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&self.params));
         // Sized for the largest rectangle (the whole frame) at the current scale.
-        let samples_size = sample_grid(targets.size, self.resolution_scale);
+        let samples_size = sample_grid(targets.size, scale);
         let stale = self
             .frame
             .as_ref()
@@ -588,10 +617,14 @@ impl RenderFeature for LensTracer {
         &mut self,
         _gpu: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
+        bindings: &FrameBindings<'_>,
         _targets: &FrameTargets,
         _output: &wgpu::TextureView,
         timer: &mut PassTimer,
     ) {
+        if !self.params.writes_pixels() {
+            return; // nothing traced and outside every horizon: the background stays
+        }
         let Some(frame) = &self.frame else {
             return; // prepare has not run yet
         };
@@ -604,16 +637,17 @@ impl RenderFeature for LensTracer {
         let grid = UVec2::new(self.params.grid[0], self.params.grid[1]);
         if grid.x > 0 && grid.y > 0 {
             pass.set_pipeline(&self.trace_pipeline);
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(0, bindings.camera, &[]);
             pass.set_bind_group(1, &frame.trace_bind_group, &[]);
             pass.dispatch_workgroups(grid.x.div_ceil(WORKGROUP), grid.y.div_ceil(WORKGROUP), 1);
         }
+        // Only the rectangle: pixels outside it keep the background.
         pass.set_pipeline(&self.resolve_pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(0, bindings.camera, &[]);
         pass.set_bind_group(1, &frame.resolve_bind_group, &[]);
         pass.dispatch_workgroups(
-            frame.target_size.x.div_ceil(WORKGROUP),
-            frame.target_size.y.div_ceil(WORKGROUP),
+            self.params.rect[2].div_ceil(WORKGROUP),
+            self.params.rect[3].div_ceil(WORKGROUP),
             1,
         );
     }
@@ -627,7 +661,7 @@ impl RenderFeature for LensTracer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BINET_WGSL, DEBUG_SKY_WGSL, LENS_TRACE_WGSL};
+    use crate::{BINET_WGSL, DEBUG_BACKGROUND_WGSL, DEBUG_SKY_WGSL, LENS_TRACE_WGSL};
     use core::mem::{offset_of, size_of};
     use glam::{DQuat, DVec2};
     use uni_gfx::{reversed_z_infinite_proj, validate_wgsl};
@@ -647,7 +681,12 @@ mod tests {
     #[test]
     fn lens_shaders_validate() {
         let lib = lib();
-        for path in [BINET_WGSL, DEBUG_SKY_WGSL, LENS_TRACE_WGSL] {
+        for path in [
+            BINET_WGSL,
+            DEBUG_SKY_WGSL,
+            DEBUG_BACKGROUND_WGSL,
+            LENS_TRACE_WGSL,
+        ] {
             let src = lib.compose(path).unwrap();
             if let Err(e) = validate_wgsl(&src) {
                 panic!("{path}: {e}");
@@ -1093,6 +1132,7 @@ mod tests {
             view_rot: Mat4::IDENTITY,
             proj: proj(),
             viewport: UVec2::new(W, H),
+            output_size: UVec2::new(W, H),
             exposure: uni_gfx::Exposure {
                 scene_ev100: 0.0,
                 star_ev100: 0.0,
@@ -1142,6 +1182,9 @@ mod tests {
                 frame_params(Some(&lens), Mat4::IDENTITY, proj(), UVec2::new(W, H), 0.5);
             assert_eq!(coverage, LensCoverage::InsideHorizon, "{cam}");
             assert_eq!(p.grid, [0, 0, 0, 1], "{cam}");
+            // The black frame is written by the resolve pass over the whole frame.
+            assert_eq!(p.rect, [0, 0, W, H], "{cam}");
+            assert!(p.writes_pixels());
             assert!(p.cam.iter().chain(&p.scale).all(|x| x.is_finite()), "{p:?}");
         }
         assert!(!inside_horizon(&lens_at(DVec3::new(2.1, 0.0, 0.0))));
@@ -1177,5 +1220,41 @@ mod tests {
         assert_eq!(clamp_resolution_scale(0.1, 0.5), 0.25);
         assert_eq!(clamp_resolution_scale(0.75, 0.5), 0.75);
         assert_eq!(clamp_resolution_scale(f32::NAN, 0.5), 0.5);
+    }
+
+    #[test]
+    fn lens_scale_handle_is_shared_and_clamped() {
+        let a = LensScale::new(2.0);
+        assert_eq!(a.get(), 1.0);
+        let b = a.clone();
+        b.set(0.1);
+        assert_eq!(a.get(), 0.25);
+        a.set(f32::NAN);
+        assert_eq!(b.get(), 0.25);
+        a.set(0.75);
+        assert_eq!(b.get(), 0.75);
+        assert_eq!(LensScale::new(f32::NAN).get(), DEFAULT_RESOLUTION_SCALE);
+    }
+
+    /// Review I3: the pass writes only its traced pixels. With no lens, a lens too far to bend
+    /// light by half a pixel, or one beyond the trace reach, it writes nothing at all, so the
+    /// background (black space in sky views) stays. When it traces, it writes the rectangle.
+    #[test]
+    fn lens_pass_writes_only_where_it_traces() {
+        let size = UVec2::new(W, H);
+        let (_, none) = frame_params(None, Mat4::IDENTITY, proj(), size, 0.5);
+        assert!(!none.writes_pixels());
+        for r in [1e6, 1e9] {
+            let lens = lens_at(DVec3::new(0.0, 0.0, r));
+            let (_, p) = frame_params(Some(&lens), Mat4::IDENTITY, proj(), size, 0.5);
+            assert!(!p.writes_pixels(), "{r} M");
+        }
+        // A coarse frame from 4000 M traces a rectangle around the hole, not the whole frame.
+        let (w, h) = (320, 180);
+        let small = reversed_z_infinite_proj(60f32.to_radians(), w as f32 / h as f32, 0.1);
+        let lens = lens_at(DVec3::new(0.0, 0.0, 4000.0));
+        let (_, p) = frame_params(Some(&lens), Mat4::IDENTITY, small, UVec2::new(w, h), 1.0);
+        assert!(p.writes_pixels());
+        assert!(p.rect[2] < w && p.rect[3] < h, "{p:?}");
     }
 }

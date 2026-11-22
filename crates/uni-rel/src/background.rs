@@ -1,0 +1,301 @@
+//! The M0 background while a lens is traced: the unlensed debug grid over the whole frame.
+//!
+//! [`DebugSkyBackground`] runs first in the pass order (uni-gfx `targets` pass contract). While
+//! the lens is traced ([`LensCoverage::Traced`]) it writes the debug grid
+//! (`shaders/debug_sky.wgsl`) into every `hdr` pixel; the lens pass then overwrites only its
+//! traced rectangle with the same grid seen through the lens. Everywhere else (no lens on
+//! screen, a lens beyond the trace reach, or inside a horizon) it writes nothing, so the cleared
+//! black is space and the catalogue stars are the sky. The HUD's "Lens background: M0 debug
+//! grid" label is shown under exactly the same condition.
+//!
+//! M1's Milky Way band replaces the role of this feature: a real environment drawn first, which
+//! the lens then samples with its exit directions instead of `debug_sky`.
+
+use anyhow::Context as _;
+use uni_gfx::{
+    FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer, RenderFeature,
+    ShaderLib,
+};
+
+use crate::tracer::{LensCoverage, LensScale, lens_coverage};
+
+/// Feature name, also the GPU timing label.
+const NAME: &str = "background";
+/// Workgroup edge of `cs_background` (`@workgroup_size(8, 8, 1)`).
+const WORKGROUP: u32 = 8;
+
+/// GPU twin of `struct BackgroundParams` in `shaders/debug_background.wgsl` (one vec4;
+/// `background_params_layout_matches_wgsl` checks it with naga).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct BackgroundParams {
+    /// x: 1 / the lens resolution scale (line-width factor); yzw: 0.
+    scale: [f32; 4],
+}
+
+/// Whether the debug grid background draws for a frame with this lens coverage: only while
+/// the lens is traced, so the grid is never shown where no lens bends it.
+pub fn debug_background_draws(coverage: LensCoverage) -> bool {
+    coverage == LensCoverage::Traced
+}
+
+/// Group 1 of `cs_background`: the params uniform and the hdr storage texture.
+fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(size_of::<BackgroundParams>() as u64),
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format: HDR_FORMAT,
+                view_dimension: wgpu::TextureViewDimension::D2,
+            },
+            count: None,
+        },
+    ]
+}
+
+/// The debug-grid background (`RenderFeature` named "background").
+pub struct DebugSkyBackground {
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    params_buffer: wgpu::Buffer,
+    scale: LensScale,
+    /// Decided in `prepare` for this frame's `encode`.
+    draws: bool,
+    /// Group 1 over the current `hdr` view; `None` until first used and after a resize.
+    binding: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+}
+
+impl DebugSkyBackground {
+    /// Registers the uni-rel shaders in `lib` and builds the pass. `camera_bgl` is
+    /// `Renderer::camera_bind_group_layout()`; `scale` is the lens tracer's resolution-scale
+    /// handle, so the unlensed lines are as wide as the traced ones.
+    pub fn new(
+        gpu: &GpuContext,
+        lib: &mut ShaderLib,
+        camera_bgl: &wgpu::BindGroupLayout,
+        scale: LensScale,
+    ) -> anyhow::Result<Self> {
+        crate::register_shaders(lib);
+        let device = &gpu.device;
+        let module = lib
+            .module(device, crate::DEBUG_BACKGROUND_WGSL)
+            .context("compiling the debug background shader")?;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("debug background bgl"),
+            entries: &layout_entries(),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("debug background"),
+            bind_group_layouts: &[Some(camera_bgl), Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("debug background"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("cs_background"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug background params"),
+            size: size_of::<BackgroundParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            anyhow::bail!("creating the debug background pipeline: {err}");
+        }
+        Ok(Self {
+            pipeline,
+            bgl,
+            params_buffer,
+            scale,
+            draws: false,
+            binding: None,
+        })
+    }
+}
+
+impl RenderFeature for DebugSkyBackground {
+    fn name(&self) -> &'static str {
+        NAME
+    }
+
+    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
+        self.draws = debug_background_draws(lens_coverage(ctx));
+        if !self.draws {
+            return;
+        }
+        let params = BackgroundParams {
+            scale: [1.0 / self.scale.get(), 0.0, 0.0, 0.0],
+        };
+        gpu.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+        if self
+            .binding
+            .as_ref()
+            .is_none_or(|(view, _)| *view != targets.hdr_view)
+        {
+            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("debug background bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
+                    },
+                ],
+            });
+            self.binding = Some((targets.hdr_view.clone(), bind_group));
+        }
+    }
+
+    fn encode(
+        &mut self,
+        _gpu: &GpuContext,
+        enc: &mut wgpu::CommandEncoder,
+        frame: &FrameBindings<'_>,
+        targets: &FrameTargets,
+        _output: &wgpu::TextureView,
+        timer: &mut PassTimer,
+    ) {
+        if !self.draws {
+            return;
+        }
+        let Some((_, bind_group)) = &self.binding else {
+            return;
+        };
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(NAME),
+            timestamp_writes: timer.compute_writes(NAME),
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, frame.camera, &[]);
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.dispatch_workgroups(
+            targets.size.x.div_ceil(WORKGROUP),
+            targets.size.y.div_ceil(WORKGROUP),
+            1,
+        );
+    }
+
+    fn resize(&mut self, _gpu: &GpuContext, _targets: &FrameTargets) {
+        self.binding = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::offset_of;
+    use uni_gfx::validate_wgsl;
+    use wgpu::naga;
+
+    fn module() -> naga::Module {
+        let mut lib = ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        let src = lib.compose(crate::DEBUG_BACKGROUND_WGSL).unwrap();
+        validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}\n{src}"))
+    }
+
+    #[test]
+    fn background_params_layout_matches_wgsl() {
+        let m = module();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(m.to_ctx()).unwrap();
+        let (handle, ty) = m
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("BackgroundParams"))
+            .expect("struct BackgroundParams");
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("not a struct");
+        };
+        assert_eq!(
+            layouter[handle].size as usize,
+            size_of::<BackgroundParams>()
+        );
+        let wgsl: Vec<(String, usize)> = members
+            .iter()
+            .map(|m| (m.name.clone().unwrap_or_default(), m.offset as usize))
+            .collect();
+        assert_eq!(
+            wgsl,
+            [("scale".to_owned(), offset_of!(BackgroundParams, scale))]
+        );
+    }
+
+    /// `cs_background` uses group 0's camera and exactly the group-1 bindings of its layout.
+    #[test]
+    fn bindings_match_the_layout() {
+        let m = module();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
+        )
+        .validate(&m)
+        .unwrap();
+        assert_eq!(m.entry_points.len(), 1);
+        assert_eq!(m.entry_points[0].name, "cs_background");
+        let used = info.get_entry_point(0);
+        let mut bindings: Vec<(u32, u32, String)> = m
+            .global_variables
+            .iter()
+            .filter(|(h, _)| !used[*h].is_empty())
+            .map(|(_, v)| {
+                let rb = v.binding.as_ref().expect("resource binding");
+                (rb.group, rb.binding, v.name.clone().unwrap_or_default())
+            })
+            .collect();
+        bindings.sort();
+        assert_eq!(
+            bindings,
+            [
+                (0, 0, "camera".to_owned()),
+                (1, 0, "background".to_owned()),
+                (1, 1, "hdr_out".to_owned()),
+            ]
+        );
+        let entries = layout_entries();
+        assert_eq!(entries.map(|e| e.binding), [0, 1]);
+        assert!(matches!(
+            entries[1].ty,
+            wgpu::BindingType::StorageTexture {
+                format: HDR_FORMAT,
+                ..
+            }
+        ));
+    }
+
+    /// Review I3: the grid is the lens's environment, so it is drawn exactly when the lens is
+    /// traced, never in sky views or beyond the trace reach.
+    #[test]
+    fn grid_background_only_while_the_lens_is_traced() {
+        assert!(debug_background_draws(LensCoverage::Traced));
+        for c in [
+            LensCoverage::Unlensed,
+            LensCoverage::BeyondReach,
+            LensCoverage::InsideHorizon,
+        ] {
+            assert!(!debug_background_draws(c), "{c:?}");
+        }
+    }
+}

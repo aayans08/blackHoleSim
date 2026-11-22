@@ -5,10 +5,14 @@
 //    scale), build the camera ray with pixel_dir, apply static_observer_ray, integrate it with
 //    binet_trace (r_far = max(2·r_cam, 1000) M, at most 2000 steps) and store the exit
 //    direction and capture flag.
-// 2. cs_resolve, over the full frame: inside the rectangle, upsample the samples bilinearly
-//    (captured → black and lens_mask 1); outside it, draw the unlensed debug sky, since the
-//    deflection there is under half a pixel. If the camera is inside the horizon, every pixel
-//    is black with lens_mask 1.
+// 2. cs_resolve, over the lens rectangle only: upsample the samples bilinearly into hdr
+//    (captured → black) and lens_mask (captured → 1). If the camera is inside the horizon, the
+//    rectangle is the whole frame and every pixel is black with lens_mask 1.
+//
+// The pass writes nothing outside its rectangle (uni-gfx targets.rs, pass contract): there the
+// deflection is under half a pixel, and the background drawn before the lens pass stays. Its
+// escaped rays show the same environment that background draws (in M0 the debug grid, drawn by
+// rel/debug_background.wgsl while the lens is traced), so the rectangle's edge is invisible.
 //
 // Step budget. The step cap is 5 M, so 2000 steps carry a ray at most about 1e4 M. Measured
 // with the CPU twin, as the camera moves out:
@@ -35,7 +39,8 @@
 struct LensParams {
     // xyz: camera position relative to the hole [M], root axes; w: r_cam [M].
     cam: vec4<f32>,
-    // Traced rectangle in full-resolution pixels: min x, min y, width, height.
+    // Traced rectangle in full-resolution pixels: min x, min y, width, height (the whole frame
+    // when the camera is inside the horizon).
     rect: vec4<u32>,
     // Samples across the rectangle (x, y; 0 = nothing traced), max steps,
     // camera inside the horizon (1 = the whole frame is black).
@@ -50,7 +55,8 @@ struct LensParams {
 @group(1) @binding(1) var samples_out: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(2) var samples_in: texture_2d<f32>;
 @group(1) @binding(3) var hdr_out: texture_storage_2d<rgba16float, write>;
-// 1.0 where the ray was captured (read by the star pass as 1 − lens_mask).
+// The captured fraction of each traced pixel (uni_gfx::LENS_MASK_FORMAT; read by the star pass
+// as 1 − lens_mask). Written only inside the rectangle.
 @group(1) @binding(4) var lens_mask_out: texture_storage_2d<r32float, write>;
 
 // The full-resolution pixel index whose centre (pixel_dir adds 0.5) is the centre of sample
@@ -74,13 +80,6 @@ fn cs_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(samples_out, gid.xy, result);
 }
 
-// Unlensed angular size [rad] of full-resolution pixel `p`, whose direction is `d`.
-fn pixel_footprint(p: vec2<f32>, d: vec3<f32>) -> f32 {
-    let dx = length(pixel_dir(p + vec2<f32>(1.0, 0.0)) - d);
-    let dy = length(pixel_dir(p + vec2<f32>(0.0, 1.0)) - d);
-    return max(dx, dy);
-}
-
 // Angle (as a chord) between the exit directions of two samples; 0 if either was captured.
 fn sample_gap(a: vec4<f32>, b: vec4<f32>) -> f32 {
     if (a.w > 0.5 || b.w > 0.5) {
@@ -89,42 +88,36 @@ fn sample_gap(a: vec4<f32>, b: vec4<f32>) -> f32 {
     return length(a.xyz - b.xyz);
 }
 
-// Colour (rgb) and lens mask (a) of one sample.
-fn shade_sample(s: vec4<f32>, footprint: f32, ev100: f32) -> vec4<f32> {
+// Pre-exposed colour (rgb) and lens mask (a) of one sample.
+fn shade_sample(s: vec4<f32>, footprint: f32) -> vec4<f32> {
     if (s.w > 0.5) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return vec4<f32>(debug_sky(s.xyz, footprint, ev100), 0.0);
+    return vec4<f32>(debug_sky(s.xyz, footprint), 0.0);
 }
 
+// Dispatched over the rectangle only: `gid` is the pixel's offset inside it.
 @compute @workgroup_size(8, 8, 1)
 fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(hdr_out);
-    if (gid.x >= dims.x || gid.y >= dims.y) {
+    if (gid.x >= lens.rect.z || gid.y >= lens.rect.w) {
         return;
     }
-    let p = gid.xy;
+    let p = lens.rect.xy + gid.xy;
+    let dims = textureDimensions(hdr_out);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
     if (lens.grid.w != 0u) {
         // Camera inside the horizon: no light from outside reaches it.
         textureStore(hdr_out, p, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(lens_mask_out, p, vec4<f32>(1.0, 0.0, 0.0, 0.0));
         return;
     }
-    let ev100 = camera.exposure.x;
     let pf = vec2<f32>(p);
-    let rel = vec2<i32>(p) - vec2<i32>(lens.rect.xy);
-    let traced = lens.grid.x > 0u && lens.grid.y > 0u;
-    let in_rect = traced && all(rel >= vec2<i32>(0)) && all(rel < vec2<i32>(lens.rect.zw));
-    if (!in_rect) {
-        // Unlensed. Lines match the traced region's width (one sample = 1/scale pixels).
-        let d = pixel_dir(pf);
-        let c = debug_sky(d, pixel_footprint(pf, d) * lens.scale.w, ev100);
-        textureStore(hdr_out, p, vec4<f32>(c, 1.0));
-        return;
-    }
+    let rel = vec2<f32>(gid.xy);
     // Bilinear upsampling: this pixel's centre in sample coordinates (samples sit at their
     // centres, see sample_pixel). At scale 1, q is the integer sample index and t = 0.
-    let q = (vec2<f32>(rel) + 0.5) / lens.scale.xy - 0.5;
+    let q = (rel + 0.5) / lens.scale.xy - 0.5;
     let q0 = floor(q);
     let t = clamp(q - q0, vec2<f32>(0.0), vec2<f32>(1.0));
     let last = vec2<i32>(lens.grid.xy) - 1;
@@ -141,8 +134,8 @@ fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         // No escaped neighbour pair (rectangle corner or shadow edge): use the unlensed size.
         fp = pixel_footprint(pf, pixel_dir(pf)) * max(lens.scale.x, lens.scale.y);
     }
-    let top = mix(shade_sample(s00, fp, ev100), shade_sample(s10, fp, ev100), t.x);
-    let bottom = mix(shade_sample(s01, fp, ev100), shade_sample(s11, fp, ev100), t.x);
+    let top = mix(shade_sample(s00, fp), shade_sample(s10, fp), t.x);
+    let bottom = mix(shade_sample(s01, fp), shade_sample(s11, fp), t.x);
     let c = mix(top, bottom, t.y);
     textureStore(hdr_out, p, vec4<f32>(c.rgb, 1.0));
     textureStore(lens_mask_out, p, vec4<f32>(c.a, 0.0, 0.0, 0.0));

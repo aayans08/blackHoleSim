@@ -1,0 +1,34 @@
+// rel/debug_background.wgsl: the M0 background while a lens is traced (DebugSkyBackground in
+// crates/uni-rel/src/background.rs).
+//
+// One compute pass over the whole frame, run BEFORE the lens pass (uni-gfx targets.rs, pass
+// contract): it writes the unlensed debug grid into every hdr pixel. The lens pass then
+// overwrites only the pixels it traces, with the same grid seen through the lens, so outside
+// the lens rectangle (where the deflection is under half a pixel) the grid continues unlensed and
+// the edge is invisible. The host runs it only while the lens is traced; elsewhere the cleared
+// black is space, and the stars are the sky.
+
+#import "common/camera.wgsl"
+#import "rel/debug_sky.wgsl"
+
+// Twin of `BackgroundParams` in crates/uni-rel/src/background.rs (vec4 members only).
+struct BackgroundParams {
+    // x: line-width factor, 1 / the lens tracer's resolution scale, so the unlensed lines are as
+    // wide as the traced region's (one ray sample = 1/scale pixels); yzw: 0.
+    scale: vec4<f32>,
+}
+
+@group(1) @binding(0) var<uniform> background: BackgroundParams;
+@group(1) @binding(1) var hdr_out: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn cs_background(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(hdr_out);
+    if (gid.x >= dims.x || gid.y >= dims.y) {
+        return;
+    }
+    let pf = vec2<f32>(gid.xy);
+    let d = pixel_dir(pf);
+    let c = debug_sky(d, pixel_footprint(pf, d) * background.scale.x);
+    textureStore(hdr_out, gid.xy, vec4<f32>(c, 1.0));
+}
