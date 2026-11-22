@@ -1,6 +1,9 @@
 //! Photometry (M1 Task A3): asteroid H, G magnitudes (Bowell et al. 1989), comet total
 //! magnitudes, Lambert and lunar-Lambert (McEwen 1991) reflectance, disk illuminance, and star
 //! radii from bolometric corrections (Torres 2010). A0b stub; A3 implements.
+//!
+//! [`rho_from_geometric_albedo`] is already implemented, and this file already ends with a
+//! `#[cfg(test)] mod tests`: A3 adds its tests inside it (a second `mod tests` does not compile).
 
 /// A surface reflectance model.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -1,5 +1,8 @@
 //! Comets (`comets.ron`) and asteroids (`asteroids.bin` + `asteroid_names.txt`) from the JPL
 //! Small-Body Database (M1 Task A9). A0b stub; A9 implements.
+//!
+//! This file already ends with a `#[cfg(test)] mod tests` holding `asteroid_record_is_80_bytes`
+//! (lead ruling, review I2): A9 adds its tests inside it (a second `mod tests` does not compile).
 
 use std::path::Path;
 

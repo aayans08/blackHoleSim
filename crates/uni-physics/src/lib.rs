@@ -6,8 +6,10 @@
 //! - A2: [`moon`], [`galilean`], [`saturn_moons`], [`sat_elements`], [`rotation`], [`ephemeris`]
 //! - A3: [`photometry`], [`smallbody`], [`dust`], [`calc`]
 //!
-//! One exception: [`photometry::rho_from_geometric_albedo`] is already implemented (A0b fix
-//! round 1, review I3), because A8 calls it before A3 lands.
+//! Two exceptions are already implemented by the lead's A0b (review I3), because a parallel task
+//! calls them before their owner lands: [`photometry::rho_from_geometric_albedo`] (fix round 1;
+//! A8's bake) and [`bodies::major_bodies`] with [`bodies::by_naif`] (fix round 2; A9's
+//! `facts_cover_major_bodies`). Their owners (A3, A1) keep, check and extend them.
 //!
 //! CPU maths is SI units in `f64`; positions are ICRS/J2000 axes (CLAUDE.md §3).
 
