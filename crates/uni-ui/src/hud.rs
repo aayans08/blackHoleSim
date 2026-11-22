@@ -50,6 +50,10 @@ const HONESTY_LABELS: [&str; 2] = [
     "Stars near the hole are not yet lensed (M0)",
 ];
 
+/// Shown in amber while stars are exposed differently from the scene (design §7 item 4; §2
+/// anti-goal 2): the "Eye-adapted stars" dual exposure is not what a camera would record.
+pub const EYE_ADAPTED_STARS_LABEL: &str = "Eye-adapted stars (dual exposure, non-physical)";
+
 /// The app's own hotkeys in uni-nav's key map (Task 6): Tab hides the HUD, F1 shows the
 /// controls list, F12 saves the view as a bookmark. Matched by physical key, as uni-nav does.
 const APP_HOTKEYS: [KeyCode; 3] = [KeyCode::Tab, KeyCode::F1, KeyCode::F12];
@@ -62,12 +66,20 @@ const HEADLESS_MAX_RUNS: usize = 4;
 /// What the HUD shows this frame. Filled by the app; the HUD only reads it.
 #[derive(Clone, Debug)]
 pub struct HudData {
+    /// Smoothed frames per second of the window (0 in captures, where it is not shown).
     pub fps: f32,
     pub cpu_ms: f32,
-    /// (pass name, GPU ms) per pass, from the pass timer.
-    pub gpu_ms: Vec<(&'static str, f32)>,
+    /// (pass name, GPU ms) per pass, from the pass timer; `None` where the device returned no
+    /// valid measurement (shown as "n/a", never as 0).
+    pub gpu_ms: Vec<(&'static str, Option<f32>)>,
+    /// Whole-frame GPU time [ms], if measured and valid.
+    pub gpu_frame_ms: Option<f32>,
     /// False when the device has no timestamp queries; the HUD then shows "GPU ms n/a".
     pub gpu_timing_available: bool,
+    /// Internal render resolution [px] (the frame targets).
+    pub render_size: [u32; 2],
+    /// Output resolution [px] (the swapchain or capture) the frame is upscaled to.
+    pub output_size: [u32; 2],
     pub dist_from_sun_m: f64,
     pub nearest_name: String,
     pub nearest_dist_m: f64,
@@ -84,6 +96,9 @@ pub struct HudData {
     /// background: M0 debug grid" and "Stars near the hole are not yet lensed (M0)". Sky views
     /// skip the pass, so neither line would be true there.
     pub lens_on_screen: bool,
+    /// True when this frame's stars are exposed at a different EV from the scene. The HUD then
+    /// shows [`EYE_ADAPTED_STARS_LABEL`] in amber.
+    pub eye_adapted_stars: bool,
 }
 
 /// Settings the HUD edits. The app reads them back after [`Hud::draw`].
@@ -475,7 +490,9 @@ fn show_panel(ctx: &egui::Context, data: &HudData, controls: &mut HudControls) {
             if data.inside_horizon {
                 ui.label(RichText::new("Inside event horizon").color(RED).strong());
             }
-            ui.monospace(format!("{:.0} fps · CPU {:.2} ms", data.fps, data.cpu_ms));
+            for line in perf_lines(data) {
+                ui.monospace(line);
+            }
             for line in gpu_timing_lines(data) {
                 ui.monospace(line);
             }
@@ -502,7 +519,9 @@ fn show_panel(ctx: &egui::Context, data: &HudData, controls: &mut HudControls) {
                     } else {
                         speed
                     };
-                    row(ui, "Speed", speed);
+                    // The cruise setting (wheel, = / -), not the current velocity: the camera
+                    // moves at it only while a movement key is held.
+                    row(ui, "Cruise speed", speed);
                     row(ui, "Epoch", format_epoch(data.epoch).into());
                     row(ui, "Rate", format_time_rate(data.time_rate).into());
                     row(ui, "Stars", data.star_count.to_string().into());
@@ -531,8 +550,8 @@ fn show_panel(ctx: &egui::Context, data: &HudData, controls: &mut HudControls) {
                     .text("Lens scale")
                     .fixed_decimals(2),
             );
-            for label in honesty_labels(data.lens_on_screen) {
-                ui.label(RichText::new(*label).color(AMBER));
+            for label in honesty_labels(data.lens_on_screen, data.eye_adapted_stars) {
+                ui.label(RichText::new(label).color(AMBER));
             }
             ui.small("F1 controls · Tab hide HUD");
         });
@@ -559,13 +578,37 @@ fn show_controls_list(ctx: &egui::Context, open: &mut bool) {
         });
 }
 
-/// The amber honesty lines for a frame: [`HONESTY_LABELS`] when the lens pass draws, else none,
-/// since a label must be true where it is shown (design anti-goal 2).
-fn honesty_labels(lens_on_screen: bool) -> &'static [&'static str] {
-    if lens_on_screen { &HONESTY_LABELS } else { &[] }
+/// The amber honesty lines for a frame, each only while it is true (design anti-goal 2):
+/// [`HONESTY_LABELS`] when the lens pass draws, and [`EYE_ADAPTED_STARS_LABEL`] while the stars'
+/// exposure differs from the scene's.
+fn honesty_labels(lens_on_screen: bool, eye_adapted_stars: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if lens_on_screen {
+        out.extend(HONESTY_LABELS);
+    }
+    if eye_adapted_stars {
+        out.push(EYE_ADAPTED_STARS_LABEL);
+    }
+    out
 }
 
-/// One `"GPU <pass> <ms> ms"` line per timed pass, or `"GPU ms n/a"` when the device has no
+/// The frame-rate and resolution lines: `"<fps> fps · <ms> ms · CPU <ms> ms"` (frame time from
+/// the smoothed fps; the fps part is left out when there is none, as in captures) and
+/// `"Render <w>×<h> → <w>×<h>"` (internal → output).
+fn perf_lines(data: &HudData) -> Vec<String> {
+    let cpu = format!("CPU {:.2} ms", data.cpu_ms);
+    let first = if data.fps > 0.0 && data.fps.is_finite() {
+        format!("{:.0} fps · {:.1} ms · {cpu}", data.fps, 1e3 / data.fps)
+    } else {
+        cpu
+    };
+    let [rw, rh] = data.render_size;
+    let [ow, oh] = data.output_size;
+    vec![first, format!("Render {rw}×{rh} → {ow}×{oh}")]
+}
+
+/// `"GPU frame <ms> ms"`, then one `"GPU <pass> <ms> ms"` line per timed pass, with "n/a" for an
+/// invalid measurement (review I5: never 0.00); or `"GPU ms n/a"` when the device has no
 /// timestamp queries (Review Focus 4). Before the first read-back there is nothing to show yet.
 fn gpu_timing_lines(data: &HudData) -> Vec<String> {
     if !data.gpu_timing_available {
@@ -574,9 +617,13 @@ fn gpu_timing_lines(data: &HudData) -> Vec<String> {
     if data.gpu_ms.is_empty() {
         return vec!["GPU ms pending".into()];
     }
-    data.gpu_ms
-        .iter()
-        .map(|(pass, ms)| format!("GPU {pass} {ms:.2} ms"))
+    let ms = |v: Option<f32>| v.map_or_else(|| "n/a".to_owned(), |ms| format!("{ms:.2} ms"));
+    std::iter::once(format!("GPU frame {}", ms(data.gpu_frame_ms)))
+        .chain(
+            data.gpu_ms
+                .iter()
+                .map(|(pass, v)| format!("GPU {pass} {}", ms(*v))),
+        )
         .collect()
 }
 
@@ -585,12 +632,15 @@ mod tests {
     use super::*;
     use winit::event::{DeviceId, MouseButton};
 
-    fn data(gpu_ms: Vec<(&'static str, f32)>, gpu_timing_available: bool) -> HudData {
+    fn data(gpu_ms: Vec<(&'static str, Option<f32>)>, gpu_timing_available: bool) -> HudData {
         HudData {
             fps: 60.0,
             cpu_ms: 1.0,
             gpu_ms,
+            gpu_frame_ms: Some(16.5),
             gpu_timing_available,
+            render_size: [1728, 1080],
+            output_size: [2560, 1600],
             dist_from_sun_m: 0.0,
             nearest_name: "Sun".into(),
             nearest_dist_m: 0.0,
@@ -601,6 +651,7 @@ mod tests {
             warnings: Vec::new(),
             inside_horizon: false,
             lens_on_screen: false,
+            eye_adapted_stars: false,
         }
     }
 
@@ -672,8 +723,48 @@ mod tests {
     /// Sky views skip the pass and show black space with real stars.
     #[test]
     fn honesty_labels_iff_lens_on_screen() {
-        assert_eq!(honesty_labels(true), HONESTY_LINES);
-        assert!(honesty_labels(false).is_empty());
+        assert_eq!(honesty_labels(true, false), HONESTY_LINES);
+        assert!(honesty_labels(false, false).is_empty());
+    }
+
+    /// Review I4: dual exposure is labelled exactly while star EV ≠ scene EV (design §7.4).
+    #[test]
+    fn eye_adapted_stars_label_iff_dual_exposure() {
+        assert_eq!(
+            EYE_ADAPTED_STARS_LABEL,
+            "Eye-adapted stars (dual exposure, non-physical)"
+        );
+        assert_eq!(honesty_labels(false, true), [EYE_ADAPTED_STARS_LABEL]);
+        let both = honesty_labels(true, true);
+        assert_eq!(both.len(), 3);
+        assert_eq!(both[2], EYE_ADAPTED_STARS_LABEL);
+        for eye_adapted in [true, false] {
+            let mut d = data(Vec::new(), false);
+            d.eye_adapted_stars = eye_adapted;
+            let (_, texts) = first_headless_draw(1.0, &d, controls(false));
+            match (eye_adapted, find(&texts, EYE_ADAPTED_STARS_LABEL)) {
+                (true, Some(p)) => assert_eq!(p.color, AMBER),
+                (true, None) => panic!("no eye-adapted label in {texts:?}"),
+                (false, Some(p)) => panic!("same exposure, yet {p:?} is drawn"),
+                (false, None) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn perf_lines_show_fps_frame_time_and_resolutions() {
+        let d = data(Vec::new(), true);
+        assert_eq!(
+            perf_lines(&d),
+            [
+                "60 fps · 16.7 ms · CPU 1.00 ms",
+                "Render 1728×1080 → 2560×1600"
+            ]
+        );
+        // A capture has no frame rate.
+        let mut d = d;
+        d.fps = 0.0;
+        assert_eq!(perf_lines(&d)[0], "CPU 1.00 ms");
     }
 
     #[test]
@@ -717,11 +808,28 @@ mod tests {
 
     #[test]
     fn gpu_timing_lists_each_pass() {
-        let d = data(vec![("lens", 1.234), ("stars", 0.5)], true);
+        let d = data(vec![("lens", Some(1.234)), ("stars", Some(0.5))], true);
         assert_eq!(
             gpu_timing_lines(&d),
-            ["GPU lens 1.23 ms", "GPU stars 0.50 ms"]
+            [
+                "GPU frame 16.50 ms",
+                "GPU lens 1.23 ms",
+                "GPU stars 0.50 ms"
+            ]
         );
+    }
+
+    /// Review I5: an invalid measurement reads "n/a", never "0.00 ms".
+    #[test]
+    fn invalid_gpu_timings_read_na() {
+        let mut d = data(vec![("stars", Some(0.5)), ("tonemap", None)], true);
+        d.gpu_frame_ms = None;
+        let lines = gpu_timing_lines(&d);
+        assert_eq!(
+            lines,
+            ["GPU frame n/a", "GPU stars 0.50 ms", "GPU tonemap n/a"]
+        );
+        assert!(lines.iter().all(|l| !l.contains("0.00")), "{lines:?}");
     }
 
     #[test]
@@ -845,9 +953,16 @@ mod tests {
             assert_eq!(out_ppp, ppp);
             let screen =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0 / ppp, 1080.0 / ppp));
-            for needle in ["fps", "GPU ms n/a", "Show / hide HUD", "Save view bookmark"]
-                .into_iter()
-                .chain(HONESTY_LINES)
+            for needle in [
+                "fps",
+                "Render 1728×1080",
+                "GPU ms n/a",
+                "Cruise speed",
+                "Show / hide HUD",
+                "Save view bookmark",
+            ]
+            .into_iter()
+            .chain(HONESTY_LINES)
             {
                 assert!(
                     find(&texts, needle).is_some(),

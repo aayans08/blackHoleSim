@@ -4,4 +4,4 @@ pub mod format;
 pub mod hud;
 
 pub use format::{format_distance, format_epoch, format_speed};
-pub use hud::{Hud, HudControls, HudData};
+pub use hud::{EYE_ADAPTED_STARS_LABEL, Hud, HudControls, HudData};
