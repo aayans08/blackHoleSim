@@ -31,7 +31,9 @@ pixelated look; copying a commercial product; docs that lie.
 > (lens scale 0.5) 38.7 ms GPU, 25.6 fps serial; `bh-shadow-30M` (lens scale 1.0) 157 ms. At the window's
 > 1728×1080 internal size, `start` runs at 27 fps. The brute-force lens pass is ground truth only; M3 replaces it.
 > The window itself was not run in this wave, so its FPS is still unmeasured; the HUD now shows it.
-> M0 capture sheet (numbers from tag `m0`, before this wave): https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE
+> Capture sheet after this wave (lead re-run at `caee1f3`, with the bench table): https://claude.ai/artifact/826GQeJr5fJL542uRbm9sx
+> The older M0 sheet (https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE) shows timings corrupted by a Metal query-resolve
+> race (tonemap 0.00 ms, stars 1.1–4.7 ms); don't quote them.
 
 What exists now:
 ```
