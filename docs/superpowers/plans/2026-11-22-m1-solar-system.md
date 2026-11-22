@@ -195,7 +195,7 @@ Sizes from `docs/research/2026-11-20-assets.md` (Content-Length measured 2026-11
 | `sss-8k` | Solar System Scope: `8k_earth_daymap.jpg` 4.57 MB, `8k_earth_clouds.jpg` 11.62, `8k_moon.jpg` 15.03, `8k_mars.jpg` 8.40, `8k_mercury.jpg` 15.04, `4k_venus_atmosphere.jpg` 1.55, `8k_jupiter.jpg` 3.08, `8k_saturn.jpg` 1.10, `8k_saturn_ring_alpha.png` 0.065, `2k_uranus.jpg` 0.078, `2k_neptune.jpg` 0.24 | CC BY 4.0, "Solar System Scope" | 60.8 MB | `data/baked/maps/*.big` ≈ 411 MB on disk if the six "8k" files decode at 8192 × 4096 (BC7 albedo 44.7 MB each with mips, BC4 clouds 22.4 MB, Venus 4k 11.2 MB, Uranus/Neptune 2k 2.8 MB each, plus a 2k uncompressed copy of every map, 11.2 MB RGBA / 2.8 MB R8: 268 + 22.4 + 11.2 + 5.6 + 101 + 2.8 = 411 MB on disk; on the GPU only the BC mip chains load, 268 + 22.4 + 11.2 + 5.6 = 307 MB, or the 2k copies, 9 × 11.2 + 2.8 = 104 MB, when BC is absent), git-ignored; `maps/index.ron`, committed; `saturn_rings.ron` ≈ 20 KB, committed | A8 |
 | `maps-tier-b` | Galilean moons, Pluto/Charon, Ceres global mosaics (NASA/USGS Astrogeology, public domain) — only versions ≤ 60 MB each, ≤ 300 MB raw in total (ruling 12; Titan is not in the ruled list, and its surface is hidden by haze anyway) | public domain, mission credit | confirm (≤ 60 MB each) | as above | A8 |
 | `sbdb-comets` | JPL SBDB Query API, `sb-kind=c` numbered periodic + the named long-period list in A9 | public (JPL/NASA) | ≈ 0.2 MB (confirm) | `comets.ron` ≈ 0.1 MB, committed | A9 |
-| `sbdb-asteroids` | JPL SBDB Query API, `sb-kind=a`, `H ≤ 14` (count confirmed first with `limit=1`; ruling 11) | public (JPL/NASA) | 5–15 MB (confirm) | `asteroids.bin` (72 B/object; ≈ 3.6 MB at 50 k), committed if < 10 MB | A9 |
+| `sbdb-asteroids` | JPL SBDB Query API, `sb-kind=a`, `H ≤ 14` (count confirmed first with `limit=1`; ruling 11) | public (JPL/NASA) | 5–15 MB (confirm) | `asteroids.bin` (80 B/object, lead ruling after A0b; ≈ 4.0 MB at 50 k), committed if < 10 MB | A9 |
 | `jpl-sats` | https://ssd.jpl.nasa.gov/sats/elem/ and `/sats/phys_par/` (HTML tables) | public (JPL SSD) | ≈ 0.3 MB | `sat_elements.ron` ≈ 60 KB, committed | A9 |
 | `horizons` | JPL Horizons API (`https://ssd.jpl.nasa.gov/api/horizons.api`), vectors and observer tables listed in A9 | public (JPL SSD); DE440/441 | ≈ 0.7 MB over ~170 calls | `data/golden/horizons_spots.ron`, `sky_spots.ron` ≈ 90 KB, committed | A9 |
 | `facts` | NASA NSSDCA planetary and satellite fact sheets (web pages) | public (NASA) | ≈ 0.2 MB | `body_facts.ron` ≈ 30 KB, committed | A9 |
@@ -628,7 +628,7 @@ impl FlyCamera { pub fn reanchor(&mut self, frames: &uni_core::FrameTree, t: uni
         within the accuracy Meeus states for ch. 37 (record it; verify); print the measured errors */ }
   #[test] fn pluto_outside_window_is_two_body_and_flagged() { /* 1800 and 2200: finite, 29 AU < r < 50 AU, in_window false;
         state just inside vs just outside each window edge differs by < 1 km */ } // Review Focus 1
-  #[test] fn radii_order_and_flattening() { /* Saturn b/a = 54364/60268 ±1e-5; Jupiter 66854/71492; every a ≥ b ≥ c > 0 */ }
+  #[test] fn radii_order_and_flattening() { /* Saturn c/a = 54364/60268 (polar/equatorial) ±1e-5; Jupiter 66854/71492; every a ≥ b ≥ c > 0 */ }
   ```
 - [ ] **Step 2: Confirm they fail:** `cargo test -p uni-physics --lib` (the Horizons tests also fail until A9 lands `horizons_spots.ron`; they load the file through `uni_data::data_dir()` and fail with "golden file missing: …", never skip).
 - [ ] **Step 3: Implement.** `propagate_universal`: Stumpff C(z), S(z) with series for |z| < 1e-6; Newton on χ with a Laguerre fallback; for e < 1 reduce dt modulo the period first. Every public function returns finite values for finite input (NaN in → NaN out is allowed only for NaN input; document it).
@@ -1016,7 +1016,7 @@ impl FlyCamera { pub fn reanchor(&mut self, frames: &uni_core::FrameTree, t: uni
   pub fn load_comets(path: &Path) -> Result<Vec<Comet>, DataError>;
   #[repr(C)] #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
   pub struct AsteroidRecord { pub a_au: f64, pub e: f64, pub i_deg: f64, pub node_deg: f64, pub argp_deg: f64, pub m0_deg: f64, pub epoch_jd_tdb: f64,
-      pub h: f32, pub g: f32, pub diameter_km: f32 /* NaN unknown */, pub albedo: f32 /* NaN unknown */, pub spkid: u32, pub name_index: u32 } // 72 B
+      pub h: f32, pub g: f32, pub diameter_km: f32 /* NaN unknown */, pub albedo: f32 /* NaN unknown */, pub spkid: u32, pub name_index: u32 } // 80 B (lead ruling after A0b: the contracted fields sum to 80 B)
   pub fn load_asteroids(bin: &Path, names: &Path) -> Result<(Vec<AsteroidRecord>, Vec<String>), DataError>;   // magic b"UNIAST1\0"
   #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
   pub struct SatRecord { pub naif: i32, pub name: String, pub planet_naif: i32, pub a_km: f64, pub e: f64, pub argp_deg: f64, pub m_deg: f64,
@@ -1052,7 +1052,7 @@ impl FlyCamera { pub fn reanchor(&mut self, frames: &uni_core::FrameTree, t: uni
 - [ ] **Step 4: Fonts.** Download the Inter and IBM Plex Mono release archives, keep only the listed TTFs and their OFL texts.
 - [ ] **Step 5: Write the failing tests.**
   ```rust
-  #[test] fn asteroid_record_is_72_bytes() { assert_eq!(std::mem::size_of::<AsteroidRecord>(), 72); }
+  #[test] fn asteroid_record_is_80_bytes() { assert_eq!(std::mem::size_of::<AsteroidRecord>(), 80); }
   #[test] fn asteroid_roundtrip() {}  #[test] fn comet_ron_roundtrip() {}  #[test] fn golden_ron_roundtrip() {}
   #[test] fn ceres_row() { /* baked file: Ceres a ≈ 2.77 AU ±0.01, H ≈ 3.3 ±0.2 */ }
   #[test] fn halley_row() { /* 1P q ≈ 0.575 AU ±0.01, e ≈ 0.967 ±0.002 */ }
