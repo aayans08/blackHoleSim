@@ -6,8 +6,8 @@
 //    binet_trace (r_far = max(2·r_cam, 1000) M, at most 2000 steps) and store the exit
 //    direction and capture flag.
 // 2. cs_resolve, over the lens rectangle only: upsample the samples bilinearly into hdr
-//    (captured → black) and lens_mask (captured → 1). If the camera is inside the horizon, the
-//    rectangle is the whole frame and every pixel is black with lens_mask 1.
+//    (captured → black) and lens_mask.r (captured → 1). If the camera is inside the horizon, the
+//    rectangle is the whole frame and every pixel is black with lens_mask.r 1.
 //
 // The pass writes nothing outside its rectangle (uni-gfx targets.rs, pass contract): there the
 // deflection is under half a pixel, and the background drawn before the lens pass stays. Its
@@ -55,9 +55,10 @@ struct LensParams {
 @group(1) @binding(1) var samples_out: texture_storage_2d<rgba32float, write>;
 @group(1) @binding(2) var samples_in: texture_2d<f32>;
 @group(1) @binding(3) var hdr_out: texture_storage_2d<rgba16float, write>;
-// The captured fraction of each traced pixel (uni_gfx::LENS_MASK_FORMAT; read by the star pass
-// as 1 − lens_mask). Written only inside the rectangle.
-@group(1) @binding(4) var lens_mask_out: texture_storage_2d<r32float, write>;
+// uni_gfx::LENS_MASK_FORMAT (M1 frame contract, crates/uni-gfx/src/targets.rs), written only
+// inside the rectangle: r = captured fraction of the pixel (the star pass multiplies by 1 − r),
+// g = 0 (no sky occlusion on a repainted pixel), b = 1 (the lens pass wrote this pixel), a = 0.
+@group(1) @binding(4) var lens_mask_out: texture_storage_2d<rgba16float, write>;
 
 // The full-resolution pixel index whose centre (pixel_dir adds 0.5) is the centre of sample
 // `s`. At resolution scale 1 this is exactly the integer pixel index.
@@ -110,7 +111,7 @@ fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (lens.grid.w != 0u) {
         // Camera inside the horizon: no light from outside reaches it.
         textureStore(hdr_out, p, vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        textureStore(lens_mask_out, p, vec4<f32>(1.0, 0.0, 0.0, 0.0));
+        textureStore(lens_mask_out, p, vec4<f32>(1.0, 0.0, 1.0, 0.0));
         return;
     }
     let pf = vec2<f32>(p);
@@ -138,5 +139,5 @@ fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let bottom = mix(shade_sample(s01, fp), shade_sample(s11, fp), t.x);
     let c = mix(top, bottom, t.y);
     textureStore(hdr_out, p, vec4<f32>(c.rgb, 1.0));
-    textureStore(lens_mask_out, p, vec4<f32>(c.a, 0.0, 0.0, 0.0));
+    textureStore(lens_mask_out, p, vec4<f32>(c.a, 0.0, 1.0, 0.0));
 }

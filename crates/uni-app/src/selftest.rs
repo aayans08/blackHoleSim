@@ -5,7 +5,9 @@
 //! - `pcg3d`: `common/hash.wgsl` vs `uni_core::pcg3d`, 4096 inputs, bit-exact;
 //! - `agx`: `post/tonemap.wgsl` vs `uni_post::agx`, 256 inputs, within 1e-3;
 //! - `binet`: `rel/binet.wgsl` vs `uni_rel::binet`, 64 rays traced as the lens pass traces
-//!   them (same step rule and budget), exit direction within 2e-3 rad, same capture flags.
+//!   them (same step rule and budget), exit direction within 2e-3 rad, same capture flags;
+//! - then every `gpu_probes` of the M1 render crates (`uni_gfx::probe::ProbeResult`), so far
+//!   uni-gfx's `cube_dir` (`common/cube.wgsl` vs `uni_gfx::env::cube_dir`).
 //!
 //! Probe buffers sit in bind group 2: `post/tonemap.wgsl` claims groups 0 and 1.
 
@@ -145,7 +147,7 @@ pub fn run() -> bool {
             return false;
         }
     };
-    let lib = probe_lib();
+    let mut lib = probe_lib();
     let checks: [(&str, fn(&GpuContext, &ShaderLib) -> Result<String, String>); 3] = [
         ("pcg3d", check_pcg3d),
         ("agx", check_agx),
@@ -160,6 +162,11 @@ pub fn run() -> bool {
                 all_pass = false;
             }
         }
+    }
+    for probe in uni_gfx::probe::gpu_probes(&gpu, &mut lib) {
+        let verdict = if probe.pass { "PASS" } else { "FAIL" };
+        println!("{verdict} {}: {}", probe.name, probe.detail);
+        all_pass &= probe.pass;
     }
     // An uncaptured GPU error during the probes fails the run (review m6).
     let errors = gpu.take_errors();

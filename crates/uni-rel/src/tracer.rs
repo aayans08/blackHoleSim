@@ -1128,6 +1128,7 @@ mod tests {
                 pos: uni_core::UniversePos::default(),
                 orient: DQuat::IDENTITY,
                 fov_y_rad: 60f64.to_radians(),
+                velocity_mps: DVec3::ZERO,
             },
             view_rot: Mat4::IDENTITY,
             proj: proj(),
@@ -1138,6 +1139,9 @@ mod tests {
                 star_ev100: 0.0,
             },
             lenses: cam_m.map(lens_at).into_iter().collect(),
+            lights: Vec::new(),
+            sim_dt_s: 0.0,
+            jitter_px: glam::Vec2::ZERO,
         };
         let cases = [
             (None, LensCoverage::Unlensed),

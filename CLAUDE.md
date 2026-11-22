@@ -80,32 +80,71 @@ Target responsibilities per crate are in design §5.1. Every render crate implem
 (prepare + encode). The `uni-core` and `uni-gfx` interfaces are frozen. After M0 only the lead changes them.
 Git-ignored outputs: `data/cache/` (raw downloads), `captures/` (capture PNG + JSON).
 
-**Render contract (uni-gfx, changed in the M0 final-review fix wave; every feature follows it)**
+**Render contract (uni-gfx: the M1 frame contract, set by Task A0a; full text in the `crates/uni-gfx/src/targets.rs`
+doc comment; every feature follows it)**
 - *Shared group 0.* `RenderFeature::encode(gpu, enc, frame: &FrameBindings, targets, output, timer)`. Bind
-  `frame.camera` at group 0 (binding 0 `CameraUniform`, binding 1 `ExposureUniform`, layout
-  `Renderer::camera_bind_group_layout()`). The `Renderer` is the only writer of both buffers; features keep no
-  camera copies and put their own bindings in groups ≥ 1.
+  `frame.camera` at group 0 (layout `Renderer::camera_bind_group_layout()`): binding 0 `CameraUniform` (336 B:
+  view_rot, proj, inv_view_proj, prev_view_proj, viewport, output, time, sim, cam_delta), binding 1
+  `ExposureUniform` (32 B), binding 2 `LightUniform` (144 B: the first `MAX_LIGHTS` = 4 finite
+  `FrameCtx::lights`). The `Renderer` is the only CPU writer of all three; it keeps the previous frame's
+  view_proj and camera `UniversePos` for `prev_view_proj` and `cam_delta` (f64 difference, then f32). `sim.x` is
+  TDB seconds since J2000 mod 2^22 s (`sim_time_s()`, ≤ 0.25 s steps). Features keep no camera copies and put
+  their own bindings in groups ≥ 1. WGSL: `common/camera.wgsl` (group 0, `pixel_dir`, `scene_pre()`,
+  `star_pre()`, `sim_time_s()`); `common/exposure.wgsl` (`ExposureUniform`, `HDR_MAX`, `exposure_scale`, no
+  bindings: a pass that writes the exposure buffer as storage imports only it, never group 0); `common/cube.wgsl`
+  (`cube_dir`, the WebGPU cube-face convention, twin `uni_gfx::env::cube_dir`).
+- *Shared inputs.* Per-frame app → feature data goes through `uni_gfx::SharedInput<T>`. The app sets each one
+  before `Renderer::render`; features read them only in `prepare`.
 - *Pre-exposed HDR.* `hdr` (Rgba16Float) holds light × exposure, and the tonemap applies AgX with no exposure
-  of its own. World light writes luminance [cd/m²] × `scene_pre()`. Catalogue stars write E/Ω × `star_pre()`,
-  with no scene term. Each is `exposure_scale(EV) = 1/(1.2·2^EV)` from `ExposureUniform`. Clamp what you write
-  to `HDR_MAX` (60000 < f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4 at scene EV 15. The exposure buffer
-  is also `STORAGE`, so M1's histogram auto-exposure can write it on the GPU. That histogram must run before the
-  star pass (or mask stars out): stars are pre-exposed on their own scale and must not feed back into the scene
-  exposure.
-- *Pass order and lens mask.* Background → opaque → lens → stars → post. The lens pass writes `hdr` and
-  `lens_mask` only on the pixels it traces (its screen rectangle, or the whole frame from inside a horizon).
-  Everything outside keeps what the background drew. Its escaped rays must show the same environment the
-  background draws (M0: both draw the debug grid; M1: sample the shared environment). `lens_mask.r` is the
-  captured fraction of a traced pixel (1 = shadow), 0 elsewhere. Every feature drawn after the lens multiplies
-  by `1 − lens_mask`. M3's per-pixel magnification needs a second channel.
+  of its own. World light (bodies, the Sun's disk, rings, atmospheres, comets) writes luminance [cd/m²] ×
+  `scene_pre()`. Sky light and point sources (catalogue stars, the band, planets/Sun/asteroids drawn as points)
+  write luminance × `star_pre()` (ruling 5). `star_pre == scene_pre` unless "Eye-adapted stars" is in effect
+  (`eye_adapted && !daylight`, which the HUD label follows). A body 1.5–4 px in radius blends from `star_pre` to
+  `scene_pre`. Each factor is `exposure_scale(EV) = 1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 <
+  f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4 at scene EV 15. The exposure buffer is also `STORAGE`,
+  so the auto-exposure resolve can write it on the GPU; the meter reads world light only, before any sky light
+  or point source is written. Environment cubemap texels hold absolute luminance in units of `ENV_UNIT_CD_M2`
+  (1e-4 cd/m²), not pre-exposed.
+- *Lens mask.* `lens_mask` is Rgba16Float (since A0a; m0.1 had R32Float), cleared to 0 every frame. `r`: the
+  captured fraction of a traced pixel (1 = shadow). `g`: sky occlusion, 1 − transmittance toward the
+  background, written with `BlendOperation::Max` on green only (bodies and comet nuclei their coverage, rings
+  their opacity, atmospheres 1 − luminance(T)); the lens pass writes `g = 0` on pixels it repaints. `b`: 1 where
+  the lens pass wrote the lensed environment. `a`: reserved for M3's star magnification. Sky features multiply
+  what they add by (1 − r)(1 − g), the band also by (1 − b); point sprites and asteroids by (1 − r) only. Built
+  at A0a: the lens pass writes (captured, 0, 1, 0) on its traced pixels and the star pass multiplies by (1 − r);
+  nothing writes `g` yet.
+- *Pass order.* M1 target: exposure resolve → band-update → background (M0 debug grid, only with the debug lens
+  environment and a traced lens) → sun → bodies → rings → comets → atmosphere → histogram (meter) → lens → band
+  → stars → points → asteroids → bloom → tonemap, then the HUD. Built at A0a: background → lens → stars →
+  tonemap. The lens pass writes `hdr` and `lens_mask` only on the pixels it traces (its screen rectangle, or the
+  whole frame from inside a horizon), and its escaped rays show the same environment as the sky drawn around
+  them (M0: both draw the debug grid). Target (B7): it reads depth and leaves pixels with depth ≠ 0 (a body in
+  front) untouched.
+- *Band-order deviation (ruling 4).* The band is drawn after the opaque passes and the meter, not first as the
+  design (§5.3) puts the background. The band is sky light at star exposure, so it must not be metered, and
+  drawing it after the bodies with (1 − g) composites it correctly behind partly transparent atmospheres and
+  rings. It draws only where there is no body (depth test `GreaterEqual` at depth 0) and honours `lens_mask` as
+  above.
 - *Internal vs output size.* `FrameCtx.viewport` is the internal render size, and `Renderer::render` keeps the
   targets at it. `FrameCtx.output_size` is the swapchain or capture size. The tonemap reads `hdr` 1:1 when the
   two are equal (captures, `--bench`) and bilinearly upscales otherwise (the window: about 1080 lines at the
   window's aspect, `scene::internal_size`). The lens rectangle and `pixel_dir` both use the internal size.
-- *Timing.* `Renderer::gpu_ms() -> Vec<(&str, Option<f32>)>` and `gpu_frame_ms() -> Option<f32>`. `None` means
-  no valid measurement: show "n/a" (HUD, terminal, sheet) or write `null` (capture JSON), never 0.
-- *GPU errors.* `GpuContext` logs uncaptured errors and device loss instead of panicking. The window shows the
-  latest on the HUD; `--capture`, `--bench` and `--selftest` fail on them.
+- *Timing.* `Renderer::gpu_ms() -> Vec<(&str, Option<f32>)>` and `gpu_frame_ms() -> Option<f32>`, up to 64 timed
+  passes per frame. `None` means no valid measurement: show "n/a" (HUD, terminal, sheet) or write `null`
+  (capture JSON), never 0.
+- *GPU errors and features.* `GpuContext` logs uncaptured errors and device loss instead of panicking. The
+  window shows the latest on the HUD; `--capture`, `--bench` and `--selftest` fail on them. The device is
+  created with `adapter.features() ∩ {SHADER_F16, FLOAT32_FILTERABLE, TIMESTAMP_QUERY, TEXTURE_COMPRESSION_BC,
+  DUAL_SOURCE_BLENDING}` (ruling 1; the M3 has all five). The app must run without any of the last three
+  (`has_timestamps()`, `has_bc_compression()`, `has_dual_source_blending()`): no timestamps → "n/a"; no BC → the
+  2k uncompressed map copies; no dual-source blending → the grey-transmittance atmosphere. WGSL using
+  `@blend_src` validates with `validate_wgsl_with(src, caps)`; `ShaderLib::compose` hoists every `enable …;`
+  line to the top, once each.
+- *Probes and HDR read-back.* `uni_gfx::probe::run_compute` runs a compute probe (read-only storage input at
+  binding 0, storage output at binding 1 of one group) and reads it back; each render crate's
+  `gpu_probes(gpu, lib) -> Vec<ProbeResult>` runs under `universe --selftest` (so far uni-gfx's `cube_dir`).
+  `uni_gfx::read_hdr` reads the pre-exposed `hdr` back as RGBA f32 (`hdr` has `COPY_SRC`), for the `--hdr`
+  capture sidecar (target).
 
 ## 3. Global Constraints
 

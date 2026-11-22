@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use glam::{DQuat, UVec2};
+use glam::{DQuat, DVec3, UVec2};
 use uni_core::{CameraView, Epoch, UniversePos};
 use uni_data::CatalogStar;
 use uni_gfx::GpuContext;
@@ -122,6 +122,7 @@ fn start_view(
                 pos: UniversePos::default(),
                 orient: DQuat::IDENTITY,
                 fov_y_rad: FALLBACK_FOV_Y_RAD,
+                velocity_mps: DVec3::ZERO,
             }
         }
     }

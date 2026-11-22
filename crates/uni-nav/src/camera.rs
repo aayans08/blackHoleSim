@@ -120,6 +120,7 @@ mod tests {
             pos: UniversePos::default(),
             orient: DQuat::IDENTITY,
             fov_y_rad: 60_f64.to_radians(),
+            velocity_mps: DVec3::ZERO,
         })
     }
 

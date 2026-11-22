@@ -86,11 +86,23 @@ pub fn blackbody_linear_srgb(temp_k: f64) -> Vec3 {
         .as_vec3()
 }
 
+/// B−V range passed to the temperature formula, and the temperature for a missing colour (the
+/// lead's ruling for the BSC5 bake, M0 Task 7; moved here in M1, review T3).
+const BV_MIN: f64 = -0.4;
+const BV_MAX: f64 = 2.0;
+/// Teff [K] for a non-finite B−V: close to the Sun's nominal 5772 K (IAU 2015 B3), near white.
+const UNKNOWN_BV_TEFF_K: f64 = 5800.0;
+
 /// Effective temperature [K] from B−V colour index (Ballesteros 2012, EPL 97 34008).
 ///
-/// T = 4600 K · [1/(0.92 (B−V) + 1.7) + 1/(0.92 (B−V) + 0.62)]. The formula is applied as is;
-/// it diverges at B−V = −0.674, so callers should clamp catalogue colours first.
+/// T = 4600 K · [1/(0.92 (B−V) + 1.7) + 1/(0.92 (B−V) + 0.62)]. The formula diverges at
+/// B−V = −0.674, so B−V is first clamped to [−0.4, 2.0] (2.0 gives about 3170 K; only very red
+/// stars such as carbon stars and Miras reach it). A non-finite B−V gives 5800 K.
 pub fn bv_to_teff(bv: f64) -> f64 {
+    if !bv.is_finite() {
+        return UNKNOWN_BV_TEFF_K;
+    }
+    let bv = bv.clamp(BV_MIN, BV_MAX);
     4600.0 * (1.0 / (0.92 * bv + 1.7) + 1.0 / (0.92 * bv + 0.62))
 }
 
@@ -201,6 +213,22 @@ mod tests {
     #[test]
     fn sun_teff_from_bv() {
         assert!((bv_to_teff(0.65) - 5778.4).abs() < 1.0);
+    }
+
+    #[test]
+    fn bv_to_teff_clamps() {
+        assert_eq!(bv_to_teff(5.0), bv_to_teff(2.0));
+        assert_eq!(bv_to_teff(-3.0), bv_to_teff(-0.4));
+        // Past the formula's pole at −0.674 it would otherwise go negative or infinite.
+        assert!(bv_to_teff(-0.674).is_finite() && bv_to_teff(-0.674) > 0.0);
+        assert_eq!(bv_to_teff(f64::NAN), 5800.0);
+        assert_eq!(bv_to_teff(f64::INFINITY), 5800.0);
+        assert_eq!(bv_to_teff(f64::NEG_INFINITY), 5800.0);
+        // Inside the range the formula is applied unchanged.
+        assert_eq!(
+            bv_to_teff(0.65),
+            4600.0 * (1.0 / (0.92 * 0.65 + 1.7) + 1.0 / (0.92 * 0.65 + 0.62))
+        );
     }
 
     #[test]

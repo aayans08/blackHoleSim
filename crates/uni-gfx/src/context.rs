@@ -75,11 +75,19 @@ impl GpuErrors {
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const SURFACE_SRGB_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 
-/// Optional device features we use when the adapter has them (global constraints, "GPU").
-/// Everything must still work without `TIMESTAMP_QUERY` (the timer then records nothing).
+/// Optional device features we use when the adapter has them (global constraints, "GPU"; M1
+/// ruling 1). The device is created with `adapter.features() ∩ WANTED_FEATURES`, and the app
+/// must run without any of the last three:
+/// - no `TIMESTAMP_QUERY`: the timer records nothing and GPU times show "n/a";
+/// - no `TEXTURE_COMPRESSION_BC`: maps load their 2k uncompressed copies;
+/// - no `DUAL_SOURCE_BLENDING`: the atmosphere uses its grey-transmittance variant.
+///
+/// The M3 has all five (docs/research/wgpu30-skeleton/m3-probe-output.txt).
 const WANTED_FEATURES: wgpu::Features = wgpu::Features::SHADER_F16
     .union(wgpu::Features::FLOAT32_FILTERABLE)
-    .union(wgpu::Features::TIMESTAMP_QUERY);
+    .union(wgpu::Features::TIMESTAMP_QUERY)
+    .union(wgpu::Features::TEXTURE_COMPRESSION_BC)
+    .union(wgpu::Features::DUAL_SOURCE_BLENDING);
 
 impl GpuContext {
     /// Creates a device that can present to `window`.
@@ -191,6 +199,22 @@ impl GpuContext {
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY)
     }
+
+    /// True when the device was created with `TEXTURE_COMPRESSION_BC` (BC7 and BC4 maps);
+    /// without it, maps load their uncompressed 2k copies.
+    pub fn has_bc_compression(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+    }
+
+    /// True when the device was created with `DUAL_SOURCE_BLENDING` (`@blend_src` outputs; see
+    /// `shader::validate_wgsl_with`); without it, the atmosphere uses its grey variant.
+    pub fn has_dual_source_blending(&self) -> bool {
+        self.device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+    }
 }
 
 /// Requests the device with `adapter.features() ∩ WANTED_FEATURES` and the adapter's own
@@ -212,6 +236,19 @@ async fn request_device(adapter: &wgpu::Adapter) -> anyhow::Result<(wgpu::Device
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wanted_features_include_bc_and_dual_source() {
+        assert!(WANTED_FEATURES.contains(
+            wgpu::Features::SHADER_F16
+                | wgpu::Features::FLOAT32_FILTERABLE
+                | wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TEXTURE_COMPRESSION_BC
+                | wgpu::Features::DUAL_SOURCE_BLENDING
+        ));
+        // Nothing else: every feature we request has a fallback, and no other is needed.
+        assert_eq!(WANTED_FEATURES.iter().count(), 5);
+    }
 
     #[test]
     fn errors_are_kept_bounded_and_taken_once() {

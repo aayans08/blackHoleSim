@@ -162,6 +162,34 @@ impl Epoch {
         Some(Self::from_utc_day(unix_day, utc_sec))
     }
 
+    /// Days of 86400 s since J2000.0 (TDB), as one f64: `day + sec / 86400`.
+    ///
+    /// An f64 keeps about 0.2 µs at today's epochs and 0.1 ms a million years out.
+    pub fn days_since_j2000(self) -> f64 {
+        self.day as f64 + self.sec / DAY
+    }
+
+    /// Inverse of [`Epoch::days_since_j2000`]. A non-finite `d` names no instant: it is logged
+    /// and gives J2000.0.
+    pub fn from_days_since_j2000(d: f64) -> Self {
+        if !d.is_finite() {
+            log::warn!("non-finite day count {d} since J2000.0; using J2000.0");
+            return Epoch::J2000;
+        }
+        let whole = d.floor();
+        // `as` saturates beyond ±2^63 days, far past any date this program shows.
+        Epoch {
+            day: whole as i64,
+            sec: 0.0,
+        }
+        .add_seconds((d - whole) * DAY)
+    }
+
+    /// Julian date in TDB: J2000.0 is JD 2451545.0 (IERS Conventions 2010).
+    pub fn jd_tdb(self) -> f64 {
+        2_451_545.0 + self.days_since_j2000()
+    }
+
     /// Julian centuries of 36525 days since J2000.0.
     pub fn julian_centuries(self) -> f64 {
         // Julian century = 36525 days (IAU 1976 System of Astronomical Constants).
@@ -336,6 +364,35 @@ mod tests {
             "2016-12-30T23:59:60Z",
         ] {
             assert_eq!(Epoch::parse_iso_utc(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn days_since_j2000_roundtrip() {
+        // 2026-11-20T00:00:00Z is 9819 d + 43 269.184 s after J2000.0 (12:00 TT, TT − UTC =
+        // 69.184 s), i.e. 9819.500 800 74 d.
+        let e = Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap();
+        let d = e.days_since_j2000();
+        assert!((d - 9819.5008).abs() < 1e-6, "{d}");
+        assert!((d - (9819.0 + 43_269.184 / 86_400.0)).abs() < 1e-9, "{d}");
+        assert!(
+            (e.jd_tdb() - 2_461_364.500_800_74).abs() < 1e-6,
+            "{}",
+            e.jd_tdb()
+        );
+        assert_eq!(Epoch::J2000.jd_tdb(), 2_451_545.0);
+
+        let back = Epoch::from_days_since_j2000(d);
+        assert!(back.seconds_since(e).abs() < 1e-6, "{back:?} vs {e:?}");
+        for d in [0.0, -0.25, -1.0e6 - 0.125, 3.0e6 + 0.75, 36_525.0] {
+            let e = Epoch::from_days_since_j2000(d);
+            assert!((0.0..86_400.0).contains(&e.sec), "{d} -> {e:?}");
+            assert!((e.days_since_j2000() - d).abs() < 1e-9, "{d} -> {e:?}");
+        }
+
+        // A non-finite day count cannot name an instant: it gives J2000.0.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(Epoch::from_days_since_j2000(bad), Epoch::J2000);
         }
     }
 

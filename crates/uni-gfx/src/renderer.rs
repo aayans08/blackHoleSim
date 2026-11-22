@@ -1,7 +1,9 @@
 //! The fixed-order pass scheduler: features run in push order into shared frame targets.
 //!
-//! The renderer owns group 0 (the camera and exposure uniforms of `shaders/common/camera.wgsl`)
-//! and is its only writer; every feature binds [`FrameBindings::camera`] there. The frame
+//! The renderer owns group 0 (the camera, exposure and light uniforms of
+//! `shaders/common/camera.wgsl`) and is its only CPU writer; every feature binds
+//! [`FrameBindings::camera`] there. (M1's auto-exposure then overwrites the exposure buffer on
+//! the GPU.) The frame
 //! targets live at the internal render resolution (`FrameCtx::viewport`), decoupled from the
 //! output view; the tonemap upscales to the output. The pass order and what each feature may
 //! write are documented in [`crate::targets`].
@@ -9,14 +11,14 @@
 use glam::UVec2;
 
 use crate::context::GpuContext;
-use crate::frame::{CameraUniform, ExposureUniform, FrameCtx};
+use crate::frame::{CameraHistory, CameraUniform, ExposureUniform, FrameCtx, LightUniform};
 use crate::targets::FrameTargets;
 use crate::timer::{GpuTimings, PassTimer};
 
 /// The shared per-frame bindings a feature receives in [`RenderFeature::encode`].
 pub struct FrameBindings<'a> {
     /// Group 0 for every feature (layout: [`Renderer::camera_bind_group_layout`]):
-    /// binding 0 `CameraUniform`, binding 1 `ExposureUniform`.
+    /// binding 0 `CameraUniform`, binding 1 `ExposureUniform`, binding 2 `LightUniform`.
     pub camera: &'a wgpu::BindGroup,
 }
 
@@ -24,8 +26,8 @@ pub struct FrameBindings<'a> {
 pub trait RenderFeature {
     /// Stable name, used for GPU timing labels.
     fn name(&self) -> &'static str;
-    /// Uploads per-frame data. The camera and exposure are the renderer's (group 0), so a
-    /// feature uploads only its own parameters here.
+    /// Uploads per-frame data. The camera, exposure and lights are the renderer's (group 0), so
+    /// a feature uploads only its own parameters here, and reads its `SharedInput`s only here.
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets);
     /// Records this feature's passes into `enc`. `frame.camera` is bound at group 0;
     /// `output` is the output view (only the tonemap writes it).
@@ -42,18 +44,22 @@ pub trait RenderFeature {
     fn resize(&mut self, _gpu: &GpuContext, _targets: &FrameTargets) {}
 }
 
-/// Most timed passes per frame, the two frame brackets included; plenty for M0.
-const MAX_TIMED_PASSES: u32 = 32;
+/// Most timed passes per frame, the two frame brackets included. M1 has 16 features, and bloom
+/// alone times up to 12 passes.
+const MAX_TIMED_PASSES: u32 = 64;
 
-/// Owns the frame targets, group 0 (camera and exposure uniforms) and the features, in push
-/// order.
+/// Owns the frame targets, group 0 (camera, exposure and light uniforms) and the features, in
+/// push order.
 pub struct Renderer {
     features: Vec<Box<dyn RenderFeature>>,
     targets: FrameTargets,
     camera_buffer: wgpu::Buffer,
     exposure_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
     camera_bind_group_layout: wgpu::BindGroupLayout,
     camera_bind_group: wgpu::BindGroup,
+    /// The previous frame's camera, for `prev_view_proj` and `cam_delta`.
+    history: CameraHistory,
     timer: PassTimer,
 }
 
@@ -64,6 +70,7 @@ impl Renderer {
         let targets = FrameTargets::new(device, internal_size);
         let camera_size = std::mem::size_of::<CameraUniform>() as u64;
         let exposure_size = std::mem::size_of::<ExposureUniform>() as u64;
+        let lights_size = std::mem::size_of::<LightUniform>() as u64;
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera uniform"),
             size: camera_size,
@@ -79,6 +86,12 @@ impl Renderer {
                 | wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let lights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lights uniform"),
+            size: lights_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let uniform_entry = |binding: u32, size: u64| wgpu::BindGroupLayoutEntry {
@@ -99,6 +112,7 @@ impl Renderer {
                 entries: &[
                     uniform_entry(0, camera_size),
                     uniform_entry(1, exposure_size),
+                    uniform_entry(2, lights_size),
                 ],
             });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -113,6 +127,10 @@ impl Renderer {
                     binding: 1,
                     resource: exposure_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lights_buffer.as_entire_binding(),
+                },
             ],
         });
         Self {
@@ -120,14 +138,17 @@ impl Renderer {
             targets,
             camera_buffer,
             exposure_buffer,
+            lights_buffer,
             camera_bind_group_layout,
             camera_bind_group,
+            history: CameraHistory::default(),
             timer: PassTimer::new(gpu, MAX_TIMED_PASSES),
         }
     }
 
-    /// Layout of group 0: binding 0 `CameraUniform`, binding 1 `ExposureUniform`. Features
-    /// put it first in their pipeline layouts.
+    /// Layout of group 0: binding 0 `CameraUniform`, binding 1 `ExposureUniform`, binding 2
+    /// `LightUniform`, each visible to vertex, fragment and compute stages. Features put it
+    /// first in their pipeline layouts.
     pub fn camera_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
         &self.camera_bind_group_layout
     }
@@ -165,7 +186,8 @@ impl Renderer {
     ///
     /// Order: collect finished GPU timings from earlier frames (non-blocking); recreate the
     /// targets if `ctx.viewport` changed (so the targets always match the viewport every
-    /// feature plans with); write the camera and exposure uniforms; every feature's `prepare`,
+    /// feature plans with); write the camera (with the previous frame's view_proj and the
+    /// camera's motion since then), exposure and light uniforms; every feature's `prepare`,
     /// in push order; the opening frame bracket; clear `hdr` and `lens_mask` to 0 and `depth`
     /// to 0.0 (infinitely far, reversed-Z); every feature's `encode`, in push order; the
     /// closing frame bracket; close the pass timer's record (its queries are resolved once the
@@ -183,12 +205,17 @@ impl Renderer {
         gpu.queue.write_buffer(
             &self.camera_buffer,
             0,
-            bytemuck::bytes_of(&CameraUniform::from_ctx(ctx)),
+            bytemuck::bytes_of(&self.history.uniform(ctx)),
         );
         gpu.queue.write_buffer(
             &self.exposure_buffer,
             0,
             bytemuck::bytes_of(&ExposureUniform::from_exposure(ctx.exposure)),
+        );
+        gpu.queue.write_buffer(
+            &self.lights_buffer,
+            0,
+            bytemuck::bytes_of(&LightUniform::from_ctx(ctx)),
         );
         for f in &mut self.features {
             f.prepare(gpu, ctx, &self.targets);

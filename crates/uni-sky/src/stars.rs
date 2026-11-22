@@ -254,7 +254,7 @@ impl StarField {
                     // The vertex stage reads the attachment size and the fragment stage the mask.
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // R32Float is unfilterable without FLOAT32_FILTERABLE (textureLoad only).
+                        // Read with textureLoad only, so it is bound as unfilterable.
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,

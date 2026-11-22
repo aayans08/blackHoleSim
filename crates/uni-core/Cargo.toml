@@ -9,3 +9,7 @@ publish.workspace = true
 [dependencies]
 glam.workspace = true
 serde.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+ron.workspace = true

@@ -39,10 +39,9 @@ struct StarInstance {
 }
 
 @group(1) @binding(0) var<storage, read> stars: array<StarInstance>;
-// R32Float, 1.0 where a black hole captured the ray. R32Float is not filterable without
-// FLOAT32_FILTERABLE, so it is read with textureLoad at the fragment's integer pixel. It is the
-// same size as `hdr` (uni_gfx::FrameTargets), so the vertex stage also reads the attachment size
-// from it.
+// uni_gfx::LENS_MASK_FORMAT; `.r` is the fraction of the pixel a black hole captured (1 = shadow).
+// It is read with textureLoad at the fragment's integer pixel. It is the same size as `hdr`
+// (uni_gfx::FrameTargets), so the vertex stage also reads the attachment size from it.
 @group(1) @binding(1) var lens_mask: texture_2d<f32>;
 
 // PSF constants; see the Rust twins in psf.rs for their sources.

@@ -10,7 +10,7 @@
 use std::ops::RangeInclusive;
 
 use anyhow::Context as _;
-use glam::{DMat4, UVec2};
+use glam::{DMat4, UVec2, Vec2};
 use uni_core::{CameraView, Epoch};
 use uni_data::CatalogStar;
 use uni_gfx::{Exposure, FrameCtx, GpuContext, Renderer, ShaderLib, reversed_z_infinite_proj};
@@ -134,6 +134,8 @@ pub fn frame_ctx(
 ) -> FrameCtx {
     let viewport = viewport.max(UVec2::ONE);
     let aspect = viewport.x as f32 / viewport.y as f32;
+    // What `World::advance` moved the epoch by for this `dt_real_s` (it skips a non-finite step).
+    let sim_dt_s = dt_real_s * world.time_rate;
     FrameCtx {
         frame_index,
         epoch: world.epoch,
@@ -145,6 +147,10 @@ pub fn frame_ctx(
         output_size: output_size.max(UVec2::ONE),
         exposure,
         lenses: world.lens_views(&view.pos),
+        // M0's world has no light sources yet (the Sun becomes one in Wave A).
+        lights: Vec::new(),
+        sim_dt_s: if sim_dt_s.is_finite() { sim_dt_s } else { 0.0 },
+        jitter_px: Vec2::ZERO,
     }
 }
 
@@ -205,11 +211,12 @@ pub fn apply_bookmark(
     Ok(view)
 }
 
-/// `b`'s view with its position normalised and its orientation renormalised, or an error if it
-/// is not finite, the orientation is degenerate, or the field of view is outside (0°, 180°).
+/// `b`'s view with its position normalised and its orientation renormalised, or an error if its
+/// position or velocity is not finite, the orientation is degenerate, or the field of view is
+/// outside (0°, 180°).
 fn checked_view(b: &Bookmark) -> anyhow::Result<CameraView> {
     let v = &b.view;
-    let pos_ok = v.pos.local.is_finite();
+    let pos_ok = v.pos.local.is_finite() && v.velocity_mps.is_finite();
     let len = v.orient.length();
     let orient = (len.is_finite() && len > 1e-12).then(|| v.orient / len);
     let fov_ok = v.fov_y_rad > 0.0 && v.fov_y_rad < std::f64::consts::PI;
@@ -218,10 +225,11 @@ fn checked_view(b: &Bookmark) -> anyhow::Result<CameraView> {
             pos: v.pos.normalized(),
             orient,
             fov_y_rad: v.fov_y_rad,
+            velocity_mps: v.velocity_mps,
         }),
         _ => anyhow::bail!(
-            "bookmark {:?}: the view needs a finite position, a non-zero orientation and \
-             0 < fov_y_rad < π (got {:?})",
+            "bookmark {:?}: the view needs a finite position and velocity, a non-zero \
+             orientation and 0 < fov_y_rad < π (got {:?})",
             b.name,
             v
         ),
@@ -320,6 +328,7 @@ mod tests {
             pos,
             orient,
             fov_y_rad: 60_f64.to_radians(),
+            velocity_mps: DVec3::ZERO,
         }
     }
 
@@ -634,6 +643,17 @@ mod tests {
         let mut nan_pos = ok.clone();
         nan_pos.pos.local.x = f64::NAN;
         bad.push(bookmark(nan_pos));
+        bad.push(bookmark(CameraView {
+            velocity_mps: DVec3::new(0.0, f64::INFINITY, 0.0),
+            ..ok.clone()
+        }));
+        // A finite velocity (a travel mode's, saved with the view) is kept.
+        let moving = CameraView {
+            velocity_mps: DVec3::new(0.0, 3.0e4, 0.0),
+            ..ok.clone()
+        };
+        let applied = apply_bookmark(&bookmark(moving.clone()), &mut world, &mut controls);
+        assert_eq!(applied.unwrap().velocity_mps, moving.velocity_mps);
         let mut bad_epoch = bookmark(ok);
         bad_epoch.epoch_utc = Some("yesterday".to_owned());
         bad.push(bad_epoch);

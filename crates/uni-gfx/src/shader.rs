@@ -6,6 +6,10 @@
 //! text is placed before the text of the file that imports it, and the result is the same
 //! on every call. Each file's text is preceded by a `// ---- path ----` marker so naga
 //! errors in composed source can be traced back to a file.
+//!
+//! WGSL global directives must come before every declaration, but an import's text is placed
+//! before its importer's. So every `enable …;` line of every composed file is moved to the top
+//! of the output, once each (review I7).
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,8 +46,16 @@ impl ShaderLib {
             include_str!("../shaders/common/color.wgsl"),
         );
         lib.add(
+            "common/exposure.wgsl",
+            include_str!("../shaders/common/exposure.wgsl"),
+        );
+        lib.add(
             "common/camera.wgsl",
             include_str!("../shaders/common/camera.wgsl"),
+        );
+        lib.add(
+            "common/cube.wgsl",
+            include_str!("../shaders/common/cube.wgsl"),
         );
         lib
     }
@@ -53,20 +65,30 @@ impl ShaderLib {
         self.sources.insert(path, src);
     }
 
-    /// Expands `#import "path"` recursively, including each file at most once.
+    /// Expands `#import "path"` recursively, including each file at most once, with every
+    /// `enable` directive hoisted to the top (once each, in first-seen order).
     pub fn compose(&self, entry: &str) -> Result<String, ShaderError> {
         let mut seen = HashSet::new();
-        let mut out = String::new();
-        self.expand(entry, &mut seen, &mut out)?;
+        let mut directives = Vec::new();
+        let mut body = String::new();
+        self.expand(entry, &mut seen, &mut directives, &mut body)?;
+        let mut out = String::with_capacity(body.len());
+        for d in directives {
+            out.push_str(d);
+            out.push('\n');
+        }
+        out.push_str(&body);
         Ok(out)
     }
 
     /// Appends `path`'s imports (depth-first) and then its own lines to `out`, unless
-    /// `path` is already in `seen`. Marking before recursing also ends import cycles.
+    /// `path` is already in `seen`. Marking before recursing also ends import cycles. Its
+    /// `enable` lines go to `directives` instead, unless already there.
     fn expand(
         &self,
         path: &str,
         seen: &mut HashSet<&'static str>,
+        directives: &mut Vec<&'static str>,
         out: &mut String,
     ) -> Result<(), ShaderError> {
         let (&key, &src) = self
@@ -78,12 +100,15 @@ impl ShaderLib {
         }
         let mut body = String::with_capacity(src.len());
         for line in src.lines() {
-            match import_path(line) {
-                Some(dep) => self.expand(dep, seen, out)?,
-                None => {
-                    body.push_str(line);
-                    body.push('\n');
+            if let Some(dep) = import_path(line) {
+                self.expand(dep, seen, directives, out)?;
+            } else if let Some(directive) = enable_directive(line) {
+                if !directives.contains(&directive) {
+                    directives.push(directive);
                 }
+            } else {
+                body.push_str(line);
+                body.push('\n');
             }
         }
         out.push_str("// ---- ");
@@ -127,14 +152,36 @@ fn import_path(line: &str) -> Option<&str> {
     Some(path.unwrap_or(""))
 }
 
+/// The trimmed line if it is a WGSL `enable` directive (`enable f16;`), else `None`.
+fn enable_directive(line: &'static str) -> Option<&'static str> {
+    let t = line.trim();
+    let rest = t.strip_prefix("enable")?;
+    rest.starts_with(char::is_whitespace).then_some(t)
+}
+
 /// Parses and validates WGSL with naga.
 ///
 /// Capabilities are naga's defaults plus `SHADER_FLOAT16`, matching the device on the
 /// target M3 (which enables `SHADER_F16`; see docs/research/wgpu30-skeleton/m3-probe-output.txt).
+/// A shader that needs more (dual-source blending) uses [`validate_wgsl_with`].
 pub fn validate_wgsl(src: &str) -> Result<naga::Module, ShaderError> {
-    let module =
-        naga::front::wgsl::parse_str(src).map_err(|e| ShaderError::Naga(e.emit_to_string(src)))?;
-    let caps = naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16;
+    validate_wgsl_with(
+        src,
+        naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
+    )
+}
+
+/// Parses and validates WGSL with naga under `caps`, which gate both `enable` directives and
+/// the validator (for example `DUAL_SOURCE_BLENDING` for `@blend_src`, review I7).
+pub fn validate_wgsl_with(
+    src: &str,
+    caps: naga::valid::Capabilities,
+) -> Result<naga::Module, ShaderError> {
+    let mut options = naga::front::wgsl::Options::new();
+    options.capabilities = caps;
+    let module = naga::front::wgsl::Frontend::new_with_options(options)
+        .parse(src)
+        .map_err(|e| ShaderError::Naga(e.emit_to_string(src)))?;
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
         .validate(&module)
         .map_err(|e| ShaderError::Naga(e.emit_to_string(src)))?;
@@ -145,11 +192,13 @@ pub fn validate_wgsl(src: &str) -> Result<naga::Module, ShaderError> {
 mod tests {
     use super::*;
 
-    const COMMON: [&str; 4] = [
+    const COMMON: [&str; 6] = [
         "common/constants.wgsl",
         "common/hash.wgsl",
         "common/color.wgsl",
+        "common/exposure.wgsl",
         "common/camera.wgsl",
+        "common/cube.wgsl",
     ];
 
     #[test]
@@ -177,6 +226,9 @@ mod tests {
         assert!(has_fn("common/camera.wgsl", "exposure_scale"));
         assert!(has_fn("common/camera.wgsl", "scene_pre"));
         assert!(has_fn("common/camera.wgsl", "star_pre"));
+        assert!(has_fn("common/camera.wgsl", "sim_time_s"));
+        assert!(has_fn("common/exposure.wgsl", "exposure_scale"));
+        assert!(has_fn("common/cube.wgsl", "cube_dir"));
         assert!(has_fn("common/hash.wgsl", "pcg3d"));
         assert!(has_fn("common/color.wgsl", "luminance"));
         assert!(has_fn("common/color.wgsl", "linear_to_srgb"));
@@ -202,10 +254,13 @@ mod tests {
 #import "common/hash.wgsl"
 #import "common/color.wgsl"
 #import "common/constants.wgsl"
+#import "common/exposure.wgsl"
+#import "common/cube.wgsl"
 @group(1) @binding(0) var out_tex: texture_storage_2d<rgba16float, write>;
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dir = pixel_dir(vec2<f32>(gid.xy));
+    let dir = pixel_dir(vec2<f32>(gid.xy)) + cube_dir(gid.z, vec2<f32>(0.5)) * sim_time_s()
+        + lights.lights[0].pos_radius.xyz * f32(lights.info.x) + camera.cam_delta.xyz;
     let h = pcg3d(vec3<u32>(gid.xy, 7u));
     let n = f32(h.x) / 4294967296.0 * TAU / PI;
     let c = linear_to_srgb(abs(dir) * scene_pre() * star_pre() * n);
@@ -284,6 +339,79 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         assert!(
             matches!(&err, ShaderError::MissingImport(p) if p == "test/not-registered.wgsl"),
             "{err}"
+        );
+    }
+
+    /// Fragment output with two blend sources (WGSL `dual_source_blending` extension).
+    const DUAL_SOURCE: &str = r#"enable dual_source_blending;
+struct BlendOut {
+    @location(0) @blend_src(0) color: vec4<f32>,
+    @location(0) @blend_src(1) transmittance: vec4<f32>,
+}
+@fragment
+fn fs_main() -> BlendOut {
+    return BlendOut(vec4<f32>(1.0), vec4<f32>(0.5));
+}
+"#;
+
+    #[test]
+    fn validate_wgsl_with_dual_source() {
+        use naga::valid::Capabilities as Caps;
+        let caps = Caps::default() | Caps::SHADER_FLOAT16;
+        validate_wgsl_with(DUAL_SOURCE, caps | Caps::DUAL_SOURCE_BLENDING).unwrap();
+        let err = validate_wgsl_with(DUAL_SOURCE, caps).unwrap_err();
+        assert!(matches!(err, ShaderError::Naga(_)), "{err}");
+        // validate_wgsl keeps m0.1's capabilities, which do not include dual-source blending.
+        assert!(validate_wgsl(DUAL_SOURCE).is_err());
+        validate_wgsl_with("enable f16;\nconst H: f16 = 1.5h;\n", caps).unwrap();
+    }
+
+    #[test]
+    fn compose_hoists_enable_directives() {
+        let mut lib = ShaderLib::with_common();
+        lib.add(
+            "test/blend.wgsl",
+            concat!(
+                "enable dual_source_blending;\n",
+                "#import \"test/half.wgsl\"\n",
+                "#import \"common/camera.wgsl\"\n",
+                "struct BlendOut {\n",
+                "    @location(0) @blend_src(0) color: vec4<f32>,\n",
+                "    @location(0) @blend_src(1) transmittance: vec4<f32>,\n",
+                "}\n",
+                "@fragment\n",
+                "fn fs_main() -> BlendOut {\n",
+                "    return BlendOut(vec4<f32>(f32(half()) * scene_pre()), vec4<f32>(0.5));\n",
+                "}\n",
+            ),
+        );
+        // An import with its own directives, one of them repeated.
+        lib.add(
+            "test/half.wgsl",
+            "enable f16;\nenable dual_source_blending;\nfn half() -> f16 { return 0.5h; }\n",
+        );
+        let out = lib.compose("test/blend.wgsl").unwrap();
+        assert!(
+            out.starts_with("enable dual_source_blending;\nenable f16;\n"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("enable dual_source_blending;").count(),
+            1,
+            "{out}"
+        );
+        assert_eq!(out.matches("enable f16;").count(), 1, "{out}");
+        use naga::valid::Capabilities as Caps;
+        validate_wgsl_with(
+            &out,
+            Caps::default() | Caps::SHADER_FLOAT16 | Caps::DUAL_SOURCE_BLENDING,
+        )
+        .unwrap();
+        // A file with no directives composes exactly as before (no blank first line).
+        assert!(
+            lib.compose("common/camera.wgsl")
+                .unwrap()
+                .starts_with("// ---- common/exposure.wgsl ----\n")
         );
     }
 
