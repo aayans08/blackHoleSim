@@ -144,6 +144,9 @@ baked_path = "data/baked/exoplanets.ron"
 # data/baked/saturn_rings.ron; raw files deleted after baking. Decoded pixel sizes are recorded in
 # index.ron's `width`/`height` and `source` strings (8k_jupiter.jpg and 8k_saturn.jpg decode at
 # 4096×2048, not 8k). Re-downloaded 2026-11-22 for A8 fix round 1 (same SHA-256), re-baked, deleted.
+# Fix round 2 (2026-11-22): 8k_earth_daymap.jpg, 8k_earth_clouds.jpg and 4k_venus_atmosphere.jpg
+# re-downloaded (same SHA-256), Earth and Venus re-baked with --modal-reflectance / --grey-contrast,
+# raw files deleted again.
 # Solar System Scope: https://www.solarsystemscope.com/textures/ ("Distributed under Attribution
 # 4.0 International license", based on NASA elevation and imagery data).
 

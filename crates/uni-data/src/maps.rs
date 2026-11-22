@@ -15,16 +15,24 @@
 //!
 //! **Reflectance ≤ 1.** The reflectance of a texel is `albedo_scale` × its decoded linear value,
 //! per channel, and it never exceeds 1 (energy conservation; the M1 plan's "ρ is capped at 1",
-//! review I4). The bake solves `albedo_scale` with that cap inside the disk average. When the
-//! geometric albedo needs texels brighter than 1, the file stores the capped reflectance itself,
-//! min(1, s · decoded), and `albedo_scale` is 1; the solved s is in `source`. The renderer
-//! multiplies by `albedo_scale` and needs no clamp of its own.
+//! review I4). For most maps the bake solves `albedo_scale` so the map's disk average gives the
+//! body's geometric albedo, with that cap inside the disk average. When the geometric albedo needs
+//! texels brighter than 1, the file stores the capped reflectance itself, min(1, s · decoded), and
+//! `albedo_scale` is 1; the solved s is in `source`. The renderer multiplies by `albedo_scale` and
+//! needs no clamp of its own. Two maps are not normalised to p_V (A8 fix round 2; `source` says
+//! how each was calibrated and what disk average it gives):
+//! - **Earth's ground** is calibrated on its ocean (the map's modal colour) at the sea surface's
+//!   measured reflectance. p_V also holds Rayleigh scattering, which the atmosphere draws, and
+//!   Earth's real cloud cover; pushed into the ground they made it 4–8× too bright.
+//! - **Venus's cloud tops** (`CloudTops`) are neutral grey: the source's luminance pattern with a
+//!   disk-averaged ρ below 1 and the largest contrast that stays ≤ 1. p_V 0.689 exceeds a Lambert
+//!   sphere's 2/3, so matching it would leave only a uniform white map.
 //!
-//! **Earth's clouds** (`Clouds`, one channel c ∈ [0, 1], stored linear) are composited over the
-//! ground map as white clouds of coverage c, and both entries carry the same `albedo_scale` s:
-//! ρ = s · [(1 − c) · ρ_ground + c]. The cloud layer's reflectance s is at most 1 like every
-//! other texel's. The bake solves s with the clouds composited, so the composite's disk average
-//! matches Earth's geometric albedo (review I4).
+//! **Earth's clouds** (`Clouds`, one channel c ∈ [0, 1], stored linear) are a cloud layer of
+//! albedo c × the cloud entry's `albedo_scale` s_c, composited over the ground as
+//! ρ = (1 − c) · ρ_ground + c · s_c, with ρ_ground = the ground entry's `albedo_scale` × its
+//! decoded texel. Water clouds barely absorb in the visible, so a layer that reflects c transmits
+//! 1 − c; s_c is 1 for the baked map, and at most 1 for any map.
 
 use std::path::Path;
 
@@ -241,9 +249,17 @@ mod tests {
         }
     }
 
+    /// Linear BT.709 luminance of an RGBA8 sRGB texel.
+    fn luminance(t: &[u8]) -> f64 {
+        0.2126 * srgb_to_linear(t[0])
+            + 0.7152 * srgb_to_linear(t[1])
+            + 0.0722 * srgb_to_linear(t[2])
+    }
+
     /// The committed index: every entry names its files, no reflectance exceeds 1, and every map
     /// baked on this machine (the `.big` files are git-ignored) loads at the size the bake stores
     /// for the recorded decoded size, with the 2k fallback and the formats the renderer expects.
+    /// Earth's and Venus's calibrations (A8 fix round 2) are checked on the files as baked.
     #[test]
     fn baked_index_maps_load() {
         let dir = crate::data_dir().join("baked/maps");
@@ -252,10 +268,11 @@ mod tests {
         let mut baked = 0;
         for map in &maps {
             assert!((-360.0..=360.0).contains(&map.lon0_deg), "{map:?}");
-            // Clouds are white: their reflectance at full cover is the scale itself (review r0
-            // Important 1: it was 2.33).
+            // A cloud layer's reflectance at full cover is its scale: at most 1 (review r0
+            // Important 1: it was 2.33), and 1 for the baked map, whose c is the cloud albedo
+            // (fix round 2, review r1 N2).
             if map.kind == MapKind::Clouds {
-                assert!(map.albedo_scale <= 1.0, "{map:?}");
+                assert_eq!(map.albedo_scale, 1.0, "{map:?}");
             }
             let bc = match load_tex(&dir.join(&map.file)) {
                 Ok(tex) => tex,
@@ -293,6 +310,48 @@ mod tests {
                     "{}: brightest ρ {rho}",
                     map.fallback_file
                 );
+                let scale = f64::from(map.albedo_scale);
+                let texels: Vec<f64> = fallback.mips[0].chunks(4).map(luminance).collect();
+                // Earth's ground (review r1 N2): its modal texel, the open ocean, is at the sea
+                // surface's 0.06 (Payne 1972), not the 0.4 p_V calibration gave it.
+                if (map.naif, map.kind) == (399, MapKind::Albedo) {
+                    let mut counts = std::collections::HashMap::new();
+                    for t in fallback.mips[0].chunks(4) {
+                        *counts.entry([t[0], t[1], t[2]]).or_insert(0_usize) += 1;
+                    }
+                    let (mode, n) = counts
+                        .into_iter()
+                        .max_by_key(|&(k, n)| (n, std::cmp::Reverse(k)))
+                        .unwrap_or_default();
+                    let ocean = luminance(&mode) * scale;
+                    assert!(
+                        n * 2 > texels.len() && (ocean - 0.06).abs() < 2e-3,
+                        "{}: modal texel {mode:?} ({n} of {}) ρ {ocean}",
+                        map.fallback_file,
+                        texels.len()
+                    );
+                }
+                // Venus's cloud tops (review r1 N1): neutral and patterned, not uniform white.
+                if (map.naif, map.kind) == (299, MapKind::CloudTops) {
+                    assert!(
+                        fallback.mips[0]
+                            .chunks(4)
+                            .all(|t| t[0] == t[1] && t[1] == t[2]),
+                        "{}: not grey",
+                        map.fallback_file
+                    );
+                    let (lo, hi) = texels
+                        .iter()
+                        .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &v| {
+                            (lo.min(v), hi.max(v))
+                        });
+                    let mean = texels.iter().sum::<f64>() / texels.len() as f64;
+                    assert!(
+                        hi - lo > 0.05 && (0.85..1.0).contains(&(mean * scale)),
+                        "{}: ρ {lo}..{hi}, texel mean {mean}",
+                        map.fallback_file
+                    );
+                }
             }
             assert_eq!(2 * fallback.height, fallback.width, "{}", map.fallback_file);
             assert_eq!(

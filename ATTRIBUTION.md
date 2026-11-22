@@ -141,7 +141,9 @@ the committed `data/baked/maps/index.ron` lists them) and `data/baked/saturn_rin
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Credit: "Solar System Scope"
 ([solarsystemscope.com/textures](https://www.solarsystemscope.com/textures/)), based on NASA elevation and imagery
 data. Changes made: decoded; brightness scaled to each body's geometric albedo with every channel capped at
-reflectance 1 (the index's `source` string gives the scale); box-filtered into mip chains in linear light,
+reflectance 1 (the index's `source` string gives the scale), except Earth's day map, scaled so its ocean has the
+sea surface's measured reflectance 0.06 (Payne 1972, J. Atmos. Sci. 29, 959), and Venus's cloud-top map, reduced to
+a neutral grey pattern of lower contrast with disk-averaged reflectance 0.95; box-filtered into mip chains in linear light,
 block-compressed (BC7/BC4) plus 2k uncompressed copies; the ring PNG reduced to one radial row of 1024 samples with
 fitted radii. Files used:
 `8k_earth_daymap.jpg`, `8k_earth_clouds.jpg`, `8k_moon.jpg`, `8k_mars.jpg`, `8k_mercury.jpg`,

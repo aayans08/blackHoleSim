@@ -7,6 +7,7 @@
 //! uni-bake map [--index <index.ron>]
 //!   --input <jpg|png|tif> --body Earth --naif 399 --kind albedo|cloud-tops --lon0 -180
 //!   --geometric-albedo 0.434 [--brdf lambert|lunar-lambert] [--view-lon <deg>]
+//!   [--modal-reflectance <ρ> | --grey-contrast <ρ̄>]
 //!   [--encoding srgb|linear] [--fill-nodata <max DN>] [--clouds <img> --clouds-out <big>]
 //!   --source "<credit>" --out data/baked/maps/earth_albedo.big [--preview <png>]
 //!   [--input … next map]
@@ -31,9 +32,25 @@
 //! - `albedo_scale` is solved with each channel's reflectance capped at 1 inside the disk average
 //!   (`DiskHistogram::solve`). When the geometric albedo needs texels brighter than 1, the files
 //!   store the capped reflectance min(1, s·a) and the index's scale is 1, so the stored texel ×
-//!   `albedo_scale` never exceeds 1 (review r0 Important 1).
+//!   `albedo_scale` never exceeds 1 (review r0 Important 1). Every texel counts for the cap,
+//!   including a fixed view's far side (review r1 N4).
+//! - Two bodies cannot be calibrated that way (fix round 2, review r1 N1/N2), because a Lambert
+//!   map normalised to p_V would have to carry light the map's surface does not reflect:
+//!   - `--modal-reflectance ρ` (Earth): p_V includes Rayleigh scattering (B3 draws it) and Earth's
+//!     real cloud cover, so normalising the ground to p_V made the ocean and deserts 4–8× too
+//!     bright. Instead the map's modal colour, which must carry at least half the disk weight
+//!     (Earth's ocean, one flat colour in the Solar System Scope map), gets the measured
+//!     reflectance ρ and every texel scales with it, capped at 1. The cloud map is the cloud
+//!     layer's own albedo c (non-absorbing in the visible, so it transmits 1 − c), and its entry's
+//!     `albedo_scale` is 1.
+//!   - `--grey-contrast ρ̄` (Venus): p_V 0.689 exceeds a Lambert sphere's 2/3, so ρ(p_V) is 1 and
+//!     only an all-white map meets it with every texel ≤ 1. Instead the map's luminance pattern is
+//!     stored neutral (the source's orange hue would cap the luminance near 0.7) with disk average
+//!     ρ̄ and the largest contrast, at most the source's own, that keeps every texel ≤ 1.
+//!
+//!   Both report the disk average they give against ρ(p_V).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -144,6 +161,18 @@ enum View {
     Fixed { sub_observer_lon_deg: f64 },
 }
 
+/// How a map's absolute reflectance is set (see the module doc).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Calibration {
+    /// The default (review I4): the disk average gives ρ(p_V) for the BRDF, each channel capped
+    /// at 1.
+    GeometricAlbedo,
+    /// `--modal-reflectance ρ` (Earth, fix round 2): the modal colour gets reflectance ρ.
+    Modal { rho: f64 },
+    /// `--grey-contrast ρ̄` (Venus, fix round 2): neutral luminance pattern with disk average ρ̄.
+    GreyContrast { rho: f64 },
+}
+
 /// One map group of the command line.
 #[derive(Clone, Debug, PartialEq)]
 struct MapSpec {
@@ -155,6 +184,7 @@ struct MapSpec {
     geometric_albedo: f64,
     brdf: Brdf,
     view: View,
+    calibration: Calibration,
     encoding: Transfer,
     fill_nodata: Option<u8>,
     clouds: Option<(PathBuf, PathBuf)>,
@@ -265,7 +295,7 @@ fn parse(options: &[OsString]) -> anyhow::Result<(Vec<MapSpec>, Option<PathBuf>)
 
 /// Builds one map's spec from its flags.
 fn spec_from(group: &BTreeMap<String, OsString>) -> Result<MapSpec> {
-    const KNOWN: [&str; 15] = [
+    const KNOWN: [&str; 17] = [
         "--input",
         "--body",
         "--naif",
@@ -274,6 +304,8 @@ fn spec_from(group: &BTreeMap<String, OsString>) -> Result<MapSpec> {
         "--geometric-albedo",
         "--brdf",
         "--view-lon",
+        "--modal-reflectance",
+        "--grey-contrast",
         "--encoding",
         "--fill-nodata",
         "--clouds",
@@ -350,6 +382,33 @@ fn spec_from(group: &BTreeMap<String, OsString>) -> Result<MapSpec> {
         (None, None) => None,
         _ => bail!("--clouds and --clouds-out go together"),
     };
+    let reflectance = |name: &str| -> Result<Option<f64>> {
+        text(name)?
+            .map(|v| {
+                let rho = number(name, v)?;
+                ensure!(
+                    rho > 0.0 && rho <= 1.0,
+                    "{name} {rho} is not a reflectance in (0, 1]"
+                );
+                Ok(rho)
+            })
+            .transpose()
+    };
+    let calibration = match (
+        reflectance("--modal-reflectance")?,
+        reflectance("--grey-contrast")?,
+    ) {
+        (None, None) => Calibration::GeometricAlbedo,
+        (Some(rho), None) => Calibration::Modal { rho },
+        (None, Some(rho)) => {
+            ensure!(
+                clouds.is_none(),
+                "--grey-contrast bakes a map without a cloud layer"
+            );
+            Calibration::GreyContrast { rho }
+        }
+        (Some(_), Some(_)) => bail!("--modal-reflectance and --grey-contrast exclude each other"),
+    };
     Ok(MapSpec {
         input: PathBuf::from(required("--input")?),
         body: required("--body")?.to_string(),
@@ -361,6 +420,7 @@ fn spec_from(group: &BTreeMap<String, OsString>) -> Result<MapSpec> {
         geometric_albedo,
         brdf,
         view,
+        calibration,
         encoding,
         fill_nodata,
         clouds,
@@ -441,66 +501,23 @@ fn bake_group(spec: &MapSpec) -> Result<Vec<Baked>> {
         None => None,
     };
     let cloud_map = clouds.as_ref().map(|(c, _)| c);
-    let histogram = DiskHistogram::new(&ground, cloud_map, spec.brdf, spec.view, spec.lon0_deg);
-    let average = histogram.average(1.0);
-    let target = rho_from_geometric_albedo(spec.brdf, spec.geometric_albedo);
-    let solved = histogram
-        .solve(target)
-        .with_context(|| format!("solving albedo_scale for {}", spec.body))?;
-    let capped = solved > histogram.first_cap();
-    // For the report only (the brief asks for both Earth scales): the ground map without its
-    // clouds, its disk average and its own capped scale, and the mean cloud cover.
-    let ground_alone = cloud_map.map(|clouds| {
-        let alone = DiskHistogram::new(&ground, None, spec.brdf, spec.view, spec.lon0_deg);
-        let cover = DiskHistogram::new(clouds, None, spec.brdf, spec.view, spec.lon0_deg);
-        let alone_scale = match alone.solve(target) {
-            Ok(s) => format!("{s:.4}"),
-            Err(err) => format!("none ({err})"),
-        };
-        format!(
-            "disk-weighted mean cloud cover {:.4}; ground alone: disk-averaged ρ {:.4} → capped \
-             scale {alone_scale}",
-            cover.average(1.0),
-            alone.average(1.0)
-        )
-    });
-    let (ground, scale) = apply_scale(ground, solved, histogram.first_cap());
-    // Check on the texels as stored (re-quantised when capped): their disk average × scale.
-    let stored =
-        DiskHistogram::new(&ground, cloud_map, spec.brdf, spec.view, spec.lon0_deg).average(scale);
-    let brdf = match spec.brdf {
-        Brdf::Lambert => "Lambert".to_string(),
-        Brdf::LunarLambert { l } => format!("lunar-Lambert L = {l}"),
-    };
-    let view = match spec.view {
-        View::RotationAveraged => "rotation-averaged".to_string(),
-        View::Fixed {
-            sub_observer_lon_deg,
-        } => format!("hemisphere centred on {sub_observer_lon_deg}°E"),
-    };
-    let cap_note = if capped {
-        format!(
-            "solved with each channel capped at ρ = 1: s = {solved:.4}, {:.1} % of the disk's \
-             luminance weight at the cap, texels stored as min(1, s·a) (disk average as stored \
-             {stored:.4})",
-            100.0 * histogram.share_at_cap(solved)
-        )
-    } else {
-        format!(
-            "no texel reaches ρ = 1 (brightest {:.3})",
-            solved / histogram.first_cap()
-        )
-    };
-    let scale_note = format!(
-        "albedo_scale {scale:.4}: disk-averaged ρ {average:.4} ({view}{}) → ρ {target:.4} for \
-         {brdf}, p_V {}; {cap_note}",
-        if clouds.is_some() {
-            ", clouds composited"
-        } else {
-            ""
-        },
-        spec.geometric_albedo
-    );
+    let Calibrated {
+        ground,
+        scale,
+        cloud_scale,
+        note: scale_note,
+        extra,
+        cloud_extra,
+    } = calibrate(
+        ground,
+        cloud_map,
+        spec.brdf,
+        spec.view,
+        spec.lon0_deg,
+        spec.geometric_albedo,
+        spec.calibration,
+    )
+    .with_context(|| format!("calibrating the albedo of {}", spec.body))?;
     let max_ground = (0..(ground.width * ground.height) as usize)
         .into_par_iter()
         .map(|t| {
@@ -526,14 +543,12 @@ fn bake_group(spec: &MapSpec) -> Result<Vec<Baked>> {
         ),
         scale,
         format!(
-            "max scaled texel {:.3}; stored disk average × scale {stored:.4} vs ρ {target:.4}",
+            "max scaled texel {:.3}; {extra}",
             f64::from(max_ground) * scale
         ),
         spec.preview.as_deref(),
     )?];
-    if let (Some((clouds, note)), Some((input, out)), Some(ground_alone)) =
-        (clouds, &spec.clouds, ground_alone)
-    {
+    if let (Some((clouds, note)), Some((input, out))) = (clouds, &spec.clouds) {
         baked.push(write_map(
             spec,
             MapKind::Clouds,
@@ -541,15 +556,13 @@ fn bake_group(spec: &MapSpec) -> Result<Vec<Baked>> {
             decoded,
             out,
             format!(
-                "{}: {}; {note}; coverage c, composited (1 − c)·ρ + c; {scale_note}",
+                "{}: {}; {note}; cloud map c = DN/255 (linear), composited (1 − c)·ρ_ground + \
+                 c·{cloud_scale:.4}; {scale_note}",
                 file_name(input),
                 spec.source
             ),
-            scale,
-            format!(
-                "cloud reflectance at full cover {:.3}; {ground_alone}",
-                scale.min(1.0)
-            ),
+            cloud_scale,
+            cloud_extra,
             None,
         )?);
     }
@@ -762,6 +775,458 @@ fn to_rgba8(level: &Image8) -> Vec<u8> {
         .collect()
 }
 
+/// A calibrated map: the texels to store and the index's scales.
+struct Calibrated {
+    ground: Image8,
+    /// The map entry's `albedo_scale`.
+    scale: f64,
+    /// Earth's cloud entry's `albedo_scale`: the cloud layer's reflectance at full cover.
+    cloud_scale: f64,
+    /// For the index's `source` (both entries).
+    note: String,
+    /// For the map's report line.
+    extra: String,
+    /// For the cloud map's report line.
+    cloud_extra: String,
+}
+
+/// Sets a map's absolute reflectance as `calibration` says (see the module doc): the texels to
+/// store, the map's `albedo_scale` and, with Earth's `clouds`, the cloud entry's.
+fn calibrate(
+    ground: Image8,
+    clouds: Option<&Image8>,
+    brdf: Brdf,
+    view: View,
+    lon0_deg: f64,
+    geometric_albedo: f64,
+    calibration: Calibration,
+) -> Result<Calibrated> {
+    let photometry = Photometry {
+        brdf,
+        view,
+        lon0_deg,
+        geometric_albedo,
+    };
+    match calibration {
+        Calibration::GeometricAlbedo => to_geometric_albedo(ground, clouds, &photometry),
+        Calibration::Modal { rho } => on_modal_colour(ground, clouds, &photometry, rho),
+        Calibration::GreyContrast { rho } => {
+            ensure!(clouds.is_none(), "a grey cloud-top map has no cloud layer");
+            grey_contrast(ground, &photometry, rho)
+        }
+    }
+}
+
+/// How a map's disk average is taken, and the body's geometric albedo.
+struct Photometry {
+    brdf: Brdf,
+    view: View,
+    lon0_deg: f64,
+    geometric_albedo: f64,
+}
+
+impl Photometry {
+    fn histogram(&self, ground: &Image8, clouds: Option<&Image8>) -> DiskHistogram {
+        DiskHistogram::new(ground, clouds, self.brdf, self.view, self.lon0_deg)
+    }
+
+    fn weights(&self, image: &Image8) -> DiskWeights {
+        DiskWeights::new(
+            image.width,
+            image.height,
+            self.brdf,
+            self.view,
+            self.lon0_deg,
+        )
+    }
+
+    /// ρ(p_V) for the BRDF (review I4).
+    fn pv_rho(&self) -> f64 {
+        rho_from_geometric_albedo(self.brdf, self.geometric_albedo)
+    }
+
+    fn brdf_name(&self) -> String {
+        match self.brdf {
+            Brdf::Lambert => "Lambert".to_string(),
+            Brdf::LunarLambert { l } => format!("lunar-Lambert L = {l}"),
+        }
+    }
+
+    fn view_name(&self) -> String {
+        match self.view {
+            View::RotationAveraged => "rotation-averaged".to_string(),
+            View::Fixed {
+                sub_observer_lon_deg,
+            } => format!("hemisphere centred on {sub_observer_lon_deg}°E"),
+        }
+    }
+}
+
+/// The default calibration (review I4): the capped disk average gives ρ(p_V); Earth's clouds,
+/// if any, are composited and scaled with the ground.
+fn to_geometric_albedo(
+    ground: Image8,
+    clouds: Option<&Image8>,
+    photometry: &Photometry,
+) -> Result<Calibrated> {
+    let histogram = photometry.histogram(&ground, clouds);
+    let average = histogram.average(1.0);
+    let target = photometry.pv_rho();
+    let solved = histogram.solve(target)?;
+    let capped = solved > histogram.first_cap();
+    // For the report only (the brief asks for both Earth scales): the ground map without its
+    // clouds, its disk average and its own capped scale, and the mean cloud cover.
+    let ground_alone = clouds.map(|clouds| {
+        let alone = photometry.histogram(&ground, None);
+        let cover = photometry.histogram(clouds, None);
+        let alone_scale = match alone.solve(target) {
+            Ok(s) => format!("{s:.4}"),
+            Err(err) => format!("none ({err})"),
+        };
+        format!(
+            "disk-weighted mean cloud cover {:.4}; ground alone: disk-averaged ρ {:.4} → capped \
+             scale {alone_scale}",
+            cover.average(1.0),
+            alone.average(1.0)
+        )
+    });
+    let (ground, scale) = apply_scale(ground, solved, histogram.first_cap());
+    // Check on the texels as stored (re-quantised when capped): their disk average × scale.
+    let stored = photometry.histogram(&ground, clouds).average(scale);
+    let cap_note = if capped {
+        format!(
+            "solved with each channel capped at ρ = 1: s = {solved:.4}, {:.1} % of the disk's \
+             luminance weight at the cap, texels stored as min(1, s·a) (disk average as stored \
+             {stored:.4})",
+            100.0 * histogram.share_at_cap(solved)
+        )
+    } else {
+        format!(
+            "no texel reaches ρ = 1 (brightest {:.3})",
+            solved / histogram.first_cap()
+        )
+    };
+    let note = format!(
+        "albedo_scale {scale:.4}: disk-averaged ρ {average:.4} ({}{}) → ρ {target:.4} for {}, \
+         p_V {}; {cap_note}",
+        photometry.view_name(),
+        if clouds.is_some() {
+            ", clouds composited"
+        } else {
+            ""
+        },
+        photometry.brdf_name(),
+        photometry.geometric_albedo
+    );
+    Ok(Calibrated {
+        ground,
+        scale,
+        cloud_scale: scale.min(1.0),
+        note,
+        extra: format!("stored disk average × scale {stored:.4} vs ρ {target:.4}"),
+        cloud_extra: format!(
+            "cloud reflectance at full cover {:.3}; {}",
+            scale.min(1.0),
+            ground_alone.unwrap_or_default()
+        ),
+    })
+}
+
+/// Linear reflectance of one texel's codes: BT.709 luminance of RGB, or the grey value.
+fn luminance(codes: &[u8], transfer: Transfer) -> f64 {
+    if codes.len() == 3 {
+        codes
+            .iter()
+            .zip(LUMA)
+            .map(|(&code, k)| k * f64::from(transfer.decode(code)))
+            .sum()
+    } else {
+        codes
+            .first()
+            .map_or(0.0, |&code| f64::from(transfer.decode(code)))
+    }
+}
+
+/// `--modal-reflectance ρ` (Earth; fix round 2, review r1 N2). The modal colour, which must carry
+/// at least half the disk weight, gets reflectance ρ (its luminance × s = ρ); every texel is
+/// scaled by the same s and capped at 1. The cloud map, if any, is the cloud layer's albedo c
+/// itself: liquid water barely absorbs in the visible (imaginary refractive index ≈ 2 × 10⁻⁹ at
+/// 550 nm; Hale & Querry 1973, Appl. Opt. 12, 555), so a cloud layer that reflects c transmits
+/// 1 − c, and the composite is (1 − c)·ρ_ground + c with the cloud entry's scale 1 (to first
+/// order in ρ_ground; light reflected back and forth between ground and cloud base is left out).
+fn on_modal_colour(
+    ground: Image8,
+    clouds: Option<&Image8>,
+    photometry: &Photometry,
+    rho: f64,
+) -> Result<Calibrated> {
+    let (mode, share) = modal_colour(&ground, &photometry.weights(&ground));
+    ensure!(
+        share >= 0.5,
+        "the modal colour {mode:?} carries {:.1} % of the disk weight: --modal-reflectance \
+         anchors on the majority surface (≥ 50 %)",
+        100.0 * share
+    );
+    let mode_rho = luminance(&mode, ground.transfer);
+    ensure!(mode_rho > 0.0, "the modal colour {mode:?} is black");
+    let solved = rho / mode_rho;
+    let alone = photometry.histogram(&ground, None);
+    let average = alone.average(1.0);
+    let first_cap = alone.first_cap();
+    let at_cap = alone.share_at_cap(solved);
+    let (ground, scale) = apply_scale(ground, solved, first_cap);
+    let stored_mode = luminance(
+        &apply_codes(&mode, ground.transfer, solved, first_cap),
+        ground.transfer,
+    ) * scale;
+    let ground_average = photometry.histogram(&ground, None).average(scale);
+    let cap_note = if solved > first_cap {
+        format!(
+            "texels stored as min(1, s·a), {:.2} % of the disk's luminance weight at the cap",
+            100.0 * at_cap
+        )
+    } else {
+        "no texel reaches ρ = 1".to_string()
+    };
+    let composite = clouds.map(|clouds| {
+        let cover = photometry.histogram(clouds, None).average(1.0);
+        let composite = photometry
+            .histogram(&ground, Some(clouds))
+            .composite(scale, 1.0);
+        format!(
+            "; with the cloud layer (albedo c, disk-weighted mean {cover:.4}) composited: ρ \
+             {composite:.4}"
+        )
+    });
+    let colour = mode
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = format!(
+        "albedo_scale {scale:.4}: calibrated on the map's modal colour, sRGB ({colour}), {:.1} % \
+         of the disk weight ({}), set to ρ {rho}: s = {rho} / {mode_rho:.4} = {solved:.4}; \
+         {cap_note}; disk-averaged ρ {average:.4} → {ground_average:.4} ({}){}; not normalised \
+         to p_V {} (ρ {:.4} for {})",
+        100.0 * share,
+        photometry.view_name(),
+        photometry.brdf_name(),
+        composite.as_deref().unwrap_or(""),
+        photometry.geometric_albedo,
+        photometry.pv_rho(),
+        photometry.brdf_name()
+    );
+    Ok(Calibrated {
+        ground,
+        scale,
+        cloud_scale: 1.0,
+        note,
+        extra: format!("modal colour as stored × scale: ρ {stored_mode:.4} vs {rho}"),
+        cloud_extra: "cloud albedo c = DN/255, cloud entry scale 1".to_string(),
+    })
+}
+
+/// The codes `codes` are stored as when the map is scaled by `scale` (capped at 1 when `scale`
+/// is above `first_cap`, as [`apply_scale`] does), so their reflectance can be checked.
+fn apply_codes(codes: &[u8], transfer: Transfer, scale: f64, first_cap: f64) -> Vec<u8> {
+    if scale <= first_cap {
+        return codes.to_vec();
+    }
+    codes
+        .iter()
+        .map(|&code| transfer.encode((scale * f64::from(transfer.decode(code))).min(1.0) as f32))
+        .collect()
+}
+
+/// `--grey-contrast ρ̄` (Venus; fix round 2, review r1 N1). Each texel's reflectance is
+/// ρ̄·[1 + k·(Y/Ȳ − 1)], neutral (one grey channel): Y is its luminance, Ȳ the map's disk
+/// average, so the disk average is ρ̄ exactly before quantisation, and k is the largest contrast
+/// that keeps the brightest texel of the whole map at 1, at most the source's own (k ≤ 1).
+fn grey_contrast(ground: Image8, photometry: &Photometry, rho: f64) -> Result<Calibrated> {
+    ensure!(
+        rho > 0.0 && rho <= 1.0,
+        "reflectance {rho} is outside (0, 1]"
+    );
+    let weights = photometry.weights(&ground);
+    let (w, h, ch, transfer) = (
+        ground.width as usize,
+        ground.height as usize,
+        ground.channels,
+        ground.transfer,
+    );
+    let lum = |t: usize| luminance(&ground.data[t * ch..(t + 1) * ch], transfer);
+    let (sum, total, brightest) = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let row = weights.row(y);
+            (0..w).fold((0.0, 0.0, 0.0_f64), |(sum, total, max), x| {
+                let (weight, value) = (weights.texel(&row, x), lum(y * w + x));
+                (sum + weight * value, total + weight, max.max(value))
+            })
+        })
+        .reduce(
+            || (0.0, 0.0, 0.0),
+            |a, b| (a.0 + b.0, a.1 + b.1, a.2.max(b.2)),
+        );
+    ensure!(total > 0.0 && sum > 0.0, "the map is black");
+    let mean = sum / total;
+    let peak = brightest / mean;
+    let k = if peak > 1.0 {
+        ((1.0 / rho - 1.0) / (peak - 1.0)).min(1.0)
+    } else {
+        0.0
+    };
+    let value = |t: usize| rho * (1.0 + k * (lum(t) / mean - 1.0));
+    let data = (0..w * h)
+        .into_par_iter()
+        .map(|t| Transfer::Srgb.encode(value(t) as f32))
+        .collect();
+    let (rms_sum, _) = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let row = weights.row(y);
+            (0..w).fold((0.0, 0.0), |(acc, n), x| {
+                let weight = weights.texel(&row, x);
+                (acc + weight * (value(y * w + x) - rho).powi(2), n + weight)
+            })
+        })
+        .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let rms = (rms_sum / total).sqrt() / rho;
+    let stored_image = Image8 {
+        width: ground.width,
+        height: ground.height,
+        channels: 1,
+        transfer: Transfer::Srgb,
+        data,
+    };
+    let stored = photometry.histogram(&stored_image, None).average(1.0);
+    let pv_rho = photometry.pv_rho();
+    let note = format!(
+        "albedo_scale 1.0000: the map's luminance pattern stored neutral, ρ = ρ̄·[1 + k·(Y/Ȳ − \
+         1)] with disk-averaged ρ̄ {rho} ({}, {}), Ȳ {mean:.4}, k {k:.4} (the largest contrast \
+         that keeps every texel ≤ 1, at most the source's): disk rms {:.1} %; ρ(p_V {}) is \
+         {pv_rho:.4}, so the disk is {:.3} mag fainter at phase 0; disk average as stored \
+         {stored:.4}",
+        photometry.view_name(),
+        photometry.brdf_name(),
+        100.0 * rms,
+        photometry.geometric_albedo,
+        2.5 * (pv_rho / rho).log10()
+    );
+    Ok(Calibrated {
+        ground: stored_image,
+        scale: 1.0,
+        cloud_scale: 1.0,
+        note,
+        extra: format!(
+            "stored disk average {stored:.4} vs ρ̄ {rho}; k {k:.4}, rms {:.2} %",
+            100.0 * rms
+        ),
+        cloud_extra: String::new(),
+    })
+}
+
+/// The phase-0 disk-average weight of every texel of a map, f(μ)·μ·dA (see [`DiskHistogram`]).
+struct DiskWeights {
+    l: f64,
+    view: View,
+    lon0_deg: f64,
+    width: usize,
+    dlat: f64,
+}
+
+/// One texel row's weight under a full rotation, and its mid latitude [rad].
+struct RowWeight {
+    rotation: f64,
+    mid: f64,
+}
+
+impl DiskWeights {
+    fn new(width: u32, height: u32, brdf: Brdf, view: View, lon0_deg: f64) -> DiskWeights {
+        let l = match brdf {
+            Brdf::Lambert => 0.0,
+            Brdf::LunarLambert { l } => l,
+        };
+        DiskWeights {
+            l,
+            view,
+            lon0_deg,
+            width: width as usize,
+            dlat: std::f64::consts::PI / f64::from(height),
+        }
+    }
+
+    /// Row `y` (top row first): the rotation-averaged latitude weight
+    /// 2L cos²φ + (1 − L)(π/2) cos³φ integrated exactly over the row.
+    fn row(&self, y: usize) -> RowWeight {
+        let top = std::f64::consts::FRAC_PI_2 - y as f64 * self.dlat;
+        let bottom = top - self.dlat;
+        // ∫cos²φ dφ = φ/2 + sin 2φ/4; ∫cos³φ dφ = sin φ − sin³φ/3.
+        let int_cos2 = |p: f64| p / 2.0 + (2.0 * p).sin() / 4.0;
+        let int_cos3 = |p: f64| p.sin() - p.sin().powi(3) / 3.0;
+        RowWeight {
+            rotation: 2.0 * self.l * (int_cos2(top) - int_cos2(bottom))
+                + (1.0 - self.l) * std::f64::consts::FRAC_PI_2 * (int_cos3(top) - int_cos3(bottom)),
+            mid: top - 0.5 * self.dlat,
+        }
+    }
+
+    /// Texel `x` of `row`: 0 on a fixed view's far side.
+    fn texel(&self, row: &RowWeight, x: usize) -> f64 {
+        match self.view {
+            View::RotationAveraged => row.rotation,
+            View::Fixed {
+                sub_observer_lon_deg,
+            } => {
+                let lon = self.lon0_deg + (x as f64 + 0.5) * 360.0 / self.width as f64;
+                let mu = row.mid.cos() * (lon - sub_observer_lon_deg).to_radians().cos();
+                if mu <= 0.0 {
+                    0.0
+                } else {
+                    (self.l + (1.0 - self.l) * mu) * mu * row.mid.cos() * self.dlat
+                }
+            }
+        }
+    }
+}
+
+/// The colour (texel codes) that carries the most disk weight, and its share of the disk weight.
+fn modal_colour(image: &Image8, weights: &DiskWeights) -> (Vec<u8>, f64) {
+    let (w, ch) = (image.width as usize, image.channels);
+    let key = |t: usize| {
+        image.data[t * ch..(t + 1) * ch]
+            .iter()
+            .fold(0_u32, |k, &v| (k << 8) | u32::from(v))
+    };
+    let empty = || (HashMap::<u32, f64>::new(), 0.0_f64);
+    let (colours, total) = (0..image.height as usize)
+        .into_par_iter()
+        .fold(empty, |(mut colours, mut total), y| {
+            let row = weights.row(y);
+            for x in 0..w {
+                let weight = weights.texel(&row, x);
+                if weight > 0.0 {
+                    *colours.entry(key(y * w + x)).or_insert(0.0) += weight;
+                    total += weight;
+                }
+            }
+            (colours, total)
+        })
+        .reduce(empty, |(mut a, ta), (b, tb)| {
+            for (k, v) in b {
+                *a.entry(k).or_insert(0.0) += v;
+            }
+            (a, ta + tb)
+        });
+    // Ties go to the smaller key, so the result does not depend on the hash order.
+    let (key, weight) = colours
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+        .unwrap_or((0, 0.0));
+    let codes = (0..ch).map(|c| (key >> (8 * (ch - 1 - c))) as u8).collect();
+    (codes, if total > 0.0 { weight / total } else { 0.0 })
+}
+
 /// A map's phase-0 disk-average weights binned by 8-bit code, so the disk average of the scaled
 /// reflectance capped at 1, min(1, s·a) per channel, is a sum over 256 codes per channel for any
 /// scale s.
@@ -779,8 +1244,13 @@ fn to_rgba8(level: &Image8) -> Vec<u8> {
 struct DiskHistogram {
     /// Per ground channel: Σ w·(1 − c) over the texels holding each code.
     ground: Vec<[f64; 256]>,
+    /// Per ground channel: the codes present anywhere in the map, weighted or not (a fixed
+    /// view's far side too; review r1 N4).
+    present: Vec<[bool; 256]>,
     /// Σ w·c: the weight of the white clouds (0 without clouds).
     clouds: f64,
+    /// Whether any cloud texel anywhere is above 0.
+    clouds_present: bool,
     /// Σ w.
     total: f64,
     /// Linear value of each code in the ground's transfer.
@@ -798,64 +1268,75 @@ impl DiskHistogram {
         view: View,
         lon0_deg: f64,
     ) -> DiskHistogram {
-        let l = match brdf {
-            Brdf::Lambert => 0.0,
-            Brdf::LunarLambert { l } => l,
-        };
+        /// Partial sums over a run of rows.
+        struct Sums {
+            hist: Vec<[f64; 256]>,
+            present: Vec<[bool; 256]>,
+            clouds: f64,
+            clouds_present: bool,
+            total: f64,
+        }
+        let weights = DiskWeights::new(ground.width, ground.height, brdf, view, lon0_deg);
         let (w, h, ch) = (
             ground.width as usize,
             ground.height as usize,
             ground.channels,
         );
-        let dlat = std::f64::consts::PI / h as f64;
-        let empty = || (vec![[0.0_f64; 256]; ch], 0.0_f64, 0.0_f64);
-        let (hist, cloud_weight, total) = (0..h)
+        let empty = || Sums {
+            hist: vec![[0.0_f64; 256]; ch],
+            present: vec![[false; 256]; ch],
+            clouds: 0.0,
+            clouds_present: false,
+            total: 0.0,
+        };
+        let sums = (0..h)
             .into_par_iter()
-            .fold(empty, |(mut hist, mut cloud_weight, mut total), y| {
-                let top = std::f64::consts::FRAC_PI_2 - y as f64 * dlat;
-                let bottom = top - dlat;
-                let mid = top - 0.5 * dlat;
-                // ∫cos²φ dφ = φ/2 + sin 2φ/4; ∫cos³φ dφ = sin φ − sin³φ/3.
-                let int_cos2 = |p: f64| p / 2.0 + (2.0 * p).sin() / 4.0;
-                let int_cos3 = |p: f64| p.sin() - p.sin().powi(3) / 3.0;
-                let row_weight = 2.0 * l * (int_cos2(top) - int_cos2(bottom))
-                    + (1.0 - l) * std::f64::consts::FRAC_PI_2 * (int_cos3(top) - int_cos3(bottom));
+            .fold(empty, |mut sums, y| {
+                let row = weights.row(y);
                 for x in 0..w {
-                    let weight = match view {
-                        View::RotationAveraged => row_weight,
-                        View::Fixed {
-                            sub_observer_lon_deg,
-                        } => {
-                            let lon = lon0_deg + (x as f64 + 0.5) * 360.0 / w as f64;
-                            let mu = mid.cos() * (lon - sub_observer_lon_deg).to_radians().cos();
-                            if mu <= 0.0 {
-                                continue;
-                            }
-                            (l + (1.0 - l) * mu) * mu * mid.cos() * dlat
-                        }
-                    };
                     let t = y * w + x;
-                    let c = clouds.map_or(0.0, |clouds| f64::from(clouds.linear(t, 0)));
-                    for (k, bins) in hist.iter_mut().enumerate() {
-                        bins[usize::from(ground.data[t * ch + k])] += weight * (1.0 - c);
+                    let codes = &ground.data[t * ch..(t + 1) * ch];
+                    for (seen, &code) in sums.present.iter_mut().zip(codes) {
+                        seen[usize::from(code)] = true;
                     }
-                    cloud_weight += weight * c;
-                    total += weight;
+                    let c = clouds.map_or(0.0, |clouds| f64::from(clouds.linear(t, 0)));
+                    sums.clouds_present |= c > 0.0;
+                    let weight = weights.texel(&row, x);
+                    if weight <= 0.0 {
+                        continue;
+                    }
+                    for (bins, &code) in sums.hist.iter_mut().zip(codes) {
+                        bins[usize::from(code)] += weight * (1.0 - c);
+                    }
+                    sums.clouds += weight * c;
+                    sums.total += weight;
                 }
-                (hist, cloud_weight, total)
+                sums
             })
             .reduce(empty, |mut a, b| {
-                for (bins, other) in a.0.iter_mut().zip(&b.0) {
+                for (bins, other) in a.hist.iter_mut().zip(&b.hist) {
                     for (n, m) in bins.iter_mut().zip(other) {
                         *n += m;
                     }
                 }
-                (a.0, a.1 + b.1, a.2 + b.2)
+                for (seen, other) in a.present.iter_mut().zip(&b.present) {
+                    for (s, o) in seen.iter_mut().zip(other) {
+                        *s |= o;
+                    }
+                }
+                Sums {
+                    clouds: a.clouds + b.clouds,
+                    clouds_present: a.clouds_present || b.clouds_present,
+                    total: a.total + b.total,
+                    ..a
+                }
             });
         DiskHistogram {
-            ground: hist,
-            clouds: cloud_weight,
-            total,
+            ground: sums.hist,
+            present: sums.present,
+            clouds: sums.clouds,
+            clouds_present: sums.clouds_present,
+            total: sums.total,
             decode: std::array::from_fn(|code| f64::from(ground.transfer.decode(code as u8))),
         }
     }
@@ -869,9 +1350,16 @@ impl DiskHistogram {
         }
     }
 
-    /// Disk-averaged reflectance with every channel scaled by `scale` and capped at 1. At
-    /// `scale` 1 nothing is capped (texels are ≤ 1), so this is the map's own disk average.
+    /// Disk-averaged reflectance with every channel scaled by `scale` and capped at 1, the clouds
+    /// (if any) scaled with the ground. At `scale` 1 nothing is capped (texels are ≤ 1), so this
+    /// is the map's own disk average.
     fn average(&self, scale: f64) -> f64 {
+        self.composite(scale, scale.min(1.0))
+    }
+
+    /// Disk-averaged reflectance with the ground's channels scaled by `ground_scale` and capped at
+    /// 1, and the clouds' reflectance at full cover `cloud_reflectance`.
+    fn composite(&self, ground_scale: f64, cloud_reflectance: f64) -> f64 {
         let ground: f64 = self
             .ground
             .iter()
@@ -880,11 +1368,11 @@ impl DiskHistogram {
                 k * bins
                     .iter()
                     .zip(&self.decode)
-                    .map(|(n, a)| n * (scale * a).min(1.0))
+                    .map(|(n, a)| n * (ground_scale * a).min(1.0))
                     .sum::<f64>()
             })
             .sum();
-        (ground + self.clouds * scale.min(1.0)) / self.total
+        (ground + self.clouds * cloud_reflectance) / self.total
     }
 
     /// Share of the disk-averaged luminance weight that sits at the cap at `scale`.
@@ -917,9 +1405,19 @@ impl DiskHistogram {
         ground.chain((self.clouds > 0.0).then_some(1.0))
     }
 
-    /// The largest scale at which no texel reaches the cap: 1 / the brightest lit value.
+    /// The largest scale at which no texel reaches the cap: 1 / the brightest value anywhere in
+    /// the map, weighted or not, so a fixed view's far side counts too (review r1 N4), and 1 for
+    /// the clouds.
     fn first_cap(&self) -> f64 {
-        1.0 / self.lit().fold(0.0, f64::max)
+        let ground = self.present.iter().flat_map(|seen| {
+            seen.iter()
+                .zip(&self.decode)
+                .filter(|&(seen, _)| *seen)
+                .map(|(_, a)| *a)
+        });
+        1.0 / ground
+            .chain(self.clouds_present.then_some(1.0))
+            .fold(0.0, f64::max)
     }
 
     /// The scale s whose capped disk average is `target` (review I4 with the plan's "ρ is capped
@@ -1366,6 +1864,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_calibration_options() {
+        let base = [
+            "--input",
+            "e.jpg",
+            "--body",
+            "Earth",
+            "--naif",
+            "399",
+            "--kind",
+            "albedo",
+            "--lon0",
+            "-180",
+            "--geometric-albedo",
+            "0.434",
+            "--source",
+            "SSS",
+            "--out",
+            "e.big",
+        ];
+        let with = |extra: &[&str]| {
+            let mut line = base.to_vec();
+            line.extend_from_slice(extra);
+            parse(&args(&line)).map(|(specs, _)| specs[0].calibration)
+        };
+        assert_eq!(with(&[]).expect("default"), Calibration::GeometricAlbedo);
+        assert_eq!(
+            with(&["--modal-reflectance", "0.06"]).expect("modal"),
+            Calibration::Modal { rho: 0.06 }
+        );
+        assert_eq!(
+            with(&["--grey-contrast", "0.95"]).expect("grey"),
+            Calibration::GreyContrast { rho: 0.95 }
+        );
+        assert!(
+            with(&["--modal-reflectance", "0.06", "--grey-contrast", "0.95"]).is_err(),
+            "one calibration per map"
+        );
+        for bad in ["0", "-0.1", "1.5", "x"] {
+            assert!(with(&["--modal-reflectance", bad]).is_err(), "{bad}");
+            assert!(with(&["--grey-contrast", bad]).is_err(), "{bad}");
+        }
+        assert!(
+            with(&[
+                "--grey-contrast",
+                "0.95",
+                "--clouds",
+                "c.jpg",
+                "--clouds-out",
+                "c.big"
+            ])
+            .is_err(),
+            "a grey cloud-top map has no cloud layer"
+        );
+        assert!(
+            with(&[
+                "--modal-reflectance",
+                "0.06",
+                "--clouds",
+                "c.jpg",
+                "--clouds-out",
+                "c.big"
+            ])
+            .is_ok()
+        );
+    }
+
     // ---- mips and packing ----
 
     #[test]
@@ -1780,6 +2345,207 @@ mod tests {
         assert!((bare - rho_ground).abs() < 1e-6);
     }
 
+    /// Review r1 N4: every texel counts for the cap, not only those the disk average weights. A
+    /// Moon-like fixed view whose brightest texels are on the far side: the plain ratio (2) would
+    /// put them at 1.8.
+    #[test]
+    fn far_side_texels_count_for_the_cap() {
+        // Column 0 (lon −177°) is on the far side of a view centred on 0°E.
+        let map = image(64, 32, 3, Transfer::Srgb, |x, _, _| {
+            linear_to_srgb(if x == 0 { 0.9 } else { 0.1 })
+        });
+        let brdf = Brdf::LunarLambert { l: 0.9 };
+        let view = View::Fixed {
+            sub_observer_lon_deg: 0.0,
+        };
+        // p = ρ·[L + 2(1 − L)/3] for ρ = 0.2 (plan l.705).
+        let p_v = 0.2 * (0.9 + 2.0 * 0.1 / 3.0);
+        let (stored, scale) = bake_scale(&map, None, brdf, view, p_v);
+        assert!(
+            brightest_rho(&stored, scale) <= 1.0 + 1e-9,
+            "far-side texel × scale = {}",
+            brightest_rho(&stored, scale)
+        );
+        let rendered = rendered_disk_average(&stored, -180.0, brdf, &[0.0]) * scale;
+        assert!((rendered - 0.2).abs() < 2e-3, "{rendered}");
+    }
+
+    /// Linear BT.709 luminance of texel `t` of a stored sRGB map (grey or RGB).
+    fn stored_luminance(map: &Image8, t: usize) -> f64 {
+        texel_rho(map, t)
+    }
+
+    /// An Earth-like map: 3 of every 4 columns are "ocean", one flat colour (Solar System
+    /// Scope's sRGB (30, 58, 117), luminance 0.0459); the rest is varied, brighter "land".
+    fn ocean_map() -> Image8 {
+        image(128, 64, 3, Transfer::Srgb, |x, y, c| {
+            if x % 4 != 0 {
+                [30, 58, 117][c]
+            } else {
+                (60 + (y * 3) % 150 + c as u32 * 20) as u8
+            }
+        })
+    }
+
+    /// Earth (fix round 2, review r1 N2): the ground is calibrated on its modal colour, the flat
+    /// ocean, to the sea surface's measured reflectance, not on p_V; land keeps its contrast to
+    /// the ocean, and the clouds keep their own albedo (entry scale 1).
+    #[test]
+    fn modal_reflectance_anchors_the_ocean() {
+        let map = ocean_map();
+        let clouds = image(128, 64, 1, Transfer::Linear, |x, y, _| {
+            ((x * 3 + y * 5) % 200) as u8
+        });
+        let weights = DiskWeights::new(128, 64, Brdf::Lambert, View::RotationAveraged, -180.0);
+        let (mode, share) = modal_colour(&map, &weights);
+        assert_eq!(mode, vec![30, 58, 117]);
+        assert!((share - 0.75).abs() < 0.01, "modal share {share}");
+        let calibrated = calibrate(
+            map.clone(),
+            Some(&clouds),
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+            0.434,
+            Calibration::Modal { rho: 0.06 },
+        )
+        .expect("calibrated");
+        let ocean = stored_luminance(&calibrated.ground, 1) * calibrated.scale;
+        // Within half an sRGB step of each channel near these values.
+        assert!((ocean - 0.06).abs() < 1.5e-3, "ocean ρ {ocean}");
+        assert_eq!(
+            calibrated.cloud_scale, 1.0,
+            "the cloud map is the layer's albedo"
+        );
+        // Land scales with the ocean: one factor 0.06 / 0.0459 for every uncapped texel.
+        let factor = 0.06 / stored_luminance(&map, 1);
+        let land = stored_luminance(&calibrated.ground, 0) * calibrated.scale;
+        assert!(
+            (land / stored_luminance(&map, 0) / factor - 1.0).abs() < 0.03,
+            "land {land}"
+        );
+        assert!(brightest_rho(&calibrated.ground, calibrated.scale) <= 1.0 + 1e-9);
+        // Not normalised to p_V: the composite stays far below ρ(p_V) = 0.651.
+        let composite = DiskHistogram::new(
+            &calibrated.ground,
+            Some(&clouds),
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+        )
+        .composite(calibrated.scale, calibrated.cloud_scale);
+        let pv_rho = rho_from_geometric_albedo(Brdf::Lambert, 0.434);
+        assert!(composite < pv_rho - 0.1, "{composite} vs {pv_rho}");
+    }
+
+    /// The anchor must be the majority surface: a map whose modal colour holds under half the
+    /// disk weight is refused.
+    #[test]
+    fn modal_reflectance_needs_a_majority_colour() {
+        let speckled = image(128, 64, 3, Transfer::Srgb, |x, y, c| {
+            if x % 3 == 0 {
+                [30, 58, 117][c]
+            } else {
+                ((x * 7 + y * 13 + c as u32 * 31) % 200 + 20) as u8
+            }
+        });
+        let result = calibrate(
+            speckled,
+            None,
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+            0.434,
+            Calibration::Modal { rho: 0.06 },
+        );
+        assert!(result.is_err(), "a third of the disk is not the majority");
+    }
+
+    /// An orange map like Solar System Scope's Venus (luminance ≈ 0.54 with red near 1).
+    fn venus_like_map() -> Image8 {
+        image(128, 64, 3, Transfer::Srgb, |x, y, c| {
+            let p = 1.0 + 0.3 * (f64::from(y) * 0.3).sin() * (f64::from(x) * 0.2).cos();
+            linear_to_srgb(([0.70, 0.46, 0.19][c] * p).min(1.0))
+        })
+    }
+
+    /// Venus (fix round 2, review r1 N1). With ρ(p_V) = 1 and per-channel capping the map comes
+    /// out uniform white; with `--grey-contrast 0.95` it keeps its pattern, neutral, with disk
+    /// average 0.95, its brightest texel at 1 and no texel above.
+    #[test]
+    fn grey_contrast_keeps_the_pattern_under_one() {
+        let map = venus_like_map();
+        // The default calibration, for the record: every texel at the cap.
+        let white = calibrate(
+            map.clone(),
+            None,
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+            0.689,
+            Calibration::GeometricAlbedo,
+        )
+        .expect("p_V");
+        assert!(white.ground.data.iter().all(|&v| v == 255), "uniform white");
+
+        let grey = calibrate(
+            map.clone(),
+            None,
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+            0.689,
+            Calibration::GreyContrast { rho: 0.95 },
+        )
+        .expect("grey");
+        assert_eq!(grey.scale, 1.0);
+        let texels = (grey.ground.width * grey.ground.height) as usize;
+        let stored: Vec<f64> = (0..texels)
+            .map(|t| stored_luminance(&grey.ground, t))
+            .collect();
+        // Neutral: every channel equal.
+        assert!(
+            grey.ground
+                .data
+                .chunks(grey.ground.channels)
+                .all(|t| t.iter().all(|&v| v == t[0]))
+        );
+        let rendered = rendered_disk_average(&grey.ground, -180.0, Brdf::Lambert, &rotation());
+        assert!((rendered - 0.95).abs() < 2e-3, "disk average {rendered}");
+        let (lo, hi) = stored
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        assert!(hi <= 1.0 && hi > 0.99, "brightest {hi}");
+        assert!(hi - lo > 0.05, "the pattern is kept: {lo}..{hi}");
+        // The pattern is the source's: ordering texels by source luminance orders them stored.
+        let mut order: Vec<usize> = (0..texels).collect();
+        order.sort_by(|&a, &b| texel_rho(&map, a).total_cmp(&texel_rho(&map, b)));
+        assert!(order.windows(2).all(|p| stored[p[0]] <= stored[p[1]]));
+        // Never more contrast than the source: at ρ̄ 0.5 the map is the source's luminance
+        // pattern rescaled to mean 0.5, with k capped at 1.
+        let half = calibrate(
+            map.clone(),
+            None,
+            Brdf::Lambert,
+            View::RotationAveraged,
+            -180.0,
+            0.689,
+            Calibration::GreyContrast { rho: 0.5 },
+        )
+        .expect("grey 0.5");
+        let source_mean = disk_average(&map, None, Brdf::Lambert, View::RotationAveraged, -180.0);
+        for t in [0, 77, 4000] {
+            let want = 0.5 * texel_rho(&map, t) / source_mean;
+            let got = stored_luminance(&half.ground, t);
+            assert!(
+                (got / want - 1.0).abs() < 0.02,
+                "texel {t}: {got} vs {want}"
+            );
+        }
+    }
+
     // ---- tier-B preparation ----
 
     #[test]
@@ -1850,8 +2616,9 @@ mod tests {
 
     // ---- end to end ----
 
-    /// A whole `uni-bake map` run on two small synthetic maps (one with clouds): files, index
-    /// entries, sizes, formats and the shared Earth scale.
+    /// A whole `uni-bake map` run on three small synthetic maps: Earth (flat ocean, with clouds,
+    /// `--modal-reflectance`), Venus (`--grey-contrast`) and a tier-B grey map: files, index
+    /// entries, sizes, formats and scales.
     #[test]
     fn bakes_small_maps_end_to_end() {
         let dir = std::env::temp_dir().join(format!("uni-bake-map-{}", std::process::id()));
@@ -1859,10 +2626,22 @@ mod tests {
         let ground = dir.join("ground.png");
         let clouds = dir.join("clouds.png");
         let grey = dir.join("grey.png");
+        let venus = dir.join("venus.png");
         image::RgbImage::from_fn(256, 128, |x, y| {
-            image::Rgb([(x % 256) as u8, (y * 2) as u8, 90])
+            if x % 4 != 0 {
+                image::Rgb([30, 58, 117])
+            } else {
+                image::Rgb([(x % 256) as u8, (y * 2) as u8, 90])
+            }
         })
         .save(&ground)
+        .expect("png");
+        image::RgbImage::from_fn(256, 128, |x, y| {
+            let p = 1.0 + 0.3 * (f64::from(y) * 0.2).sin() * (f64::from(x) * 0.1).cos();
+            let c = |k: f64| linear_to_srgb(k * p);
+            image::Rgb([c(0.70), c(0.46), c(0.19)])
+        })
+        .save(&venus)
         .expect("png");
         image::GrayImage::from_fn(256, 128, |x, _| image::Luma([(x / 2) as u8]))
             .save(&clouds)
@@ -1886,6 +2665,8 @@ mod tests {
             "-180",
             "--geometric-albedo",
             "0.434",
+            "--modal-reflectance",
+            "0.06",
             "--clouds",
             &p("clouds.png"),
             "--clouds-out",
@@ -1894,6 +2675,24 @@ mod tests {
             "test",
             "--out",
             &p("earth_albedo.big"),
+            "--input",
+            &p("venus.png"),
+            "--body",
+            "Venus",
+            "--naif",
+            "299",
+            "--kind",
+            "cloud-tops",
+            "--lon0",
+            "-180",
+            "--geometric-albedo",
+            "0.689",
+            "--grey-contrast",
+            "0.95",
+            "--source",
+            "test",
+            "--out",
+            &p("venus_cloud_tops.big"),
             "--input",
             &p("grey.png"),
             "--body",
@@ -1919,7 +2718,7 @@ mod tests {
         ]))
         .expect("bake");
         let maps = uni_data::load_map_index(&dir.join("index.ron")).expect("index");
-        assert_eq!(maps.len(), 3);
+        assert_eq!(maps.len(), 4);
         let find = |body: &str, kind: uni_data::MapKind| {
             maps.iter()
                 .find(|m| m.body == body && m.kind == kind)
@@ -1928,11 +2727,8 @@ mod tests {
         };
         let earth = find("Earth", uni_data::MapKind::Albedo);
         let earth_clouds = find("Earth", uni_data::MapKind::Clouds);
+        let venus = find("Venus", uni_data::MapKind::CloudTops);
         let ceres = find("Ceres", uni_data::MapKind::Albedo);
-        assert_eq!(
-            earth.albedo_scale, earth_clouds.albedo_scale,
-            "scaled together"
-        );
         assert_eq!((earth.width, earth.height), (256, 128));
         // The index records the decoded size (the stub's meaning); the files hold the nearest
         // 2:1 power of two, 256×128 (review r0 Important 2).
@@ -1940,15 +2736,45 @@ mod tests {
         assert!(ceres.source.contains("200×100"), "{}", ceres.source);
         assert!(ceres.source.contains("256×128"), "{}", ceres.source);
         assert_eq!(earth_clouds.fallback_file, "earth_clouds.r2k.big");
-        // Earth's p_V needs clouds brighter than 1 at the plain ratio; capped, the cloud
-        // reflectance is the shared scale, at most 1 (review r0 Important 1).
-        assert!(earth.albedo_scale <= 1.0, "{}", earth.albedo_scale);
-        for map in [&earth, &earth_clouds, &ceres] {
+        // The cloud map is the cloud layer's albedo (fix round 2): its entry's scale is 1.
+        assert_eq!(earth_clouds.albedo_scale, 1.0);
+        assert!(earth.source.contains("modal colour"), "{}", earth.source);
+        assert_eq!(venus.albedo_scale, 1.0);
+        for map in [&earth, &earth_clouds, &venus, &ceres] {
             let bc = uni_data::load_tex(&dir.join(&map.file)).expect("bc");
             let fallback = uni_data::load_tex(&dir.join(&map.fallback_file)).expect("fallback");
             let stored = uni_data::maps::baked_size(map.width);
             assert_eq!((bc.width, bc.height), stored, "{}", map.file);
             assert_eq!((fallback.width, fallback.height), stored, "{}", map.file);
+            if map.kind == uni_data::MapKind::Clouds {
+                continue;
+            }
+            // Mip 0 as stored (RGBA8 sRGB): the ocean at 0.06, Venus grey and patterned.
+            let texels: Vec<f64> = fallback.mips[0]
+                .chunks(4)
+                .map(|t| {
+                    0.2126 * srgb_to_linear(t[0])
+                        + 0.7152 * srgb_to_linear(t[1])
+                        + 0.0722 * srgb_to_linear(t[2])
+                })
+                .collect();
+            let scale = f64::from(map.albedo_scale);
+            if map.body == "Earth" {
+                assert!((texels[1] * scale - 0.06).abs() < 1.5e-3, "{}", texels[1]);
+            }
+            if map.body == "Venus" {
+                assert!(
+                    fallback.mips[0]
+                        .chunks(4)
+                        .all(|t| t[0] == t[1] && t[1] == t[2])
+                );
+                let (lo, hi) = texels
+                    .iter()
+                    .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &v| {
+                        (lo.min(v), hi.max(v))
+                    });
+                assert!(hi <= 1.0 && hi - lo > 0.05, "{lo}..{hi}");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -21,7 +21,7 @@
     height: 2048,
     lon0_deg: -180.0,
     albedo_scale: 1.0,
-    source: "4k_venus_atmosphere.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.689 NSSDCA Venus fact sheet; decoded 4096×2048; albedo_scale 1.0000: disk-averaged ρ 0.5454 (rotation-averaged) → ρ 1.0000 for Lambert, p_V 0.689; solved with each channel capped at ρ = 1: s = 18.9177, 100.0 % of the disk\'s luminance weight at the cap, texels stored as min(1, s·a) (disk average as stored 1.0000)",
+    source: "4k_venus_atmosphere.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.689 NSSDCA Venus fact sheet; disk-averaged ρ 0.95 = 5 % below ρ(p_V) = 1, the point-to-disk flux tolerance of B1; decoded 4096×2048; albedo_scale 1.0000: the map\'s luminance pattern stored neutral, ρ = ρ\u{304}·[1 + k·(Y/Ȳ − 1)] with disk-averaged ρ\u{304} 0.95 (rotation-averaged, Lambert), Ȳ 0.5454, k 0.1156 (the largest contrast that keeps every texel ≤ 1, at most the source\'s): disk rms 1.9 %; ρ(p_V 0.689) is 1.0000, so the disk is 0.056 mag fainter at phase 0; disk average as stored 0.9500",
   ),
   (
     body: "Moon",
@@ -45,7 +45,7 @@
     height: 4096,
     lon0_deg: -180.0,
     albedo_scale: 1.0,
-    source: "8k_earth_daymap.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.434 NSSDCA Earth fact sheet; decoded 8192×4096; albedo_scale 1.0000: disk-averaged ρ 0.2799 (rotation-averaged, clouds composited) → ρ 0.6510 for Lambert, p_V 0.434; solved with each channel capped at ρ = 1: s = 10.6439, 40.9 % of the disk\'s luminance weight at the cap, texels stored as min(1, s·a) (disk average as stored 0.6520)",
+    source: "8k_earth_daymap.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.434 NSSDCA Earth fact sheet; ocean reflectance 0.06 = sea-surface albedo (Payne 1972, J. Atmos. Sci. 29, 959); decoded 8192×4096; albedo_scale 1.0000: calibrated on the map\'s modal colour, sRGB (30, 59, 117), 71.0 % of the disk weight (rotation-averaged), set to ρ 0.06: s = 0.06 / 0.0469 = 1.2798; texels stored as min(1, s·a), 0.34 % of the disk\'s luminance weight at the cap; disk-averaged ρ 0.0955 → 0.1221 (Lambert); with the cloud layer (albedo c, disk-weighted mean 0.2010) composited: ρ 0.3019; not normalised to p_V 0.434 (ρ 0.6510 for Lambert)",
   ),
   (
     body: "Earth",
@@ -57,7 +57,7 @@
     height: 4096,
     lon0_deg: -180.0,
     albedo_scale: 1.0,
-    source: "8k_earth_clouds.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.434 NSSDCA Earth fact sheet; decoded 8192×4096; coverage c, composited (1 − c)·ρ + c; albedo_scale 1.0000: disk-averaged ρ 0.2799 (rotation-averaged, clouds composited) → ρ 0.6510 for Lambert, p_V 0.434; solved with each channel capped at ρ = 1: s = 10.6439, 40.9 % of the disk\'s luminance weight at the cap, texels stored as min(1, s·a) (disk average as stored 0.6520)",
+    source: "8k_earth_clouds.jpg: Solar System Scope (CC BY 4.0, https://www.solarsystemscope.com/textures/); p_V 0.434 NSSDCA Earth fact sheet; ocean reflectance 0.06 = sea-surface albedo (Payne 1972, J. Atmos. Sci. 29, 959); decoded 8192×4096; cloud map c = DN/255 (linear), composited (1 − c)·ρ_ground + c·1.0000; albedo_scale 1.0000: calibrated on the map\'s modal colour, sRGB (30, 59, 117), 71.0 % of the disk weight (rotation-averaged), set to ρ 0.06: s = 0.06 / 0.0469 = 1.2798; texels stored as min(1, s·a), 0.34 % of the disk\'s luminance weight at the cap; disk-averaged ρ 0.0955 → 0.1221 (Lambert); with the cloud layer (albedo c, disk-weighted mean 0.2010) composited: ρ 0.3019; not normalised to p_V 0.434 (ρ 0.6510 for Lambert)",
   ),
   (
     body: "Mars",
