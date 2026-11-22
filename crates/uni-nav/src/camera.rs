@@ -52,14 +52,19 @@ pub struct FlyCamera {
     /// from it plus a private tail that holds the part below its f64 spacing (2^-5 m at
     /// 1000 AU, 4 m at 2e5 AU), so slow flight far from the anchor is not lost.
     ///
-    /// The tail belongs to the value the camera last wrote: writing `rel_m` from outside drops
-    /// it, and the next `sync` gives exactly origin + the written `rel_m`. To move the camera
-    /// relative to its anchor at full precision, use [`FlyCamera::translate`]; to place it at a
-    /// root position, set `view.pos` and call [`FlyCamera::reanchor`].
+    /// Move the camera with [`FlyCamera::translate`] (relative to its anchor, at full
+    /// precision), or set `view.pos` and call [`FlyCamera::reanchor`] (to place it at a root
+    /// position). Both work for every anchor, [`ROOT_FRAME`] included.
+    ///
+    /// Writing `rel_m` from outside works only for a non-root anchor. The tail belongs, per
+    /// component, to the value the camera last wrote: a component written with a new value
+    /// drops its tail, and the next `sync` gives origin + the written `rel_m` (one rounding, as
+    /// [`FlyCamera::sync`] says); a component written with its current value keeps its tail,
+    /// so the camera does not move along it.
     ///
     /// Anchored to [`ROOT_FRAME`], which never moves, `view.pos` is the camera's position and
-    /// `rel_m` only mirrors it in f64 metres from the SSB (4.3e9 m apart at 1 Gpc), so `sync`
-    /// keeps `view.pos` there instead of rebuilding it from `rel_m`.
+    /// `rel_m` only mirrors it in f64 metres from the SSB (4.3e9 m apart at 1 Gpc): `sync`
+    /// keeps `view.pos` and overwrites `rel_m` from it, so a write to `rel_m` has no effect.
     pub rel_m: DVec3,
     /// The part of the anchor offset below `rel_m`'s spacing (review r0 I1).
     tail: RelTail,
@@ -160,6 +165,12 @@ impl FlyCamera {
     /// body, this is ([`Self::anchored_view`], its name); anchored to [`ROOT_FRAME`], or to a
     /// frame `body_name` cannot name, it is the root view with no anchor, so a saved bookmark
     /// always resolves.
+    ///
+    /// `body_name` must name the object whose centre is the frame's origin, because
+    /// [`crate::resolve_bookmark`] measures the saved offset from the object's centre. A4's
+    /// frames are body-centred (the Sun, each planet, each moon), so with uni-sim's `World` it
+    /// is `|f| world.objects().iter().find(|o| o.frame == Some(f)).map(|o| o.name.clone())`.
+    /// The app's F12 must save this pair, not `view` with `anchor: None` (review r0 I2).
     pub fn bookmark_view(
         &self,
         body_name: impl FnOnce(FrameId) -> Option<String>,
@@ -780,6 +791,41 @@ mod tests {
         assert_eq!(cam.view.pos, add_m(frames.origin_in_root(sun, t), placed));
         cam.reanchor(&frames, t, sun);
         assert_eq!(cam.rel_m, placed);
+    }
+
+    #[test]
+    fn rel_m_writes_follow_the_documented_rules() {
+        // Review r1 minor 1: the `rel_m` doc's two exceptions to "a written `rel_m` is honoured".
+        // 1. A component written with its current value keeps its tail, so the camera stays.
+        let mut frames = FrameTree::new();
+        let sun = sun_like(&mut frames);
+        let t = Epoch::J2000.add_seconds(5.0e5);
+        let rel0 = DVec3::new(0.0, 0.0, 8.5 * CELL_SIZE_M + 0.123);
+        let mut cam = camera_at(frames.origin_in_root(sun, t).offset(rel0));
+        cam.reanchor(&frames, t, sun);
+        cam.speed_log10 = -1.0;
+        let mut input = InputState::new();
+        input.set_down(Action::Forward, true);
+        cam.update(&mut input, 0.1);
+        cam.sync(&frames, t);
+        // 1 cm of flight at 1000 AU, where f64 metres are 2^-5 m apart, lives in the tail.
+        assert_ne!(cam.rel_lo().z, 0.0);
+        let (pos, z) = (cam.view.pos, cam.rel_m.z);
+        cam.rel_m.z = z;
+        cam.sync(&frames, t);
+        assert_eq!(cam.view.pos, pos);
+
+        // 2. Anchored to ROOT, `view.pos` is the truth: `sync` ignores a written `rel_m` and
+        // mirrors `view.pos` again.
+        let far = UniversePos::from_meters(DVec3::new(1e9 * PC, 0.0, 0.0));
+        let mut cam = camera_at(far);
+        assert_eq!(cam.anchor, ROOT_FRAME);
+        cam.sync(&frames, t);
+        let mirror = cam.rel_m;
+        cam.rel_m = DVec3::new(1.0, 2.0, 3.0);
+        cam.sync(&frames, t);
+        assert_eq!(cam.view.pos, far);
+        assert_eq!(cam.rel_m, mirror);
     }
 
     #[test]

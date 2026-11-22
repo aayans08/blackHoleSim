@@ -148,8 +148,9 @@ fn look_at_orient(dir: DVec3, up: DVec3) -> anyhow::Result<DQuat> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bookmark::load_bookmarks;
+    use crate::bookmark::{load_bookmarks, save_bookmarks};
     use crate::camera::FlyCamera;
+    use crate::input::{Action, InputState};
     use glam::{DQuat, DVec3, I64Vec3};
     use std::path::Path;
     use uni_core::{AU, CELL_SIZE_M, Epoch, FrameMotion, FrameTree, ROOT_FRAME};
@@ -475,5 +476,93 @@ mod tests {
         assert_eq!((resolved.pos, frame), (cam.view.pos, mars));
 
         assert_eq!(cam.bookmark_view(|_| None), (cam.view.clone(), None));
+    }
+
+    #[test]
+    fn f12_bookmark_survives_the_file() {
+        // Review r0/r1 I2, uni-nav half. B9's per-frame loop (update → sync → reanchor to the
+        // dominant frame) flies a camera from ROOT into a moving Mars's frame. F12 names the
+        // anchor through the world's object table (name, own frame), as uni-sim's
+        // `World::objects()` gives it, and writes the file. Loading and resolving it at the
+        // same epoch gives back the camera's frame and root position.
+        let mut frames = FrameTree::new();
+        let mars = frames.add(
+            ROOT_FRAME,
+            "Mars",
+            FrameMotion::Custom(Box::new(|t: Epoch| {
+                let y = 24_000.0 * t.seconds_since(Epoch::J2000);
+                (
+                    UniversePos::from_meters(DVec3::new(1.5 * AU, y, 0.0)),
+                    DQuat::IDENTITY,
+                )
+            })),
+        );
+        // A frame-less object first, so the lookup has to match the frame.
+        let objects = [("TestBH-1", None), ("Mars", Some(mars))];
+        let path = std::env::temp_dir().join(format!("uni-nav-{}-f12.ron", std::process::id()));
+        let f12 = |cam: &FlyCamera| {
+            let (view, anchor) = cam.bookmark_view(|f| {
+                objects
+                    .iter()
+                    .find(|(_, frame)| *frame == Some(f))
+                    .map(|(name, _)| (*name).to_owned())
+            });
+            let mut b = bookmark(DVec3::ZERO);
+            (b.view, b.anchor) = (view, anchor);
+            save_bookmarks(&path, &[b]).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let mut loaded = load_bookmarks(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(loaded.len(), 1);
+            (text, loaded.remove(0))
+        };
+        // Mars's frame dominates within 1e9 m of its centre (a stand-in for its Hill sphere).
+        let dominant = |t: Epoch, p: UniversePos| {
+            let near = delta_m(p, frames.origin_in_root(mars, t)).length() < 1.0e9;
+            if near { mars } else { ROOT_FRAME }
+        };
+
+        let mut t = Epoch::J2000.add_seconds(86_400.0);
+        let mut cam = FlyCamera::new(CameraView {
+            pos: frames
+                .origin_in_root(mars, t)
+                .offset(DVec3::new(2.0e6, -3.0e6, 1.05e9)),
+            orient: DQuat::IDENTITY,
+            fov_y_rad: 0.7,
+            velocity_mps: DVec3::ZERO,
+        });
+
+        // Outside Mars's sphere the camera is root-anchored: no anchor, the root view itself.
+        let (text, b) = f12(&cam);
+        assert!(!text.contains("anchor"), "{text}");
+        let world = FakeWorld(vec![("Mars", frames.origin_in_root(mars, t), mars)]);
+        assert_eq!(
+            resolve_bookmark(&b, &world).unwrap(),
+            (cam.view.clone(), ROOT_FRAME)
+        );
+
+        // 1 s toward Mars at 1e8 m/s crosses into its sphere, then 1 s at 0.1 m/s.
+        let mut input = InputState::new();
+        input.set_down(Action::Forward, true);
+        for i in 0..120 {
+            cam.speed_log10 = if i < 60 { 8.0 } else { -1.0 };
+            cam.update(&mut input, 1.0 / 60.0);
+            t = t.add_seconds(1.0 / 60.0);
+            cam.sync(&frames, t);
+            cam.reanchor(&frames, t, dominant(t, cam.view.pos));
+        }
+        assert_eq!(cam.anchor, mars);
+
+        let (text, b) = f12(&cam);
+        assert!(text.contains("anchor: Some(\"Mars\")"), "{text}");
+        assert_eq!(b.view.pos.cell, I64Vec3::ZERO);
+        let world = FakeWorld(vec![("Mars", frames.origin_in_root(mars, t), mars)]);
+        let (view, frame) = resolve_bookmark(&b, &world).unwrap();
+        assert_eq!(frame, mars);
+        assert_eq!(view.orient, cam.view.orient);
+        // The file keeps `rel_m` (f64, about 1e9 m: 1.2e-7 m apart) but not its tail, and each
+        // side rounds once at Mars's cell-local metres (2^-15 m apart at 1.5 AU).
+        let err = view.pos.delta_from(cam.view.pos).length();
+        assert!(err < 1e-4, "resolved {err} m from the camera");
     }
 }
