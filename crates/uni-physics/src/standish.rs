@@ -519,7 +519,11 @@ mod tests {
     /// blend (A1b): the page's table itself, which its error tables describe. For Neptune
     /// (SSB-fitted) the Sun's SSB offset is built from the same table's states by the closed
     /// form of [`crate::ssb`], repeated here; with the table in force at `t` this is A1's state
-    /// bit for bit, and outside the bands it equals [`heliocentric_state_icrs`].
+    /// bit for bit. Outside the bands, with the table in force, it equals
+    /// [`heliocentric_state_icrs`] bit for bit: asserted in every regime by
+    /// [`table_state_is_the_apps_outside_the_bands`] and at every Horizons spot outside the
+    /// bands by [`check_against_horizons`] (A1b review r0 I2), so a change to [`crate::ssb`]
+    /// or [`fitted_state_icrs`] that this copy misses fails the tests.
     fn table_heliocentric_state_icrs(p: Planet, t: Epoch, table: Validity) -> (DVec3, DVec3) {
         use crate::bodies::{GM_SUN_DE440_M3S2, system_gm_m3s2};
         let state =
@@ -546,6 +550,11 @@ mod tests {
     /// Compares every Horizons spot of each barycentre (1..=8 @ 10) whose JD passes `keep`
     /// with `state`, prints the per-spot, worst and RMS errors next to the JPL table, and
     /// asserts the expected `table` and the bounds described at [`PEAK_OVER_1800_2050`].
+    ///
+    /// At every spot outside the handover bands (`handover_weight` is `None`) it also asserts
+    /// that `state` is the app's [`heliocentric_state_icrs`], bit for bit (A1b review r0 I2):
+    /// a test state other than the app's may differ from it only inside the bands. Returns
+    /// how many (planet, spot) pairs it pinned that way.
     fn check_against_horizons(
         keep: impl Fn(f64) -> bool,
         table: Validity,
@@ -553,11 +562,12 @@ mod tests {
         jpl: &[[f64; 3]; 8],
         peak_over: &[Over],
         rms_over: &[Over],
-    ) {
+    ) -> usize {
         let mut worst = [[0.0f64; 3]; 8];
         let mut sum_sq = [[0.0f64; 3]; 8];
         let mut count = [0usize; 8];
         let mut worst_dv = 0.0f64;
+        let mut pinned = 0;
         for (k, p) in Planet::ALL.into_iter().enumerate() {
             let spots: Vec<_> = horizons_spots(p.barycentre_id(), 10)
                 .into_iter()
@@ -568,6 +578,15 @@ mod tests {
                 let t = epoch_of(s.jd_tdb);
                 assert_eq!(validity(t), table, "{p:?} at JD {}", s.jd_tdb);
                 let (r, v) = state(p, t);
+                if handover_weight(t.julian_centuries()).is_none() {
+                    assert_eq!(
+                        (r, v),
+                        heliocentric_state_icrs(p, t),
+                        "{p:?} at JD {}: outside the bands the tested state must be the app's",
+                        s.jd_tdb
+                    );
+                    pinned += 1;
+                }
                 let err = ecliptic_errors(r, pos_m(&s));
                 let dv = (v - vel_m_s(&s)).length() / vel_m_s(&s).length();
                 worst_dv = worst_dv.max(dv);
@@ -618,15 +637,18 @@ mod tests {
         }
         // Velocities: derivative of the mean ellipse, so within the position error's order.
         assert!(worst_dv < 1e-2, "{worst_dv}");
+        pinned
     }
 
     /// Every Horizons barycentre spot in AD 1800–2050 against the JPL 1800–2050 error table,
     /// asserted as described at [`PEAK_OVER_1800_2050`]. Target 399 is not the EMB and is not
     /// used. The state is Table 1's alone (A1b): the spots at 1800-01-01 and 2050-01-01 lie in
-    /// the handover bands, where the app's state is Table 2's ([`handover_bounds_hold`]).
+    /// the handover bands, where the app's state is Table 2's ([`handover_bounds_hold`]). At
+    /// the other four spots (1900, 1950, 2000, 2026-11-20) Table 1 alone is the app's state,
+    /// asserted bit for bit for all eight planets.
     #[test]
     fn standish_within_error_table() {
-        check_against_horizons(
+        let pinned = check_against_horizons(
             |jd| (2_378_495.0..=2_469_807.5).contains(&jd),
             Validity::Table1,
             |p, t| table_heliocentric_state_icrs(p, t, Validity::Table1),
@@ -634,20 +656,61 @@ mod tests {
             &PEAK_OVER_1800_2050,
             &[],
         );
+        assert_eq!(pinned, 4 * 8, "spots checked against the app's state");
     }
 
     /// The spots at JD 2086307.5 (AD 1000-01-01, Julian calendar) and 2634166.5
-    /// (AD 2500-01-01) against the JPL 3000 BC – AD 3000 table, read the same way.
+    /// (AD 2500-01-01) against the JPL 3000 BC – AD 3000 table, read the same way. Both are
+    /// centuries from the handover bands, so this tests the app's state directly.
     #[test]
     fn standish_table2_window() {
-        check_against_horizons(
+        let pinned = check_against_horizons(
             |jd| jd == 2_086_307.5 || jd == 2_634_166.5,
             Validity::Table2,
-            |p, t| table_heliocentric_state_icrs(p, t, Validity::Table2),
+            heliocentric_state_icrs,
             &JPL_3000BC_3000AD,
             &PEAK_OVER_3000BC_3000AD,
             &RMS_OVER_3000BC_3000AD,
         );
+        assert_eq!(pinned, 2 * 8, "spots outside the bands");
+    }
+
+    /// A1b review r0 I2: the test-only single-table state ([`table_heliocentric_state_icrs`],
+    /// whose Neptune path repeats [`crate::ssb`]'s closed form) is the app's
+    /// [`heliocentric_state_icrs`] bit for bit wherever the table it is given stands alone:
+    /// Table 1 just outside each band and deep inside, Table 2 just outside Table 1's window
+    /// and across its own, and the frozen-edge extrapolation, for every planet.
+    #[test]
+    fn table_state_is_the_apps_outside_the_bands() {
+        let one_day_cy = 1.0 / 36_525.0;
+        let epochs_cy = [
+            TABLE1_T_MIN + BAND_CY + one_day_cy,
+            -1.0,
+            0.0,
+            0.269, // ≈ 2026-11-20
+            TABLE1_T_MAX - BAND_CY - one_day_cy,
+            TABLE1_T_MIN - one_day_cy,
+            TABLE1_T_MAX + one_day_cy,
+            -30.0,
+            5.0,
+            TABLE2_T_MIN,
+            TABLE2_T_MAX,
+            -1e4,
+            1e4,
+        ];
+        for t_cy in epochs_cy {
+            let t = at_cy(t_cy);
+            let t_cy = t.julian_centuries();
+            assert_eq!(handover_weight(t_cy), None, "T {t_cy} is in a band");
+            for p in Planet::ALL {
+                assert_eq!(
+                    table_heliocentric_state_icrs(p, t, validity_at(t_cy)),
+                    heliocentric_state_icrs(p, t),
+                    "{p:?} at T {t_cy} ({:?})",
+                    validity_at(t_cy)
+                );
+            }
+        }
     }
 
     /// The evidence for [`ssb_fitted`] (A1 fix round 1, review I1). At the six 1800–2050 spots
@@ -902,10 +965,11 @@ mod tests {
     }
 
     /// Table 1 covers T ∈ [−2, 0.5] (1799-12-30 12h … 2050-01-01 0h TDB) inclusive, Table 2
-    /// T ∈ [−50, 10]. Prints how far each planet moves in 1 ms across the window edges: since
-    /// A1b's blend, its motion in 1 ms (the hard cut jumped up to 1.28e7 km, A1 report).
+    /// T ∈ [−50, 10]. Also prints how far each planet moves in the 1 ms across each end of
+    /// Table 1's window; before A1b's blend the hard cut jumped up to 1.28e7 km there (A1
+    /// report). The bound on that motion is asserted by [`handover_is_continuous`].
     #[test]
-    fn validity_windows_and_switch_jumps() {
+    fn validity_windows_and_handover_motion() {
         let at_t = |t_cy: f64| Epoch::from_days_since_j2000(t_cy * 36_525.0);
         assert_eq!(validity(Epoch::J2000), Validity::Table1);
         assert_eq!(validity(at_t(-2.0)), Validity::Table1);
@@ -933,7 +997,7 @@ mod tests {
                 let (r2, _) = heliocentric_state_icrs(p, t.add_seconds(outside));
                 let jump_m = (r2 - r1).length();
                 assert!(jump_m.is_finite());
-                println!("Table 1 ↔ 2 switch at {label}: {p:?} moves {jump_m:.3} m in 1 ms");
+                println!("Table 1 ↔ 2 handover at {label}: {p:?} moves {jump_m:.3} m in 1 ms");
             }
         }
     }
@@ -1060,6 +1124,9 @@ mod tests {
             .filter(|&jd| in_band(jd))
             .collect();
         assert_eq!(jds, [2_378_496.5, 2_469_807.5]);
+        // `validity()` still reports Table 1 across the bands (it names the window, not the
+        // blend), while the state at these two spots (w ≤ 1.3e-7) is Table 2's: hence Table 1
+        // as the expected validity against Table 2's error entries.
         check_against_horizons(
             in_band,
             Validity::Table1,
