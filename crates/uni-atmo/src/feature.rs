@@ -4,9 +4,9 @@
 //! intersects each atmosphere's shell, clips by the scene depth and the planet's ground, and
 //! marches the inscattered light (world light × the body's exposure, `scene_pre()` from 4 px
 //! on), writing `lens_mask.g = 1 − luminance(T)` and `lens_mask.a` = the star share 1 − w, both
-//! with `Max`. Two variants (review I7): dual-source blending (two pipelines,
-//! `atmosphere_dual.wgsl` + `atmosphere_mask.wgsl`) or grey transmittance (one pipeline,
-//! `atmosphere_grey.wgsl`).
+//! with `Max`. Two variants (review I7): dual-source blending (composite + mask pipelines,
+//! `atmosphere_dual.wgsl` + `atmosphere_mask.wgsl`) or grey transmittance (one composite
+//! pipeline, `atmosphere_grey.wgsl`); both march at half resolution first (`fs_march`, task B9p).
 //!
 //! **Exposure and star share (lead ruling B6 I1, task B10).** A body in the 1.5–4 px LOD band is
 //! drawn at pre = pre_mix(star_pre, scene_pre, w), the log-space blend star_pre^(1 − w)·
@@ -22,10 +22,21 @@
 //! subnormal that Metal could flush to 0; with the log blend the snap moves pre by less than
 //! 2⁻¹⁴·(EV_scene − EV_star) stops (0.0012 stop at a 19-stop gap).
 //!
-//! **Recorded deviation (frame contract):** a per-pixel march (32 steps, up to 48 on long limb
-//! paths) through Hillaire's transmittance and multiple-scattering LUTs, not his sky-view and
-//! aerial-perspective LUTs (design §5.1); those are the M2 upgrade. Ladder if over budget
-//! (3.0 ms): `g` from the LUT ratio, fewer steps, half resolution.
+//! **Recorded deviation (frame contract):** a view march through Hillaire's transmittance and
+//! multiple-scattering LUTs, not his sky-view and aerial-perspective LUTs (design §5.1); those are
+//! the M2 upgrade.
+//!
+//! **Performance ladder, all three steps applied (task B9p; budget 3.0 ms; the pass measured
+//! 11.2 ms at `earth-map-closeup`):**
+//! 1. The dual variant's `g` comes from the transmittance-LUT ratio, not a second march
+//!    ([`segment_transmittance_lut`]).
+//! 2. The march takes 16 steps, up to 24 on long limb paths (it took 32 and 48). The quality cost
+//!    is documented at `lut::VIEW_MARCH_STEPS`: a few % on a dawn limb's low red layer.
+//! 3. The march runs at half resolution; the composite upsamples where the samples share the
+//!    pixel's ray geometry and agree, and marches every other pixel exactly
+//!    ([`upsample_weights`]).
+//!
+//! Result: 2.6 ms there.
 //!
 //! **The shell follows the body's ellipsoid.** Each draw maps root axes into the body-fixed frame
 //! (`AtmoDraw::orient`) and scales it by R/(a, b, c) ([`atmosphere_frame`]), so the body's
@@ -45,8 +56,8 @@ use uni_gfx::{
 };
 
 use crate::lut::{
-    AtmosphereSet, March, cpu_luts, lut_transmittance, march_steps, ray_hits_ground, ray_sphere,
-    view_step_count,
+    AtmosphereSet, CpuLuts, March, cpu_luts, lut_transmittance, march_steps, ray_hits_ground,
+    ray_sphere, view_step_count,
 };
 use crate::params::AtmosphereParams;
 
@@ -327,23 +338,35 @@ pub fn segment_transmittance_lut(
         return Vec3::ONE;
     };
     let luts = cpu_luts(params);
-    let (o, e) = (ro + rd * t0, ro + rd * t1);
+    lut_ratio_transmittance(&luts, ro + rd * t0, rd, t1 - t0).as_vec3()
+}
+
+/// The LUT ratio itself, from the segment's start `o` (body-centred) along `d` for `len`
+/// metres, as `atmo_segment_lut_transmittance(o, d, len)` takes it (the probe compares the two
+/// on the same inputs).
+pub(crate) fn lut_ratio_transmittance(luts: &CpuLuts, o: DVec3, d: DVec3, len: f64) -> DVec3 {
+    let (num, den) = lut_ratio_parts(luts, o, d, len);
+    (num / den.max(DVec3::splat(1e-30))).min(DVec3::ONE)
+}
+
+/// The numerator and denominator of [`lut_ratio_transmittance`] (the probe scales its tolerance
+/// by the denominator: a LUT error ε moves the ratio by about ε·(1 + T)/den).
+pub(crate) fn lut_ratio_parts(luts: &CpuLuts, o: DVec3, d: DVec3, len: f64) -> (DVec3, DVec3) {
+    let dn = d.normalize_or_zero();
+    let e = o + d * len;
     let (r0, r1) = (o.length(), e.length());
-    let (mu0, mu1) = (o.dot(rd) / r0, e.dot(rd) / r1);
-    let (num, den) = if ray_hits_ground(params, r0, mu0) {
+    let (mu0, mu1) = (o.dot(dn) / r0, e.dot(dn) / r1);
+    if ray_hits_ground(luts.params(), r0, mu0) {
         (
-            lut_transmittance(&luts, r1, -mu1),
-            lut_transmittance(&luts, r0, -mu0),
+            lut_transmittance(luts, r1, -mu1),
+            lut_transmittance(luts, r0, -mu0),
         )
     } else {
         (
-            lut_transmittance(&luts, r0, mu0),
-            lut_transmittance(&luts, r1, mu1),
+            lut_transmittance(luts, r0, mu0),
+            lut_transmittance(luts, r1, mu1),
         )
-    };
-    (num / den.max(DVec3::splat(1e-30)))
-        .min(DVec3::ONE)
-        .as_vec3()
+    }
 }
 
 /// Disk-integrated reflectance of a body with this atmosphere over a uniform Lambert ground of
@@ -1525,6 +1548,59 @@ mod tests {
             segment_transmittance_lut(&p, DVec3::ZERO, DVec3::Y, f64::INFINITY),
             Vec3::ONE
         );
+    }
+
+    /// Ladder step 2's cost where it is largest: `earth-limb-dawn` (420 km up, looking at the
+    /// limb, the Sun 1.8° below it), the low red layer (tangent heights 1–12 km) and the high
+    /// blue arc (30–60 km), against a 1024-step reference, per channel relative to that channel.
+    /// Measured (B9p fix round 1):
+    /// - Low layer: 16–24 steps 0.3–3.9 % (R/B 0.6–3.5 % low), against 0.05–0.75 % at 32–48.
+    /// - High arc: 16–24 steps 0.19–0.57 %, against 0.06–0.15 % at 32–48.
+    ///
+    /// The captured `limb_arc_low` R/B went from 33.7 to 31.4.
+    #[test]
+    fn view_march_at_the_dawn_terminator() {
+        let p = earth();
+        let b = p.bottom_radius_m;
+        let luts = cpu_luts(&p);
+        let alt = 420e3;
+        let ro = DVec3::new(0.0, 0.0, b + alt);
+        let dip_limb = (b / (b + alt)).acos().to_degrees();
+        let sun = dir_elev(-(dip_limb + 1.8), 0.0);
+        for (h, view_tol, lut_tol) in [
+            (1e3, 0.05, 0.01),
+            (3e3, 0.05, 0.01),
+            (6e3, 0.05, 0.01),
+            (9e3, 0.05, 0.01),
+            (12e3, 0.05, 0.01),
+            (30e3, 0.01, 0.002),
+            (40e3, 0.01, 0.002),
+            (50e3, 0.01, 0.002),
+            (60e3, 0.01, 0.002),
+        ] {
+            let elev = -((b + h) / (b + alt)).acos().to_degrees();
+            let rd = dir_elev(elev, 0.0);
+            let (t0, t1) = segment_bounds(&p, ro, rd, f64::INFINITY).unwrap();
+            let (o, len) = (ro + rd * t0, t1 - t0);
+            let reference = march_steps(&luts, o, rd, 0.0, len, sun, 1024.0);
+            let rel = |m: March| {
+                ((m.inscatter - reference.inscatter).abs() / reference.inscatter).max_element()
+            };
+            let view = rel(march_steps(
+                &luts,
+                o,
+                rd,
+                0.0,
+                len,
+                sun,
+                view_step_count(&p, len),
+            ));
+            let lut = rel(crate::lut::march(&luts, o, rd, 0.0, len, sun));
+            assert!(
+                view <= view_tol && lut <= lut_tol,
+                "tangent height {h} m: 16–24 steps {view:.2e}, 32–48 steps {lut:.2e}"
+            );
+        }
     }
 
     /// The 32–48-step march (LUT passes, probes) is within 1 % of a 1024-step reference

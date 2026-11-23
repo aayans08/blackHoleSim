@@ -47,7 +47,17 @@ pub const MARCH_STEPS: f64 = 32.0;
 pub const MARCH_STEPS_LIMB: f64 = 48.0;
 /// Per-pixel view-march steps: 16, rising smoothly to 24 on long limb paths (plan fallback
 /// ladder, atmosphere step 2, task B9p: the pass measured 8.2 ms at `earth-map-closeup` with
-/// 32–48). `march_converges` gives the error against a 1024-step reference.
+/// 32–48).
+///
+/// **Quality cost, against a 1024-step reference.**
+/// - Most paths: under 1 % (`march_converges`), as at 32–48.
+/// - Where step 2 costs most, the low red layer of a dawn limb (`earth-limb-dawn`, tangent
+///   heights 1–12 km; `view_march_at_the_dawn_terminator`):
+///   - inscatter off by up to 3.9 % per channel, against 0.75 % at 32–48;
+///   - R/B up to 3.5 % low;
+///   - in the capture, `limb_arc_low` R/B 33.7 → 31.4 (the check needs ≥ 1.5), and up to 11
+///     code values on some 5 500 channels of that layer.
+/// - The high blue arc: 0.6 % (against 0.15 %).
 pub const VIEW_MARCH_STEPS: f64 = 16.0;
 /// See [`VIEW_MARCH_STEPS`].
 pub const VIEW_MARCH_STEPS_LIMB: f64 = 24.0;
@@ -1081,6 +1091,24 @@ mod tests {
             layer2_extinction: Vec3::ZERO,
             ..earth()
         }
+    }
+
+    /// The WGSL step counts are the Rust ones: the view march's 16/24 (`atmosphere_common.wgsl`
+    /// `ATMO_VIEW_MARCH_STEPS(_LIMB)`, ladder step 2) and the LUT passes' 32/48, so
+    /// `segment_radiance` and the pass cannot drift apart (B9p review I1).
+    #[test]
+    fn march_step_constants_match_wgsl() {
+        let src = include_str!("../shaders/atmosphere_common.wgsl");
+        for (name, value) in [
+            ("ATMO_MARCH_STEPS", MARCH_STEPS),
+            ("ATMO_MARCH_STEPS_LIMB", MARCH_STEPS_LIMB),
+            ("ATMO_VIEW_MARCH_STEPS", VIEW_MARCH_STEPS),
+            ("ATMO_VIEW_MARCH_STEPS_LIMB", VIEW_MARCH_STEPS_LIMB),
+        ] {
+            let line = format!("const {name}: f32 = {:?};", value as f32);
+            assert_eq!(src.matches(line.as_str()).count(), 1, "{line}");
+        }
+        assert!(src.contains("return atmo_step_count_between(len, ATMO_VIEW_MARCH_STEPS, ATMO_VIEW_MARCH_STEPS_LIMB);"));
     }
 
     /// Earth Rayleigh only, r = bottom, μ = 1: T = exp(−β·H·(1 − e^{−100 km/H})) ±1e-4.
