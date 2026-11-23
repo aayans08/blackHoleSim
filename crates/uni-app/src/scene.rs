@@ -307,6 +307,8 @@ pub struct Scene {
     pub hdr_tap: HdrTap,
     /// The HDR tap right after the meter (world light only, for `lit_px`).
     pub world_tap: HdrTap,
+    /// The frame tag (sustained bench only; [`crate::tap::FrameTag`]).
+    pub frame_tag: crate::tap::FrameTag,
 }
 
 impl Scene {
@@ -469,6 +471,12 @@ impl Scene {
         let (hdr_tap, hdr_tap_pass) =
             HdrTap::new(gpu, crate::tap::TAP_PREBLOOM).context("creating the pre-bloom HDR tap")?;
 
+        // 0: the clear mark and the bench's frame tag (B9t; uni-app's own, untimed work: none).
+        renderer.push(Box::new(
+            crate::tap::ClearMark::new(gpu).context("creating the clear mark")?,
+        ));
+        let (frame_tag, frame_tag_pass) = crate::tap::FrameTag::new();
+        renderer.push(Box::new(frame_tag_pass));
         renderer.push(Box::new(resolve));
         renderer.push(Box::new(band_cube));
         renderer.push(Box::new(background));
@@ -509,6 +517,7 @@ impl Scene {
             notices,
             hdr_tap,
             world_tap,
+            frame_tag,
         })
     }
 
@@ -989,12 +998,20 @@ fn checked_view(name: &str, v: &CameraView) -> anyhow::Result<CameraView> {
     }
 }
 
-/// Per-pass GPU durations from the timer's per-pass values, which on Metal are effectively
-/// cumulative end stamps (B4L report §5: a render pass is sampled from the start of its vertex
-/// stage, which runs ahead, to the end of its fragment stage; lead ruling: report the
-/// differences of consecutive stamps). Pass i's duration is its stamp minus the latest valid
-/// stamp before it (0 for the first), floored at 0 where passes overlapped; an invalid stamp
-/// stays `None` ("n/a", JSON `null`) and does not move the running stamp.
+/// Per-pass GPU durations from per-pass **end times on the frame's origin** (lead ruling 7, the
+/// timeline B9p measured with): pass i's duration is its end minus the latest valid end before
+/// it (0 for the first, the frame's start), floored at 0 where passes overlapped; an invalid
+/// end stays `None` ("n/a", JSON `null`) and does not move the running end. The durations then
+/// sum to the last pass's end, the frame time less the closing bracket.
+///
+/// B9t found why the bench's per-pass numbers summed to only 50–65 % of `gpu_frame_ms`, with
+/// compute passes at 0 (bloom 0.00): the timer (uni-gfx `PassTimer`) reports each pass's own
+/// span, end − begin, not its end. A render pass's span starts at its vertex stage, which on
+/// Metal runs ahead of the passes before it, so it is roughly cumulative; a compute pass's span
+/// is exact (start and end of its encoder). Differencing spans therefore floors every compute
+/// pass, and the render passes after them, to 0. [`pass_times`] picks the timer's values; until
+/// uni-gfx reports end times (`GpuTimings::pass_end_ms`, the lead's change, task-B9g-report.md
+/// "Fix round 1 + B9t"), it passes the spans and the per-pass numbers keep that defect.
 pub fn pass_durations(stamps: &[(&'static str, Option<f32>)]) -> Vec<(&'static str, Option<f32>)> {
     let mut prev = 0.0_f32;
     stamps
@@ -1025,6 +1042,22 @@ pub fn duplicate_pass_names(timings: &[(&'static str, Option<f32>)]) -> Vec<Stri
         .collect()
 }
 
+/// The timer values [`pass_durations`] takes from a frame's timings: each pass's end time on the
+/// frame's origin once uni-gfx reports it (`&t.pass_end_ms`); today the spans, `&t.passes`
+/// (see [`pass_durations`]). The one place the HUD, the capture JSON and the bench read them.
+pub fn pass_times(t: &uni_gfx::GpuTimings) -> &[(&'static str, Option<f32>)] {
+    &t.passes
+}
+
+/// The latest frame's per-pass GPU durations ([`pass_durations`] of [`pass_times`]); empty
+/// without timings.
+pub fn frame_durations(renderer: &Renderer) -> Vec<(&'static str, Option<f32>)> {
+    renderer
+        .gpu_timings()
+        .map(|t| pass_durations(pass_times(t)))
+        .unwrap_or_default()
+}
+
 /// Frame timings for the HUD.
 pub struct Perf {
     pub fps: f32,
@@ -1042,7 +1075,7 @@ impl Perf {
         Self {
             fps,
             cpu_ms,
-            gpu_ms: pass_durations(&renderer.gpu_ms()),
+            gpu_ms: frame_durations(renderer),
             gpu_frame_ms: renderer.gpu_frame_ms(),
             gpu_timing_available: gpu.has_timestamps(),
         }
@@ -1399,7 +1432,8 @@ mod tests {
     /// test below: `gpu_ms` in the capture JSON is keyed by label, so two passes with one label
     /// would share one entry. A tap times its copy only on the frames it is armed for (captures).
     /// The live check is `duplicate_pass_names` on the timer's own list, run on every capture.
-    const TIMED_PASSES: [&str; 18] = [
+    const TIMED_PASSES: [&str; 19] = [
+        crate::tap::CLEAR_MARK,
         "exposure",
         "band-update",
         "background",
@@ -1419,6 +1453,60 @@ mod tests {
         "bloom composite",
         "tonemap",
     ];
+
+    /// B9t (a): on a frame laid out as Metal samples it (render spans begin at their vertex
+    /// stage, early, right after the previous pass began; compute spans are exact; an untimed
+    /// clear first), durations from end times sum to the frame within 5 %, while differences of
+    /// spans floor the compute passes (bloom) to 0 and sum to well under the frame, the 50–65 %
+    /// B9p measured. Times in ms; the frame starts at 0.
+    #[test]
+    fn durations_from_end_times_sum_to_the_frame() {
+        // (label, compute?, own work [ms]); the clear (0.4 ms) is untimed but marked.
+        let passes = [
+            ("clear targets", true, 0.4),
+            ("exposure", true, 0.02),
+            ("sun", false, 0.3),
+            ("bodies", false, 0.8),
+            ("atmosphere", false, 1.2),
+            ("atmosphere composite", false, 0.9),
+            ("atmosphere mask", false, 0.4),
+            ("histogram", true, 0.3),
+            ("band", false, 0.55),
+            ("stars", false, 1.1),
+            ("points", false, 0.05),
+            ("bloom", true, 0.8),
+            ("bloom composite", false, 0.3),
+            ("tonemap", false, 0.26),
+        ];
+        let (mut t, mut prev_begin) = (0.0_f32, 0.0_f32);
+        let (mut spans, mut ends) = (Vec::new(), Vec::new());
+        for (label, compute, work) in passes {
+            let begin = if compute { t } else { prev_begin };
+            let end = t + work;
+            spans.push((label, Some(end - begin)));
+            ends.push((label, Some(end)));
+            prev_begin = begin.max(t - 0.01);
+            t = end;
+        }
+        let frame_ms = t + 0.01;
+        let sum = |d: &[(&str, Option<f32>)]| d.iter().filter_map(|p| p.1).sum::<f32>();
+        let from_ends = pass_durations(&ends);
+        let from_spans = pass_durations(&spans);
+        assert!(
+            (sum(&from_ends) / frame_ms - 1.0).abs() < 0.05,
+            "{from_ends:?}"
+        );
+        for ((label, d), (_, _, work)) in from_ends.iter().zip(passes) {
+            assert!((d.unwrap() - work).abs() < 1e-4, "{label}: {d:?} vs {work}");
+        }
+        let bloom = from_spans.iter().find(|p| p.0 == "bloom").unwrap().1;
+        assert_eq!(bloom, Some(0.0), "span differences floor a compute pass");
+        assert!(
+            sum(&from_spans) / frame_ms < 0.7,
+            "{}",
+            sum(&from_spans) / frame_ms
+        );
+    }
 
     /// Review B9 r0 Important 1: each armed tap is its own timed span, named "tap-world" and
     /// "tap-prebloom", right after the meter and right before bloom, and every timer label of

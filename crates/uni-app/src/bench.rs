@@ -12,15 +12,21 @@
 //!   its GPU timings are read back before the next one starts. `frame_ms` is the serial cost
 //!   (CPU + GPU + the submit/wait round trip), an upper bound on the window's frame time.
 //! - **Sustained** (`--sustained s`): each bookmark renders continuously for `s` seconds with up
-//!   to two frames in flight, as the window does; GPU timings are collected without blocking.
+//!   to two frames in flight, as the window does (warm-up frames too); GPU timings are collected
+//!   without blocking. Each frame carries a frame tag (`crate::tap::FrameTag`), so a timing
+//!   record, which arrives frames later, is attached to the frame it came from (B9t; review B9
+//!   r0 minor 9: records were attached to the oldest frame without one, so when the timer's ring
+//!   dropped records the backlog grew and the last 10 s got none). A frame whose record the
+//!   timer dropped has no GPU numbers; its interval and CPU time still count.
 //!   `interval_ms` is the time between consecutive frame starts (the frame rate the window would
 //!   reach), `frame_ms` a frame's latency from its start to the GPU finishing it. The M3 Air is
 //!   fanless, so the first and the last 10 s are reported apart (plan "Performance budget").
 //!
 //! Every frame records: `cpu_ms` (snapshot, inputs and encode), `snapshot_cpu_ms`
 //! (`World::snapshot`), `gpu_frame_ms` (the timer's frame brackets), and per pass the GPU
-//! **duration** (`scene::pass_durations`: differences of the timer's stamps; invalid ones stay
-//! `null`, never 0, review I5). `comets_cpu_ms` is `null`: no comet tails are drawn before Wave C.
+//! **duration** (`scene::pass_durations` of `scene::pass_times`; invalid ones stay `null`, never
+//! 0, review I5). Each window also gives `pass_sum_ms`, the per-frame sum of the valid
+//! durations, to set against `gpu_frame_ms` (B9t: the sum should be within 5 % of the frame). `comets_cpu_ms` is `null`: no comet tails are drawn before Wave C.
 //! Windows `all`, `first10s` and `last10s` are cut by the time since the bookmark's first measured
 //! frame; a window with no frame is `null`.
 
@@ -35,7 +41,9 @@ use uni_gfx::{CAPTURE_FORMAT, CaptureTarget};
 use crate::capture::{CaptureError, headless_gpu, load_world, ms_or_na, submit_and_wait};
 use crate::scene::{
     INTERACTIVE_LENS_SCALE, Scene, StarCatalog, apply_bookmark, default_controls, pass_durations,
+    pass_times,
 };
+use crate::tap::{FRAME_TAG_COUNT, frame_tag_of};
 
 /// Default internal resolution of a bench run (design §6, "1080p internal").
 pub const DEFAULT_SIZE: UVec2 = UVec2::new(1920, 1080);
@@ -118,6 +126,8 @@ pub struct WindowStats {
     pub gpu_frame_ms: Option<Stats>,
     pub cpu_ms: Option<Stats>,
     pub passes: BTreeMap<String, PassStats>,
+    /// Per frame, the sum of its valid pass durations [ms] (B9t: against `gpu_frame_ms`).
+    pub pass_sum_ms: Option<Stats>,
     pub snapshot_cpu_ms: Option<Stats>,
     pub comets_cpu_ms: Option<Stats>,
 }
@@ -158,9 +168,44 @@ fn window(samples: &[&Sample]) -> Option<WindowStats> {
                 )
             })
             .collect(),
+        pass_sum_ms: stats(&col(&|s| {
+            s.passes
+                .as_ref()
+                .map(|p| p.iter().filter_map(|&(_, ms)| ms).sum())
+        })),
         snapshot_cpu_ms: stats(&col(&|s| Some(s.snapshot_cpu_ms))),
         comets_cpu_ms: None,
     })
+}
+
+/// A timing record's frame tag (`crate::tap::FrameTag`) and its passes without the tag.
+fn split_tag(
+    passes: &[(&'static str, Option<f32>)],
+) -> (Option<usize>, Vec<(&'static str, Option<f32>)>) {
+    let tag = passes.iter().find_map(|(l, _)| frame_tag_of(l));
+    let rest = passes
+        .iter()
+        .filter(|(l, _)| frame_tag_of(l).is_none())
+        .copied()
+        .collect();
+    (tag, rest)
+}
+
+/// Sustained mode: attaches a timing record (its `pass_times` and frame time) to the frame its
+/// tag names (`tag_sample[tag]`, the sample index of the last measured frame rendered with that
+/// tag), unless that frame has one already. Returns the sample it went to.
+fn attach_by_tag(
+    samples: &mut [Sample],
+    tag_sample: &[Option<usize>; FRAME_TAG_COUNT],
+    times: &[(&'static str, Option<f32>)],
+    frame_ms: Option<f32>,
+) -> Option<usize> {
+    let (tag, passes) = split_tag(times);
+    let i = tag_sample[tag?]?;
+    let s = samples.get_mut(i).filter(|s| s.passes.is_none())?;
+    s.gpu_frame_ms = frame_ms;
+    s.passes = Some(pass_durations(&passes));
+    Some(i)
 }
 
 /// One bookmark's result.
@@ -205,6 +250,11 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
     let (gm, gp) = pick(w.gpu_frame_ms);
     let (cm, cp) = pick(w.cpu_ms);
     let (sm, _) = pick(w.snapshot_cpu_ms);
+    let (psm, _) = pick(w.pass_sum_ms);
+    let share = match (psm, gm) {
+        (Some(p), Some(g)) if g > 0.0 => format!(" ({:.0} % of the GPU frame)", 100.0 * p / g),
+        _ => String::new(),
+    };
     let fps = w
         .interval_ms
         .or(w.frame_ms)
@@ -228,7 +278,7 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
     format!(
         "bench {} ({}×{}, {} frames, lens scale {}): frame {} ms mean, {} ms p95; interval {} \
          ms mean, {} ms p95 ({fps} fps); GPU frame {} ms mean, {} ms p95; CPU {} ms mean, {} ms \
-         p95 (snapshot {} ms)\n  GPU passes (mean duration ms): {passes}",
+         p95 (snapshot {} ms)\n  GPU passes (mean duration ms): {passes}; sum {} ms{share}",
         r.name,
         size.x,
         size.y,
@@ -243,6 +293,7 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
         ms_or_na(cm),
         ms_or_na(cp),
         ms_or_na(sm),
+        ms_or_na(psm),
     )
 }
 
@@ -276,9 +327,16 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
         world.sim.settle_comets();
         scene.set_lens_scale(controls.lens_scale);
         let mut samples: Vec<Sample> = Vec::new();
-        // Submitted frames still waiting for their GPU timings: (sample index, timer seq floor).
-        let mut in_flight: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, Instant)> =
-            std::collections::VecDeque::new();
+        // Submitted frames not yet finished: (sample index for a measured frame, submission,
+        // start).
+        let mut in_flight: std::collections::VecDeque<(
+            Option<usize>,
+            wgpu::SubmissionIndex,
+            Instant,
+        )> = std::collections::VecDeque::new();
+        // The measured frame each frame tag was last rendered with (sustained mode).
+        let mut tag_sample: [Option<usize>; FRAME_TAG_COUNT] = [None; FRAME_TAG_COUNT];
+        let sustained = args.sustained_s.is_some();
         let mut last_seq = scene.renderer.gpu_timings().map(|t| t.seq);
         let mut bench_start: Option<Instant> = None;
         let mut prev_start: Option<Instant> = None;
@@ -293,6 +351,8 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                 }
             }
             let start = Instant::now();
+            let tag = (frame_index % FRAME_TAG_COUNT as u64) as usize;
+            scene.frame_tag.set(sustained.then_some(tag));
             world.advance(BENCH_DT_S);
             let frame = scene.prepare(
                 &world,
@@ -320,6 +380,7 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                 });
                 samples.len() - 1
             });
+            tag_sample[tag] = sample_index;
             prev_start = measuring.then_some(start);
             if args.sustained_s.is_none() {
                 // Serial: wait for this frame and read its timings back before the next.
@@ -331,18 +392,17 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                 if let (Some(i), Some(t)) = (sample_index, t.filter(|t| Some(t.seq) != last_seq)) {
                     samples[i].frame_ms = Some(done);
                     samples[i].gpu_frame_ms = t.frame_ms;
-                    samples[i].passes = Some(pass_durations(&t.passes));
+                    samples[i].passes = Some(pass_durations(&split_tag(pass_times(t)).1));
                 } else if let Some(i) = sample_index {
                     samples[i].frame_ms = Some(done);
                 }
                 last_seq = scene.renderer.gpu_timings().map(|t| t.seq);
                 continue;
             }
-            // Sustained: keep at most FRAMES_IN_FLIGHT frames on the GPU.
+            // Sustained: keep at most FRAMES_IN_FLIGHT frames on the GPU, warm-up frames too
+            // (review B9 r0 minor 9).
             let idx = gpu.queue.submit(std::iter::once(cmd));
-            if let Some(i) = sample_index {
-                in_flight.push_back((i, idx, start));
-            }
+            in_flight.push_back((sample_index, idx, start));
             while in_flight.len() >= FRAMES_IN_FLIGHT {
                 let Some((i, idx, s)) = in_flight.pop_front() else {
                     break;
@@ -353,31 +413,41 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                         timeout: None,
                     })
                     .context("waiting for a bench frame")?;
-                samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+                if let Some(i) = i {
+                    samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+                }
             }
             let errors = gpu.take_errors();
             if !errors.is_empty() {
                 return Err(anyhow::anyhow!("bench {:?}: {}", b.name, errors.join("; ")).into());
             }
             // Timings arrive a few frames late (read without blocking in `render`): attach each
-            // new record to the oldest measured frame still without one.
+            // new record to the frame its tag names.
             if let Some(t) = scene.renderer.gpu_timings()
                 && Some(t.seq) != last_seq
             {
                 last_seq = Some(t.seq);
-                if let Some(s) = samples.iter_mut().find(|s| s.passes.is_none()) {
-                    s.gpu_frame_ms = t.frame_ms;
-                    s.passes = Some(pass_durations(&t.passes));
-                }
+                attach_by_tag(&mut samples, &tag_sample, pass_times(t), t.frame_ms);
             }
         }
-        // Drain what is still in flight.
+        // Drain what is still in flight, and collect the newest record.
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .context("draining the bench frames")?;
         for (i, _, s) in in_flight.drain(..) {
-            samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+            if let Some(i) = i {
+                samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+            }
         }
+        if sustained {
+            scene.renderer.poll_timings(&gpu);
+            if let Some(t) = scene.renderer.gpu_timings()
+                && Some(t.seq) != last_seq
+            {
+                attach_by_tag(&mut samples, &tag_sample, pass_times(t), t.frame_ms);
+            }
+        }
+        scene.frame_tag.set(None);
         let result = BookmarkResult {
             name: b.name.clone(),
             lens_scale: scene.lens_scale(),
@@ -473,6 +543,78 @@ mod tests {
         assert_eq!(v["comets_cpu_ms"], serde_json::Value::Null);
         assert_eq!(v["interval_ms"]["count"], 299);
         assert!(windows(&[])["all"].is_none());
+    }
+
+    /// B9t (d), review B9 r0 minor 9: sustained records attach to the frame their tag names.
+    /// 600 measured frames (10 s at 60 fps, then 10 s more), the timer's ring keeping only every
+    /// other record and each arriving 3 frames late: every record lands on its own frame, the
+    /// last 10 s get half their frames timed, and no frame gets another frame's numbers. The
+    /// old rule (the oldest frame without a record) piles every record onto the first frames
+    /// and leaves the last 10 s with none, the "no valid GPU timing" B9 and B9p saw.
+    #[test]
+    fn sustained_records_attach_to_their_own_frames() {
+        let n = 1_200;
+        let mut samples: Vec<Sample> = (0..n)
+            .map(|i| sample(f64::from(i) / 60.0, 16.0, None))
+            .collect();
+        let mut old_rule = samples.clone();
+        let mut tag_sample = [None; FRAME_TAG_COUNT];
+        // A record: (pass times, frame time), both naming the frame by value.
+        let record = |frame: u32| {
+            let ms = f32::from(u16::try_from(frame).unwrap());
+            let times = vec![
+                (
+                    crate::tap::FRAME_TAGS[frame as usize % FRAME_TAG_COUNT],
+                    None,
+                ),
+                ("bloom", Some(ms)),
+            ];
+            (times, Some(ms))
+        };
+        for frame in 0..n {
+            tag_sample[frame as usize % FRAME_TAG_COUNT] = Some(frame as usize);
+            // Frame `frame − 3`'s record arrives now, if the ring kept it (even frames).
+            if frame >= 3 && (frame - 3) % 2 == 0 {
+                let (times, ms) = record(frame - 3);
+                assert_eq!(
+                    attach_by_tag(&mut samples, &tag_sample, &times, ms),
+                    Some((frame - 3) as usize)
+                );
+                if let Some(s) = old_rule.iter_mut().find(|s| s.passes.is_none()) {
+                    s.gpu_frame_ms = ms;
+                    s.passes = Some(pass_durations(&times));
+                }
+            }
+        }
+        for (i, s) in samples.iter().enumerate() {
+            match s.gpu_frame_ms {
+                Some(ms) => assert_eq!(ms, i as f32, "frame {i} got another frame's record"),
+                None => assert!(i % 2 == 1 || i + 3 >= n as usize, "frame {i}"),
+            }
+            if let Some(p) = &s.passes {
+                assert!(
+                    p.iter().all(|(l, _)| frame_tag_of(l).is_none()),
+                    "tag left in"
+                );
+            }
+        }
+        let w = windows(&samples);
+        let last = w["last10s"].as_ref().unwrap();
+        assert!(
+            last.gpu_frame_ms.unwrap().count >= 290,
+            "{:?}",
+            last.gpu_frame_ms
+        );
+        let old = windows(&old_rule);
+        assert!(old["last10s"].as_ref().unwrap().gpu_frame_ms.is_none());
+        // A record whose frame has one already, or a tag no frame carries, attaches nowhere.
+        let (times, ms) = record(n - 4);
+        assert_eq!(attach_by_tag(&mut samples, &tag_sample, &times, ms), None);
+        let untagged = [("bloom", Some(1.0))];
+        assert_eq!(
+            attach_by_tag(&mut samples, &[None; FRAME_TAG_COUNT], &untagged, Some(1.0)),
+            None
+        );
     }
 
     /// The JSON is B8's reader schema: `{size, frames, sustained_s, bookmarks: [{name,

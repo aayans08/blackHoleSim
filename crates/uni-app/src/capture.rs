@@ -35,7 +35,7 @@ use uni_ui::Hud;
 use crate::measure::{self, Measurements};
 use crate::scene::{
     CAPTURE_LENS_SCALE, Frame, Perf, Scene, StarCatalog, ViewChoices, apply_bookmark,
-    default_controls, hud_data, pass_durations,
+    default_controls, frame_durations, hud_data,
 };
 use crate::world::{self, Assets, World, baked_dir, iso_utc};
 
@@ -247,7 +247,12 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         let mut settle_frames = 0;
         let mut settled = true;
         let last = if auto {
-            let min = args.frames.saturating_sub(MANUAL_FRAMES).max(2);
+            // At most MAX_SETTLE_FRAMES, or a long --frames would never let it settle (review
+            // B9g r0 minor 4).
+            let min = args
+                .frames
+                .saturating_sub(MANUAL_FRAMES)
+                .clamp(2, MAX_SETTLE_FRAMES);
             let mut prev: Option<[f32; 2]> = None;
             settled = false;
             for i in 0..MAX_SETTLE_FRAMES {
@@ -366,13 +371,12 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         if !settled {
             notes.push(unsettled_note());
         }
-        let timings = scene.renderer.gpu_ms();
-        notes.extend(crate::scene::duplicate_pass_names(&timings));
+        notes.extend(crate::scene::duplicate_pass_names(&scene.renderer.gpu_ms()));
         let metrics = CaptureMetrics {
             name: b.name.clone(),
             width: target.size.x,
             height: target.size.y,
-            gpu_ms: pass_durations(&timings)
+            gpu_ms: frame_durations(&scene.renderer)
                 .into_iter()
                 .map(|(pass, ms)| (pass.to_owned(), ms))
                 .collect(),

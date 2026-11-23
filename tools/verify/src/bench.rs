@@ -14,7 +14,9 @@
 //!
 //! `--budgets` also flags every pass whose mean in the window exceeds 1.25 × its budget in the
 //! plan's per-pass table ([`PASS_BUDGETS_MS`], compiled in), and the two CPU sub-budgets
-//! ([`CPU_BUDGETS_MS`]). A pass that ran but never timed validly is flagged as unmeasured; one
+//! ([`CPU_BUDGETS_MS`]). A feature timed as several passes is budgeted as their sum
+//! ([`FEATURE_PASSES`], B9t: the atmosphere's march, composite and mask; the bloom's pyramid,
+//! downsample and upsample in one compute pass, and its composite); its parts are listed. A pass that ran but never timed validly is flagged as unmeasured; one
 //! that did not run, or has no budget (the lens, the M0 debug grid), is listed and not flagged.
 //! Any flag fails the run, since the gate turns each into a perf-fix task.
 
@@ -94,7 +96,9 @@ pub const PASS_BUDGETS_MS: &[(&str, f64)] = &[
     ("comets", 0.5),
     ("atmosphere", 3.0),
     ("histogram", 0.3),
-    ("band", 0.3),
+    // Lead ruling "band budget" (Wave B gate): re-baselined 0.3 → 0.6 ms, the measured floor
+    // of a full-screen pass on the M3 (≈ 0.34 ms) plus the faithful band's own work (≈ 0.55).
+    ("band", 0.6),
     ("stars", 2.5),
     ("points", 0.2),
     ("asteroids", 1.0),
@@ -102,6 +106,26 @@ pub const PASS_BUDGETS_MS: &[(&str, f64)] = &[
     ("tonemap", 0.6),
     ("hud", 0.5),
 ];
+
+/// Features the renderer times as several passes, budgeted together under the first name's
+/// budget (B9t): (budget key, the timer labels that make it up). uni-atmo's half-resolution
+/// march (task B9p) is "atmosphere" + "atmosphere composite" + "atmosphere mask"; uni-post's
+/// bloom is "bloom" (the pyramid: every downsample and upsample dispatch, one compute pass) +
+/// "bloom composite".
+pub const FEATURE_PASSES: &[(&str, &[&str])] = &[
+    (
+        "atmosphere",
+        &["atmosphere", "atmosphere composite", "atmosphere mask"],
+    ),
+    ("bloom", &["bloom", "bloom composite"]),
+];
+
+/// The feature that pass `name` is a part of, if any.
+fn feature_of(name: &str) -> Option<&'static (&'static str, &'static [&'static str])> {
+    FEATURE_PASSES
+        .iter()
+        .find(|(_, parts)| parts.contains(&name))
+}
 
 /// CPU sub-budgets per frame [ms] (plan "Performance budget", ruling 3): the World snapshot and
 /// the comet tails, keyed by their bench JSON fields.
@@ -244,7 +268,51 @@ fn budget_line(what: &str, mean: f64, budget: f64) -> (String, bool) {
 /// The budget lines of one window, each with whether it is flagged.
 pub(crate) fn budget_lines(win: &BenchWindow) -> Vec<(String, bool)> {
     let mut lines = Vec::new();
+    for (feature, parts) in FEATURE_PASSES {
+        let ran: Vec<(&str, &PassStats)> = parts
+            .iter()
+            .filter_map(|p| win.passes.get(*p).map(|s| (*p, s)))
+            .filter(|(_, s)| s.runs.unwrap_or(0.0) > 0.0)
+            .collect();
+        let Some(budget) = budget_ms(feature) else {
+            continue;
+        };
+        if ran.is_empty() {
+            continue;
+        }
+        let means: Vec<Option<f64>> = ran
+            .iter()
+            .map(|(_, s)| {
+                s.mean
+                    .filter(|m| m.is_finite() && s.valid.unwrap_or(0.0) > 0.0)
+            })
+            .collect();
+        let names = ran.iter().map(|(p, _)| *p).collect::<Vec<_>>().join(" + ");
+        lines.push(if means.iter().all(Option::is_some) {
+            let sum = means.iter().flatten().sum();
+            budget_line(&format!("feature {feature} ({names})"), sum, budget)
+        } else {
+            (
+                format!(
+                    "  feature {feature} ({names}): a part has no valid timing, budget {budget} \
+                     ms: OVER BUDGET (unmeasured)"
+                ),
+                true,
+            )
+        });
+    }
     for (pass, stats) in &win.passes {
+        if let Some((feature, _)) = feature_of(pass) {
+            let mean = stats.mean.filter(|m| m.is_finite());
+            lines.push((
+                format!(
+                    "  pass {pass}: mean {} (part of feature {feature})",
+                    mean.map_or_else(|| "n/a".to_owned(), |m| format!("{m:.3} ms"))
+                ),
+                false,
+            ));
+            continue;
+        }
         let runs = stats.runs.unwrap_or(0.0);
         let valid = stats.valid.unwrap_or(0.0);
         let mean = stats.mean.filter(|m| m.is_finite() && valid > 0.0);
@@ -495,15 +563,70 @@ mod tests {
     #[test]
     fn budget_table_matches_the_plan() {
         // Plan "Performance budget": the budgeted passes sum to 12.35 ms (band-update counted
-        // at 0 steady, the HUD at 0.5).
+        // at 0 steady, the HUD at 0.5), 12.65 ms since the lead's band re-baseline (0.3 → 0.6).
         let sum: f64 = PASS_BUDGETS_MS
             .iter()
             .filter(|(name, _)| *name != "band-update")
             .map(|(_, ms)| ms)
             .sum();
-        assert!((sum - 12.35).abs() < 1e-9, "{sum}");
+        assert!((sum - 12.65).abs() < 1e-9, "{sum}");
+        assert_eq!(budget_ms("band"), Some(0.6));
         assert_eq!(budget_ms("bodies"), Some(1.5));
         assert_eq!(budget_ms("lens"), None);
+    }
+
+    /// B9t (c): a feature timed as several passes is judged on their sum, and each part is
+    /// listed without a budget of its own: the atmosphere's march 1.3 + composite 0.9 + mask
+    /// 0.45 = 2.65 ms is within 1.25 × 3.0 ms though the march alone would read 1.3; the bloom's
+    /// pyramid 0.6 + composite 0.8 = 1.4 ms is over 1.25 × 1.0 ms, which the pyramid alone
+    /// (0.6) would hide.
+    #[test]
+    fn features_are_budgeted_with_all_their_passes() {
+        let win: BenchWindow = serde_json::from_str(
+            r#"{"passes": {
+                "atmosphere": {"mean": 1.3, "valid": 10, "runs": 10},
+                "atmosphere composite": {"mean": 0.9, "valid": 10, "runs": 10},
+                "atmosphere mask": {"mean": 0.45, "valid": 10, "runs": 10},
+                "bloom": {"mean": 0.6, "valid": 10, "runs": 10},
+                "bloom composite": {"mean": 0.8, "valid": 10, "runs": 10},
+                "tonemap": {"mean": 0.26, "valid": 10, "runs": 10}
+            }}"#,
+        )
+        .expect("window");
+        let lines = budget_lines(&win);
+        let find = |what: &str| {
+            lines
+                .iter()
+                .find(|(l, _)| l.contains(what))
+                .unwrap_or_else(|| panic!("{what}: {lines:#?}"))
+        };
+        let (atmo, flagged) = find("feature atmosphere");
+        assert!(!flagged && atmo.contains("2.650"), "{atmo}");
+        assert!(atmo.contains("atmosphere + atmosphere composite + atmosphere mask"));
+        let (bloom, flagged) = find("feature bloom");
+        assert!(*flagged && bloom.contains("1.400"), "{bloom}");
+        let (part, flagged) = find("pass atmosphere composite");
+        assert!(
+            !flagged && part.contains("part of feature atmosphere"),
+            "{part}"
+        );
+        let (part, flagged) = find("pass bloom:");
+        assert!(!flagged && part.contains("part of feature bloom"), "{part}");
+        assert!(!find("pass tonemap").1);
+        assert_eq!(lines.iter().filter(|(_, f)| *f).count(), 1);
+        // A part without a valid timing makes the feature unmeasured.
+        let mut win = win;
+        if let Some(s) = win.passes.get_mut("atmosphere mask") {
+            s.valid = Some(0.0);
+            s.mean = None;
+        }
+        let lines = budget_lines(&win);
+        assert!(
+            lines
+                .iter()
+                .any(|(l, f)| *f && l.contains("feature atmosphere") && l.contains("unmeasured")),
+            "{lines:#?}"
+        );
     }
 
     #[test]
