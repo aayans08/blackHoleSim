@@ -1,6 +1,7 @@
 //! Photometry (M1 Task A3): asteroid H, G magnitudes (Bowell et al. 1989), comet total
-//! magnitudes, Lambert and lunar-Lambert (McEwen 1991) reflectance, disk illuminance, and star
-//! radii from bolometric corrections (Torres 2010).
+//! magnitudes, Lambert and lunar-Lambert (McEwen 1991) reflectance, disk illuminance, the
+//! planets' observed phase curves (Mallama & Hilton 2018) as a correction to those BRDFs, and
+//! star radii from bolometric corrections (Torres 2010).
 //!
 //! Radiance convention (shared with `body.wgsl`): a surface of normal reflectance ρ lit by an
 //! illuminance E☉ at normal incidence has radiance L = ρ · [`reflectance`](μ₀, μ) · E☉/π, where
@@ -12,6 +13,8 @@
 use std::f64::consts::{FRAC_PI_2, PI};
 
 use uni_core::L_SUN_W;
+
+use crate::NaifId;
 
 /// A surface reflectance model.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +162,150 @@ pub fn disk_illuminance_lux(
     let integral = sum * d_theta * d_phi;
     let ratio = radius_m / dist_m;
     albedo * sun_lux / PI * ratio * ratio * integral
+}
+
+/// Lommel–Seeliger sphere phase function Φ(α) = 1 − sin(α/2) tan(α/2) ln cot(α/4), relative to
+/// α = 0 (Fairbairn 2005, JRASC 99, 92). `a` is unsigned and at most π, where Φ = 0.
+fn lommel_seeliger_phase(a: f64) -> f64 {
+    if a == 0.0 {
+        return 1.0; // the 0 · ∞ limit of the closed form
+    }
+    if a >= PI {
+        return 0.0;
+    }
+    let h = 0.5 * a;
+    (1.0 - h.sin() * h.tan() * (1.0 / (0.25 * a).tan()).ln()).max(0.0)
+}
+
+/// Disk-integrated phase function of a sphere with this BRDF, relative to α = 0 (closed form).
+///
+/// The lunar-Lambert reflectance (McEwen 1991, Icarus 92, 298) is linear in L: L times
+/// Lommel–Seeliger plus (1 − L) times Lambert. Their disk integrals at α = 0 are ρ and (2/3)ρ
+/// (see [`rho_from_geometric_albedo`]), so Φ = [L·Φ_LS + (1 − L)(2/3)·Φ_L] / [L + (1 − L)(2/3)],
+/// with Φ_L = [`lambert_phase`] (Russell 1916) and Φ_LS = 1 − sin(α/2) tan(α/2) ln cot(α/4)
+/// (Fairbairn 2005, JRASC 99, 92). Then
+/// `disk_illuminance_lux(brdf, ρ, R, E☉, α, d)` = ρ·[L + 2(1 − L)/3]·E☉·(R/d)²·Φ(α) to the
+/// integral's accuracy (`disk_phase_function_matches_integral`), which lets a point path
+/// evaluate a body's flux in O(1) instead of 65 536 reflectance samples. The phase angle is
+/// unsigned and capped at π (Φ = 0); NaN gives NaN.
+pub fn disk_phase_function(brdf: Brdf, phase_rad: f64) -> f64 {
+    let a = phase_rad.abs().clamp(0.0, PI);
+    if a.is_nan() {
+        return f64::NAN;
+    }
+    let l = match brdf {
+        Brdf::Lambert => 0.0,
+        Brdf::LunarLambert { l } => l,
+    };
+    // Weights: each part's disk integral at α = 0 per unit ρ.
+    let (w_ls, w_lambert) = (l, (1.0 - l) * 2.0 / 3.0);
+    (w_ls * lommel_seeliger_phase(a) + w_lambert * lambert_phase(a)) / (w_ls + w_lambert)
+}
+
+/// Mallama & Hilton 2018 (Astron. Comput. 25, 10; arXiv:1808.01973), the planetary magnitude
+/// laws of *The Astronomical Almanac* and of JPL Horizons' APmag: V(1, α) [mag] of planet
+/// `naif`'s globe at unit distances from the Sun and observer, α in degrees, or `None` for a
+/// body without a law. Coefficients transcribed from the paper's Eq. 2–17 (all angular
+/// coefficients in degrees); A3 checked them against Horizons' APmag at the 2026-11-20 sky
+/// spots (`mallama_hilton_matches_horizons_apmag`).
+///
+/// - Mercury, Eq. 2: sixth-order polynomial.
+/// - Venus, Eq. 3 for α ≤ 163.7°, Eq. 4 above (the forward-scattering brightening; a
+///   0.007 mag step at the join, as published).
+/// - Earth, Eq. 5 (Tinetti et al. 2006's realistic-cloud model with V(1,0) = −3.99).
+/// - Mars, Eq. 6 for α ≤ 50°, Eq. 7 above (the mean of Mercury's and Earth's dimming), without
+///   the sub-Earth-longitude and L_s terms (not modelled here; 0.018 mag at the 2026-11-20
+///   spot).
+/// - Jupiter, Eq. 8 for α ≤ 12°, Eq. 9 above (Mayorga et al. 2016, Cassini green filter).
+/// - Saturn's globe without its rings, Eq. 11 for α ≤ 6°, Eq. 12 above. The rings are a
+///   separate body in the renderer, so the ringed law (Eq. 10) is not used.
+/// - Uranus, Eq. 15 without its −8.4 × 10⁻⁴ φ′ sub-latitude term (≤ 0.07 mag, φ′ ≤ 82°).
+/// - Neptune, Eq. 17 (the post-2000 V(1,0) = −7.00 of Eq. 16).
+fn mallama_hilton_v1(naif: NaifId, a: f64) -> Option<f64> {
+    // a₀ + a₁α + a₂α² + …
+    let poly = |x: f64, c: &[f64]| c.iter().rev().fold(0.0, |acc, &k| acc * x + k);
+    let v = match naif {
+        199 => poly(
+            a,
+            &[
+                -0.613,
+                6.3280e-2,
+                -1.6336e-3,
+                3.3644e-5,
+                -3.4265e-7,
+                1.6893e-9,
+                -3.0334e-12,
+            ],
+        ),
+        299 if a <= 163.7 => poly(a, &[-4.384, -1.044e-3, 3.687e-4, -2.814e-6, 8.938e-9]),
+        299 => poly(a, &[236.05828, -2.81914, 8.39034e-3]),
+        399 => poly(a, &[-3.99, -1.060e-3, 2.054e-4]),
+        499 if a <= 50.0 => poly(a, &[-1.601, 0.02267, -0.0001302]),
+        499 => poly(a, &[-0.367, -0.02573, 0.0003445]),
+        599 if a <= 12.0 => poly(a, &[-9.395, -3.7e-4, 6.16e-4]),
+        // Eq. 9 takes the phase in units of 180°.
+        599 => {
+            -9.428 - 2.5 * poly(a / 180.0, &[1.0, -1.507, -0.363, -0.062, 2.809, -1.876]).log10()
+        }
+        699 if a <= 6.0 => poly(a, &[-8.95, -3.7e-4, 6.16e-4]),
+        699 => poly(a, &[-8.94, 2.446e-4, 2.672e-4, -1.505e-6, 4.767e-9]),
+        799 => poly(a, &[-7.110, 6.587e-3, 1.045e-4]),
+        899 => poly(a, &[-7.00, 7.944e-3, 9.617e-5]),
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// The largest phase angle [deg] that each [`mallama_hilton_v1`] law covers; beyond it
+/// [`planet_phase_correction`] holds its value there. From the paper: Mercury's observations
+/// span 2.1°–169.5° (§4.1), Venus's Eq. 4 ends at 179°, Jupiter's Eq. 9 is "not trustworthy
+/// beyond ~130°", Saturn's Eq. 12 is valid to 150°, Uranus's Eq. 15 to 154°, Neptune's Eq. 17 to
+/// 133°. The paper gives no limit for Earth's Eq. 5 or Mars's Eq. 7 (built from Mercury's and
+/// Earth's curves); A3 holds both beyond 170°, near Mercury's observed limit.
+fn mallama_hilton_max_deg(naif: NaifId) -> Option<f64> {
+    match naif {
+        199 => Some(169.5),
+        299 => Some(179.0),
+        399 | 499 => Some(170.0),
+        599 => Some(130.0),
+        699 => Some(150.0),
+        799 => Some(154.0),
+        899 => Some(133.0),
+        _ => None,
+    }
+}
+
+/// Observed-phase-curve correction for planet `naif` drawn with `brdf`: the factor that makes
+/// the BRDF's disk-integrated flux at phase `phase_rad` follow Mallama & Hilton 2018.
+///
+/// C(α) = 10^(−0.4[V(1, α) − V(1, 0)]) / Φ_brdf(α), with V(1, ·) the paper's law for the planet
+/// (see `mallama_hilton_v1`) and Φ_brdf = [`disk_phase_function`]. C(0) = 1, so the geometric
+/// albedo calibration ([`rho_from_geometric_albedo`]) is untouched; only the phase dependence
+/// changes. Lambert and lunar-Lambert spheres cannot reproduce the observed curves (A3 review
+/// r0 I1): at the 2026-11-20 spots they put Mercury 1.78 mag too bright at α = 82°, Mars
+/// 0.47 mag too bright at 38° and Venus 0.54 mag too faint at 130°. Multiplying by C brings all
+/// seven planets within 0.1 mag of Horizons (`planet_magnitudes_vs_horizons`).
+///
+/// Use: multiply the point flux (`disk_illuminance_lux`, or the closed form in
+/// [`disk_phase_function`]'s doc) by C, and the disk's radiance by the same C at every pixel,
+/// so the two paths still agree at the handover. The radiance distribution across the disk
+/// keeps the BRDF's shape; only its total follows the observed curve. Beyond the law's range
+/// (`mallama_hilton_max_deg`) C is held at its value at the limit, so the BRDF's own shape
+/// carries the deeper crescent. Bodies without a law (the Moon, Pluto, moons, small bodies)
+/// get 1. The phase angle is unsigned; NaN gives NaN.
+pub fn planet_phase_correction(naif: NaifId, brdf: Brdf, phase_rad: f64) -> f64 {
+    if phase_rad.is_nan() {
+        return f64::NAN;
+    }
+    let (Some(max_deg), Some(v0)) = (mallama_hilton_max_deg(naif), mallama_hilton_v1(naif, 0.0))
+    else {
+        return 1.0;
+    };
+    let a_deg = phase_rad.abs().to_degrees().min(max_deg);
+    let Some(v) = mallama_hilton_v1(naif, a_deg) else {
+        return 1.0;
+    };
+    10_f64.powf(-0.4 * (v - v0)) / disk_phase_function(brdf, a_deg.to_radians())
 }
 
 /// Torres 2010 (AJ 140, 1158), Table 1: Flower's (1996, ApJ 469, 355) BC_V polynomial in
@@ -433,40 +580,45 @@ mod tests {
         PlanetCase { naif: 899, name: "Neptune", brdf: Brdf::Lambert, bound: 0.3 },
     ];
 
-    /// The planets whose measured m − APmag the brief's model does not bring inside the brief's
-    /// bound at these spots, with the measured value [mag] (A3 report: escalated to the lead).
-    /// Horizons' APmag follows Mallama & Hilton 2018 (Astron. Comput. 25, 10), whose observed
-    /// phase curves are steeper than Lambert or lunar-Lambert for Mercury (82°) and Mars (38°)
-    /// and flatter than Lambert for Venus's clouds (130°). The test checks that each listed
-    /// planet really is over its bound (so the list stays exact) and within 0.01 mag of the
-    /// recorded value; every other planet must meet its bound.
-    const OVER_BOUND: [(i32, f64); 3] = [(199, -1.779), (299, 0.536), (499, -0.466)];
+    /// A planet's geocentric Horizons sky spot on 2026-11-20: (APmag, r [au], Δ [au], α [deg]).
+    fn horizons_spot(spots: &[uni_data::SkySpot], naif: i32) -> (f64, f64, f64, f64) {
+        let target = naif.to_string();
+        let spot = spots
+            .iter()
+            .find(|s| s.target == target && s.observer == 399)
+            .unwrap_or_else(|| panic!("no geocentric sky spot for {target}"));
+        let (Some(apmag), Some(r_au), Some(phase_deg)) = (spot.apmag, spot.r_au, spot.phase_deg)
+        else {
+            panic!("sky spot for {target} lacks APmag, r or phase");
+        };
+        (apmag, r_au, spot.delta_au, phase_deg)
+    }
 
+    fn load_spots() -> Vec<uni_data::SkySpot> {
+        let path = uni_data::data_dir().join("golden").join("sky_spots.ron");
+        uni_data::load_sky_spots(&path)
+            .unwrap_or_else(|e| panic!("golden file missing: {} ({e})", path.display()))
+    }
+
+    /// Review I4 and A3 review r0 I1. The brief's BRDFs alone (Lambert; lunar-Lambert L 0.9 for
+    /// Mercury) miss Horizons' APmag by −1.779 (Mercury, α 82°), +0.536 (Venus, 130°) and
+    /// −0.466 mag (Mars, 38°): their phase curves are not the planets' observed ones (Mallama &
+    /// Hilton 2018, which Horizons uses). With [`planet_phase_correction`] every planet meets
+    /// the brief's bound (0.3 mag; 0.5 for Mercury, Venus and Saturn). Both columns are printed.
     #[test]
     fn planet_magnitudes_vs_horizons() {
-        let dir = uni_data::data_dir();
-        let spots_path = dir.join("golden").join("sky_spots.ron");
-        let spots = uni_data::load_sky_spots(&spots_path)
-            .unwrap_or_else(|e| panic!("golden file missing: {} ({e})", spots_path.display()));
-        let facts_path = dir.join("baked").join("body_facts.ron");
+        let spots = load_spots();
+        let facts_path = uni_data::data_dir().join("baked").join("body_facts.ron");
         let facts = uni_data::load_body_facts(&facts_path)
             .unwrap_or_else(|e| panic!("facts file missing: {} ({e})", facts_path.display()));
 
         println!(
-            "planet   BRDF     p_V    rho    r[au]   Δ[au]  α[deg]   model  APmag   m−AP  bound"
+            "planet   BRDF     p_V    rho    r[au]   Δ[au]  α[deg]  APmag   BRDF−AP   C     m−AP  bound"
         );
         let mut failures = Vec::new();
         for case in &PLANETS {
             let target = case.naif.to_string();
-            let spot = spots
-                .iter()
-                .find(|s| s.target == target && s.observer == 399)
-                .unwrap_or_else(|| panic!("no geocentric sky spot for {target}"));
-            let (Some(apmag), Some(r_au), Some(phase_deg)) =
-                (spot.apmag, spot.r_au, spot.phase_deg)
-            else {
-                panic!("sky spot for {target} lacks APmag, r or phase");
-            };
+            let (apmag, r_au, delta_au, phase_deg) = horizons_spot(&spots, case.naif);
             let fact = facts
                 .iter()
                 .find(|f| f.naif == case.naif)
@@ -481,40 +633,150 @@ mod tests {
                 fact.mean_radius_km * 1e3,
                 sun_lux_at(r_au),
                 phase_deg.to_radians(),
-                spot.delta_au * AU,
+                delta_au * AU,
             );
-            let m = -2.5 * (e / star_illuminance_lux(0.0)).log10();
-            let diff = m - apmag;
+            let e0 = star_illuminance_lux(0.0);
+            let brdf_only = -2.5 * (e / e0).log10() - apmag;
+            let c = planet_phase_correction(case.naif, case.brdf, phase_deg.to_radians());
+            let diff = -2.5 * (e * c / e0).log10() - apmag;
             let brdf = match case.brdf {
                 Brdf::Lambert => "Lambert",
                 Brdf::LunarLambert { .. } => "LL 0.9",
             };
             println!(
-                "{:<8} {brdf:<7} {p_v:5.3} {rho:6.4} {r_au:7.4} {:7.4} {phase_deg:7.3} {m:7.3} {apmag:6.3} {diff:+6.3}  {:.1}",
-                case.name, spot.delta_au, case.bound
+                "{:<8} {brdf:<7} {p_v:5.3} {rho:6.4} {r_au:7.4} {delta_au:7.4} {phase_deg:7.3} {apmag:6.3} {brdf_only:+7.3} {c:6.3} {diff:+6.3}  {:.1}",
+                case.name, case.bound
             );
-            match OVER_BOUND.iter().find(|(naif, _)| *naif == case.naif) {
-                Some(&(_, recorded)) => {
-                    if diff.abs() <= case.bound || (diff - recorded).abs() > 0.01 {
-                        failures.push(format!(
-                            "{}: m − APmag = {diff:+.3} is no longer the recorded {recorded:+.3} over the bound {}",
-                            case.name, case.bound
-                        ));
-                    }
-                }
-                None => {
-                    if diff.abs() > case.bound {
-                        failures.push(format!(
-                            "{}: |m − APmag| = {:.3} > {}",
-                            case.name,
-                            diff.abs(),
-                            case.bound
-                        ));
-                    }
-                }
+            if !(diff.abs() <= case.bound) {
+                failures.push(format!(
+                    "{}: |m − APmag| = {:.3} > {}",
+                    case.name,
+                    diff.abs(),
+                    case.bound
+                ));
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The transcription of Mallama & Hilton 2018 against Horizons' APmag (which uses it) at the
+    /// same spots: V = V(1, α) + 5 log₁₀(rΔ). Mercury, Venus and Jupiter agree to ≤ 0.001 mag
+    /// (bound 0.002). The others differ by what this module leaves out, each bound just above
+    /// the measured gap: Mars's sub-Earth-longitude and L_s terms (−0.018); Saturn's rings
+    /// (+0.085: APmag is brighter than the globe law, as the ringed Eq. 10 is at a ring opening
+    /// near 7°, which this test does not compute; the 2018 paper says Horizons then reported the
+    /// globe alone); Uranus's −8.4 × 10⁻⁴ φ′ sub-latitude term (+0.065, i.e. φ′ ≈ 77°); Neptune,
+    /// whose APmag matches Eq. 16's V(1,0) without Eq. 17's phase term (+0.013, that term at
+    /// 1.57°).
+    #[test]
+    fn mallama_hilton_matches_horizons_apmag() {
+        let spots = load_spots();
+        #[rustfmt::skip]
+        let cases = [
+            (199, 0.002), (299, 0.002), (499, 0.025), (599, 0.002),
+            (699, 0.095), (799, 0.075), (899, 0.015),
+        ];
+        for (naif, tolerance) in cases {
+            let (apmag, r_au, delta_au, phase_deg) = horizons_spot(&spots, naif);
+            let v = mallama_hilton_v1(naif, phase_deg).unwrap() + 5.0 * (r_au * delta_au).log10();
+            println!(
+                "{naif}: V = {v:7.3}, APmag {apmag:7.3}, V − APmag = {:+.3}",
+                v - apmag
+            );
+            assert!(
+                (v - apmag).abs() <= tolerance,
+                "{naif}: V {v} vs APmag {apmag}"
+            );
+        }
+        // Mercury's law at 50°, summed by hand from Eq. 2: dimming 1.624 446 875 mag.
+        let dimming = mallama_hilton_v1(199, 50.0).unwrap() - mallama_hilton_v1(199, 0.0).unwrap();
+        assert!((dimming - 1.624_446_875).abs() < 1e-12, "{dimming}");
+        // Jupiter's Eq. 9 at 90° (x = 0.5): −9.428 − 2.5 log₁₀(0.264 937 5) = −7.985 859 (by
+        // hand).
+        let jupiter = mallama_hilton_v1(599, 90.0).unwrap();
+        assert!((jupiter + 7.985_858_6).abs() < 1e-6, "{jupiter}");
+        assert_eq!(mallama_hilton_v1(301, 10.0), None);
+    }
+
+    /// The closed form of [`disk_phase_function`] against the numerical disk integral, for
+    /// L ∈ {0, 0.5, 0.9, 1} and phases up to 170°.
+    #[test]
+    fn disk_phase_function_matches_integral() {
+        for l in [0.0, 0.5, 0.9, 1.0] {
+            let brdf = Brdf::LunarLambert { l };
+            let norm = l + 2.0 * (1.0 - l) / 3.0;
+            for deg in [0.0_f64, 10.0, 30.0, 60.0, 90.0, 120.0, 150.0, 170.0] {
+                let a = deg.to_radians();
+                let integral = disk_illuminance_lux(brdf, 1.0, 1.0, 1.0, a, 1.0) / norm;
+                let closed = disk_phase_function(brdf, a);
+                let rel = closed / integral - 1.0;
+                assert!(rel.abs() < 1e-3, "L {l}, α {deg}°: {closed} vs {integral}");
+            }
+        }
+        // Lambert is L = 0; Φ(0) = 1, Φ(π) = 0, unsigned, NaN propagates.
+        for a in [0.0, 0.4, 1.3, 2.9] {
+            assert_eq!(
+                disk_phase_function(Brdf::Lambert, a),
+                disk_phase_function(Brdf::LunarLambert { l: 0.0 }, a)
+            );
+            assert_eq!(
+                disk_phase_function(LUNAR_LAMBERT, -a),
+                disk_phase_function(LUNAR_LAMBERT, a)
+            );
+        }
+        assert_eq!(disk_phase_function(LUNAR_LAMBERT, 0.0), 1.0);
+        // At α = π only sin π's rounding (1.2e-16) is left.
+        assert!(disk_phase_function(LUNAR_LAMBERT, PI).abs() < 1e-15);
+        assert!(disk_phase_function(LUNAR_LAMBERT, PI - 1e-9) >= 0.0);
+        assert!(disk_phase_function(Brdf::Lambert, f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn planet_phase_correction_properties() {
+        let planets = [199, 299, 399, 499, 599, 699, 799, 899];
+        for naif in planets {
+            for brdf in [Brdf::Lambert, LUNAR_LAMBERT] {
+                // C(0) = 1: the albedo calibration at opposition is untouched.
+                assert!((planet_phase_correction(naif, brdf, 0.0) - 1.0).abs() < 1e-12);
+                // Unsigned; finite and positive across the whole range, including past the
+                // law's limit (held there) and at α = π.
+                for deg in (0..=180).step_by(5).map(f64::from) {
+                    let c = planet_phase_correction(naif, brdf, deg.to_radians());
+                    assert!(c.is_finite() && c > 0.0, "{naif} {brdf:?} {deg}°: {c}");
+                    assert_eq!(c, planet_phase_correction(naif, brdf, -deg.to_radians()));
+                }
+            }
+        }
+        // Held beyond the law's range: Jupiter's Eq. 9 stops at 130°.
+        let at_limit = planet_phase_correction(599, Brdf::Lambert, 130f64.to_radians());
+        assert_eq!(
+            planet_phase_correction(599, Brdf::Lambert, 160f64.to_radians()),
+            at_limit
+        );
+        // The piece joins are continuous to the paper's own steps: Venus 163.7° (0.007 mag),
+        // Mars 50°, Jupiter 12°, Saturn 6° (≤ 0.001 mag).
+        for (naif, join, step_mag) in [
+            (299, 163.7, 0.008),
+            (499, 50.0, 0.001),
+            (599, 12.0, 0.001),
+            (699, 6.0, 0.001),
+        ] {
+            let below =
+                planet_phase_correction(naif, Brdf::Lambert, (join - 1e-9_f64).to_radians());
+            let above =
+                planet_phase_correction(naif, Brdf::Lambert, (join + 1e-9_f64).to_radians());
+            let jump = 2.5 * (below / above).log10();
+            assert!(jump.abs() < step_mag, "{naif} at {join}°: {jump} mag");
+        }
+        // Mercury at α 50° with lunar-Lambert L 0.9: 10^(−0.4 · 1.624 446 875) / Φ_LL(50°).
+        let want = 10_f64.powf(-0.4 * 1.624_446_875)
+            / disk_phase_function(LUNAR_LAMBERT, 50f64.to_radians());
+        let c = planet_phase_correction(199, LUNAR_LAMBERT, 50f64.to_radians());
+        assert!((c / want - 1.0).abs() < 1e-12, "{c} vs {want}");
+        // Bodies without a law are left alone; NaN propagates.
+        assert_eq!(planet_phase_correction(301, LUNAR_LAMBERT, 1.0), 1.0);
+        assert_eq!(planet_phase_correction(999, LUNAR_LAMBERT, 1.0), 1.0);
+        assert!(planet_phase_correction(199, LUNAR_LAMBERT, f64::NAN).is_nan());
     }
 
     #[test]
