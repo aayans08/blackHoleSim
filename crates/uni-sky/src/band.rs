@@ -948,6 +948,17 @@ fn worst(a: f64, e: f64) -> f64 {
     }
 }
 
+/// The largest channel of |got − want| relative to `want`'s largest channel (floored at
+/// `floor`), or NaN when any channel of either is not finite. glam's `max_element` skips NaN, so
+/// `(got - want).abs().max_element()` alone would pass a GPU result with one NaN channel (B9 fix
+/// round); with NaN here, [`worst`] and the `<=` tolerance test fail it.
+fn rel_err_finite(got: DVec3, want: DVec3, floor: f64) -> f64 {
+    if !(got.is_finite() && want.is_finite()) {
+        return f64::NAN;
+    }
+    (got - want).abs().max_element() / want.max_element().max(floor)
+}
+
 /// B5's probes, called from [`crate::gpu_probes`]: `gal_band_radiance` GPU vs CPU
 /// (`band_radiance`), the cube face convention written then sampled on the GPU
 /// (`band_cube_sample`), and the real update pass against [`band_texel`] and its box-filtered
@@ -1004,7 +1015,7 @@ fn check_band_radiance(
                 f64::from(r.dir[3]),
             );
             let gpu = Vec3::from_slice(&g[..3]).as_dvec3();
-            (gpu - cpu).abs().max_element() / cpu.max_element()
+            rel_err_finite(gpu, cpu, 0.0)
         })
         .fold(0.0, worst);
     Ok((
@@ -1378,7 +1389,7 @@ fn check_band_update(
             ))
             .as_dvec3();
             let got = mip0[at(ENV_SIZE, face, x, y)].as_dvec3();
-            (got - want).abs().max_element() / want.max_element()
+            rel_err_finite(got, want, 0.0)
         })
         .fold(0.0, worst);
     let mut worst_mip = 0.0_f64;
@@ -1392,8 +1403,8 @@ fn check_band_update(
                     let mean = 0.25 * (child(0, 0) + child(1, 0) + child(0, 1) + child(1, 1));
                     let got = coarse[at(size, face, x, y)];
                     // A floor of 1e-4 units (1e-8 cd/m²) keeps f16's subnormal steps out.
-                    let err = (got - mean).abs().max_element() / mean.max_element().max(1e-4);
-                    worst_mip = worst(worst_mip, f64::from(err));
+                    let err = rel_err_finite(got.as_dvec3(), mean.as_dvec3(), 1e-4);
+                    worst_mip = worst(worst_mip, err);
                 }
             }
         }
@@ -1577,6 +1588,32 @@ mod tests {
     /// The CPU twin samples the model in the right frame: the texel toward the Galactic centre
     /// (ICRS direction from ESA 1997, row 0 of `ICRS_TO_GALACTIC`) holds the model's radiance
     /// toward the centre, and a camera off the SSB is moved into the model's frame.
+    /// A GPU result with one NaN (or infinite) channel fails the probes' checks: `rel_err_finite` is
+    /// NaN,
+    /// [`worst`] keeps it, and `<=` against a tolerance is false. The old form,
+    /// `(gpu - cpu).abs().max_element()`, skipped the NaN channel and passed (B9 fix round).
+    #[test]
+    fn probe_errors_fail_on_a_non_finite_channel() {
+        let cpu = DVec3::new(1.0, 2.0, 3.0);
+        let gpu = DVec3::new(1.0, f64::NAN, 3.0);
+        // The bug this guards against: glam's max_element skips the NaN channel.
+        assert_eq!((gpu - cpu).abs().max_element() / cpu.max_element(), 0.0);
+        for bad in [
+            gpu,
+            DVec3::new(f64::INFINITY, 2.0, 3.0),
+            DVec3::new(1.0, 2.0, f64::NEG_INFINITY),
+        ] {
+            let e = rel_err_finite(bad, cpu, 0.0);
+            assert!(e.is_nan(), "{bad}: {e}");
+            let folded = [0.0, e, 1e-6].into_iter().fold(0.0, worst);
+            assert!(!(folded <= BAND_TOLERANCE), "{bad}: folded {folded}");
+        }
+        // A NaN in the reference fails too; finite inputs keep the old value.
+        assert!(rel_err_finite(cpu, gpu, 0.0).is_nan());
+        assert!((rel_err_finite(DVec3::new(1.0, 2.0, 3.3), cpu, 0.0) - 0.1).abs() < 1e-12);
+        assert!((rel_err_finite(DVec3::splat(1e-5), DVec3::ZERO, 1e-4) - 0.1).abs() < 1e-12);
+    }
+
     #[test]
     fn band_texel_matches_model() {
         let model = GalaxyModel::milky_way();
