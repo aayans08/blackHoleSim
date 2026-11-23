@@ -277,10 +277,123 @@ pub fn segment_radiance(
     (m.inscatter.as_vec3(), m.transmittance.as_vec3())
 }
 
+/// Disk-integrated reflectance of a body with this atmosphere over a uniform Lambert ground of
+/// albedo `ground_albedo`, seen from far away at solar phase angle `phase_rad` (Sun–body–observer),
+/// per channel, in units of geometric albedo.
+///
+/// It is the body's flux divided by that of a Lambert disk of albedo 1 and radius R =
+/// `bottom_radius_m`, seen face-on under the same illuminance from the same distance. At phase 0
+/// it is the geometric albedo p, and at phase α it is p·Φ(α), the phase function as defined by
+/// Russell 1916 (ApJ 43, 173). F/F_ref = (1/R²)·∫ (L/E) dA over the projected disk out to the
+/// shell top, where L/E is:
+/// - [`segment_radiance`]'s inscatter along the ray; plus,
+/// - where the ray reaches the ground, the view transmittance × ρ/π × (T_sun·μ₀ + sky
+///   irradiance), using [`crate::ground::ground_lighting`] (the bodies pass's twin).
+///
+/// Limits and conventions:
+/// - The body is the preset's sphere: no ellipsoid, no terrain, no clouds beyond what the
+///   ground albedo holds. Sun and observer are at infinity.
+/// - The integral uses `rings` annuli of impact parameter in total, split between the ground
+///   disk and the shell annulus so that none straddles the ground's limb. Within each part the
+///   rings are midpoints in θ, with b = R·sin θ, so they crowd toward the limb.
+/// - For α > 0 it adds about `sectors` azimuth cells over the half disk, because the light is
+///   mirror-symmetric about the plane of Sun and observer. A ring that crosses the terminator is
+///   split at it.
+/// - Each sample is one view march (about 5 ms in an unoptimised build). With 32 rings × 16
+///   sectors a bare Lambert sphere is within 1 % of Russell's closed form at 0°, 60° and 120°
+///   (`disk_reflectance_follows_lambert_phase_law`).
+/// - For Venus, R is the cloud-top sphere. Multiply by (R/R_ref)² to refer the result to another
+///   radius.
+///
+/// Uses: CPU only. It gives B9's expected disk flux for an atmosphere body (the W-B1 check,
+/// review I4) and the report's albedo numbers. A non-finite phase or radius gives 0.
+pub fn disk_reflectance(
+    params: &AtmosphereParams,
+    ground_albedo: Vec3,
+    phase_rad: f64,
+    rings: usize,
+    sectors: usize,
+) -> Vec3 {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let (r, top) = (params.bottom_radius_m, params.top_radius_m);
+    if !(phase_rad.is_finite() && r.is_finite() && top.is_finite() && r > 0.0 && top >= r) {
+        return Vec3::ZERO;
+    }
+    let alpha = phase_rad.abs().min(PI);
+    let rings = rings.max(1);
+    let sectors = if alpha == 0.0 { 1 } else { sectors.max(1) };
+    // Observer on +x; the Sun at phase α in the x–y plane; parallel rays toward −x from outside
+    // the shell.
+    let sun = DVec3::new(alpha.cos(), alpha.sin(), 0.0);
+    let far = 1e9 + 10.0 * top;
+    let rho = ground_albedo.as_dvec3();
+    // L/E along the ray at impact parameter b and azimuth φ (from +y toward +z).
+    let radiance = |b: f64, phi: f64| -> DVec3 {
+        let (y, z) = (b * phi.cos(), b * phi.sin());
+        let (l, t) = segment_radiance(params, DVec3::new(far, y, z), -DVec3::X, f64::INFINITY, sun);
+        let mut radiance = l.as_dvec3();
+        if b < r {
+            let normal = DVec3::new((r * r - b * b).sqrt(), y, z) / r;
+            let mu_s = normal.dot(sun);
+            let (t_sun, sky) = crate::ground::ground_lighting(Some(params), r, mu_s);
+            radiance +=
+                t.as_dvec3() * rho / PI * (t_sun.as_dvec3() * mu_s.max(0.0) + sky.as_dvec3());
+        }
+        radiance
+    };
+    // Rings: b = R_m·sin θ with the midpoint rule in θ, whose area element b·db·dφ =
+    // R_m²·sin θ·cos θ·dθ·dφ is smooth where the view cosine μ = √(1 − b²/R²) is not. The
+    // ground disk [0, R] (R_m = R, θ ∈ [0, π/2]) and the shell annulus [R, top] (R_m = top,
+    // θ ∈ [asin(R/top), π/2]) get separate rings, so no ring straddles the limb of the ground.
+    let theta_r = (r / top).asin();
+    let shell_rings = if top > r {
+        ((rings as f64 * (1.0 - theta_r / FRAC_PI_2)).round() as usize).clamp(1, rings)
+    } else {
+        0
+    };
+    let ground_rings = (rings - shell_rings).max(1);
+    let ranges = [
+        (r, 0.0, FRAC_PI_2, ground_rings),
+        (top, theta_r, FRAC_PI_2, shell_rings),
+    ];
+    let mut sum = DVec3::ZERO;
+    for (r_m, theta0, theta1, n_rings) in ranges {
+        let d_theta = (theta1 - theta0) / n_rings.max(1) as f64;
+        for k in 0..n_rings {
+            let theta = theta0 + d_theta * (k as f64 + 0.5);
+            let b = r_m * theta.sin();
+            let ring_area_per_rad = r_m * r_m * theta.sin() * theta.cos() * d_theta;
+            // Azimuth arcs over the half disk φ ∈ [0, π]. A ring that crosses the terminator is
+            // split there, at the kink of the sunlit ground term (μ₀ = 0 at azimuth φ_t,
+            // cos φ_t = −cos α·√(R² − b²)/(b·sin α)), so the midpoint rule sees a smooth
+            // integrand on each arc.
+            let mut arcs = [(0.0, PI, sectors), (PI, PI, 0)];
+            if sectors > 1 && b < r && alpha.sin() > 1e-9 {
+                let c = -alpha.cos() * (r * r - b * b).sqrt() / (b * alpha.sin());
+                if c.abs() < 1.0 {
+                    let phi_t = c.acos();
+                    let lit =
+                        ((sectors as f64 * phi_t / PI).round() as usize).clamp(1, sectors - 1);
+                    arcs = [(0.0, phi_t, lit), (phi_t, PI, sectors - lit)];
+                }
+            }
+            for (start, end, n) in arcs {
+                let d_phi = (end - start) / n.max(1) as f64;
+                for j in 0..n {
+                    // Doubled for the mirrored half disk (2π in all).
+                    let phi = start + d_phi * (j as f64 + 0.5);
+                    sum += radiance(b, phi) * (ring_area_per_rad * 2.0 * d_phi);
+                }
+            }
+        }
+    }
+    (sum / (r * r)).as_vec3()
+}
+
 /// The atmosphere's frame of body `naif` with body-fixed → ICRS rotation `orient`: the matrix
 /// R/(a, b, c) × (body-fixed ← ICRS), R = (abc)^⅓, from root (ICRS) axes to the body-fixed
 /// axes scaled so the WGCCRE reference ellipsoid ([`body_shape_m`]) becomes the sphere of radius
-/// R. R equals the preset's bottom radius to within 1 m for Earth, 11 m for Mars and 70 m for
+/// R. R equals the preset's bottom radius to within 1 m for Earth, 14 m for Mars and 70 m for
 /// Titan. Venus is a sphere, so only the rotation applies and its bottom stays at the cloud
 /// tops. Positions relative to the
 /// body centre and directions mapped by it are what the march, the LUT twins,
@@ -1253,32 +1366,82 @@ mod tests {
         }
     }
 
-    /// Geometric albedo at phase 0 per channel over a Lambert ground (see
-    /// `earth_disk_albedo_w_b1`), with `n` impact parameters.
+    /// Geometric albedo (phase 0) per channel over a Lambert ground, with `n` impact-parameter
+    /// rings: [`disk_reflectance`] at phase 0.
     fn disk_albedo(p: &AtmosphereParams, ground: Vec3, n: usize) -> Vec3 {
-        let (r, top) = (p.bottom_radius_m, p.top_radius_m);
-        let mut sum = DVec3::ZERO;
-        for k in 0..n {
-            let s = |k: usize| top * (k as f64 / n as f64 * std::f64::consts::FRAC_PI_2).sin();
-            let (b0, b1) = (s(k), s(k + 1));
-            let b = 0.5 * (b0 + b1);
-            let (l, t) = segment_radiance(
-                p,
-                DVec3::new(1e9 + 10.0 * top, 0.0, b),
-                -DVec3::X,
-                f64::INFINITY,
-                DVec3::X,
-            );
-            let mut radiance = l.as_dvec3();
-            if b < r {
-                let mu = (1.0 - (b / r).powi(2)).sqrt();
-                let (t_sun, sky) = crate::ground::ground_lighting(Some(p), r, mu);
-                radiance += t.as_dvec3() * ground.as_dvec3() / std::f64::consts::PI
-                    * (t_sun.as_dvec3() * mu + sky.as_dvec3());
-            }
-            sum += radiance * b * (b1 - b0);
+        disk_reflectance(p, ground, 0.0, n, 1)
+    }
+
+    /// The same preset with no air at all: every coefficient 0, so a bare Lambert sphere.
+    fn airless(p: AtmosphereParams) -> AtmosphereParams {
+        AtmosphereParams {
+            rayleigh_scattering: Vec3::ZERO,
+            mie_scattering: Vec3::ZERO,
+            mie_extinction: Vec3::ZERO,
+            layer2_scattering: Vec3::ZERO,
+            layer2_extinction: Vec3::ZERO,
+            ..p
         }
-        (sum * std::f64::consts::TAU / (r * r)).as_vec3()
+    }
+
+    /// Review I4: `disk_reflectance` against the closed form for a Lambert sphere of albedo ρ
+    /// (no air): p·Φ(α) = (2ρ/3)·(sin α + (π − α)·cos α)/π (Russell 1916, "On the albedo of the
+    /// planets and their satellites", ApJ 43, 173). Phase 0 takes the rotationally symmetric
+    /// path; 60° and 120° the azimuth grid, with the terminator crossing it.
+    #[test]
+    fn disk_reflectance_follows_lambert_phase_law() {
+        use std::f64::consts::PI;
+        let (p, rho) = (airless(earth()), 0.3);
+        for deg in [0.0f64, 60.0, 120.0] {
+            let a = deg.to_radians();
+            let want = 2.0 * rho / 3.0 * (a.sin() + (PI - a) * a.cos()) / PI;
+            let got = disk_reflectance(&p, Vec3::splat(rho as f32), a, 32, 16);
+            for c in 0..3 {
+                assert!(
+                    (got[c] as f64 / want - 1.0).abs() < 0.01,
+                    "{deg}°: {got} against {want:.5}"
+                );
+            }
+        }
+    }
+
+    /// Review I4 (ruling W-B1): physical air cannot bring Earth's disk up to the catalogue p_V
+    /// 0.434.
+    /// - Over a uniform Lambert ground of albedo ρ, p₅₅₀ is affine in ρ. With this atmosphere the
+    ///   ρ that would reach 0.434 is ≈ 0.76. A Lambert sphere's Bond albedo is ρ (the air changes
+    ///   it by a few per cent), and Earth's is 0.294: both catalogue values are NASA NSSDCA's
+    ///   Earth fact sheet, baked in `data/baked/body_facts.ron`. So p_V and the Bond albedo
+    ///   cannot both hold for any Lambert Earth; the real Earth's phase integral
+    ///   q = A/p = 0.294/0.434 = 0.68 is well below a Lambert sphere's 3/2. The gap is in the
+    ///   phase law of the clouds and ground (backscatter toward phase 0), not in the air.
+    ///   `report_numbers` integrates this model over phase: over A8's 0.302 composite its Bond
+    ///   albedo at 550 nm is 0.292 (Earth's 0.294), with p 0.210 and q 1.39.
+    /// - Nor does more air help: ×2 and ×3 the whole column (Rayleigh, aerosol, ozone) leaves
+    ///   p₅₅₀ over A8's 0.302 composite at ≤ 0.22, because the thicker air dims the ground as much
+    ///   as it adds.
+    #[test]
+    fn w_b1_p_v_needs_a_non_lambert_earth() {
+        const P_V: f64 = 0.434;
+        const BOND: f64 = 0.294;
+        let e = earth();
+        let p0 = disk_albedo(&e, Vec3::ZERO, 200).y as f64;
+        let p1 = disk_albedo(&e, Vec3::ONE, 200).y as f64;
+        let rho_needed = (P_V - p0) / (p1 - p0);
+        assert!(
+            rho_needed > 2.0 * BOND,
+            "Lambert ground reaching p_V: {rho_needed}"
+        );
+        for k in [2.0f32, 3.0] {
+            let thick = AtmosphereParams {
+                rayleigh_scattering: e.rayleigh_scattering * k,
+                mie_scattering: e.mie_scattering * k,
+                mie_extinction: e.mie_extinction * k,
+                layer2_extinction: e.layer2_extinction * k,
+                ..earth()
+            };
+            let p = disk_albedo(&thick, Vec3::splat(0.302), 200).y;
+            assert!(p < 0.22, "air ×{k}: p₅₅₀ {p}");
+        }
     }
 
     /// Prints every number the B3 report quotes (`cargo test -p uni-atmo --lib report_numbers
@@ -1485,6 +1648,67 @@ mod tests {
                     (a - b) / 1e3
                 );
             }
+        }
+        // Review I4 (W-B1): what physical air can and cannot do for Earth's p₅₅₀.
+        let lambert =
+            |a: f64| (a.sin() + (std::f64::consts::PI - a) * a.cos()) / std::f64::consts::PI;
+        for deg in [0.0f64, 60.0, 120.0, 150.0] {
+            let a = deg.to_radians();
+            let got = disk_reflectance(&airless(earth()), Vec3::splat(0.3), a, 32, 16).y as f64;
+            println!(
+                "W-B1 quadrature: bare Lambert 0.3 at {deg}°: {got:.5} against Russell {:.5} ({:+.2} %)",
+                0.2 * lambert(a),
+                (got / (0.2 * lambert(a)) - 1.0) * 100.0
+            );
+        }
+        let (p0, p1) = (
+            disk_albedo(&e, Vec3::ZERO, 600),
+            disk_albedo(&e, Vec3::ONE, 600),
+        );
+        println!(
+            "W-B1 Earth p over ground 0 / 1: {p0} / {p1}; Lambert ground reaching p_V 0.434: {}",
+            (Vec3::splat(0.434) - p0) / (p1 - p0)
+        );
+        let lut_ground = AtmosphereParams {
+            ground_albedo: Vec3::splat(0.302),
+            ..earth()
+        };
+        println!(
+            "W-B1 Earth p over 0.302 with the LUT's ground albedo 0.302 (preset 0.1): {}",
+            disk_albedo(&lut_ground, Vec3::splat(0.302), 600)
+        );
+        for k in [2.0f32, 3.0, 5.0, 10.0] {
+            let column = AtmosphereParams {
+                rayleigh_scattering: e.rayleigh_scattering * k,
+                mie_scattering: e.mie_scattering * k,
+                mie_extinction: e.mie_extinction * k,
+                layer2_extinction: e.layer2_extinction * k,
+                ..earth()
+            };
+            let rayleigh = AtmosphereParams {
+                rayleigh_scattering: e.rayleigh_scattering * k,
+                ..earth()
+            };
+            println!(
+                "W-B1 Earth p over 0.302, air column ×{k}: {}; Rayleigh only ×{k}: {}",
+                disk_albedo(&column, Vec3::splat(0.302), 300),
+                disk_albedo(&rayleigh, Vec3::splat(0.302), 300)
+            );
+        }
+        // Bond albedo A = p·q = 2∫₀^π p·Φ(α)·sin α dα (Russell 1916), 12 midpoints of 15°.
+        for (name, p) in [("Earth", earth()), ("bare Lambert", airless(earth()))] {
+            let n = 12;
+            let mut bond = DVec3::ZERO;
+            for i in 0..n {
+                let a = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
+                bond += disk_reflectance(&p, Vec3::splat(0.302), a, 32, 12).as_dvec3()
+                    * (2.0 * a.sin() * std::f64::consts::PI / n as f64);
+            }
+            let p0 = disk_albedo(&p, Vec3::splat(0.302), 600).as_dvec3();
+            println!(
+                "W-B1 {name} over 0.302: Bond albedo {bond:.4}, p {p0:.4}, phase integral q {:.3}",
+                bond.y / p0.y
+            );
         }
     }
 }
