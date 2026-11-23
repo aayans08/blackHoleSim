@@ -134,12 +134,15 @@ doc comment; every feature must follow it)**
   when it zooms (point sources gain contrast over extended light), so it stays; it is not a bug to fix.
 - *Lens mask.* `lens_mask` is Rgba16Float (since A0a; m0.1 had R32Float), cleared to 0 every frame. `r`: the
   captured fraction of a traced pixel (1 = shadow). `g`: sky occlusion, 1 − transmittance toward the
-  background, written with `BlendOperation::Max` on green only (bodies and comet nuclei their coverage, rings
+  background, written with `BlendOperation::Max` (bodies and comet nuclei their coverage, rings
   their opacity, atmospheres 1 − luminance(T)); the lens pass writes `g = 0` on pixels it repaints. `b`: 1 where
-  the lens pass wrote the lensed environment. `a`: reserved for M3's star magnification. Sky features multiply
-  what they add by (1 − r)(1 − g), the band also by (1 − b); point sprites and asteroids by (1 − r) only. Built
-  at A0a: the lens pass writes (captured, 0, 1, 0) on its traced pixels and the star pass multiplies by (1 − r);
-  nothing writes `g` yet.
+  the lens pass wrote the lensed environment. `a` (since B10, lead ruling on B6 I1): the star share s = 1 − w of a
+  world writer whose exposure is `mix(star_pre, scene_pre, w)` (bodies, rings, star surfaces and atmospheres in the
+  1.5–4 px LOD band; w snapped to 1 when 1 − w < 2⁻¹⁴), Max-composited, 0 elsewhere; the histogram meter divides by
+  `mix(scene_pre, star_pre, s)`. M3's star magnification will need a new channel. Sky features multiply what they
+  add by (1 − r)(1 − g), the band also by (1 − b); point sprites and asteroids by (1 − r) only, and by (1 − g) too
+  when the camera is inside an atmosphere shell (B4 fix). The lens pass writes (captured, 0, 1, 0) on its traced
+  pixels.
 - *Pass order* (push order in `uni-app/src/scene.rs`; full table with writes and depth in `targets.rs`). M1
   target, by owning crate: exposure resolve (uni-post; own bind group, never group 0) → band-update (uni-sky) →
   background (uni-rel: the M0 debug grid, only with `LensEnv::DebugGrid` and a traced lens; it is
