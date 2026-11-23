@@ -7,6 +7,7 @@
 //! - A7: `athyg`, `exo`
 //! - A8: `map`, `rings` (BC encoders in `bc`)
 //! - A9: `sbdb`, `sats`, `facts`, `horizons`
+//! - A4r: `comets-epoch` (comets.ron re-osculated to the start date)
 //!
 //! Log level follows `RUST_LOG` (default `info`).
 
@@ -19,6 +20,7 @@
 mod athyg;
 mod bc;
 mod bsc5;
+mod comet_epoch;
 mod exo;
 mod facts;
 mod horizons;
@@ -42,10 +44,10 @@ use rayon as _;
 use ron as _;
 use serde as _;
 use serde_json as _;
-use uni_physics as _;
 
 const USAGE: &str = "usage: uni-bake <subcommand> [options]
   bsc5 --input <catalog.gz> --out <bsc5.bin>
+  comets-epoch [--input <comets.ron>] [--out <comets_2026.ron>]
   athyg | exo | map | rings | sbdb | sats | facts | horizons [options]: see each module's doc";
 
 /// A parsed command line. The M1 variants carry their options unparsed, in order.
@@ -60,6 +62,7 @@ enum Command {
     Sats(Vec<OsString>),
     Facts(Vec<OsString>),
     Horizons(Vec<OsString>),
+    CometsEpoch(Vec<OsString>),
 }
 
 /// Parses the arguments after the program name.
@@ -78,6 +81,7 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Command> {
         Some("sats") => Command::Sats(options),
         Some("facts") => Command::Facts(options),
         Some("horizons") => Command::Horizons(options),
+        Some("comets-epoch") => Command::CometsEpoch(options),
         _ => bail!("unknown subcommand {subcommand:?}\n{USAGE}"),
     })
 }
@@ -121,6 +125,7 @@ fn main() -> anyhow::Result<()> {
         Command::Sats(options) => sats::run(&options)?,
         Command::Facts(options) => facts::run(&options)?,
         Command::Horizons(options) => horizons::run(&options)?,
+        Command::CometsEpoch(options) => comet_epoch::run(&options)?,
     }
     Ok(())
 }
@@ -149,7 +154,7 @@ mod tests {
     #[test]
     fn parses_module_subcommands() {
         let options = ["--input", "in", "--out", "out"];
-        let cases: [(&str, fn(Vec<OsString>) -> Command); 8] = [
+        let cases: [(&str, fn(Vec<OsString>) -> Command); 9] = [
             ("athyg", Command::Athyg),
             ("exo", Command::Exo),
             ("map", Command::Map),
@@ -158,6 +163,7 @@ mod tests {
             ("sats", Command::Sats),
             ("facts", Command::Facts),
             ("horizons", Command::Horizons),
+            ("comets-epoch", Command::CometsEpoch),
         ];
         for (name, variant) in cases {
             let mut line = vec![name];

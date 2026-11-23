@@ -81,6 +81,7 @@ orbital elements and physical parameters retrieved through the SBDB Query API
 Dynamics Group, Jet Propulsion Laboratory, California Institute of Technology, under contract with NASA
 (<https://ssd.jpl.nasa.gov/tools/sbdb_query.html>). The orbit solutions are JPL's and the Minor Planet Center's, as
 SBDB records per object. Licence: public JPL Solar System Dynamics data (no stated terms).
+`data/baked/comets_2026.ron` is derived from `comets.ron`: its orbital elements are re-osculated to 2026-11-20 TDB by this project's planet-perturbed integrator (`uni-bake comets-epoch`), so they are ours, not JPL's; names, ids and magnitudes are SBDB's.
 
 **JPL planetary-satellite mean elements and physical parameters** (`data/baked/sat_elements.ron`, 460 moons).
 "Planetary Satellite Mean Elements" (<https://ssd.jpl.nasa.gov/sats/elem/>) and "Planetary Satellite Physical

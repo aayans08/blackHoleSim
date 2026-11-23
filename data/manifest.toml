@@ -493,6 +493,19 @@ credit = "JPL Small-Body Database, Solar System Dynamics Group, Jet Propulsion L
 raw_path = "data/cache/sbdb-comets/*.json"
 baked_path = "data/baked/comets.ron"
 
+# Derived (M1 A4r, lead ruling A4 P1): comets.ron re-osculated to 2026-11-20 00:00 TDB by
+# `uni-bake comets-epoch` using uni-physics' planet-perturbed RK4 integrator (A3), so the world's
+# start-up needs no comet integration. Regenerate whenever comets.ron is re-baked. No download.
+# 147831 B, sha256 9a25dbe26af29f6ec0e2c1f03836976694cec893ee441742c2c58dde3c35d43c.
+[[entry]]
+id = "sbdb-comets-2026"
+url = "derived from data/baked/comets.ron (id sbdb-comets); no download"
+sha256 = "503ddcff10324ece0d46536fe86dbc1bc358ae21a86d90186498efedc3f6462a"
+license = "public JPL Solar System Dynamics data (no stated terms); elements re-osculated by this project"
+credit = "JPL Small-Body Database, Solar System Dynamics Group, Jet Propulsion Laboratory / Caltech, under contract with NASA; orbital elements re-osculated to 2026-11-20 TDB by this project's planet-perturbed integrator"
+raw_path = "data/baked/comets.ron"
+baked_path = "data/baked/comets_2026.ron"
+
 # JPL SSD planetary-satellite mean elements (A9 Step 3), fetched 2026-11-22 by
 # `cargo run -p uni-bake -- sats --out data/baked/sat_elements.ron`: 582 924 B, 461 rows (Puck listed twice).
 # Baked together with jpl-sats-phys: 460 moons, sat_elements.ron 155 578 B,
