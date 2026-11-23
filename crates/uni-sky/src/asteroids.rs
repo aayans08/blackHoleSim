@@ -778,9 +778,13 @@ const PROBE_DAY: f64 = 9_820.5;
 /// Real records the probe checks (brief: 256), spread evenly through the catalogue.
 const PROBE_REAL: usize = 256;
 /// The brief's position bound for the GPU path [m]: ≤ 100 km, "the stated f32 bound" (a few
-/// ulps of a). It is three f32 ulps in the main belt's binade (1.84–3.68 au: 32.8 km per ulp);
-/// [`position_tol_m`] holds every orbit to three ulps of its own aphelion distance, at least this.
+/// ulps of a). It is three f32 ulps in the main belt's binade (1.84–3.68 au: 32.8 km per ulp).
+/// The probe holds every main-belt record ([`PROBE_MAIN_BELT_R_M`]) to it from any camera, and
+/// [`position_tol_m`] every orbit to three ulps of its own aphelion distance, at least this.
 pub(crate) const POSITION_TOL_M: f64 = 100.0e3;
+/// The main belt for the probe's [`POSITION_TOL_M`] gate: records within 3.3 au of the Sun at the
+/// probe's date (the outer edge of the brief's 2.1–3.3 au annulus).
+const PROBE_MAIN_BELT_R_M: f64 = 3.3 * AU;
 /// f32 ulps of the aphelion distance in [`position_tol_m`].
 pub(crate) const POSITION_TOL_ULPS: f64 = 3.0;
 /// The procedural path's bound: M = M₀ + n·t in f32 (brief: statistical objects) is off by a few
@@ -1010,34 +1014,38 @@ fn run_probe(
     Ok(out)
 }
 
-/// `asteroid_positions`: every real record's GPU position within [`position_tol_m`] of
-/// uni_physics' f64 state (the brief's ≤ 100 km in the main belt, three f32 ulps of the
-/// aphelion distance beyond it), and the main belt's worst error reported in km.
+/// `asteroid_positions`: every main-belt record (within [`PROBE_MAIN_BELT_R_M`] of the Sun)
+/// within the brief's [`POSITION_TOL_M`] (≤ 100 km) of uni_physics' f64 state, from whichever
+/// camera (review r0 I1), and every real record within its [`position_tol_m`] (three f32 ulps of
+/// the aphelion distance, at least 100 km, plus one ulp of the distance). The probe needs at
+/// least one main-belt record, or it has not checked the brief's bound.
 fn check_real_positions(
     cases: &[ProbeCase],
     out: &[AsteroidProbeOut],
     source: &str,
 ) -> (bool, String) {
     let (mut worst_main, mut worst_ratio, mut worst_ea) = (0.0f64, 0.0f64, 0.0f64);
-    let mut n = 0;
+    let (mut n, mut n_main) = (0, 0);
     for (c, o) in cases.iter().zip(out).filter(|(c, _)| !c.belt) {
         n += 1;
         let got = Vec3::from_slice(&o.rel_ea[..3]).as_dvec3();
         let err = (got - c.want_rel_m).length();
-        if c.r_m <= 3.3 * AU {
+        if c.r_m <= PROBE_MAIN_BELT_R_M {
+            n_main += 1;
             worst_main = nan_max(worst_main, err);
         }
         worst_ratio = nan_max(worst_ratio, err / c.tol_m);
         worst_ea = nan_max(worst_ea, (f64::from(o.rel_ea[3]) - c.want_ea).abs());
     }
     (
-        n > 0 && worst_ratio <= 1.0,
+        n_main > 0 && worst_main <= POSITION_TOL_M && worst_ratio <= 1.0,
         format!(
-            "{n} real records ({source}): main belt (r ≤ 3.3 au) max {:.1} km (bound 100 km), \
-             worst error / bound {worst_ratio:.2} (bound: 3 f32 ulps of a(1 + e), ≥ 100 km, \
-             + 1 ulp of the distance); \
+            "{n} real records ({source}): {n_main} in the main belt (r ≤ 3.3 au), max {:.1} km \
+             (bound {:.0} km); all: worst error / bound {worst_ratio:.2} (bound: 3 f32 ulps of \
+             a(1 + e), ≥ 100 km, + 1 ulp of the distance); \
              eccentric anomaly max |GPU − f64| {worst_ea:.1e} rad",
-            worst_main / 1e3
+            worst_main / 1e3,
+            POSITION_TOL_M / 1e3
         ),
     )
 }
@@ -1580,7 +1588,8 @@ mod tests {
 
     /// The probe's cases and checks on the CPU: the twin's outputs (the GPU's arithmetic without
     /// fast math) pass both checks, so the bounds hold the f32 path itself; a real record 1 000 km
-    /// off, a belt object 10⁻³ of r off, an illuminance 1 % off or a NaN fail.
+    /// off, a main-belt record 110 km off (inside its generic bound), a belt object 10⁻³ of r
+    /// off, an illuminance 1 % off or a NaN fail.
     #[test]
     fn asteroid_probe_passes_on_the_twin_and_fails_on_errors() {
         let (cases, source) = probe_cases();
@@ -1605,6 +1614,25 @@ mod tests {
         // 1 000 km off fails a real record; 10⁻³ of r (a wrong orbit or anomaly) a belt object.
         let off = corrupt(0, &|o| o.rel_ea[0] += 1.0e6);
         assert!(!check_real_positions(&cases, &off, &source).0);
+        // A main-belt record 110 km off fails (review r0 I1: the brief's ≤ 100 km) although its
+        // generic bound accepts it (100 km + one f32 ulp of a distance beyond 0.92 au: 116–165 km),
+        // so only the main-belt gate can fail it. Of the main-belt records whose bound exceeds
+        // 115 km, the one that the f32 rounding of the shifted offset leaves closest to 110 km off.
+        let (main_k, wrong, err) = cases
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.belt && c.r_m <= PROBE_MAIN_BELT_R_M && c.tol_m > 115.0e3)
+            .map(|(k, c)| {
+                let wrong = (c.want_rel_m + c.want_rel_m.normalize() * 110.0e3).as_vec3();
+                (k, wrong, (wrong.as_dvec3() - c.want_rel_m).length())
+            })
+            .min_by(|a, b| (a.2 - 110.0e3).abs().total_cmp(&(b.2 - 110.0e3).abs()))
+            .expect("a main-belt record whose bound exceeds 115 km");
+        assert!((err - 110.0e3).abs() < 2.0e3, "{err} m");
+        assert!(err < cases[main_k].tol_m, "{err} m vs {} m", cases[main_k].tol_m);
+        let off = corrupt(main_k, &|o| o.rel_ea[..3].copy_from_slice(&wrong.to_array()));
+        let (pass, detail) = check_real_positions(&cases, &off, &source);
+        assert!(!pass, "a main-belt record {err:.0} m off passed: {detail}");
         let shift = (1.0e-3 * cases[belt_k].r_m) as f32;
         let off = corrupt(belt_k, &|o| o.rel_ea[0] += shift);
         assert!(!check_belt_and_lux(&cases, &off).0);
