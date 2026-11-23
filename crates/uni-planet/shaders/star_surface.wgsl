@@ -278,8 +278,18 @@ fn vs_main(@location(0) pos: vec3<f32>, @builtin(instance_index) k: u32) -> Star
 struct StarFsOut {
     // Premultiplied pre-exposed light; alpha = coverage.
     @location(0) color: vec4<f32>,
-    // lens_mask: g = coverage (blended with Max, green only).
+    // lens_mask: g = coverage, a = the star share (blended with Max, green and alpha).
     @location(1) mask: vec4<f32>,
+}
+
+// The star share this fragment stores in lens_mask.a, blended with Max (M1 frame contract, lead
+// ruling B6 I1): 1 - w where it covers anything, else 0, with the instance's own w (no draw
+// split). The meter (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
+// mix(scene_pre(), star_pre(), share) = this pass's mix(star_pre(), scene_pre(), w). The CPU
+// snaps w to 1 when 1 - w < 2^-14 (uni_planet::body::exposure_weight). CPU twin:
+// uni_planet::body::star_share.
+fn star_share(w: f32, coverage: f32) -> f32 {
+    return select(0.0, 1.0 - w, coverage > 0.0);
 }
 
 // Fraction of the pixel the disk covers, from the ray's angular distance to the silhouette:
@@ -335,6 +345,6 @@ fn fs_main(in: StarVsOut) -> StarFsOut {
     let pre = mix(star_pre(), scene_pre(), s.l0.w);
     var out: StarFsOut;
     out.color = vec4<f32>(min(lum * pre, vec3<f32>(HDR_MAX)) * cov, cov);
-    out.mask = vec4<f32>(0.0, cov, 0.0, 0.0);
+    out.mask = vec4<f32>(0.0, cov, 0.0, star_share(s.l0.w, cov));
     return out;
 }

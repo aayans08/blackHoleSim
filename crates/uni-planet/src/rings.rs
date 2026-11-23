@@ -1,11 +1,13 @@
 //! Saturn's rings, pass "rings" (Task B2).
 //!
 //! An annulus mesh in the ring plane (256 segments, exact plane depth), depth-tested without
-//! depth write, premultiplied, `lens_mask.g` = the opacity along the view ray with `Max`. The
-//! radii come from the profile (A8's span; uni-sim's `RingView` uses the same, lead ruling after
-//! A4). The app pushes this pass only when `WorldData::rings` loaded (ruling A.3); without it the
-//! load warning is shown. Card note (review m11): `Rings: Solar System Scope texture; phase
-//! function approximate`.
+//! depth write, premultiplied, `lens_mask.g` = the opacity along the view ray and `lens_mask.a`
+//! = the star share 1 − w ([`crate::body::star_share`], lead ruling B6 I1), both with `Max`. The
+//! exposure weight w is the planet's ([`crate::body::exposure_weight`]). The radii come from the
+//! profile (A8's span; uni-sim's `RingView` uses the same, lead ruling after A4). The app pushes
+//! this pass only when `WorldData::rings` loaded (ruling A.3); without it the load warning is
+//! shown. Card note (review m11): `Rings: Solar System Scope texture; phase function
+//! approximate`.
 //!
 //! **Photometry.** Radiance L = (E/π)·ρ(r)·P(θ)·A(τ, μ₀, μ) [cd/m²], i.e. I/F = ρ·P·A, with
 //! - E the sunlight at the planet [lx] × [`planet_shadow_on_ring`] (the ray to the Sun against
@@ -41,12 +43,11 @@ use uni_core::{R_SUN_M, TEFF_SUN_K, blackbody_linear_srgb};
 use uni_data::RingProfile;
 use uni_gfx::probe::{ProbeResult, run_compute};
 use uni_gfx::{
-    DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT,
-    PassTimer, RenderFeature, ShaderLib, SharedInput,
+    DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer,
+    RenderFeature, ShaderLib, SharedInput,
 };
 
-use crate::body::BodyScene;
-use crate::lod_exposure_mix;
+use crate::body::{BodyScene, exposure_weight, lens_mask_target};
 
 /// Segments of the annulus (B2 brief; the performance ladder's step is 128). Twin of
 /// `RING_SEGMENTS` in `rings.wgsl`.
@@ -238,7 +239,8 @@ impl RingRenderer {
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::COLOR,
                     }),
-                    Some(lens_mask_green_max()),
+                    // lens_mask.g = max(g, opacity), lens_mask.a = max(a, 1 − w).
+                    Some(lens_mask_target()),
                 ],
             }),
             // Both faces are drawn.
@@ -275,24 +277,6 @@ impl RingRenderer {
             capacity,
             count: 0,
         })
-    }
-}
-
-/// `lens_mask`: green only, blended with `Max` (frame contract; for `Max` the factors must be
-/// `One`).
-pub(crate) fn lens_mask_green_max() -> wgpu::ColorTargetState {
-    let max = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Max,
-    };
-    wgpu::ColorTargetState {
-        format: LENS_MASK_FORMAT,
-        blend: Some(wgpu::BlendState {
-            color: max,
-            alpha: max,
-        }),
-        write_mask: wgpu::ColorWrites::GREEN,
     }
 }
 
@@ -532,7 +516,8 @@ pub fn planet_shadow_on_ring(p_ring: DVec3, sun_dir: DVec3, radii: DVec3) -> f32
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct RingGpu {
-    /// Planet centre − camera [m], root axes; w: the exposure blend weight (1 = scene).
+    /// Planet centre − camera [m], root axes; w: the exposure blend weight (1 = scene), the
+    /// planet's [`exposure_weight`].
     pub centre: [f32; 4],
     /// The body x axis (root axes); w: inner radius [m].
     pub axis_x: [f32; 4],
@@ -576,11 +561,8 @@ pub(crate) fn plan_rings(scene: &BodyScene, inner_m: f64, outer_m: f64) -> Vec<R
             }
             let sun = b.sun_rel_m / d_sun;
             let body_sun = b.orient.conjugate() * sun;
-            let mix = if scene.eye_adapted {
-                lod_exposure_mix(b.proj_radius_px)
-            } else {
-                1.0
-            };
+            // The planet's exposure weight, snapped (lead ruling B6 I1).
+            let mix = exposure_weight(b.proj_radius_px, scene.eye_adapted);
             Some(RingGpu {
                 centre: vec4(b.rel_pos_m, f64::from(mix)),
                 axis_x: vec4(b.orient * DVec3::X, inner_m),
@@ -1010,6 +992,34 @@ mod tests {
                 .iter()
                 .all(|x| x.is_finite())
         );
+    }
+
+    /// Lead ruling B6 I1 (task B10): the rings take their planet's snapped exposure weight
+    /// ([`exposure_weight`]), so the share 1 − w they store in `lens_mask.a` is 0 or at least
+    /// 2⁻¹⁴ (an f16 normal), and just below 4 px (3.995 px, where 1 − w < 2⁻¹⁴) they draw at
+    /// scene exposure and store no share.
+    #[test]
+    fn ring_exposure_weight_is_the_planets_snapped() {
+        use crate::body::{STAR_SHARE_MIN, star_share};
+        let sun_rel = DVec3::new(-1.4e12, 2.0e11, 1.0e11);
+        let mut scene = BodyScene {
+            bodies: vec![saturn_view(DVec3::new(1.0e9, 2.0e9, -3.0e8), sun_rel)],
+            eye_adapted: true,
+            ..Default::default()
+        };
+        for r in [1.0, 1.5, 2.5, 3.95, 3.99, 3.995, 4.0, 50.0] {
+            scene.bodies[0].proj_radius_px = r;
+            let w = plan_rings(&scene, 7.0e7, 1.4e8)[0].centre[3];
+            assert_eq!(w, exposure_weight(r, true), "{r} px");
+            let s = star_share(w, 0.5);
+            assert!(s == 0.0 || s >= STAR_SHARE_MIN, "{r} px: share {s}");
+        }
+        scene.bodies[0].proj_radius_px = 3.995;
+        assert!(crate::lod_exposure_mix(3.995) < 1.0);
+        assert_eq!(plan_rings(&scene, 7.0e7, 1.4e8)[0].centre[3], 1.0);
+        scene.bodies[0].proj_radius_px = 2.0;
+        let w = plan_rings(&scene, 7.0e7, 1.4e8)[0].centre[3];
+        assert!(w > 0.0 && w < 1.0 && star_share(w, 0.5) == 1.0 - w);
     }
 
     /// The WGSL twin's constants equal the Rust ones (read from naga's module).

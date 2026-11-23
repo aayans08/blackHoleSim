@@ -16,7 +16,9 @@
 //! distance to the silhouette. Surface luminance per channel c:
 //! L_c(μ) = I/(πR²) · colour_c · LD_c(μ)/⟨LD_c⟩ · G_c, written × the exposure (world light, scene
 //! exposure; blended from star exposure below 4 px with [`crate::lod_exposure_mix`] while
-//! eye-adapted stars are in effect) and clamped to `HDR_MAX`.
+//! eye-adapted stars are in effect, [`crate::body::exposure_weight`]) and clamped to `HDR_MAX`.
+//! `lens_mask.g` gets the coverage and `lens_mask.a` the star share 1 − w, per instance
+//! ([`crate::body::star_share`], lead ruling B6 I1), both with `Max`.
 //!
 //! **Approximations**, labelled on the card as `Granulation: procedural (measured cell size and
 //! lifetime)`: the granulation pattern is procedural; the Sun's limb darkening is used for every
@@ -36,9 +38,8 @@ use uni_gfx::{
 use uni_sim::snapshot::StarSurfaceView;
 use wgpu::util::DeviceExt as _;
 
-use crate::body::BodyScene;
-use crate::rings::lens_mask_green_max;
-use crate::{CAP_RINGS, CAP_SEGMENTS, cap_indices, cap_mesh, lod_exposure_mix};
+use crate::body::{BodyScene, exposure_weight, lens_mask_target};
+use crate::{CAP_RINGS, CAP_SEGMENTS, cap_indices, cap_mesh};
 
 /// Vertices of one star's cap mesh, 1 + [`CAP_RINGS`] × [`CAP_SEGMENTS`].
 const CAP_VERTICES: usize = 1 + (CAP_RINGS * CAP_SEGMENTS) as usize;
@@ -127,7 +128,9 @@ impl StarSurfaceRenderer {
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::COLOR,
                     }),
-                    Some(lens_mask_green_max()),
+                    // lens_mask.g = max(g, coverage), lens_mask.a = max(a, 1 − w) with each
+                    // instance's own w (lead ruling B6 I1).
+                    Some(lens_mask_target()),
                 ],
             }),
             // No culling: the cap faces the camera by construction.
@@ -715,7 +718,8 @@ pub(crate) struct StarGpu {
     pub to_body_y: [f32; 4],
     pub to_body_z: [f32; 4],
     /// rgb: I/(πR²)·colour/⟨LD⟩ [cd/m²], the disk-centre luminance per channel; w: the exposure
-    /// blend weight (1 = scene exposure).
+    /// blend weight (1 = scene exposure, [`exposure_weight`]); the shader stores 1 − w in
+    /// `lens_mask.a`.
     pub l0: [f32; 4],
     /// x: radius [m]; y: granule cell size [m]; z, w: the r and b granulation contrast relative
     /// to g ([`channel_contrast`]).
@@ -778,7 +782,8 @@ pub(crate) fn star_gpu(view: &StarSurfaceView, exposure_mix: f32) -> StarGpu {
 /// - Each other star gets a [`cap_mesh`] of [`CAP_RINGS`] × [`CAP_SEGMENTS`] for a sphere whose
 ///   silhouette is [`AA_MARGIN_PX`] wider (at most half-way to 90°), camera-relative in f64 and
 ///   then f32, and its [`star_gpu`] record with the exposure blend
-///   `lod_exposure_mix(proj_radius_px)` while eye-adapted stars are in effect (1 otherwise).
+///   [`exposure_weight`]`(proj_radius_px, eye_adapted)`: `lod_exposure_mix(proj_radius_px)`,
+///   snapped to 1 when 1 − w < 2⁻¹⁴, while eye-adapted stars are in effect (1 otherwise).
 pub(crate) fn plan_stars(scene: &BodyScene, fov_y_rad: f64, height_px: f64) -> StarFrame {
     let px_angle = 2.0 * (0.5 * fov_y_rad).tan() / height_px.max(1.0);
     let mut frame = StarFrame {
@@ -811,11 +816,7 @@ pub(crate) fn plan_stars(scene: &BodyScene, fov_y_rad: f64, height_px: f64) -> S
         if unit.len() != CAP_VERTICES {
             continue;
         }
-        let mix = if scene.eye_adapted {
-            lod_exposure_mix(view.proj_radius_px)
-        } else {
-            1.0
-        };
+        let mix = exposure_weight(view.proj_radius_px, scene.eye_adapted);
         frame.draws.push(StarDraw {
             gpu: star_gpu(view, mix),
             vertices: unit
@@ -1401,6 +1402,43 @@ mod tests {
             (e / want - 1.0).abs() <= 0.01,
             "α Cen A: {e} lx vs {want} lx"
         );
+    }
+
+    /// Lead ruling B6 I1 (task B10): each star's record carries its own snapped exposure weight
+    /// ([`exposure_weight`]), which the instanced draw stores per instance as the share 1 − w in
+    /// `lens_mask.a` (no draw split). Two stars at different sizes in one frame keep their own
+    /// w; just below 4 px (3.995 px) w snaps to 1; without eye-adapted stars every w is 1.
+    #[test]
+    fn star_exposure_weight_per_instance_snapped() {
+        use crate::body::{STAR_SHARE_MIN, star_share};
+        let star = |z: f64, px: f64| {
+            let mut v = star_view(DVec3::new(0.0, 0.0, z), R_SUN_M, TEFF_SUN_K, M_V_SUN);
+            v.proj_radius_px = px;
+            v
+        };
+        let mut scene = BodyScene {
+            stars: vec![star(-3.0 * R_SUN_M, 2.0), star(-5.0 * R_SUN_M, 3.995)],
+            eye_adapted: true,
+            ..Default::default()
+        };
+        let weights = |scene: &BodyScene| -> Vec<f32> {
+            plan_stars(scene, 1.0, 1080.0)
+                .draws
+                .iter()
+                .map(|d| d.gpu.l0[3])
+                .collect()
+        };
+        let w = weights(&scene);
+        assert_eq!(w, vec![exposure_weight(2.0, true), 1.0]);
+        assert!(w[0] > 0.0 && w[0] < 1.0, "{w:?}");
+        assert!(crate::lod_exposure_mix(3.995) < 1.0);
+        for &wi in &w {
+            let s = star_share(wi, 1.0);
+            assert!(s == 0.0 || s >= STAR_SHARE_MIN, "{s}");
+        }
+        assert_eq!(star_share(w[0], 1.0), 1.0 - w[0]);
+        scene.eye_adapted = false;
+        assert_eq!(weights(&scene), vec![1.0, 1.0]);
     }
 
     /// Review Focus 2, review C2: a camera inside a photosphere draws nothing and warns.

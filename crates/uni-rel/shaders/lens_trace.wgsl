@@ -89,7 +89,8 @@ const LENS_ENV_UNIT_CD_M2: f32 = 1.0e-4;
 // uni_gfx::LENS_MASK_FORMAT (M1 frame contract, crates/uni-gfx/src/targets.rs), written only
 // on the pixels this pass repaints: r = captured fraction of the pixel (sky passes multiply by
 // 1 − r), g = 0 (no sky occlusion on a repainted pixel), b = 1 (the lensed environment is here;
-// the band multiplies by 1 − b), a = 0 (reserved for M3).
+// the band multiplies by 1 − b), a = 0 (the world writers' star share; no world light is left
+// on a repainted sky pixel, and the meter has already read it: this is pass 10, the meter 9).
 @group(1) @binding(4) var lens_mask_out: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(5) var<uniform> lens_env: LensEnvParams;
 // uni_gfx::FrameTargets::depth (reversed-Z, cleared to 0 = infinitely far). Nothing is attached

@@ -49,7 +49,7 @@ pub const ATMOSPHERE_COMMON_WGSL: &str = "atmo/atmosphere_common.wgsl";
 pub const ATMOSPHERE_DUAL_WGSL: &str = "atmo/atmosphere_dual.wgsl";
 /// `ShaderLib` path of the grey-transmittance variant (one pipeline, two targets).
 pub const ATMOSPHERE_GREY_WGSL: &str = "atmo/atmosphere_grey.wgsl";
-/// `ShaderLib` path of the dual-source variant's `lens_mask.g` pipeline.
+/// `ShaderLib` path of the dual-source variant's `lens_mask` pipeline (`g` and the star share `a`).
 pub const ATMOSPHERE_MASK_WGSL: &str = "atmo/atmosphere_mask.wgsl";
 
 /// Registers every uni-atmo WGSL file in `lib` (which should come from

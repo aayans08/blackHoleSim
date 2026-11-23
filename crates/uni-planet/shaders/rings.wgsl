@@ -5,7 +5,8 @@
 // circumscribed polygon of the outer circle, so the mesh covers the whole annulus and the
 // fragment shader trims it to the exact radii. The mesh is planar, so its interpolated depth is
 // the plane's exact depth. Depth-tested (reversed-Z Greater) without depth write; premultiplied
-// over hdr; lens_mask.g = the opacity along the view ray, blended with Max.
+// over hdr; lens_mask.g = the opacity along the view ray and lens_mask.a = the star share 1 - w
+// (star_share), both blended with Max.
 //
 // CPU twins (crates/uni-planet/src/rings.rs): `ring_phase`, `ring_layer_factor` and
 // `planet_shadow_on_ring` (its f32 core `shadow_core`). `universe --selftest` compares all
@@ -143,8 +144,18 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) k: u32) -> R
 struct RingFsOut {
     // Premultiplied pre-exposed light; alpha = the opacity along the view ray.
     @location(0) color: vec4<f32>,
-    // lens_mask: g = the same opacity (blended with Max, green only).
+    // lens_mask: g = the same opacity, a = the star share (blended with Max, green and alpha).
     @location(1) mask: vec4<f32>,
+}
+
+// The star share this fragment stores in lens_mask.a, blended with Max (M1 frame contract, lead
+// ruling B6 I1): 1 - w where it covers anything (here: opacity > 0), else 0. The meter
+// (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
+// mix(scene_pre(), star_pre(), share) = this pass's mix(star_pre(), scene_pre(), w). w is the
+// planet's, snapped to 1 on the CPU when 1 - w < 2^-14 (uni_planet::body::exposure_weight).
+// CPU twin: uni_planet::body::star_share.
+fn star_share(w: f32, coverage: f32) -> f32 {
+    return select(0.0, 1.0 - w, coverage > 0.0);
 }
 
 // Normal opacities at or above this are treated as this (τ ≤ 9.2), so τ stays finite.
@@ -191,6 +202,6 @@ fn fs_main(in: RingVsOut) -> RingFsOut {
     let pre = mix(star_pre(), scene_pre(), ring.centre.w);
     var out: RingFsOut;
     out.color = vec4<f32>(min(radiance * pre, vec3<f32>(HDR_MAX)), alpha_view);
-    out.mask = vec4<f32>(0.0, alpha_view, 0.0, 0.0);
+    out.mask = vec4<f32>(0.0, alpha_view, 0.0, star_share(ring.centre.w, alpha_view));
     return out;
 }

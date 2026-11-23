@@ -17,8 +17,9 @@
 //!
 //! **Silhouette AA.** coverage = clamp(0.5 − d_px, 0, 1) from the signed angle between the pixel
 //! ray and the analytic limb, turned into pixels by its screen-space gradient; below 1/255 the
-//! fragment is discarded; premultiplied blend into `hdr`; `lens_mask.g` gets the coverage with
-//! `Max`. The mesh's outline ring is pushed [`AA_MARGIN_PX`] out so the rim outside the limb is
+//! fragment is discarded; premultiplied blend into `hdr`; `lens_mask.g` gets the coverage and
+//! `lens_mask.a` the star share 1 − w ([`star_share`]), both with `Max`. The mesh's outline ring
+//! is pushed [`AA_MARGIN_PX`] out so the rim outside the limb is
 //! rasterised. Edge pixels write depth, so the band and stars (depth-tested at the far plane,
 //! ruling 4) miss their (1 − coverage) share on the 1-px rim (decision N1).
 //!
@@ -38,7 +39,18 @@
 //! whole rendered disk, this pass's ground as uni-atmo's pass dims it plus that pass's
 //! in-scatter (ruling W-B1, review I3: [`body_light`], [`flux_match`]; B3's disk share from its
 //! CPU twins, [`atmo_handover`]). The exposure factor blends from `star_pre` to `scene_pre` with
-//! [`crate::lod_exposure_mix`] while eye-adapted stars are in effect.
+//! [`crate::lod_exposure_mix`] while eye-adapted stars are in effect ([`exposure_weight`]).
+//!
+//! **Star share (lead ruling B6 I1, task B10).** Every uni-planet pass that draws at
+//! pre = mix(star_pre, scene_pre, w) with w < 1 (bodies, rings, star surfaces in the 1.5–4 px
+//! band) stores s = 1 − w in `lens_mask.a` on each fragment that covers anything, blended with
+//! `Max` ([`lens_mask_target`], [`star_share`]); the clear value 0 means scene exposure. The meter
+//! (uni-post `histogram.wgsl`, pass 9) divides each pixel by mix(scene_pre, star_pre, s), which is
+//! the writer's pre, so a body in the band is metered at its true luminance and the exposure loop
+//! cannot run away. w is snapped to 1 when 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴, f16's smallest
+//! normal, which Metal may otherwise flush to 0 on store ([`exposure_weight`]). The app gives a
+//! body's atmosphere the same w (`uni_atmo::AtmoDraw::exposure_mix`), so its in-scatter shares the
+//! body's exposure and its share.
 //!
 //! No Earth- or Venus-specific calibration constant lives here (constraints §4a, W-B1..W-B3);
 //! `World::objects()` grows at run time, so nothing is sized per `ObjectId`: materials are keyed
@@ -104,6 +116,69 @@ pub(crate) const AA_MARGIN_PX: f64 = 1.0;
 /// Bindings of group 1 (`body.wgsl`): the uniform, albedo, clouds, map sampler, ring, ring
 /// sampler.
 pub(crate) const BODY_BINDINGS: u32 = 6;
+
+/// Smallest non-zero star share a uni-planet pass stores in `lens_mask.a`: 2⁻¹⁴, the smallest
+/// normal binary16 (IEEE 754-2019 §3.6; `lens_mask` is Rgba16Float). Metal does not promise to
+/// keep f16 subnormals when it stores a render target, and a share flushed to 0 reads as scene
+/// exposure while the light was written nearer `star_pre`: the meter then reads it too bright by
+/// 1 + s·(2^(EV_scene − EV_star) − 1), which still grows with the scene EV (uni-post
+/// `band_share_below_f16_normal_needs_the_snap`). [`exposure_weight`] snaps w to 1 instead (lead
+/// ruling B6 I1).
+pub const STAR_SHARE_MIN: f32 = 1.0 / 16384.0;
+
+/// The exposure weight w with which the uni-planet passes draw a resolved body, its rings or a
+/// star surface of projected radius `proj_radius_px` [px]: pre = mix(star_pre, scene_pre, w) (M1
+/// frame contract, "Exposure split").
+///
+/// While eye-adapted stars are in effect it is [`crate::lod_exposure_mix`] snapped by
+/// [`snap_exposure_weight`] (0 at ≤ 1.5 px, 1 from about 3.98 px on), otherwise 1 (scene
+/// exposure; `star_pre == scene_pre` then). The star share the pass stores is 1 − w
+/// ([`star_share`]). The app must give the body's atmosphere this same value
+/// (`uni_atmo::AtmoDraw::exposure_mix`, lead ruling B6 I1): its in-scatter then shares the body's
+/// exposure, which ruling W-B1's handover ([`flux_match`] with σ = 1) relies on.
+pub fn exposure_weight(proj_radius_px: f64, eye_adapted: bool) -> f32 {
+    if eye_adapted {
+        snap_exposure_weight(lod_exposure_mix(proj_radius_px))
+    } else {
+        1.0
+    }
+}
+
+/// `w`, or 1 when 1 − w < [`STAR_SHARE_MIN`], so the share 1 − w is either 0 or an f16 normal.
+/// 1 − smoothstep(t) ≈ 3(1 − t)², so the snap acts only for radii in about (3.982, 4) px, keeps w
+/// non-decreasing in the radius, and moves it by less than 2⁻¹⁴. The CPU applies it before the
+/// upload, so the pass's pre and its share use the same w (in f32, 1 − w is exact for w ≥ ½).
+pub(crate) fn snap_exposure_weight(w: f32) -> f32 {
+    if 1.0 - w < STAR_SHARE_MIN { 1.0 } else { w }
+}
+
+/// CPU twin of `star_share` in `body.wgsl`, `rings.wgsl` and `star_surface.wgsl`: the star share a
+/// fragment drawn with exposure weight `w` and coverage (the rings: opacity) `coverage` stores in
+/// `lens_mask.a`, blended with `Max` (lead ruling B6 I1): 1 − w where it covers anything, else 0.
+/// The meter (uni-post `histogram.wgsl`, `meter_pre`) reads it back as the pixel's pre,
+/// mix(scene_pre, star_pre, s) = mix(star_pre, scene_pre, w), the writer's own (0 = scene
+/// exposure, the clear value).
+pub fn star_share(w: f32, coverage: f32) -> f32 {
+    if coverage > 0.0 { 1.0 - w } else { 0.0 }
+}
+
+/// The `lens_mask` target of the bodies, rings and star-surface passes: green (sky occlusion) and
+/// alpha (the star share, [`star_share`]) written, both blended with `Max` (M1 frame contract;
+/// WebGPU requires factor One for `Max`); red and blue are left to the lens pass.
+pub(crate) fn lens_mask_target() -> wgpu::ColorTargetState {
+    wgpu::ColorTargetState {
+        format: LENS_MASK_FORMAT,
+        blend: Some(wgpu::BlendState {
+            color: MAX_BLEND,
+            alpha: MAX_BLEND,
+        }),
+        write_mask: LENS_MASK_WRITES,
+    }
+}
+
+/// The `lens_mask` channels the world writers own: `g` (sky occlusion) and `a` (star share).
+pub(crate) const LENS_MASK_WRITES: wgpu::ColorWrites =
+    wgpu::ColorWrites::GREEN.union(wgpu::ColorWrites::ALPHA);
 
 /// Twin of `struct BodyUniform` in `body.wgsl` (vec4-sized members only; the field docs are in
 /// the WGSL). One per body drawn, at a dynamic offset.
@@ -281,7 +356,8 @@ pub(crate) struct BodyLight {
     pub phase_rad: f64,
     /// Mallama & Hilton's C(α), clamped as in the point path.
     pub phase_correction: f64,
-    /// Ruling W-B1's flux weight w = [`lod_exposure_mix`]: 0 at 1.5 px, 1 from 4 px on.
+    /// Ruling W-B1's flux weight w = [`lod_exposure_mix`], snapped ([`snap_exposure_weight`]): 0
+    /// at 1.5 px, 1 from about 3.98 px on.
     pub flux_weight: f64,
     /// A: the point's flux over this pass's own disk flux at k = 1 (1 when there is nothing to
     /// match).
@@ -289,7 +365,8 @@ pub(crate) struct BodyLight {
     /// B: the atmosphere pass's in-scatter flux over this pass's disk flux at k = 1 (0 without
     /// an atmosphere).
     pub inscatter_share: f64,
-    /// Exposure weight: 0 `star_pre` … 1 `scene_pre`.
+    /// Exposure weight: 0 `star_pre` … 1 `scene_pre` ([`exposure_weight`]); the pass stores the
+    /// star share 1 − this in `lens_mask.a`.
     pub exposure_mix: f32,
 }
 
@@ -304,7 +381,8 @@ impl BodyLight {
         ]
     }
 
-    /// Ruling W-B1's k at σ = scene_pre / pre ([`flux_match`], as the shader computes it).
+    /// Ruling W-B1's k at σ ([`flux_match`]); the shader passes σ = 1 (the atmosphere draws at
+    /// this body's exposure).
     #[cfg(test)]
     pub fn flux_match(&self, sigma: f64) -> f64 {
         f64::from(flux_match(self.handover(), sigma as f32))
@@ -325,9 +403,11 @@ impl BodyLight {
 ///   ρ(p_V) 0.651) under B3's atmosphere, which adds its in-scatter and dims the ground. Its
 ///   point flux cross-fades to that whole rendering over the 1.5–4 px band of
 ///   [`lod_exposure_mix`]: this pass's light is scaled by k = [`flux_match`]`((w, A, B, k_max),
-///   σ)` (the shader computes σ = scene_pre/pre), so at 1.5 px this pass and the atmosphere pass
-///   together send the point's flux, and from 4 px on k = 1 (review I3: B3 draws its in-scatter
-///   at every size, unfaded, at scene_pre; uni-atmo `feature.rs` `misc[0] = 1`). In units of
+///   1)`, so at 1.5 px this pass and the atmosphere pass together send the point's flux, and from
+///   4 px on k = 1. σ = 1 because B3 draws its in-scatter at every size, unfaded, at this body's
+///   own exposure weight (lead ruling B6 I1: the app sets `uni_atmo::AtmoDraw::exposure_mix` to
+///   [`exposure_weight`] of the same body; before task B10 it drew at scene_pre and σ was
+///   scene_pre/pre). In units of
 ///   E·R_mean²/d², with ρ_p = ρ(p_V), R_d the drawn mean radius, R_b the preset's bottom radius
 ///   and lum = BT.709 ⊙ the Sun's colour:
 ///   - the point (uni-sim `reflected_lux`, Lambert): P = ρ_p·⅔Φ(α)·C;
@@ -340,7 +420,8 @@ impl BodyLight {
 ///   [`HANDOVER_GROUND_MIN`] (Titan) leaves A = 1, B = 0. Airless bodies, w = 1, or no map
 ///   statistics (`disk_rho` `None`, a 2k copy missing; the HUD says so, review I1) give A = 1,
 ///   B = 0, so k = 1.
-/// - The exposure weight is w while eye-adapted stars are in effect, else 1 (scene exposure).
+/// - w is snapped ([`snap_exposure_weight`]); the exposure weight is [`exposure_weight`]: w while
+///   eye-adapted stars are in effect, else 1 (scene exposure).
 pub(crate) fn body_light(
     view: &BodyView,
     radii: DVec3,
@@ -359,7 +440,7 @@ pub(crate) fn body_light(
     } else {
         raw.min(MAX_PHASE_CORRECTION)
     };
-    let w = f64::from(lod_exposure_mix(view.proj_radius_px));
+    let w = f64::from(snap_exposure_weight(lod_exposure_mix(view.proj_radius_px)));
     let drawn_mean = (radii.x * radii.y * radii.z).cbrt();
     let (mut a, mut b) = (1.0, 0.0);
     if let Some(rho) = disk_rho
@@ -404,7 +485,7 @@ pub(crate) fn body_light(
         flux_weight: w,
         point_share: a,
         inscatter_share: b,
-        exposure_mix: if eye_adapted { w as f32 } else { 1.0 },
+        exposure_mix: exposure_weight(view.proj_radius_px, eye_adapted),
     }
 }
 
@@ -637,15 +718,9 @@ impl BodyRenderer {
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::COLOR,
                     }),
-                    // lens_mask.g = max(g, coverage) (M1 frame contract).
-                    Some(wgpu::ColorTargetState {
-                        format: LENS_MASK_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: MAX_BLEND,
-                            alpha: MAX_BLEND,
-                        }),
-                        write_mask: wgpu::ColorWrites::GREEN,
-                    }),
+                    // lens_mask.g = max(g, coverage), lens_mask.a = max(a, 1 − w) (M1 frame
+                    // contract; lead ruling B6 I1).
+                    Some(lens_mask_target()),
                 ],
             }),
             // Every cap triangle faces the camera; no culling needed.
@@ -1465,13 +1540,19 @@ fn warm_atmo_handover(naifs: Vec<i32>) {
 }
 
 /// Twin of `flux_match` in `body.wgsl`: ruling W-B1's factor k on this pass's light, from the
-/// uniform's `handover` = (w, A, B, k_max) and σ = scene_pre / pre (pre: this pass's exposure).
+/// uniform's `handover` = (w, A, B, k_max) and σ = pre_atmo / pre (pre: this pass's exposure,
+/// pre_atmo: the atmosphere pass's for the same body).
 ///
 /// k = (1 − w)·A + w + B·(w − σ), clamped to [0, k_max]. With this pass's own disk flux D (at
 /// k = 1), the point's P = A·D and the atmosphere pass's in-scatter I = B·D (written at
-/// scene_pre), the total k·D·pre + I·scene_pre equals pre·[(1 − w)·P + w·(D + I)]: the point's
+/// pre_atmo), the total k·D·pre + I·pre_atmo equals pre·[(1 − w)·P + w·(D + I)]: the point's
 /// flux at 1.5 px (w = 0, pre = star_pre while eye-adapted stars are in effect), the real
 /// rendering from 4 px (w = 1, k = 1), and a linear cross-fade between.
+///
+/// Since task B10 the atmosphere draws at its body's exposure weight (lead ruling B6 I1,
+/// [`exposure_weight`]), so pre_atmo = pre and the shader passes σ = 1: k = (1 − w)·A + w +
+/// B·(w − 1), linear in w in both exposure modes. (Before, B3 drew at scene_pre and σ was
+/// scene_pre/pre.)
 pub(crate) fn flux_match(handover: [f32; 4], sigma: f32) -> f32 {
     let [w, a, b, k_max] = handover;
     ((1.0 - w) * a + w + b * (w - sigma)).clamp(0.0, k_max)
@@ -1728,14 +1809,17 @@ mod tests {
     /// `reflected_lux`) at star exposure. The disk's is what this pass writes
     /// (`disk_illuminance_lux` with the map's disk-averaged ρ̄ and the drawn radius, times C and
     /// k) at the blended exposure, plus, for the bodies with an atmosphere, what B3's pass does
-    /// to it: the ground dimmed by its ground factor and B3's in-scatter added at scene
-    /// exposure, both from [`fine_atmo`] at the exact phase (finer than the table [`body_light`]
-    /// reads, and between its 10° nodes). Checked with eye-adapted stars (star EV −4 against
-    /// scene EV 10) and without (one exposure). Earth, Mars and Venus exercise the cross-fade
-    /// (Venus drawn at its cloud tops); the airless bodies have ρ̄ = ρ(p_V) and k = 1. Titan's
-    /// ground is hidden under its haze, so k stays 1 there and the handover is B3's: its gap is
-    /// printed and bounded below. Also: k reaches 1 by 4 px, and the cross-fade is exact and
-    /// smooth through the band.
+    /// to it: the ground dimmed by its ground factor and B3's in-scatter added at the body's own
+    /// blended exposure (lead ruling B6 I1, task B10: the atmosphere gets the body's
+    /// [`exposure_weight`], so the shader's σ is 1), both from [`fine_atmo`] at the exact phase
+    /// (finer than the table [`body_light`] reads, and between its 10° nodes). Checked with
+    /// eye-adapted stars (star EV −4 against scene EV 10) and without (one exposure). Earth, Mars
+    /// and Venus exercise the cross-fade (Venus drawn at its cloud tops); the airless bodies have
+    /// ρ̄ = ρ(p_V) and k = 1. Titan's ground is hidden under its haze, so k stays 1 there and the
+    /// handover is B3's in-scatter alone: its gap is printed and bounded below, now in both
+    /// exposure modes (before B10 the in-scatter stayed at scene exposure and Titan's disk fell
+    /// the full star/scene gap short with eye-adapted stars). Also: k reaches 1 by 4 px, and the
+    /// cross-fade is exact and smooth through the band.
     #[test]
     fn point_disk_handover_flux_continuous() {
         let fov = 60f64.to_radians();
@@ -1871,7 +1955,8 @@ mod tests {
                         None => (bare, 0.0),
                     };
                     let pre = star_pre + (scene_pre - star_pre) * f64::from(light.exposure_mix);
-                    let k = light.flux_match(scene_pre / pre);
+                    // σ = 1: B3's in-scatter is written at this same pre (body.wgsl fs_main).
+                    let k = light.flux_match(1.0);
                     // The point path (uni-sim `reflected_lux`): C clamped to ≤ 10 (A3 ruling).
                     let c = naif
                         .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
@@ -1902,14 +1987,14 @@ mod tests {
                         eye_adapted,
                         |_| None,
                     )
-                    .flux_match(scene_pre / pre);
+                    .flux_match(1.0);
                     (
-                        k * own * pre + inscatter * scene_pre,
+                        (k * own + inscatter) * pre,
                         point * star_pre,
                         target,
                         light,
                         k,
-                        old * own * pre + inscatter * scene_pre,
+                        (old * own + inscatter) * pre,
                     )
                 };
                 let (disk, point, _, light, k0, old) = energy_at(1.5);
@@ -1929,15 +2014,14 @@ mod tests {
                 assert_eq!(light.flux_weight, 0.0, "{name}");
                 if name == "Titan" {
                     // Titan's ground is hidden (ground factor < HANDOVER_GROUND_MIN): k = 1, and
-                    // the step at 1.5 px is the atmosphere pass's (it draws at scene exposure
-                    // and does not fade; review I3, out of this pass's reach).
+                    // the step at 1.5 px is the atmosphere pass's in-scatter against the point
+                    // (it does not fade; review I3, out of this pass's reach). It is drawn at
+                    // the body's exposure since B10, so the gap is the same in both modes.
                     let t = truth.as_ref().unwrap();
                     assert!((lum * t.ground_factor).element_sum() < HANDOVER_GROUND_MIN);
                     assert_eq!((light.point_share, light.inscatter_share), (1.0, 0.0));
                     assert_eq!(k0, 1.0);
-                    if !eye_adapted {
-                        assert!(gap.abs() < 0.3, "Titan, one exposure: {gap}");
-                    }
+                    assert!(gap.abs() < 0.3, "Titan, eye-adapted {eye_adapted}: {gap}");
                 } else {
                     assert!(gap.abs() < 0.03, "{name}: disk {disk} vs point {point}");
                 }
@@ -1955,12 +2039,10 @@ mod tests {
                 // into the real rendering (k from the table, the rendering from fine_atmo), k
                 // stays in [0, k_max], and the exposure weight steps by at most 3 % between
                 // neighbouring sizes (smoothstep in ln r: at most 1.5 × the mean slope, 1.5 %
-                // here). With one exposure k is linear in w, so it steps by at most 3 % of
-                // |k₀ − 1|. With eye-adapted stars this pass's exposure falls 14 stops across the
-                // band while B3's in-scatter stays at scene_pre, so k must move fast near 4 px
-                // (σ = scene_pre/pre rises from 6e-5 to 1 in the last 1 % of w) for the exposed
-                // total to stay on the cross-fade; the exposed energy itself changes by orders
-                // of magnitude across the band, which is the eye-adapted blend's purpose.
+                // here). k is linear in w in both exposure modes (σ = 1: B3's in-scatter shares
+                // this pass's exposure since B10), so it steps by at most 3 % of |k₀ − 1|. With
+                // eye-adapted stars the exposed energy itself changes by orders of magnitude
+                // across the band, which is the eye-adapted blend's purpose.
                 let (mut prev, mut prev_k) = (light, k0);
                 for step in 1..=100 {
                     let (e, _, target, l, k, _) = energy_at(1.5 + 2.5 * f64::from(step) / 100.0);
@@ -1976,12 +2058,10 @@ mod tests {
                         assert!(off.abs() < 0.03, "{name} step {step}: {off}");
                     }
                     let dk = (k - prev_k).abs();
-                    if !eye_adapted {
-                        assert!(
-                            dk <= 0.03 * (k0 - 1.0).abs() + 1e-6,
-                            "{name} {step}: Δk {dk}"
-                        );
-                    }
+                    assert!(
+                        dk <= 0.03 * (k0 - 1.0).abs() + 1e-6,
+                        "{name} {step} eye-adapted {eye_adapted}: Δk {dk}"
+                    );
                     let dw = (l.exposure_mix - prev.exposure_mix).abs();
                     assert!((0.0..=0.03).contains(&dw), "{name} step {step}: Δw {dw}");
                     (prev, prev_k) = (l, k);
@@ -2068,8 +2148,9 @@ mod tests {
     }
 
     /// [`flux_match`] (the shader's formula): k = 1 from 4 px on; the point's share minus the
-    /// in-scatter's at 1.5 px; clamped to [0, k_max]; and the shares of the bodies with an
-    /// atmosphere at phase 0 (printed for the report): A 1.6–3, so the bound never binds there.
+    /// in-scatter's at 1.5 px (σ = 1, what the shader passes since B10); clamped to [0, k_max];
+    /// and the shares of the bodies with an atmosphere at phase 0 (printed for the report): A
+    /// 1.6–3, so the bound never binds there.
     #[test]
     fn flux_match_cases() {
         let k = |w: f32, a: f32, b: f32, sigma: f32| flux_match([w, a, b, FLUX_MATCH_MAX], sigma);
@@ -2103,8 +2184,8 @@ mod tests {
             });
             let k1 = light.flux_match(1.0);
             eprintln!(
-                "{naif} phase 0: A {:.3}, B {:.3}, k at 1.5 px {k1:.3} (one exposure), {:.3} \
-                 (eye-adapted, σ = 1/16)",
+                "{naif} phase 0: A {:.3}, B {:.3}, k at 1.5 px {k1:.3} (σ = 1, both exposure \
+                 modes since B10), {:.3} (σ = 1/16, the general formula)",
                 light.point_share,
                 light.inscatter_share,
                 light.flux_match(1.0 / 16.0)
@@ -2487,5 +2568,192 @@ mod tests {
             Placement::Skip(w) => assert!(!w.contains("Inside") && w.contains("Venus"), "{w}"),
             p => panic!("NaN position drawn: {p:?}"),
         }
+    }
+
+    /// Lead ruling B6 I1 (task B10): the star share a uni-planet pass stores in `lens_mask.a`.
+    /// - One exposure: w = 1 and the share is 0 at every size (`star_pre == scene_pre` then).
+    /// - Eye-adapted: share 1 at ≤ 1.5 px (star exposure), 0 from 4 px on, 1 − w between, and 0
+    ///   wherever the fragment covers nothing.
+    /// - The snap: every non-zero share is ≥ 2⁻¹⁴, f16's smallest normal, so the Rgba16Float store
+    ///   cannot flush it even where Metal flushes subnormals. The snap acts only just below 4 px
+    ///   (3.995 px snapped, 3.95 px not), moves w by < 2⁻¹⁴ and keeps it non-decreasing.
+    /// - The meter's encoding (uni-post `histogram.wgsl` `meter_pre`: mix(scene_pre, star_pre, s),
+    ///   0 = scene exposure) recovers the writer's pre mix(star_pre, scene_pre, w) from the
+    ///   f16-stored share to within its rounding, 2⁻¹¹·s·|star_pre − scene_pre|, at star EV −4
+    ///   against scene EV 15, 0 and −10.
+    #[test]
+    fn star_share_snapped_and_read_back_by_the_meter() {
+        use uni_data::{f16_to_f32, f32_to_f16};
+        use uni_sim::snapshot::{BLEND_LOD_PX, POINT_LOD_PX};
+        assert_eq!(STAR_SHARE_MIN, 2f32.powi(-14));
+        // 0x0400 is binary16's smallest normal (IEEE 754-2019 §3.6).
+        assert_eq!(f16_to_f32(0x0400), STAR_SHARE_MIN);
+        for r in [
+            0.0,
+            1.0,
+            1.5,
+            2.5,
+            3.99,
+            4.0,
+            100.0,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            assert_eq!(exposure_weight(r, false), 1.0, "{r}");
+            assert_eq!(star_share(exposure_weight(r, false), 1.0), 0.0, "{r}");
+        }
+        for r in [0.0, 1.0, POINT_LOD_PX] {
+            assert_eq!(star_share(exposure_weight(r, true), 1.0), 1.0, "{r}");
+        }
+        for r in [BLEND_LOD_PX, 10.0, f64::INFINITY, f64::NAN] {
+            assert_eq!(star_share(exposure_weight(r, true), 0.5), 0.0, "{r}");
+        }
+        // Coverage: none (or NaN) stores nothing; any coverage stores the whole share (Max).
+        assert_eq!(star_share(0.25, 0.0), 0.0);
+        assert_eq!(star_share(0.25, f32::NAN), 0.0);
+        assert_eq!(star_share(0.25, 1.0e-3), 0.75);
+        // The snap acts just below 4 px only.
+        assert!(lod_exposure_mix(3.995) < 1.0 && 1.0 - lod_exposure_mix(3.995) < STAR_SHARE_MIN);
+        assert_eq!(exposure_weight(3.995, true), 1.0);
+        assert!(1.0 - lod_exposure_mix(3.95) > STAR_SHARE_MIN);
+        assert_eq!(exposure_weight(3.95, true), lod_exposure_mix(3.95));
+
+        let mut radii: Vec<f64> = (0..=100_000)
+            .map(|i| POINT_LOD_PX + (BLEND_LOD_PX - POINT_LOD_PX) * f64::from(i) / 1.0e5)
+            .chain((0..=10_000).map(|i| 3.97 + 0.03 * f64::from(i) / 1.0e4))
+            .collect();
+        radii.sort_by(f64::total_cmp);
+        let pres = [(15.0, -4.0), (0.0, -4.0), (-10.0, -4.0)].map(|(scene, star)| {
+            (
+                f64::from(exposure_scale(scene)),
+                f64::from(exposure_scale(star)),
+            )
+        });
+        let (mut prev, mut snapped, mut lowest_snapped) = (0.0_f32, 0, f64::INFINITY);
+        for r in radii {
+            let lod = lod_exposure_mix(r);
+            let w = exposure_weight(r, true);
+            assert!((w - lod).abs() < STAR_SHARE_MIN, "r {r}: w {w}, lod {lod}");
+            assert!(w >= prev, "r {r}: {w} < {prev}");
+            prev = w;
+            if w == 1.0 && lod < 1.0 {
+                snapped += 1;
+                lowest_snapped = lowest_snapped.min(r);
+            }
+            let s = star_share(w, 1.0);
+            assert!(s == 0.0 || s >= STAR_SHARE_MIN, "r {r}: share {s}");
+            // What lens_mask holds after the store (round to nearest f16).
+            let stored = f16_to_f32(f32_to_f16(s));
+            assert_eq!(stored == 0.0, s == 0.0, "r {r}: {s} stored as {stored}");
+            assert!(stored == 0.0 || stored >= STAR_SHARE_MIN, "r {r}: {stored}");
+            assert!(
+                (stored - s).abs() <= s * 2f32.powi(-11),
+                "r {r}: {s} → {stored}"
+            );
+            for (scene_pre, star_pre) in pres {
+                // The writer: mix(star_pre, scene_pre, w). The meter: mix(scene_pre, star_pre, s).
+                let writer = star_pre + (scene_pre - star_pre) * f64::from(w);
+                let meter = scene_pre + (star_pre - scene_pre) * f64::from(stored.clamp(0.0, 1.0));
+                let bound = 2f64.powi(-11) * f64::from(s) * (star_pre - scene_pre).abs();
+                assert!(
+                    (meter - writer).abs() <= bound * (1.0 + 1e-9) + 1e-12 * writer,
+                    "r {r}, pres {scene_pre} {star_pre}: meter {meter} vs writer {writer}"
+                );
+                if s == 0.0 {
+                    assert_eq!(meter, scene_pre, "r {r}");
+                }
+            }
+        }
+        assert!(snapped > 0, "the snap never acted");
+        assert!(lowest_snapped > 3.98, "snapped from {lowest_snapped} px");
+    }
+
+    /// Lead ruling B6 I1: a body's atmosphere uses the body's own exposure weight. uni-atmo
+    /// cannot depend on uni-planet, so it keeps a twin of the snap
+    /// (`uni_atmo::feature::atmo_exposure_mix`): same threshold, the same result on every raw
+    /// `lod_exposure_mix` value, and a body's [`exposure_weight`] (what the app copies into
+    /// `AtmoDraw::exposure_mix`) passes through it unchanged, so the pair share one pre and one
+    /// star share.
+    #[test]
+    fn atmosphere_gets_the_bodys_exposure_weight() {
+        use uni_atmo::feature::{STAR_SHARE_MIN as ATMO_MIN, atmo_exposure_mix, atmo_star_share};
+        assert_eq!(ATMO_MIN, STAR_SHARE_MIN);
+        for i in 0..=100_000 {
+            let r = 1.0 + 3.5 * f64::from(i) / 1.0e5;
+            let lod = lod_exposure_mix(r);
+            assert_eq!(atmo_exposure_mix(lod), snap_exposure_weight(lod), "{r} px");
+            for eye_adapted in [true, false] {
+                let w = exposure_weight(r, eye_adapted);
+                assert_eq!(atmo_exposure_mix(w), w, "{r} px");
+                assert_eq!(atmo_star_share(w), star_share(w, 1.0), "{r} px");
+            }
+        }
+    }
+
+    /// The bodies, rings and star-surface passes share one `lens_mask` target (lead ruling B6 I1):
+    /// green (sky occlusion) and alpha (the star share) written, red and blue left to the lens
+    /// pass, both blended with `Max` (factors One), Rgba16Float.
+    #[test]
+    fn lens_mask_target_writes_green_and_alpha_with_max() {
+        let t = lens_mask_target();
+        assert_eq!(t.format, LENS_MASK_FORMAT);
+        assert_eq!(
+            t.write_mask,
+            wgpu::ColorWrites::GREEN | wgpu::ColorWrites::ALPHA
+        );
+        let blend = t.blend.unwrap();
+        for c in [blend.color, blend.alpha] {
+            assert_eq!(c.operation, wgpu::BlendOperation::Max);
+            assert_eq!(
+                (c.src_factor, c.dst_factor),
+                (wgpu::BlendFactor::One, wgpu::BlendFactor::One)
+            );
+        }
+    }
+
+    /// The three world writers' shaders store the star share (lead ruling B6 I1): each defines
+    /// `star_share(w, coverage)` (twin of [`star_share`]) and writes it into the mask's alpha with
+    /// the same w its pre uses, per instance for the star surfaces. body.wgsl passes σ = 1 to
+    /// `flux_match`, because the atmosphere now draws at the body's exposure weight.
+    #[test]
+    fn world_writer_shaders_store_the_star_share() {
+        let mut lib = ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        for (path, pre, mask) in [
+            (
+                crate::BODY_WGSL,
+                "let pre = mix(star_pre(), scene_pre(), body_u.light.w);",
+                "out.mask = vec4<f32>(0.0, coverage, 0.0, star_share(body_u.light.w, coverage));",
+            ),
+            (
+                crate::RINGS_WGSL,
+                "let pre = mix(star_pre(), scene_pre(), ring.centre.w);",
+                "out.mask = vec4<f32>(0.0, alpha_view, 0.0, star_share(ring.centre.w, alpha_view));",
+            ),
+            (
+                crate::STAR_SURFACE_WGSL,
+                "let pre = mix(star_pre(), scene_pre(), s.l0.w);",
+                "out.mask = vec4<f32>(0.0, cov, 0.0, star_share(s.l0.w, cov));",
+            ),
+        ] {
+            let src = lib.compose(path).unwrap();
+            let m = validate_wgsl(&src).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let arity = m
+                .functions
+                .iter()
+                .find(|(_, f)| f.name.as_deref() == Some("star_share"))
+                .map(|(_, f)| f.arguments.len());
+            assert_eq!(arity, Some(2), "{path}");
+            assert_eq!(
+                src.matches("return select(0.0, 1.0 - w, coverage > 0.0);")
+                    .count(),
+                1,
+                "{path}"
+            );
+            assert_eq!(src.matches(pre).count(), 1, "{path}: pre");
+            assert_eq!(src.matches(mask).count(), 1, "{path}: mask");
+        }
+        let body = lib.compose(crate::BODY_WGSL).unwrap();
+        assert!(body.contains("let k = flux_match(body_u.handover, 1.0);"));
     }
 }

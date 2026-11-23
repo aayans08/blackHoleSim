@@ -1,7 +1,7 @@
 // atmo/atmosphere_grey.wgsl: the grey-transmittance variant for GPUs without dual-source blending
 // (review I7): one pipeline, two targets. hdr gets dst * (1 - alpha) + L with
 // alpha = 1 - luminance(T) (a grey approximation of the per-channel transmittance); lens_mask.g
-// gets alpha with Max.
+// gets alpha and lens_mask.a the star share (atmo_star_share), both with Max (lead ruling B6 I1).
 
 #import "atmo/atmosphere_common.wgsl"
 #import "common/color.wgsl"
@@ -17,6 +17,6 @@ fn fs_grey(@builtin(position) pos: vec4<f32>) -> AtmoGreyOut {
     let alpha = clamp(1.0 - luminance(s.transmittance), 0.0, 1.0);
     return AtmoGreyOut(
         vec4<f32>(atmo_light(s.inscatter), alpha),
-        vec4<f32>(0.0, alpha, 0.0, 0.0),
+        vec4<f32>(0.0, alpha, 0.0, atmo_star_share()),
     );
 }

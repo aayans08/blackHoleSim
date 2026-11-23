@@ -2,10 +2,22 @@
 //!
 //! Pass 8 of the M1 frame contract: after the opaque passes, before the meter. Per pixel it
 //! intersects each atmosphere's shell, clips by the scene depth and the planet's ground, and
-//! marches the inscattered light (world light × `scene_pre()`), writing `lens_mask.g =
-//! 1 − luminance(T)` with `Max`. Two variants (review I7): dual-source blending (two pipelines,
+//! marches the inscattered light (world light × the body's exposure, `scene_pre()` from 4 px
+//! on), writing `lens_mask.g = 1 − luminance(T)` and `lens_mask.a` = the star share 1 − w, both
+//! with `Max`. Two variants (review I7): dual-source blending (two pipelines,
 //! `atmosphere_dual.wgsl` + `atmosphere_mask.wgsl`) or grey transmittance (one pipeline,
 //! `atmosphere_grey.wgsl`).
+//!
+//! **Exposure and star share (lead ruling B6 I1, task B10).** A body in the 1.5–4 px LOD band is
+//! drawn at pre = mix(star_pre, scene_pre, w) with w = `uni_planet::lod_exposure_mix` while
+//! eye-adapted stars are in effect. Its atmosphere uses the same w ([`AtmoDraw::exposure_mix`],
+//! which the app sets to `uni_planet::body::exposure_weight` of the same body), so the in-scatter
+//! sits at the body's exposure (closing Titan's star/scene gap at the 1.5 px handover; uni-planet
+//! `flux_match` then takes σ = 1), and every fragment the march does not discard stores
+//! s = 1 − w in `lens_mask.a` with `Max`. The meter (uni-post `histogram.wgsl`, pass 9) divides
+//! the pixel by mix(scene_pre, star_pre, s), the writer's pre. w is snapped to 1 when
+//! 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴ ([`atmo_exposure_mix`]), so a share is never an f16
+//! subnormal that Metal could flush to 0.
 //!
 //! **Recorded deviation (frame contract):** a per-pixel march (32 steps, up to 48 on long limb
 //! paths) through Hillaire's transmittance and multiple-scattering LUTs, not his sky-view and
@@ -51,6 +63,13 @@ pub struct AtmoDraw {
     pub sun_rel_m: DVec3,
     /// Solar illuminance at the body [lx].
     pub sun_illuminance_lux: f64,
+    /// The body's exposure weight w: 0 = `star_pre` … 1 = `scene_pre` (lead ruling B6 I1). The
+    /// app sets it to `uni_planet::body::exposure_weight(proj_radius_px, eye_adapted)` of the
+    /// same body, so the atmosphere and its body share one exposure in the 1.5–4 px LOD band
+    /// (1 from 4 px on, and whenever eye-adapted stars are not in effect). The pass writes its
+    /// in-scatter at mix(star_pre, scene_pre, w) and stores the star share 1 − w in
+    /// `lens_mask.a`; [`atmo_exposure_mix`] sanitises and snaps it first.
+    pub exposure_mix: f32,
 }
 
 impl AtmoDraw {
@@ -178,8 +197,8 @@ pub struct AtmoDrawGpu {
     pub sun: [f32; 4],
     /// NDC x0, y0, x1, y1 of the screen quad.
     pub rect: [f32; 4],
-    /// x exposure mix (1 = `scene_pre`); y 1 = fullscreen triangle; z the own-ground depth
-    /// tolerance [m]; w 0.
+    /// x exposure mix ([`atmo_exposure_mix`] of [`AtmoDraw::exposure_mix`]; 0 = `star_pre`,
+    /// 1 = `scene_pre`); y 1 = fullscreen triangle; z the own-ground depth tolerance [m]; w 0.
     pub misc: [f32; 4],
 }
 
@@ -493,19 +512,71 @@ pub(crate) fn draw_uniform(
             .extend(draw.sun_illuminance_lux as f32)
             .to_array(),
         rect: rect.map(|v| v as f32),
-        // Exposure mix 1 (scene_pre): AtmoDraw carries no LOD blend yet (see the task report).
-        misc: [1.0, full, own_ground as f32, 0.0],
+        // The body's exposure weight, snapped (lead ruling B6 I1).
+        misc: [
+            atmo_exposure_mix(draw.exposure_mix),
+            full,
+            own_ground as f32,
+            0.0,
+        ],
     })
+}
+
+/// Smallest non-zero star share the pass stores in `lens_mask.a`: 2⁻¹⁴, the smallest normal
+/// binary16 (IEEE 754-2019 §3.6; `lens_mask` is Rgba16Float). Metal does not promise to keep f16
+/// subnormals when it stores a render target; a share flushed to 0 would be metered at scene
+/// exposure while the light was written nearer `star_pre`. Twin of
+/// `uni_planet::body::STAR_SHARE_MIN` (uni-planet depends on this crate, not the reverse;
+/// uni-planet's tests check the two agree).
+pub const STAR_SHARE_MIN: f32 = 1.0 / 16384.0;
+
+/// The exposure weight the pass uploads (`AtmoDrawGpu::misc[0]`) for [`AtmoDraw::exposure_mix`]
+/// `w`: NaN gives 1 (scene exposure, the physical one), w is clamped to [0, 1], and snapped to 1
+/// when 1 − w < [`STAR_SHARE_MIN`], exactly as `uni_planet::body::exposure_weight` snaps the
+/// body's own w (idempotent: a w the app copied from there passes through unchanged).
+pub fn atmo_exposure_mix(w: f32) -> f32 {
+    if w.is_nan() {
+        return 1.0;
+    }
+    let w = w.clamp(0.0, 1.0);
+    if 1.0 - w < STAR_SHARE_MIN { 1.0 } else { w }
+}
+
+/// CPU twin of `atmo_star_share` in `atmosphere_common.wgsl`: the star share 1 − w that every
+/// fragment of a draw with uploaded exposure weight `w` (`misc[0]`) stores in `lens_mask.a`,
+/// blended with `Max`. Every fragment the march does not discard adds in-scatter at that
+/// exposure, so it covers its pixel for this purpose (discarded pixels store nothing).
+pub fn atmo_star_share(w: f32) -> f32 {
+    1.0 - w
+}
+
+/// The pass's `lens_mask` target: green (1 − luminance(T)) and alpha (the star share,
+/// [`atmo_star_share`]) written, both blended with `Max` (M1 frame contract, lead ruling B6 I1;
+/// WebGPU requires factor One for `Max`); red and blue are left to the lens pass.
+pub(crate) fn lens_mask_target() -> wgpu::ColorTargetState {
+    let max = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Max,
+    };
+    wgpu::ColorTargetState {
+        format: LENS_MASK_FORMAT,
+        blend: Some(wgpu::BlendState {
+            color: max,
+            alpha: max,
+        }),
+        write_mask: wgpu::ColorWrites::GREEN.union(wgpu::ColorWrites::ALPHA),
+    }
 }
 
 /// The pipelines of one variant.
 enum Pipelines {
-    /// Dual-source colour pipeline into `hdr`, then the `lens_mask.g` pipeline.
+    /// Dual-source colour pipeline into `hdr`, then the `lens_mask` (g and a) pipeline.
     Dual {
         color: wgpu::RenderPipeline,
         mask: wgpu::RenderPipeline,
     },
-    /// One pipeline into `hdr` (grey transmittance) and `lens_mask.g`.
+    /// One pipeline into `hdr` (grey transmittance) and `lens_mask` (g and a).
     Grey(wgpu::RenderPipeline),
 }
 
@@ -627,23 +698,7 @@ impl AtmosphereFeature {
                 cache: None,
             })
         };
-        // lens_mask.g with Max (WebGPU requires factor One for Min/Max).
-        let mask_target = Some(wgpu::ColorTargetState {
-            format: LENS_MASK_FORMAT,
-            blend: Some(wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Max,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::One,
-                    operation: wgpu::BlendOperation::Max,
-                },
-            }),
-            write_mask: wgpu::ColorWrites::GREEN,
-        });
+        let mask_target = Some(lens_mask_target());
         // hdr's alpha is never touched.
         let keep_alpha = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::Zero,
@@ -1262,6 +1317,7 @@ mod tests {
             orient,
             sun_rel_m: DVec3::new(1.5e11, 0.0, 0.0),
             sun_illuminance_lux: 1.27e5,
+            exposure_mix: 1.0,
         };
         // Body 5 radii ahead (−Z): a quad inside the screen, origin height ≈ 4 radii.
         let u = draw_uniform(
@@ -1314,6 +1370,114 @@ mod tests {
         assert!(draw_uniform(&p, &draw(DVec3::NAN), Mat4::IDENTITY, proj).is_none());
     }
 
+    /// Lead ruling B6 I1 (task B10): the draw uploads its body's exposure weight, sanitised and
+    /// snapped ([`atmo_exposure_mix`]): NaN → 1 (scene exposure), clamped to [0, 1], and 1 when
+    /// 1 − w < 2⁻¹⁴, so the star share 1 − w it stores in `lens_mask.a` ([`atmo_star_share`]) is
+    /// 0 or an f16 normal (≥ 2⁻¹⁴), never a subnormal Metal could flush. A w already snapped by
+    /// uni-planet passes through unchanged.
+    #[test]
+    fn exposure_mix_snapped_into_the_draw() {
+        assert_eq!(STAR_SHARE_MIN, 2f32.powi(-14));
+        let p = earth();
+        let proj = uni_gfx::reversed_z_infinite_proj(60f32.to_radians(), 16.0 / 9.0, 0.1);
+        let draw = |w: f32| AtmoDraw {
+            naif: 399,
+            rel_pos_m: DVec3::new(0.0, 0.0, -5.0 * p.bottom_radius_m),
+            orient: DQuat::IDENTITY,
+            sun_rel_m: DVec3::new(1.5e11, 0.0, 0.0),
+            sun_illuminance_lux: 1.27e5,
+            exposure_mix: w,
+        };
+        let snap_edge = 1.0 - STAR_SHARE_MIN;
+        for (w, want) in [
+            (0.0, 0.0),
+            (0.3, 0.3),
+            (0.99, 0.99),
+            (1.0 - 1.0e-4, 1.0 - 1.0e-4),
+            (snap_edge, snap_edge),
+            (1.0 - 3.0e-5, 1.0),
+            (1.0, 1.0),
+            (f32::NAN, 1.0),
+            (-0.5, 0.0),
+            (2.0, 1.0),
+        ] {
+            let u = draw_uniform(&p, &draw(w), Mat4::IDENTITY, proj).unwrap();
+            assert_eq!(u.misc[0], want, "w {w}");
+            assert_eq!(atmo_exposure_mix(want), want, "idempotent at {w}");
+            let s = atmo_star_share(u.misc[0]);
+            assert!(
+                s == 0.0 || (STAR_SHARE_MIN..=1.0).contains(&s),
+                "w {w}: share {s}"
+            );
+            assert_eq!(s, 1.0 - want);
+        }
+        // A sweep through the top of the band: the share is never in (0, 2⁻¹⁴).
+        for i in 0..=100_000 {
+            let w = 1.0 - 1.0e-3 * i as f32 / 1.0e5;
+            let s = atmo_star_share(atmo_exposure_mix(w));
+            assert!(s == 0.0 || s >= STAR_SHARE_MIN, "w {w}: share {s}");
+        }
+    }
+
+    /// The `lens_mask` target of both variants (lead ruling B6 I1): green (1 − luminance(T)) and
+    /// alpha (the star share) written, red and blue left to the lens pass, both blended with
+    /// `Max` (factors One), Rgba16Float.
+    #[test]
+    fn lens_mask_target_writes_green_and_alpha_with_max() {
+        let t = lens_mask_target();
+        assert_eq!(t.format, LENS_MASK_FORMAT);
+        assert_eq!(
+            t.write_mask,
+            wgpu::ColorWrites::GREEN | wgpu::ColorWrites::ALPHA
+        );
+        let blend = t.blend.unwrap();
+        for c in [blend.color, blend.alpha] {
+            assert_eq!(c.operation, wgpu::BlendOperation::Max);
+            assert_eq!(
+                (c.src_factor, c.dst_factor),
+                (wgpu::BlendFactor::One, wgpu::BlendFactor::One)
+            );
+        }
+    }
+
+    /// Both lens-mask writers (the dual variant's mask pipeline and the grey variant) store
+    /// `atmo_star_share()` in alpha, which is 1 − the same `misc.x` that `atmo_light` exposes the
+    /// in-scatter with (lead ruling B6 I1).
+    #[test]
+    fn atmosphere_shaders_store_the_star_share() {
+        use uni_gfx::{ShaderLib, validate_wgsl};
+        let mut lib = ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        let common = lib.compose(crate::ATMOSPHERE_COMMON_WGSL).unwrap();
+        let m = validate_wgsl(&common).unwrap();
+        let arity = m
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("atmo_star_share"))
+            .map(|(_, f)| f.arguments.len());
+        assert_eq!(arity, Some(0));
+        assert_eq!(common.matches("return 1.0 - atmo_draw.misc.x;").count(), 1);
+        assert_eq!(
+            common
+                .matches("let pre = mix(star_pre(), scene_pre(), atmo_draw.misc.x);")
+                .count(),
+            1
+        );
+        for (path, line) in [
+            (
+                crate::ATMOSPHERE_MASK_WGSL,
+                "return vec4<f32>(0.0, clamp(1.0 - luminance(t), 0.0, 1.0), 0.0, atmo_star_share());",
+            ),
+            (
+                crate::ATMOSPHERE_GREY_WGSL,
+                "vec4<f32>(0.0, alpha, 0.0, atmo_star_share()),",
+            ),
+        ] {
+            let src = lib.compose(path).unwrap();
+            assert_eq!(src.matches(line).count(), 1, "{path}");
+        }
+    }
+
     /// Review I1: [`AtmoDraw::camera_in_daylight`] and [`AtmoDraw::scintillation_strength`]
     /// measure height from the reference ellipsoid, as the shell does. At sea level on the
     /// equator (two longitudes) and at the pole of Earth and Mars the strength is the ground
@@ -1344,6 +1508,7 @@ mod tests {
                         orient,
                         sun_rel_m: orient * sun,
                         sun_illuminance_lux: 1.0,
+                        exposure_mix: 1.0,
                     }
                 };
                 let s = at(1.0, 90.0).scintillation_strength(&p);
@@ -1661,6 +1826,7 @@ mod tests {
                     orient: DQuat::IDENTITY,
                     sun_rel_m: DVec3::new(0.0, 0.0, 1.5e11),
                     sun_illuminance_lux: 1.0,
+                    exposure_mix: 1.0,
                 };
                 println!(
                     "scintillation NAIF {naif} sea level, {where_}: ellipsoid {:.3}, sphere {:.3}",
@@ -1669,8 +1835,9 @@ mod tests {
                 );
             }
         }
-        // Review I2: ground lighting at the bottom (B3's r_m) against B1's length(p_body) on the
-        // equator, bottom + (a − bottom).
+        // Review I2 (ruled: r_m is the bottom radius): ground lighting at the bottom against the
+        // equatorial ground's distance from the centre, bottom + (a − bottom), which the
+        // contract excludes.
         for (name, p, a) in [
             ("Earth", earth(), body_shape_m(399).unwrap().x),
             ("Mars", mars(), body_shape_m(499).unwrap().x),
@@ -1681,7 +1848,7 @@ mod tests {
                 let (t1, e1) = crate::ground::ground_lighting(Some(&p), a, mu_s);
                 println!(
                     "ground lighting {name} equator mu_s {mu_s}: sun T {t0} (r_m bottom) vs {t1} \
-                     (r_m = |p| = bottom + {:.1} km); sky E/E0 {e0} vs {e1}",
+                     (|p| = bottom + {:.1} km, not the contract); sky E/E0 {e0} vs {e1}",
                     (a - b) / 1e3
                 );
             }
