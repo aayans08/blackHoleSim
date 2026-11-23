@@ -25,7 +25,9 @@
 //!
 //! **Detail** (Task B4L; on screen as "Milky Way detail: procedural (real dust map in M4)"): the
 //! smooth model above is the *mean*; three seeded, deterministic fields break it up, each keeping
-//! its mean so the calibrated extinction and light stay what the smooth model says:
+//! its mean approximately (to the ~10 % a non-Gaussian fBm allows,
+//! `fbm_variance_and_lognormal_mean`) so the calibrated extinction and light stay what the
+//! smooth model says:
 //! - the dust is clumpy: κ × D(p), D log-normal with σ_ln = [`DUST_LN_SIGMA`] (the 3-D density of
 //!   supersonic interstellar turbulence is log-normal, Padoan, Nordlund & Jones 1997) on an fBm of
 //!   value noise from the turbulent outer scale [`DUST_NOISE_SCALE_PC`] down to sub-pc;
@@ -40,7 +42,9 @@
 //! only the named clouds' positions, distances and sizes are real, and those approximately. Each
 //! field fades out the octaves finer than the footprint of the sample (the environment cube's
 //! texel), and lowers its log-normal mean term with the variance it keeps, so a coarse sample is
-//! the mean of fine ones.
+//! (approximately) the mean of fine ones. [`GalaxyModel::band_extinction_mag`] integrates the
+//! dust the band renders (smooth × clumps + named clouds); the range checks of A5 run on it as
+//! well as on the smooth mean.
 //!
 //! v0 approximations, all on purpose and labelled on screen as "galaxy model v0": every component
 //! uses the local mean V luminosity per star (local M/L_V = 0.043 / 0.0519 = 0.83), so the old
@@ -232,10 +236,11 @@ const TAU_PER_MAG: f64 = 0.4 * LN_10;
 /// the octaves' lattices never line up (common fBm practice, as in the owner-approved preview's
 /// `fbm`).
 const NOISE_LACUNARITY: f64 = 2.03;
-/// Amplitude ratio of successive octaves (fBm gain 0.8, Hurst exponent −log₂ 0.8 ≈ 0.32). A
+/// Amplitude ratio of successive octaves (fBm gain 0.7, Hurst exponent −log₂ 0.7 ≈ 0.51). A
 /// procedural choice: rough enough that the projected dust keeps structure at every scale, in the
 /// spirit of the shallow k^−2.65 power spectrum of dust emission (Miville-Deschênes et al. 2010,
-/// A&A 518, L104), not fitted to it.
+/// A&A 518, L104), not fitted to it. 0.8 was tried first on CPU previews of the band and gave
+/// uniform small blotches everywhere; 0.7 keeps larger coherent lanes.
 const NOISE_GAIN: f64 = 0.7;
 /// Each octave fades out as its wavelength λ shrinks from 1/0.3 to 1/0.6 of the sample's footprint
 /// (the preview's `fbm` band limit): finer structure would only alias between texels.
@@ -253,8 +258,12 @@ const NOISE_ROT_ANGLE: f64 = 0.9;
 /// σ of ln D, the clumpy dust's log-normal factor (mean 1). Supersonic isothermal turbulence gives
 /// a log-normal density with σ_ln² = ln(1 + b²𝓜²) (Padoan, Nordlund & Jones 1997, MNRAS 288, 145;
 /// b ≈ 0.3–1, Federrath, Klessen & Schmidt 2008, ApJ 688, L79), 1 to 2 for the Mach numbers 𝓜 ≈
-/// 3–10 of the cold ISM; 1.2 is a choice in that range.
-const DUST_LN_SIGMA: f64 = 1.6;
+/// 3–10 of the cold ISM; 1.2 is a choice in that range, held to measured columns by
+/// `extinction_ranges_on_the_rendered_dust`: at 1.6 (B4L's first value) the clumps opened
+/// Baade's window to A_V ≈ 1.07, below the 1.26–2.79 Stanek 1996 measures there, and the
+/// brightest sample of a 0.5° grid over the bulge (|l| < 30°, |b| < 10°) reached 4.7e-3 cd/m²;
+/// at 1.2 the window is 1.32 and that sample 3.5e-3.
+const DUST_LN_SIGMA: f64 = 1.2;
 /// Wavelength of the dust field's largest octave [pc]: the turbulent outer scale of the ISM,
 /// ~100 pc (Haverkorn et al. 2008, ApJ 680, 362, from Faraday rotation in interarm regions).
 const DUST_NOISE_SCALE_PC: f64 = 100.0;
@@ -297,8 +306,8 @@ const BAND_TAU_STOP: f64 = 15.0;
 const DUST_SEED: u32 = 0x2545_F491;
 const STAR_SEED: u32 = 0x9E37_79B9;
 const CLOUD_SEED: u32 = 0x85EB_CA6B;
-/// Octave k of a field hashes with seed + k × this (an arbitrary odd-free constant, so octaves
-/// never share lattice values).
+/// Octave k of a field hashes with seed + k × this (an arbitrary constant, so the octaves of one
+/// field never hash the same lattice values).
 const OCTAVE_SEED_STEP: u32 = 0x68E3_1DA4;
 /// A named cloud is skipped for a ray that passes more than √50 = 7.1 σ from its centre (its
 /// column is then below e^−25 of the peak).
@@ -337,8 +346,10 @@ pub const NAMED_CLOUD_COUNT: usize = 12;
 /// §2.1); dense cores far above that are left to the internal structure.
 const NAMED_CLOUDS: [NamedCloud; NAMED_CLOUD_COUNT] = [
     // Cygnus Rift (Northern Coalsack ≈ 560 pc at l 91–93°, b +3.5…+4.3°; North America ≈ 790 pc
-    // at l 82–86°, b −2.2…0°): the northern end of the Great Rift.
-    cloud(80.0, 1.5, 650.0, 8.0, 2.5, 0.0, 80.0, 3.0),
+    // at l 82–86°, b −2.2…0°): the northern end of the Great Rift. A_V 2.5 (B4L's first 3.0 put
+    // its mean column toward l 90°, b 0° at 1.16 mag and the whole mean A_V within 1 kpc at
+    // 2.09, past the 0.5–2.0 the plane's 0.7–1.8 mag/kpc allow; 2.5 gives 0.97 and 1.89).
+    cloud(80.0, 1.5, 650.0, 8.0, 2.5, 0.0, 80.0, 2.5),
     // Serpens–Aquila (W40, Serpens Main and Low: 440–560 pc at l 28–33°, b +2.6…+5.2°).
     cloud(30.0, 3.5, 480.0, 3.5, 1.5, 0.0, 50.0, 3.0),
     // Aquila Rift (Straižys et al. 2003; Zucker et al. 2020's sightlines at l 16–22°, b +9…+17°):
@@ -643,10 +654,6 @@ impl GalaxyModel {
         let cam_rel = cam_gc_pc - self.sun;
         let clouds = self.ray_clouds(cam_rel, dir, footprint);
         let mut cloud_tau0 = clouds.column_to(BAND_S_MIN_PC);
-        let [sigma_dust, sigma_star, _, _] = self.detail_sigma;
-        let [k_dust, k_star, _, _] = self.detail_octaves;
-        let [seed_dust, seed_star, _, _] = self.detail_seed;
-        let [f_dust, f_star, _, noise_min_pc] = self.detail_scale;
         let mut s0 = BAND_S_MIN_PC;
         let mut tau = 0.0_f64;
         let mut sum = DVec3::ZERO;
@@ -657,16 +664,8 @@ impl GalaxyModel {
             let p = cam_gc_pc + dir * s;
             let arms = self.arm_strength(p);
             let [thin, thick, halo, bar] = self.components(p, arms);
-            let mut dtau = self.extinction(p, arms) * TAU_PER_MAG * ds;
-            let mut star_clouds = 1.0;
-            if s > noise_min_pc && dtau >= NOISE_MIN_DTAU {
-                let q = cam_rel + dir * s;
-                let fp = footprint * s;
-                let (n, kept) = self.fbm(q, f_dust, k_dust, seed_dust, fp);
-                dtau *= (sigma_dust * n - 0.5 * sigma_dust * sigma_dust * kept).exp();
-                let (n, kept) = self.fbm(q, f_star, k_star, seed_star, fp);
-                star_clouds = (sigma_star * n - 0.5 * sigma_star * sigma_star * kept).exp();
-            }
+            let (mut dtau, star_clouds) =
+                self.step_dust(p, arms, cam_rel + dir * s, s, ds, footprint);
             let cloud_tau1 = clouds.column_to(s1);
             dtau += cloud_tau1 - cloud_tau0;
             cloud_tau0 = cloud_tau1;
@@ -689,6 +688,75 @@ impl GalaxyModel {
             }
         }
         sum * (self.norm[3] * self.light[0])
+    }
+
+    /// One march step's clumpy dust and star-cloud factor: the step at midpoint `s` [pc] of
+    /// length `ds`, at galactocentric `p` with arm strength `arms`, `q` = p − Sun. Returns
+    /// (optical depth of the smooth layer × D over the step, S for the thin disk's light); D and
+    /// S are drawn only past `NOISE_MIN_PC` on steps whose smooth optical depth reaches
+    /// `NOISE_MIN_DTAU`, else 1. Shared by [`Self::band_radiance`] and
+    /// [`Self::band_extinction_mag`], so the range checks see the dust the band renders.
+    fn step_dust(
+        &self,
+        p: DVec3,
+        arms: f64,
+        q: DVec3,
+        s: f64,
+        ds: f64,
+        footprint: f64,
+    ) -> (f64, f64) {
+        let [sigma_dust, sigma_star, _, _] = self.detail_sigma;
+        let [k_dust, k_star, _, _] = self.detail_octaves;
+        let [seed_dust, seed_star, _, _] = self.detail_seed;
+        let [f_dust, f_star, _, noise_min_pc] = self.detail_scale;
+        let mut dtau = self.extinction(p, arms) * TAU_PER_MAG * ds;
+        let mut star_clouds = 1.0;
+        if s > noise_min_pc && dtau >= NOISE_MIN_DTAU {
+            let fp = footprint * s;
+            let (n, kept) = self.fbm(q, f_dust, k_dust, seed_dust, fp);
+            dtau *= (sigma_dust * n - 0.5 * sigma_dust * sigma_dust * kept).exp();
+            let (n, kept) = self.fbm(q, f_star, k_star, seed_star, fp);
+            star_clouds = (sigma_star * n - 0.5 * sigma_star * sigma_star * kept).exp();
+        }
+        (dtau, star_clouds)
+    }
+
+    /// A_V [mag] the band's march crosses from `cam_gc_pc` along `dir_gc` out to `s_max_pc`, at a
+    /// footprint of `footprint_rad`: the march's own steps (1 pc to 30 kpc, 128 log-spaced), its
+    /// clumpy dust ([`Self::step_dust`], smooth × D with the march's gating) and the named clouds'
+    /// exact columns. The step that holds `s_max_pc` adds the share (s_max − s₀)/Δs of its dust
+    /// and the clouds' column up to `s_max_pc`. The A5 range checks run on this, so they see the
+    /// dust the band renders, not only the smooth mean ([`Self::extinction_v_per_pc`]).
+    pub fn band_extinction_mag(
+        &self,
+        cam_gc_pc: DVec3,
+        dir_gc: DVec3,
+        s_max_pc: f64,
+        footprint_rad: f64,
+    ) -> f64 {
+        let dir = dir_gc.normalize_or_zero();
+        let ratio = BAND_S_MAX_PC / BAND_S_MIN_PC;
+        let footprint = footprint_rad.max(0.0);
+        let cam_rel = cam_gc_pc - self.sun;
+        let clouds = self.ray_clouds(cam_rel, dir, footprint);
+        let s_max = s_max_pc.clamp(BAND_S_MIN_PC, BAND_S_MAX_PC);
+        let mut s0 = BAND_S_MIN_PC;
+        let mut tau = 0.0;
+        for i in 1..=BAND_STEPS {
+            let s1 = BAND_S_MIN_PC * ratio.powf(f64::from(i) / f64::from(BAND_STEPS));
+            let s = (s0 * s1).sqrt();
+            let ds = s1 - s0;
+            let p = cam_gc_pc + dir * s;
+            let (dtau, _) =
+                self.step_dust(p, self.arm_strength(p), cam_rel + dir * s, s, ds, footprint);
+            tau += dtau * ((s_max - s0) / ds).clamp(0.0, 1.0);
+            if s1 >= s_max {
+                break;
+            }
+            s0 = s1;
+        }
+        let cloud_tau = clouds.column_to(s_max) - clouds.column_to(BAND_S_MIN_PC);
+        (tau + cloud_tau) / TAU_PER_MAG
     }
 
     /// The parameters packed for the GPU.
@@ -1095,6 +1163,84 @@ mod tests {
         assert!(south >= 0.9 * north, "south {south} north {north}");
     }
 
+    /// Mean A_V [mag] out to `s_max_pc` over 15 rays around (l, b) (±0.4° in l, ±0.2° in b): what
+    /// the band renders at a 512² cube's texel footprint ([`GalaxyModel::band_extinction_mag`]),
+    /// averaged because the clumps make neighbouring rays differ.
+    fn a_v_rendered(g: &GalaxyModel, l: f64, b: f64, s_max_pc: f64) -> f64 {
+        let sun = g.sun_galactocentric_pc();
+        let mut sum = 0.0;
+        for dl in [-0.4, -0.2, 0.0, 0.2, 0.4] {
+            for db in [-0.2, 0.0, 0.2] {
+                sum += g.band_extinction_mag(sun, lb_dir(l + dl, b + db), s_max_pc, 2.0 / 512.0);
+            }
+        }
+        sum / 15.0
+    }
+
+    /// Review r0 I2: A5's range checks on the dust the band renders (smooth × clumps + named
+    /// clouds), not only the smooth mean: the north Galactic pole to 30 kpc and l = 90°, b = 0° to
+    /// 1 kpc in A5's ranges, and Baade's window to 10 kpc inside the 1.26–2.79 mag Stanek 1996
+    /// (ApJ 460, L37) measures across it (A5's smooth check allows 1.0–3.0).
+    #[test]
+    fn extinction_ranges_on_the_rendered_dust() {
+        let g = GalaxyModel::milky_way();
+        let ngp = a_v_rendered(&g, 0.0, 90.0, 30_000.0);
+        assert!((0.03..=0.15).contains(&ngp), "A_V to the NGP {ngp}");
+        let l90 = a_v_rendered(&g, 90.0, 0.0, 1000.0);
+        assert!(
+            (0.5..=2.0).contains(&l90),
+            "A_V along l = 90°, 1 kpc: {l90}"
+        );
+        let baade = a_v_rendered(&g, 1.0, -3.9, 10_000.0);
+        assert!(
+            (1.26..=2.79).contains(&baade),
+            "A_V in Baade's window {baade}"
+        );
+    }
+
+    /// The same ranges on the detail's mean: the clumps' σ at 0 (D = 1), the named clouds' Gaussian
+    /// columns kept. Toward l = 90° the Cygnus Rift adds 0.97 mag within 1 kpc. And the helper's
+    /// log-spaced quadrature agrees with A5's 1-pc sum on the smooth layer.
+    #[test]
+    fn extinction_ranges_on_the_mean_detail() {
+        let mut g = GalaxyModel::milky_way();
+        g.detail_sigma[0] = 0.0;
+        g.detail_sigma[1] = 0.0;
+        g.detail_sigma[2] = 0.0;
+        let sun = g.sun_galactocentric_pc();
+        let a_v = |l: f64, b: f64, s: f64| g.band_extinction_mag(sun, lb_dir(l, b), s, 0.0);
+        assert!((0.03..=0.15).contains(&a_v(0.0, 90.0, 30_000.0)));
+        let l90 = a_v(90.0, 0.0, 1000.0);
+        assert!(
+            (0.5..=2.0).contains(&l90),
+            "A_V along l = 90°, 1 kpc: {l90}"
+        );
+        let smooth = GalaxyModel::milky_way_smooth();
+        let l90_smooth = smooth.band_extinction_mag(sun, lb_dir(90.0, 0.0), 1000.0, 0.0);
+        assert!(
+            (l90 - l90_smooth - 0.97).abs() < 0.01,
+            "Cygnus Rift {}",
+            l90 - l90_smooth
+        );
+        let baade = a_v(1.0, -3.9, 10_000.0);
+        assert!(
+            (1.26..=2.79).contains(&baade),
+            "A_V in Baade's window {baade}"
+        );
+        for (l, b, s_max) in [
+            (0.0, 90.0, 30_000.0),
+            (90.0, 0.0, 1000.0),
+            (1.0, -3.9, 10_000.0),
+        ] {
+            let march = smooth.band_extinction_mag(sun, lb_dir(l, b), s_max, 0.0);
+            let sum = a_v_from_sun(&smooth, lb_dir(l, b), s_max);
+            assert!(
+                (march / sum - 1.0).abs() < 0.02,
+                "({l}, {b}): {march} vs {sum}"
+            );
+        }
+    }
+
     /// Baade's window, (l, b) = (1°, −3.9°): A_V varies from 1.26 to 2.79 mag across the field
     /// (Stanek 1996, ApJ 460, L37). Summed to 10 kpc, past the bulge.
     #[test]
@@ -1371,13 +1517,20 @@ mod tests {
     }
 
     /// The detail varies the band about the smooth model's: over the band (|b| ≤ 15°, all l) the
-    /// mean luminance stays within a factor 2 of the smooth one (clumpy dust lets more light
-    /// through on average than smooth dust of the same mean, so it is brighter, not darker), and
-    /// neighbouring samples 0.5° apart differ, where the smooth band is nearly flat.
+    /// clumps alone make it brighter on average, not darker (clumpy dust lets more light through
+    /// than smooth dust of the same mean: e^−τ is convex), the named clouds then add dust of their
+    /// own on top of the smooth layer, and the whole detail keeps the mean band within −20 % and
+    /// ×2 of the smooth one (measured: 0.97 at σ_ln 1.2); neighbouring samples 0.5° apart differ,
+    /// where the smooth band is nearly flat.
     #[test]
     fn detail_varies_the_band_about_its_mean() {
         let g = GalaxyModel::milky_way();
         let smooth = GalaxyModel::milky_way_smooth();
+        let mut clumps = GalaxyModel::milky_way();
+        for k in 0..NAMED_CLOUD_COUNT {
+            clumps.clouds[4 * k][3] = 0.0;
+        }
+        let mut sum_c = 0.0;
         let sun = g.sun_galactocentric_pc();
         let fp = 2.0 / 512.0;
         let (mut sum_d, mut sum_s, mut step_d, mut step_s) = (0.0, 0.0, 0.0, 0.0);
@@ -1389,6 +1542,7 @@ mod tests {
                 };
                 let (d0, d1) = (band(&g, 0.0), band(&g, 0.5));
                 let (s0, s1) = (band(&smooth, 0.0), band(&smooth, 0.5));
+                sum_c += band(&clumps, 0.0);
                 sum_d += d0;
                 sum_s += s0;
                 step_d += (d1 / d0).ln().abs();
@@ -1398,9 +1552,15 @@ mod tests {
         }
         let ratio = sum_d / sum_s;
         assert!(
-            (1.0..2.0).contains(&ratio),
+            (0.8..2.0).contains(&ratio),
             "detailed / smooth mean band {ratio}"
         );
+        assert!(
+            sum_c > sum_s,
+            "clumps alone darken the band: {}",
+            sum_c / sum_s
+        );
+        assert!(sum_d < sum_c, "the named clouds add no dust");
         assert!(step_d / n > 0.05, "detail barely varies: {}", step_d / n);
         assert!(step_d > 5.0 * step_s, "detail {step_d} vs smooth {step_s}");
     }
