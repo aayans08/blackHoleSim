@@ -1478,12 +1478,20 @@ mod tests {
         let ahead = cap(DVec3::new(0.0, 0.0, -10.0 * R_SUN_M));
         let behind = cap(DVec3::new(0.0, 0.0, 10.0 * R_SUN_M));
         let left = cap(DVec3::new(-30.0 * R_SUN_M, 0.0, -10.0 * R_SUN_M));
-        let edge = cap(DVec3::new(-5.8 * R_SUN_M, 0.0, -10.0 * R_SUN_M));
+        // Centred 30.1° below the axis with a 4.9° radius: across the bottom edge of the view
+        // (vertical half-fov 28.6°).
+        let edge = cap(DVec3::new(0.0, -5.8 * R_SUN_M, -10.0 * R_SUN_M));
         let identity = glam::Mat4::IDENTITY;
         assert!(cap_in_view(&ahead, proj * identity));
         assert!(!cap_in_view(&behind, proj * identity));
         assert!(!cap_in_view(&left, proj * identity));
         assert!(cap_in_view(&edge, proj * identity));
+        // It does straddle the edge: some vertices are below the view (y < −w), some inside.
+        let below = |v: &[f32; 3]| {
+            let c = proj * glam::Vec4::new(v[0], v[1], v[2], 1.0);
+            c.y < -c.w
+        };
+        assert!(edge.iter().any(below) && !edge.iter().all(below));
         // Turning the camera round brings the one behind into view.
         let turned = glam::Mat4::from_rotation_y(std::f32::consts::PI);
         assert!(cap_in_view(&behind, proj * turned));
