@@ -1166,6 +1166,41 @@ fn texel_footprint(cam: &Cam, b: &BodyView, map: &CpuMap, p: DVec2) -> Vec<[f64;
     thin(out)
 }
 
+/// The in-scatter [cd/m² per lx] and the transmittance along the unit `dir` from the camera
+/// down to the ground of a body (NAIF `naif`, atmosphere `params`, body-fixed → ICRS rotation
+/// `orient`, centre − camera `rel_pos_m` and Sun − centre `sun_rel_m` in root axes [m]), as the
+/// atmosphere pass marches it (`atmo_view_ray` in `atmosphere_common.wgsl`, task B9c):
+/// - in the atmosphere's frame (`uni_atmo::feature::atmosphere_frame`: body-fixed axes scaled so
+///   the WGCCRE reference ellipsoid becomes the sphere of the preset's bottom radius, so the
+///   shell follows the oblate ground), with the Sun's direction from the body centre mapped the
+///   same way (`draw_uniform`);
+/// - ending at that ground sphere: the pass's own-ground rule ends a ray that reaches the body's
+///   own surface there, not at the proxy mesh's depth.
+///
+/// In root axes, as the samples' twin had it before B9c, an oblate body's ground lies off the
+/// shell's bottom by up to its flattening: Mars's bottom is its 3 389.5 km mean radius, so its
+/// ground sits 6.7 km above it on the equator (6.1 km at 10° latitude; WGCCRE 2015 radii
+/// 3 396.19 / 3 376.20 km) and 13.3 km below it at the poles. Above the bottom the twin's path
+/// skipped the densest dust: at 6.1 km, 1 − e^(−6.1/11) = 43 % of the dust column (H 11 km,
+/// τ 0.5). That made row 5's twin 13 % too dark in luminance at 10°N (22 % in green and blue,
+/// under 4 % in red): the pass's extra dust adds in-scatter bluer than Mars's red ground while
+/// its extinction takes mostly red ground light (B9c report).
+///
+/// The CPU march takes unit directions, so its path length differs from the pass's (true metres
+/// along the scaled, near-unit direction) by the frame's stretch |M·dir|: 0.998–1.004 for Mars.
+fn view_path(
+    params: &uni_atmo::AtmosphereParams,
+    naif: i32,
+    orient: DQuat,
+    rel_pos_m: DVec3,
+    sun_rel_m: DVec3,
+    dir: DVec3,
+) -> (Vec3, Vec3) {
+    let m = uni_atmo::feature::atmosphere_frame(naif, orient);
+    let sun = m * sun_rel_m.normalize_or_zero();
+    uni_atmo::segment_radiance(params, m * -rel_pos_m, m * dir, f64::INFINITY, sun)
+}
+
 /// sRGB code value → linear (IEC 61966-2-1 §5.2).
 fn srgb(code: u8) -> f32 {
     let c = f64::from(code) / 255.0;
@@ -1181,7 +1216,8 @@ fn srgb(code: u8) -> f32 {
 /// reflectance (the 2k map copy × `albedo_scale`, Earth's clouds as areal cover, W-B2), A3's
 /// BRDF and phase correction, the sunlight at the body, and for a body with an atmosphere B3's
 /// ground lighting (sun transmittance and skylight, `ground_lighting`) and the view path
-/// (`segment_radiance`: transmittance and in-scatter; a sphere of the preset's radii). Eclipses
+/// ([`view_path`]: transmittance and in-scatter in the pass's frame, which follows the oblate
+/// ground). Eclipses
 /// are not modelled (none at these bookmarks).
 fn map_samples(input: &Input<'_>, cam: &Cam, name: &str) -> Vec<Sample> {
     let world = input.world;
@@ -1251,7 +1287,8 @@ fn map_samples(input: &Input<'_>, cam: &Cam, name: &str) -> Vec<Sample> {
                         mu0,
                     );
                     let ground = rho * sun_color * k * (sun_t * refl + sky);
-                    let (insc, trans) = uni_atmo::segment_radiance(params, -b.rel_pos_m, dir, t, s);
+                    let (insc, trans) =
+                        view_path(params, naif, b.orient, b.rel_pos_m, b.sun_rel_m, dir);
                     trans * ground + insc * sun_color * e as f32
                 }
                 None => rho * sun_color * k * refl,
@@ -1476,6 +1513,57 @@ mod tests {
         assert_eq!(hit_ellipsoid(DVec3::ZERO, DVec3::Z, q, radii), Some(1.0));
         assert!((ellipsoid_radius(DVec3::Z, q, radii) - 1.0).abs() < 1e-12);
         assert!((ellipsoid_radius(DVec3::Y, q, radii) - 2.0).abs() < 1e-12);
+    }
+
+    /// The samples' view path follows the oblate ground as the atmosphere pass's frame does
+    /// (task B9c): looking straight down at Mars's equator (ground 6.7 km above the preset's
+    /// 3 389.5 km bottom in root axes) and at its pole (13.3 km below it), the path ends at the
+    /// bottom of the shell both times, so both see the full vertical column (B3's CPU
+    /// transmittance at the bottom, μ = 1) and the same in-scatter. In root axes, as row 5's twin
+    /// had it, the equator path stops 6.7 km up and misses ≈ 46 % of the dust (τ 0.5, H 11 km):
+    /// 26 % more transparent (T 0.762 against 0.606).
+    #[test]
+    fn view_path_reaches_the_oblate_ground() {
+        let params = uni_atmo::preset_for(499).expect("Mars preset");
+        let abc = uni_atmo::feature::body_shape_m(499).expect("Mars shape");
+        let orient = DQuat::from_rotation_x(0.4) * DQuat::from_rotation_z(1.1);
+        let column = uni_atmo::transmittance(&params, params.bottom_radius_m, 1.0);
+        let down = |fixed_axis: DVec3, radius: f64| {
+            // The camera 10 000 km above the ground point on `fixed_axis`, looking at the
+            // centre, with the Sun overhead.
+            let up = orient * fixed_axis;
+            let rel_pos = -up * (radius + 1.0e7);
+            let sun_rel = up * 2.3e11;
+            let path = view_path(&params, 499, orient, rel_pos, sun_rel, -up);
+            let root = uni_atmo::segment_radiance(&params, -rel_pos, -up, 1.0e7, sun_rel);
+            (path, root)
+        };
+        let ((eq_insc, eq_t), (_, eq_root_t)) = down(DVec3::X, abc.x);
+        let ((pole_insc, pole_t), _) = down(DVec3::Z, abc.z);
+        for k in 0..3 {
+            // The 16-step view march against the 500-step trapezoid column
+            // (`TRANSMITTANCE_STEPS`): within 1 %, `march_converges`'s bound on the view march.
+            for (what, t) in [("equator", eq_t[k]), ("pole", pole_t[k])] {
+                assert!(
+                    (t / column[k] - 1.0).abs() < 0.01,
+                    "{what} channel {k}: T {t} vs the column's {}",
+                    column[k]
+                );
+            }
+            assert!(
+                (eq_insc[k] / pole_insc[k] - 1.0).abs() < 0.005,
+                "channel {k}: in-scatter {} at the equator vs {} at the pole",
+                eq_insc[k],
+                pole_insc[k]
+            );
+            assert!(
+                eq_root_t[k] > 1.15 * column[k],
+                "channel {k}: the root-axes path {} should skip the equator's lowest dust \
+                 (column {})",
+                eq_root_t[k],
+                column[k]
+            );
+        }
     }
 
     #[test]
