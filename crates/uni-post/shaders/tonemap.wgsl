@@ -1,7 +1,7 @@
 // post/tonemap.wgsl: the M0 display transform, as one fullscreen-triangle pass.
 //
 //   hdr (pre-exposed scene-linear Rec. 709, internal resolution) → upscale to the output
-//   → agx → display-linear → sRGB code space + triangular dither of ±0.5/255
+//   → agx → display-linear → sRGB code space + triangular dither of ±1/255
 //   → display-linear → output
 //
 // The hdr target is pre-exposed (common/camera.wgsl: features write light × exposure), so this
@@ -96,8 +96,10 @@ fn agx(c: vec3<f32>) -> vec3<f32> {
 
 // ---- Dither ----------------------------------------------------------------------------
 
-// Peak dither amplitude in sRGB code space: ±0.5/255 (half an 8-bit step).
-const DITHER_AMPLITUDE: f32 = 0.5 / 255.0;
+// Peak dither amplitude in sRGB code space: ±1/255, one 8-bit step, so the triangular PDF is
+// the sum of two ±½-step uniforms and the quantisation error is independent of the signal
+// (M1 review deferral T5: faint band and atmosphere gradients; M0 had ±0.5/255).
+const DITHER_AMPLITUDE: f32 = 1.0 / 255.0;
 
 // Interleaved gradient noise in [0, 1) at integer pixel `pix`.
 // Source: Jimenez 2014, "Next Generation Post Processing in Call of Duty: Advanced Warfare",
