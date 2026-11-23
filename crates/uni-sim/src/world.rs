@@ -108,11 +108,12 @@ const ASSUMED_DENSITY_KG_M3: f64 = 1000.0;
 const DEFAULT_MOON_ALBEDO: f64 = 0.1;
 /// V geometric albedo of comet nuclei, 0.04 (Lamy et al. 2004, in *Comets II*, 223).
 const COMET_ALBEDO: f64 = 0.04;
-/// Asteroid diameter from H and p_V: D = 1329 km / √p_V · 10^(−H/5) (Fowler & Chillemi 1992,
-/// IRAS Minor Planet Survey, PL-TR-92-2049, 17; Pravec & Harris 2007, Icarus 190, 250, eq. 1).
+/// Asteroid diameter from H and p_V: D = 1329 km / √p_V · 10^(−H/5) (Harris & Harris 1997,
+/// Icarus 126, 450, eq. 2, as NASA's NEO Properties tool cites it; JPL CNEOS's size estimator,
+/// https://cneos.jpl.nasa.gov/tools/ast_size_est.html, uses the same 10^3.1236 km = 1329 km).
 const H_DIAMETER_KM: f64 = 1329.0;
-/// p_V assumed for an asteroid with neither a measured albedo nor a diameter: 0.14, the
-/// debiased mean of near-Earth asteroids (Stuart & Binzel 2004, Icarus 170, 295). The point's
+/// p_V assumed for an asteroid with neither a measured albedo nor a diameter: 0.14 ± 0.02, the
+/// debiased mean of near-Earth objects (Stuart & Binzel 2004, Icarus 170, 295). The point's
 /// brightness at zero phase does not depend on it (D² p_V is fixed by H); only the size does.
 const ASSUMED_ASTEROID_ALBEDO: f64 = 0.14;
 /// Asteroids with H at or below this are registry objects (plan A4); fainter ones are
