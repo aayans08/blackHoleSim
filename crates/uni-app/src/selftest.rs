@@ -6,8 +6,11 @@
 //! - `agx`: `post/tonemap.wgsl` vs `uni_post::agx`, 256 inputs, within 1e-3;
 //! - `binet`: `rel/binet.wgsl` vs `uni_rel::binet`, 64 rays traced as the lens pass traces
 //!   them (same step rule and budget), exit direction within 2e-3 rad, same capture flags;
-//! - then every `gpu_probes` of the M1 render crates (`uni_gfx::probe::ProbeResult`), so far
-//!   uni-gfx's `cube_dir` (`common/cube.wgsl` vs `uni_gfx::env::cube_dir`).
+//! - then every M1 render crate's `gpu_probes` (`uni_gfx::probe::ProbeResult`; B9 Step 4):
+//!   uni-gfx (`cube_dir`, `pre_mix`), uni-planet (B1's bodies, B2's star surfaces and rings,
+//!   B0's `eclipse.wgsl`, B11's `pre_mix` writers), uni-atmo (B3), uni-sky (B4's stars and
+//!   points with B4L's halo, B5's band with B4L's galaxy detail), uni-post (B6) and uni-rel
+//!   (B7). A crate that returns no probe fails, so a probe hook cannot silently go missing.
 //!
 //! Every check runs through `uni_gfx::probe::run_compute`, the same runner the crates'
 //! `gpu_probes` use. The three probes' buffers sit in bind group 2 (`post/tonemap.wgsl` claims
@@ -136,7 +139,8 @@ struct BinetOutcome {
     status: [u32; 4],
 }
 
-/// Runs every check on a headless GPU, printing `PASS name: …` or `FAIL name: …` for each.
+/// Runs every check on a headless GPU, printing `PASS name: …` or `FAIL name: …` for each,
+/// then a `selftest: <passed>/<total> PASS` line.
 /// Returns true only if all pass.
 pub fn run() -> bool {
     let gpu = match pollster::block_on(GpuContext::new_headless()) {
@@ -152,28 +156,60 @@ pub fn run() -> bool {
         ("agx", check_agx),
         ("binet", check_binet),
     ];
-    let mut all_pass = true;
+    let mut tally = Tally::default();
     for (name, check) in checks {
         match check(&gpu, &lib) {
-            Ok(detail) => println!("PASS {name}: {detail}"),
-            Err(detail) => {
-                println!("FAIL {name}: {detail}");
-                all_pass = false;
-            }
+            Ok(detail) => tally.line(name, true, &detail),
+            Err(detail) => tally.line(name, false, &detail),
         }
     }
-    for probe in uni_gfx::probe::gpu_probes(&gpu, &mut lib) {
-        let verdict = if probe.pass { "PASS" } else { "FAIL" };
-        println!("{verdict} {}: {}", probe.name, probe.detail);
-        all_pass &= probe.pass;
+    // Every M1 render crate's probes (B9 Step 4), each with a fresh shader library.
+    type Probes = fn(&GpuContext, &mut ShaderLib) -> Vec<uni_gfx::probe::ProbeResult>;
+    let crates: [(&str, Probes); 6] = [
+        ("uni-gfx", uni_gfx::probe::gpu_probes),
+        ("uni-planet", uni_planet::gpu_probes),
+        ("uni-atmo", uni_atmo::gpu_probes),
+        ("uni-sky", uni_sky::gpu_probes),
+        ("uni-post", uni_post::gpu_probes),
+        ("uni-rel", uni_rel::gpu_probes),
+    ];
+    for (krate, probes) in crates {
+        let mut crate_lib = if krate == "uni-gfx" {
+            std::mem::replace(&mut lib, ShaderLib::with_common())
+        } else {
+            ShaderLib::with_common()
+        };
+        let results = probes(&gpu, &mut crate_lib);
+        if results.is_empty() {
+            tally.line(krate, false, "no probes ran");
+        }
+        for probe in results {
+            tally.line(&probe.name, probe.pass, &probe.detail);
+        }
     }
     // An uncaptured GPU error during the probes fails the run (review m6).
     let errors = gpu.take_errors();
     if !errors.is_empty() {
-        println!("FAIL gpu errors: {}", errors.join("; "));
-        all_pass = false;
+        tally.line("gpu errors", false, &errors.join("; "));
     }
-    all_pass
+    println!("selftest: {}/{} PASS", tally.passed, tally.total);
+    tally.passed == tally.total
+}
+
+/// Counts and prints the checks.
+#[derive(Default)]
+struct Tally {
+    passed: usize,
+    total: usize,
+}
+
+impl Tally {
+    fn line(&mut self, name: &str, pass: bool, detail: &str) {
+        let verdict = if pass { "PASS" } else { "FAIL" };
+        println!("{verdict} {name}: {detail}");
+        self.total += 1;
+        self.passed += usize::from(pass);
+    }
 }
 
 /// The common shaders, the shaders under test and the three probes.

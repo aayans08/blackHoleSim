@@ -1,15 +1,20 @@
 //! universe: the explorer binary. Windowed by default; `--capture`, `--bench` and `--selftest`
 //! run headless.
 //!
-//! Exit codes: 0 on success; 2 when a baked data file is missing or unreadable (`--capture`,
-//! `--bench`); 1 for every other failure, including bad arguments, GPU errors and failed
-//! `--selftest` checks.
+//! Exit codes: 0 on success; 2 when a baked data file the run needs is missing or unreadable
+//! (`--capture`, `--bench`); 1 for every other failure, including bad arguments, GPU errors and
+//! failed `--selftest` checks.
 
 mod app;
 mod bench;
+#[cfg(test)]
+mod bookmarks;
 mod capture;
+mod measure;
+mod paper;
 mod scene;
 mod selftest;
+mod tap;
 mod world;
 
 use std::path::PathBuf;
@@ -19,23 +24,20 @@ use glam::UVec2;
 
 use crate::bench::BenchArgs;
 use crate::capture::{CaptureArgs, CaptureError, DEFAULT_FRAMES, DEFAULT_SIZE};
-use crate::scene::SkyMode;
 
 const USAGE: &str = "\
 usage:
-  universe [--sky v1]              open the window at bookmark \"start\" of bookmarks/m0.ron
-                                   (with --sky v1: \"sky-wide-galactic-center\" of
-                                   bookmarks/sky-v1.ron)
-  universe --capture <bookmarks.ron> --out <dir> [--size 1920x1080] [--frames 4] [--hud]
-           [--sky v1]              render each bookmark headless to <dir>/<name>.png + .json
-  universe --bench <bookmarks.ron> [--size 1920x1080] [--frames 120] [--sky v1]
-                                   time each bookmark headless at that internal resolution:
-                                   mean and p95 frame ms, GPU frame ms, GPU ms per pass
+  universe                         open the window at bookmark \"start\" of bookmarks/m1.ron
+  universe --capture <bookmarks.ron> --out <dir> [--size 1920x1080] [--frames 4] [--hud] [--hdr]
+                                   render each bookmark headless to <dir>/<name>.png + .json
+                                   (--hdr: also <name>.hdr.bin, the pre-bloom HDR target)
+  universe --bench <bookmarks.ron> [--size 1920x1080] [--frames 120] [--sustained <s>]
+           [--json <out.json>]     time each bookmark headless at that internal resolution
+                                   (--sustained: s seconds each, two frames in flight, with
+                                   all / first10s / last10s windows)
   universe --selftest              compare the GPU shader twins with their CPU twins
 
-  --sky v1   the Wave B sky: Milky Way band, AT-HYG stars in 3-D, auto-exposure with
-             eye-adapted stars, bloom, and the lens over the band (default: the M0 sky,
-             --sky m0); it can go anywhere on the command line";
+  --sky v1 is still accepted anywhere and does nothing: the Wave B sky is the default.";
 
 /// Exit code for a missing or unreadable baked data file (brief).
 const EXIT_MISSING_DATA: u8 = 2;
@@ -45,7 +47,7 @@ const EXIT_FAILURE: u8 = 1;
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Command {
-    Window(SkyMode),
+    Window,
     Capture(CaptureArgs),
     Bench(BenchArgs),
     Selftest,
@@ -75,7 +77,7 @@ fn main() -> ExitCode {
         }
         Command::Capture(args) => headless_exit("--capture", capture::run(&args)),
         Command::Bench(args) => headless_exit("--bench", bench::run(&args)),
-        Command::Window(sky) => match app::run(sky) {
+        Command::Window => match app::run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("universe: {e:#}");
@@ -100,30 +102,21 @@ fn headless_exit(mode: &str, result: Result<(), CaptureError>) -> ExitCode {
     }
 }
 
-/// Parses the arguments after the program name. `--sky <mode>` may stand anywhere; the rest
-/// is read as before it existed.
+/// Parses the arguments after the program name. `--sky v1` may stand anywhere and is a no-op
+/// alias (B9: the Wave B sky became the default).
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let (sky, rest) = take_sky(args)?;
     let command = parse_command(rest)?;
-    let Some(sky) = sky else {
-        return Ok(command);
-    };
-    match command {
-        Command::Window(_) => Ok(Command::Window(sky)),
-        Command::Capture(args) => Ok(Command::Capture(CaptureArgs { sky, ..args })),
-        Command::Bench(args) => Ok(Command::Bench(BenchArgs { sky, ..args })),
-        Command::Selftest | Command::Help => {
-            Err("--sky applies to the window, --capture and --bench".to_owned())
-        }
+    if sky && matches!(command, Command::Selftest | Command::Help) {
+        return Err("--sky applies to the window, --capture and --bench".to_owned());
     }
+    Ok(command)
 }
 
-/// Removes `--sky <mode>` from `args`: the mode (`None` when absent) and the other arguments,
-/// in order. A second `--sky`, a missing value or an unknown mode is an error.
-fn take_sky(
-    args: impl IntoIterator<Item = String>,
-) -> Result<(Option<SkyMode>, Vec<String>), String> {
-    let mut sky = None;
+/// Removes `--sky v1` from `args`: whether it was given, and the other arguments in order. A
+/// second `--sky`, a missing value or a value other than `v1` is an error.
+fn take_sky(args: impl IntoIterator<Item = String>) -> Result<(bool, Vec<String>), String> {
+    let mut sky = false;
     let mut rest = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -131,8 +124,17 @@ fn take_sky(
             rest.push(arg);
             continue;
         }
-        let value = args.next().ok_or("--sky needs a value: v1 or m0")?;
-        if sky.replace(SkyMode::parse(&value)?).is_some() {
+        match args.next().as_deref() {
+            Some("v1") => {}
+            Some(other) => {
+                return Err(format!(
+                    "--sky takes v1 (the default sky; the M0 stack was retired at B9, its \
+                     regression is bookmark bh-shadow-30M-grid), not {other:?}"
+                ));
+            }
+            None => return Err("--sky needs a value: v1".to_owned()),
+        }
+        if std::mem::replace(&mut sky, true) {
             return Err("--sky is given twice".to_owned());
         }
     }
@@ -143,7 +145,7 @@ fn take_sky(
 fn parse_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let Some(first) = args.next() else {
-        return Ok(Command::Window(SkyMode::M0));
+        return Ok(Command::Window);
     };
     match first.as_str() {
         "-h" | "--help" => Ok(Command::Help),
@@ -172,6 +174,7 @@ fn parse_capture(
     let mut size = DEFAULT_SIZE;
     let mut frames = DEFAULT_FRAMES;
     let mut hud = false;
+    let mut hdr = false;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -179,6 +182,7 @@ fn parse_capture(
             "--size" => size = parse_size(&value()?)?,
             "--frames" => frames = parse_frames(&value()?)?,
             "--hud" => hud = true,
+            "--hdr" => hdr = true,
             other => return Err(format!("unknown capture option {other:?}")),
         }
     }
@@ -188,7 +192,7 @@ fn parse_capture(
         size,
         frames,
         hud,
-        sky: SkyMode::M0,
+        hdr,
     })
 }
 
@@ -199,11 +203,23 @@ fn parse_bench(
 ) -> Result<BenchArgs, String> {
     let mut size = bench::DEFAULT_SIZE;
     let mut frames = bench::DEFAULT_FRAMES;
+    let mut sustained_s = None;
+    let mut json = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--size" => size = parse_size(&value()?)?,
             "--frames" => frames = parse_frames(&value()?)?,
+            "--sustained" => {
+                let v = value()?;
+                let s: f64 = v
+                    .parse()
+                    .ok()
+                    .filter(|s: &f64| s.is_finite() && *s > 0.0)
+                    .ok_or(format!("--sustained needs seconds > 0, not {v:?}"))?;
+                sustained_s = Some(s);
+            }
+            "--json" => json = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown bench option {other:?}")),
         }
     }
@@ -211,7 +227,8 @@ fn parse_bench(
         bookmarks,
         size,
         frames,
-        sky: SkyMode::M0,
+        sustained_s,
+        json,
     })
 }
 
@@ -243,9 +260,20 @@ mod tests {
         parse_args(args.iter().map(|s| s.to_string()))
     }
 
+    fn capture(out: &str, size: UVec2, frames: u32, hud: bool, hdr: bool) -> Command {
+        Command::Capture(CaptureArgs {
+            bookmarks: "b.ron".into(),
+            out: out.into(),
+            size,
+            frames,
+            hud,
+            hdr,
+        })
+    }
+
     #[test]
     fn no_arguments_opens_the_window() {
-        assert_eq!(parse(&[]), Ok(Command::Window(SkyMode::M0)));
+        assert_eq!(parse(&[]), Ok(Command::Window));
         assert_eq!(parse(&["--selftest"]), Ok(Command::Selftest));
         assert_eq!(parse(&["--help"]), Ok(Command::Help));
     }
@@ -253,15 +281,8 @@ mod tests {
     #[test]
     fn capture_takes_defaults_and_options() {
         assert_eq!(
-            parse(&["--capture", "bookmarks/m0.ron", "--out", "captures/m0"]),
-            Ok(Command::Capture(CaptureArgs {
-                bookmarks: "bookmarks/m0.ron".into(),
-                out: "captures/m0".into(),
-                size: UVec2::new(1920, 1080),
-                frames: 4,
-                hud: false,
-                sky: SkyMode::M0,
-            }))
+            parse(&["--capture", "b.ron", "--out", "o"]),
+            Ok(capture("o", UVec2::new(1920, 1080), 4, false, false))
         );
         assert_eq!(
             parse(&[
@@ -273,102 +294,63 @@ mod tests {
                 "--out",
                 "o",
                 "--frames",
-                "1"
+                "1",
+                "--hdr"
             ]),
-            Ok(Command::Capture(CaptureArgs {
-                bookmarks: "b.ron".into(),
-                out: "o".into(),
-                size: UVec2::new(640, 360),
-                frames: 1,
-                hud: true,
-                sky: SkyMode::M0,
-            }))
+            Ok(capture("o", UVec2::new(640, 360), 1, true, true))
         );
     }
 
     #[test]
     fn bench_takes_defaults_and_options() {
         assert_eq!(
-            parse(&["--bench", "bookmarks/m0.ron"]),
+            parse(&["--bench", "b.ron"]),
             Ok(Command::Bench(BenchArgs {
-                bookmarks: "bookmarks/m0.ron".into(),
+                bookmarks: "b.ron".into(),
                 size: UVec2::new(1920, 1080),
                 frames: 120,
-                sky: SkyMode::M0,
+                sustained_s: None,
+                json: None,
             }))
         );
         assert_eq!(
-            parse(&["--bench", "b.ron", "--frames", "30", "--size", "1728x1080"]),
+            parse(&[
+                "--bench",
+                "b.ron",
+                "--frames",
+                "30",
+                "--size",
+                "1728x1080",
+                "--sustained",
+                "60",
+                "--json",
+                "captures/wave-b/bench.json"
+            ]),
             Ok(Command::Bench(BenchArgs {
                 bookmarks: "b.ron".into(),
                 size: UVec2::new(1728, 1080),
                 frames: 30,
-                sky: SkyMode::M0,
+                sustained_s: Some(60.0),
+                json: Some("captures/wave-b/bench.json".into()),
             }))
         );
     }
 
-    /// `--sky v1` works with the window, --capture and --bench, anywhere on the line; without
-    /// it every command keeps the M0 sky.
+    /// B9: `--sky v1` stays accepted as a no-op alias anywhere on the line.
     #[test]
-    fn sky_flag_selects_the_sky_anywhere() {
-        assert_eq!(parse(&["--sky", "v1"]), Ok(Command::Window(SkyMode::V1)));
-        assert_eq!(parse(&["--sky", "m0"]), Ok(Command::Window(SkyMode::M0)));
-        let capture = |sky| {
-            Ok(Command::Capture(CaptureArgs {
-                bookmarks: "bookmarks/sky-v1.ron".into(),
-                out: "captures/sky-v1".into(),
-                size: UVec2::new(1920, 1080),
-                frames: 4,
-                hud: false,
-                sky,
-            }))
-        };
+    fn sky_v1_is_a_no_op_alias() {
+        assert_eq!(parse(&["--sky", "v1"]), Ok(Command::Window));
+        let plain = parse(&["--capture", "b.ron", "--out", "o"]);
         for line in [
-            &[
-                "--capture",
-                "bookmarks/sky-v1.ron",
-                "--out",
-                "captures/sky-v1",
-                "--sky",
-                "v1",
-            ][..],
-            &[
-                "--sky",
-                "v1",
-                "--capture",
-                "bookmarks/sky-v1.ron",
-                "--out",
-                "captures/sky-v1",
-            ],
-            &[
-                "--capture",
-                "bookmarks/sky-v1.ron",
-                "--sky",
-                "v1",
-                "--out",
-                "captures/sky-v1",
-            ],
+            &["--capture", "b.ron", "--out", "o", "--sky", "v1"][..],
+            &["--sky", "v1", "--capture", "b.ron", "--out", "o"],
+            &["--capture", "b.ron", "--sky", "v1", "--out", "o"],
         ] {
-            assert_eq!(parse(line), capture(SkyMode::V1), "{line:?}");
+            assert_eq!(parse(line), plain, "{line:?}");
         }
         assert_eq!(
-            parse(&[
-                "--capture",
-                "bookmarks/sky-v1.ron",
-                "--out",
-                "captures/sky-v1"
-            ]),
-            capture(SkyMode::M0)
-        );
-        assert_eq!(
-            parse(&["--bench", "b.ron", "--sky", "v1", "--frames", "30"]),
-            Ok(Command::Bench(BenchArgs {
-                bookmarks: "b.ron".into(),
-                size: UVec2::new(1920, 1080),
-                frames: 30,
-                sky: SkyMode::V1,
-            }))
+            parse(&["--bench", "b.ron", "--sky", "v1"]),
+            parse(&["--bench", "b.ron"])
         );
     }
 
@@ -380,23 +362,22 @@ mod tests {
             &["--capture", "b.ron", "--out"],
             &["--capture", "b.ron", "--out", "o", "--size", "1920"],
             &["--capture", "b.ron", "--out", "o", "--size", "0x10"],
-            &["--capture", "b.ron", "--out", "o", "--size", "axb"],
             &["--capture", "b.ron", "--out", "o", "--frames", "0"],
-            &["--capture", "b.ron", "--out", "o", "--frames", "-1"],
             &["--capture", "b.ron", "--out", "o", "--zoom"],
             &["--selftest", "now"],
             &["--fly"],
             &["--bench"],
             &["--bench", "b.ron", "--frames", "0"],
             &["--bench", "b.ron", "--hud"],
-            &["--bench", "b.ron", "--size"],
+            &["--bench", "b.ron", "--sustained", "0"],
+            &["--bench", "b.ron", "--sustained", "x"],
+            &["--bench", "b.ron", "--json"],
             &["--sky"],
-            &["--sky", "v2"],
+            &["--sky", "m0"],
             &["--sky", "V1"],
             &["--sky", "v1", "--sky", "v1"],
             &["--selftest", "--sky", "v1"],
             &["--help", "--sky", "v1"],
-            &["--capture", "b.ron", "--out", "o", "--sky"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

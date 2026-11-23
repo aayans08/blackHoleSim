@@ -1,69 +1,67 @@
-//! Headless --bench mode: frame-time and GPU-time statistics per bookmark (review I6, ledger
-//! T13 "window FPS not measured").
+//! Headless `--bench` v2: frame-time and GPU-time statistics per bookmark (M1 Task B9 Step 3).
 //!
-//! `universe --bench <bookmarks.ron> [--frames N] [--size WxH]` renders each bookmark headless
-//! at the internal resolution `--size` (default 1920×1080, the "1080p internal" of design §6
-//! and the M1 gate) into an offscreen sRGB target of the same size, so the tonemap does no
-//! upscale. Each bookmark is set up as the window would open at it: the window's lens scale
-//! (0.5) unless the bookmark names one, and the bookmark's epoch and exposures.
+//! `universe --bench <bookmarks.ron> [--size WxH] [--frames N] [--sustained <s>] [--json <out>]`
+//! renders each bookmark headless at the internal resolution `--size` (default 1920×1080, the
+//! "1080p internal" of design §6 and the M1 gate) into an offscreen sRGB target of the same size,
+//! so the tonemap does no upscale. Each bookmark is set up as the window opens it: the window's
+//! lens scale (0.5) unless the bookmark names one, its epoch, view and exposure choices; time is
+//! paused and auto-exposure adapts as in the window (no settle). [`WARMUP_FRAMES`] uncounted
+//! frames come first (pipelines, the band's first cube build).
 //!
-//! Per bookmark, [`WARMUP_FRAMES`] uncounted frames come first, then `N` measured frames. Each
-//! measured frame is built, encoded, submitted and waited for on its own, and its GPU timings
-//! are read back before the next one starts. Reported, per bookmark:
-//! - **frame**: wall-clock time from building the frame to the GPU finishing it, mean and p95
-//!   (nearest rank). Frames do not overlap here, so this is the serial cost CPU + GPU + the
-//!   submit/wait round trip: an upper bound on the window's frame time, where CPU and GPU work
-//!   overlap. The fps shown is 1000 / mean frame ms.
-//! - **GPU frame**: the timer's whole-frame GPU time (uni-gfx `PassTimer` frame brackets),
-//!   mean and p95, or n/a if the device returned no valid measurement.
-//! - **CPU**: the time to build and encode the frame, mean.
-//! - **GPU passes**: the mean of each pass's valid measurements, "n/a" when it has none, and
-//!   the count of valid ones when some were invalid (review I5: never shown as 0).
+//! - **Serial** (default): `N` frames, each built, encoded, submitted and waited for on its own;
+//!   its GPU timings are read back before the next one starts. `frame_ms` is the serial cost
+//!   (CPU + GPU + the submit/wait round trip), an upper bound on the window's frame time.
+//! - **Sustained** (`--sustained s`): each bookmark renders continuously for `s` seconds with up
+//!   to two frames in flight, as the window does; GPU timings are collected without blocking.
+//!   `interval_ms` is the time between consecutive frame starts (the frame rate the window would
+//!   reach), `frame_ms` a frame's latency from its start to the GPU finishing it. The M3 Air is
+//!   fanless, so the first and the last 10 s are reported apart (plan "Performance budget").
 //!
-//! With `--sky v1` the scene is the sky v1 stack (`Scene::new_v1`), with auto-exposure settling
-//! each frame as in captures; a header line says so. Without the flag the run is as before.
-//!
-//! Not measured: present and vsync (there is no window), the HUD (the window draws egui on
-//! top) and thermal throttling over minutes (the M3 Air is fanless; a short bench runs cool).
+//! Every frame records: `cpu_ms` (snapshot, inputs and encode), `snapshot_cpu_ms`
+//! (`World::snapshot`), `gpu_frame_ms` (the timer's frame brackets), and per pass the GPU
+//! **duration** (`scene::pass_durations`: differences of the timer's stamps; invalid ones stay
+//! `null`, never 0, review I5). `comets_cpu_ms` is `null`: no comet tails are drawn before Wave C.
+//! Windows `all`, `first10s` and `last10s` are cut by the time since the bookmark's first measured
+//! frame; a window with no frame is `null`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Context as _;
 use glam::UVec2;
-use uni_core::Epoch;
 use uni_gfx::{CAPTURE_FORMAT, CaptureTarget};
 
-use crate::capture::{CaptureError, headless_gpu, load_catalog, ms_or_na, submit_and_wait};
+use crate::capture::{CaptureError, headless_gpu, load_world, ms_or_na, submit_and_wait};
 use crate::scene::{
-    INTERACTIVE_LENS_SCALE, Scene, SkyExposure, SkyMode, apply_bookmark, default_controls,
-    frame_ctx,
+    INTERACTIVE_LENS_SCALE, Scene, StarCatalog, apply_bookmark, default_controls, pass_durations,
 };
-use crate::world::World;
 
 /// Default internal resolution of a bench run (design §6, "1080p internal").
 pub const DEFAULT_SIZE: UVec2 = UVec2::new(1920, 1080);
-/// Default measured frames per bookmark.
+/// Default measured frames per bookmark (serial mode).
 pub const DEFAULT_FRAMES: u32 = 120;
-/// Frames rendered per bookmark before measuring (pipeline warm-up, resource creation).
+/// Frames rendered per bookmark before measuring (pipeline warm-up, the band's cube build).
 pub const WARMUP_FRAMES: u32 = 8;
-/// Epoch of a bookmark that sets none, as in captures.
-const DEFAULT_EPOCH: Epoch = Epoch::J2000;
-/// Frame time handed to the features [s] (a 60 Hz frame; nothing moves).
+/// Frames in flight in sustained mode (as the window: one being recorded, one on the GPU).
+pub const FRAMES_IN_FLIGHT: usize = 2;
+/// Length of the first and last windows of a sustained run [s] (plan "Performance budget").
+pub const WINDOW_S: f64 = 10.0;
+/// Frame time handed to the features [s] (a 60 Hz frame; time is paused).
 const BENCH_DT_S: f64 = 1.0 / 60.0;
 
-/// `universe --bench <bookmarks.ron> [--frames N] [--size WxH]`.
+/// `universe --bench <bookmarks.ron> [--frames N] [--size WxH] [--sustained s] [--json f]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BenchArgs {
     pub bookmarks: PathBuf,
     pub size: UVec2,
     pub frames: u32,
-    /// `--sky`: the M0 stack (default) or sky v1.
-    pub sky: SkyMode,
+    pub sustained_s: Option<f64>,
+    pub json: Option<PathBuf>,
 }
 
-/// Mean and 95th percentile (nearest rank) of a set of samples.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Mean, 95th percentile (nearest rank) and count of a set of samples.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Stats {
     pub mean: f32,
     pub p95: f32,
@@ -88,181 +86,319 @@ pub fn stats(samples: &[f32]) -> Option<Stats> {
     })
 }
 
-/// One pass's GPU times across the measured frames.
+/// One measured frame.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct PassSamples {
-    /// Valid measurements [ms].
-    valid: Vec<f32>,
-    /// Frames in which the pass ran (valid or not).
-    runs: usize,
+struct Sample {
+    /// Seconds since the bookmark's first measured frame started.
+    t_s: f64,
+    frame_ms: Option<f32>,
+    interval_ms: Option<f32>,
+    cpu_ms: f32,
+    snapshot_cpu_ms: f32,
+    /// Filled when the frame's GPU timings arrive.
+    gpu_frame_ms: Option<f32>,
+    passes: Option<Vec<(&'static str, Option<f32>)>>,
 }
 
-/// Per-pass GPU samples in the order passes first appeared.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct PassTable(Vec<(&'static str, PassSamples)>);
+/// One pass's GPU durations in a window: the mean of the valid ones, how many were valid and in
+/// how many frames it ran (B8's `{mean, valid, runs}`).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct PassStats {
+    pub mean: Option<f32>,
+    pub valid: usize,
+    pub runs: usize,
+}
 
-impl PassTable {
-    fn add(&mut self, frame: &[(&'static str, Option<f32>)]) {
-        for &(label, ms) in frame {
-            let i = match self.0.iter().position(|(l, _)| *l == label) {
-                Some(i) => i,
-                None => {
-                    self.0.push((label, PassSamples::default()));
-                    self.0.len() - 1
-                }
-            };
-            let s = &mut self.0[i].1;
-            s.runs += 1;
-            s.valid.extend(ms);
+/// One window's statistics (B9 Step 3's schema).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct WindowStats {
+    pub frames: usize,
+    pub frame_ms: Option<Stats>,
+    pub interval_ms: Option<Stats>,
+    pub gpu_frame_ms: Option<Stats>,
+    pub cpu_ms: Option<Stats>,
+    pub passes: BTreeMap<String, PassStats>,
+    pub snapshot_cpu_ms: Option<Stats>,
+    pub comets_cpu_ms: Option<Stats>,
+}
+
+/// The statistics of `samples`.
+fn window(samples: &[&Sample]) -> Option<WindowStats> {
+    if samples.is_empty() {
+        return None;
+    }
+    let col = |f: &dyn Fn(&Sample) -> Option<f32>| -> Vec<f32> {
+        samples.iter().filter_map(|s| f(s)).collect()
+    };
+    let mut passes: BTreeMap<String, (Vec<f32>, usize)> = BTreeMap::new();
+    for s in samples {
+        for &(name, ms) in s.passes.iter().flatten() {
+            let e = passes.entry(name.to_owned()).or_default();
+            e.1 += 1;
+            e.0.extend(ms);
         }
     }
+    Some(WindowStats {
+        frames: samples.len(),
+        frame_ms: stats(&col(&|s| s.frame_ms)),
+        interval_ms: stats(&col(&|s| s.interval_ms)),
+        gpu_frame_ms: stats(&col(&|s| s.gpu_frame_ms)),
+        cpu_ms: stats(&col(&|s| Some(s.cpu_ms))),
+        passes: passes
+            .into_iter()
+            .map(|(k, (v, runs))| {
+                let mean = stats(&v).map(|s| s.mean);
+                (
+                    k,
+                    PassStats {
+                        mean,
+                        valid: v.len(),
+                        runs,
+                    },
+                )
+            })
+            .collect(),
+        snapshot_cpu_ms: stats(&col(&|s| Some(s.snapshot_cpu_ms))),
+        comets_cpu_ms: None,
+    })
+}
 
-    /// `"<pass> <mean ms>"` per pass, "n/a" with no valid sample, and "(k/n valid)" when some
-    /// were invalid.
-    fn line(&self) -> String {
-        if self.0.is_empty() {
-            return "n/a".to_owned();
-        }
-        self.0
+/// One bookmark's result.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BookmarkResult {
+    pub name: String,
+    pub lens_scale: f32,
+    /// `all`, `first10s`, `last10s`.
+    pub windows: BTreeMap<&'static str, Option<WindowStats>>,
+}
+
+/// The bench JSON (B9 Step 3).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BenchFile {
+    pub size: [u32; 2],
+    pub frames: u32,
+    pub sustained_s: Option<f64>,
+    pub bookmarks: Vec<BookmarkResult>,
+}
+
+/// The windows of one bookmark's samples.
+fn windows(samples: &[Sample]) -> BTreeMap<&'static str, Option<WindowStats>> {
+    let end = samples.last().map_or(0.0, |s| s.t_s);
+    let all: Vec<&Sample> = samples.iter().collect();
+    let first: Vec<&Sample> = samples.iter().filter(|s| s.t_s < WINDOW_S).collect();
+    let last: Vec<&Sample> = samples.iter().filter(|s| s.t_s >= end - WINDOW_S).collect();
+    BTreeMap::from([
+        ("all", window(&all)),
+        ("first10s", window(&first)),
+        ("last10s", window(&last)),
+    ])
+}
+
+/// Two report lines for a bookmark's `all` window.
+fn report(r: &BookmarkResult, size: UVec2) -> String {
+    let Some(Some(w)) = r.windows.get("all") else {
+        return format!("bench {}: no frames", r.name);
+    };
+    let pick = |s: Option<Stats>| (s.map(|s| s.mean), s.map(|s| s.p95));
+    let (fm, fp) = pick(w.frame_ms);
+    let (im, ip) = pick(w.interval_ms);
+    let (gm, gp) = pick(w.gpu_frame_ms);
+    let (cm, cp) = pick(w.cpu_ms);
+    let (sm, _) = pick(w.snapshot_cpu_ms);
+    let fps = w
+        .interval_ms
+        .or(w.frame_ms)
+        .map_or_else(|| "n/a".to_owned(), |s| format!("{:.1}", 1e3 / s.mean));
+    let passes = if w.passes.is_empty() {
+        "n/a".to_owned()
+    } else {
+        w.passes
             .iter()
-            .map(|(label, s)| {
-                let mean = stats(&s.valid).map(|st| st.mean);
-                let partial = if !s.valid.is_empty() && s.valid.len() < s.runs {
-                    format!(" ({}/{} valid)", s.valid.len(), s.runs)
+            .map(|(k, p)| {
+                let partial = if p.valid > 0 && p.valid < p.runs {
+                    format!(" ({}/{} valid)", p.valid, p.runs)
                 } else {
                     String::new()
                 };
-                format!("{label} {}{partial}", ms_or_na(mean))
+                format!("{k} {}{partial}", ms_or_na(p.mean))
             })
             .collect::<Vec<_>>()
             .join(", ")
-    }
+    };
+    format!(
+        "bench {} ({}×{}, {} frames, lens scale {}): frame {} ms mean, {} ms p95; interval {} \
+         ms mean, {} ms p95 ({fps} fps); GPU frame {} ms mean, {} ms p95; CPU {} ms mean, {} ms \
+         p95 (snapshot {} ms)\n  GPU passes (mean duration ms): {passes}",
+        r.name,
+        size.x,
+        size.y,
+        w.frames,
+        r.lens_scale,
+        ms_or_na(fm),
+        ms_or_na(fp),
+        ms_or_na(im),
+        ms_or_na(ip),
+        ms_or_na(gm),
+        ms_or_na(gp),
+        ms_or_na(cm),
+        ms_or_na(cp),
+        ms_or_na(sm),
+    )
 }
 
-/// One bookmark's results.
-struct BookmarkBench {
-    name: String,
-    lens_scale: f32,
-    frame_ms: Vec<f32>,
-    cpu_ms: Vec<f32>,
-    gpu_frame_ms: Vec<f32>,
-    passes: PassTable,
-}
-
-impl BookmarkBench {
-    /// The two report lines.
-    fn report(&self, size: UVec2) -> String {
-        let frame = stats(&self.frame_ms);
-        let fps = frame.map_or_else(|| "n/a".to_owned(), |s| format!("{:.1}", 1e3 / s.mean));
-        let gpu = stats(&self.gpu_frame_ms);
-        let cpu = stats(&self.cpu_ms);
-        format!(
-            "bench {} ({}×{}, {} frames, lens scale {}): frame {} ms mean, {} ms p95 ({fps} fps); \
-             GPU frame {} ms mean, {} ms p95{}; CPU {} ms mean\n  GPU passes (mean ms): {}",
-            self.name,
-            size.x,
-            size.y,
-            self.frame_ms.len(),
-            self.lens_scale,
-            ms_or_na(frame.map(|s| s.mean)),
-            ms_or_na(frame.map(|s| s.p95)),
-            ms_or_na(gpu.map(|s| s.mean)),
-            ms_or_na(gpu.map(|s| s.p95)),
-            match gpu {
-                Some(s) if s.count < self.frame_ms.len() => {
-                    format!(" ({}/{} valid)", s.count, self.frame_ms.len())
-                }
-                _ => String::new(),
-            },
-            ms_or_na(cpu.map(|s| s.mean)),
-            self.passes.line(),
-        )
-    }
-}
-
-/// Benchmarks every bookmark in `args.bookmarks`, printing two lines per bookmark.
+/// Benchmarks every bookmark in `args.bookmarks`: two lines per bookmark on stdout, and the
+/// JSON with `--json`.
 pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
-    let catalog = load_catalog(args.sky)?;
     let bookmarks = uni_nav::load_bookmarks(&args.bookmarks)?;
     if bookmarks.is_empty() {
         return Err(anyhow::anyhow!("the bookmark file lists no bookmarks").into());
     }
+    let (mut world, assets) = load_world()?;
     let gpu = headless_gpu(args.size, "--size")?;
-    let mut scene = Scene::for_sky(
+    let mut scene = Scene::new(
         &gpu,
         args.size,
         CAPTURE_FORMAT,
-        args.sky,
-        &catalog,
+        StarCatalog::AtHyg(world.sim.star_data()),
+        &assets,
         INTERACTIVE_LENS_SCALE,
     )?;
-    drop(catalog);
-    if args.sky == SkyMode::V1 {
-        println!(
-            "bench: sky v1 (band, {} AT-HYG stars in 3-D, auto-exposure, bloom)",
-            scene.star_count
-        );
-    }
     let target = CaptureTarget::new(&gpu.device, args.size);
-    let mut world = World::new(DEFAULT_EPOCH);
-    world.time_rate = 0.0;
     if !gpu.has_timestamps() {
         println!("bench: the device has no timestamp queries; GPU times are n/a");
     }
-
+    let mut results = Vec::new();
     let mut frame_index = 0_u64;
     for b in &bookmarks {
-        world.epoch = DEFAULT_EPOCH;
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
-        let view = apply_bookmark(b, &mut world, &mut controls)?;
-        let sky_exposure = SkyExposure::from_bookmark(b);
+        let applied = apply_bookmark(b, &mut world, &mut controls)?;
+        world.set_time_rate(0.0);
+        world.sim.settle_comets();
         scene.set_lens_scale(controls.lens_scale);
-        let mut result = BookmarkBench {
-            name: b.name.clone(),
-            lens_scale: scene.lens_scale(),
-            frame_ms: Vec::new(),
-            cpu_ms: Vec::new(),
-            gpu_frame_ms: Vec::new(),
-            passes: PassTable::default(),
-        };
-        for f in 0..WARMUP_FRAMES + args.frames {
+        let mut samples: Vec<Sample> = Vec::new();
+        // Submitted frames still waiting for their GPU timings: (sample index, timer seq floor).
+        let mut in_flight: std::collections::VecDeque<(usize, wgpu::SubmissionIndex, Instant)> =
+            std::collections::VecDeque::new();
+        let mut last_seq = scene.renderer.gpu_timings().map(|t| t.seq);
+        let mut bench_start: Option<Instant> = None;
+        let mut prev_start: Option<Instant> = None;
+        let mut f = 0_u32;
+        loop {
+            let measuring = f >= WARMUP_FRAMES;
+            if measuring {
+                match (args.sustained_s, bench_start) {
+                    (Some(s), Some(t0)) if t0.elapsed().as_secs_f64() >= s => break,
+                    (None, _) if f >= WARMUP_FRAMES + args.frames => break,
+                    _ => {}
+                }
+            }
             let start = Instant::now();
-            let fe = scene.set_exposure(&controls, sky_exposure, true);
-            let ctx = frame_ctx(
+            world.advance(BENCH_DT_S);
+            let frame = scene.prepare(
                 &world,
-                &view,
+                &applied.view,
                 args.size,
                 args.size,
-                fe.exposure,
+                &controls,
+                applied.choice,
+                false,
                 frame_index,
                 BENCH_DT_S,
             );
-            let cmds = vec![scene.render(&gpu, &ctx, &target.view)];
-            let encoded = start.elapsed();
-            // `render` collected every earlier frame's timings, so newer ones are this frame's.
-            let before = scene.renderer.gpu_timings().map(|t| t.seq);
-            submit_and_wait(&gpu, cmds, &format!("bench frame of {:?}", b.name))
-                .context("bench")?;
-            let done = start.elapsed();
+            let cmd = scene.render(&gpu, &frame, &target.view);
+            let cpu_ms = start.elapsed().as_secs_f32() * 1e3;
             frame_index += 1;
-            // The wait finished this frame, so its timings are the latest after this.
-            scene.renderer.poll_timings(&gpu);
-            if f < WARMUP_FRAMES {
+            f += 1;
+            let sample_index = measuring.then(|| {
+                let t0 = *bench_start.get_or_insert(start);
+                samples.push(Sample {
+                    t_s: start.duration_since(t0).as_secs_f64(),
+                    interval_ms: prev_start.map(|p| start.duration_since(p).as_secs_f32() * 1e3),
+                    cpu_ms,
+                    snapshot_cpu_ms: frame.snapshot_cpu_ms,
+                    ..Sample::default()
+                });
+                samples.len() - 1
+            });
+            prev_start = measuring.then_some(start);
+            if args.sustained_s.is_none() {
+                // Serial: wait for this frame and read its timings back before the next.
+                submit_and_wait(&gpu, vec![cmd], &format!("bench frame of {:?}", b.name))
+                    .context("bench")?;
+                let done = start.elapsed().as_secs_f32() * 1e3;
+                scene.renderer.poll_timings(&gpu);
+                let t = scene.renderer.gpu_timings();
+                if let (Some(i), Some(t)) = (sample_index, t.filter(|t| Some(t.seq) != last_seq)) {
+                    samples[i].frame_ms = Some(done);
+                    samples[i].gpu_frame_ms = t.frame_ms;
+                    samples[i].passes = Some(pass_durations(&t.passes));
+                } else if let Some(i) = sample_index {
+                    samples[i].frame_ms = Some(done);
+                }
+                last_seq = scene.renderer.gpu_timings().map(|t| t.seq);
                 continue;
             }
-            result.frame_ms.push(done.as_secs_f32() * 1e3);
-            result.cpu_ms.push(encoded.as_secs_f32() * 1e3);
-            // Only this frame's timings: a frame whose read-back was dropped adds nothing.
-            if let Some(t) = scene
-                .renderer
-                .gpu_timings()
-                .filter(|t| Some(t.seq) != before)
+            // Sustained: keep at most FRAMES_IN_FLIGHT frames on the GPU.
+            let idx = gpu.queue.submit(std::iter::once(cmd));
+            if let Some(i) = sample_index {
+                in_flight.push_back((i, idx, start));
+            }
+            while in_flight.len() >= FRAMES_IN_FLIGHT {
+                let Some((i, idx, s)) = in_flight.pop_front() else {
+                    break;
+                };
+                gpu.device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(idx),
+                        timeout: None,
+                    })
+                    .context("waiting for a bench frame")?;
+                samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+            }
+            let errors = gpu.take_errors();
+            if !errors.is_empty() {
+                return Err(anyhow::anyhow!("bench {:?}: {}", b.name, errors.join("; ")).into());
+            }
+            // Timings arrive a few frames late (read without blocking in `render`): attach each
+            // new record to the oldest measured frame still without one.
+            if let Some(t) = scene.renderer.gpu_timings()
+                && Some(t.seq) != last_seq
             {
-                result.gpu_frame_ms.extend(t.frame_ms);
-                result.passes.add(&t.passes);
+                last_seq = Some(t.seq);
+                if let Some(s) = samples.iter_mut().find(|s| s.passes.is_none()) {
+                    s.gpu_frame_ms = t.frame_ms;
+                    s.passes = Some(pass_durations(&t.passes));
+                }
             }
         }
-        println!("{}", result.report(args.size));
+        // Drain what is still in flight.
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .context("draining the bench frames")?;
+        for (i, _, s) in in_flight.drain(..) {
+            samples[i].frame_ms = Some(s.elapsed().as_secs_f32() * 1e3);
+        }
+        let result = BookmarkResult {
+            name: b.name.clone(),
+            lens_scale: scene.lens_scale(),
+            windows: windows(&samples),
+        };
+        println!("{}", report(&result, args.size));
+        results.push(result);
+    }
+    if let Some(path) = &args.json {
+        let file = BenchFile {
+            size: args.size.to_array(),
+            frames: args.frames,
+            sustained_s: args.sustained_s,
+            bookmarks: results,
+        };
+        let text = serde_json::to_string_pretty(&file).context("serialising the bench JSON")?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("bench: wrote {}", path.display());
     }
     Ok(())
 }
@@ -277,59 +413,106 @@ mod tests {
         assert_eq!(stats(&[f32::NAN]), None);
         let s = stats(&[3.0]).unwrap();
         assert_eq!((s.mean, s.p95, s.count), (3.0, 3.0, 1));
-        // 1..=100: mean 50.5, p95 = the 95th smallest = 95.
         let v: Vec<f32> = (1..=100).rev().map(|i| i as f32).collect();
         let s = stats(&v).unwrap();
         assert!((s.mean - 50.5).abs() < 1e-5);
         assert_eq!(s.p95, 95.0);
-        // 20 samples: rank ceil(19) = 19.
         let v: Vec<f32> = (1..=20).map(|i| i as f32).collect();
         assert_eq!(stats(&v).unwrap().p95, 19.0);
-        // Non-finite samples are ignored.
         let s = stats(&[1.0, f32::INFINITY, 3.0]).unwrap();
         assert_eq!((s.mean, s.count), (2.0, 2));
     }
 
-    /// Review I5: a pass with no valid measurement reads "n/a", and a partly valid one says how
-    /// many were valid; nothing invalid becomes 0.
-    #[test]
-    fn pass_table_reports_na_and_partial_validity() {
-        let mut t = PassTable::default();
-        assert_eq!(t.line(), "n/a");
-        t.add(&[
-            ("lens", Some(10.0)),
-            ("tonemap", None),
-            ("stars", Some(1.0)),
-        ]);
-        t.add(&[("lens", Some(20.0)), ("tonemap", None), ("stars", None)]);
-        assert_eq!(t.line(), "lens 15.00, tonemap n/a, stars 1.00 (1/2 valid)");
-        assert!(!t.line().contains("0.00 "));
+    fn sample(t_s: f64, ms: f32, passes: Option<Vec<(&'static str, Option<f32>)>>) -> Sample {
+        Sample {
+            t_s,
+            frame_ms: Some(ms),
+            interval_ms: (t_s > 0.0).then_some(ms),
+            cpu_ms: 1.0,
+            snapshot_cpu_ms: 0.5,
+            gpu_frame_ms: passes.as_ref().map(|_| ms - 1.0),
+            passes,
+        }
     }
 
+    /// The windows split by time; a pass with no valid sample has `mean: null` and its counts
+    /// (review I5: never 0).
     #[test]
-    fn report_shows_frame_gpu_and_pass_lines() {
-        let mut passes = PassTable::default();
-        passes.add(&[("lens", Some(12.0)), ("tonemap", None)]);
-        let r = BookmarkBench {
-            name: "start".to_owned(),
-            lens_scale: 0.5,
-            frame_ms: vec![10.0, 20.0],
-            cpu_ms: vec![0.5, 0.5],
-            gpu_frame_ms: vec![9.0],
-            passes,
-        };
-        let text = r.report(UVec2::new(1920, 1080));
-        assert!(
-            text.starts_with(
-                "bench start (1920×1080, 2 frames, lens scale 0.5): frame 15.00 ms mean, \
-                 20.00 ms p95 (66.7 fps); GPU frame 9.00 ms mean, 9.00 ms p95 (1/2 valid); \
-                 CPU 0.50 ms mean"
-            ),
-            "{text}"
+    fn windows_split_by_time_and_keep_na() {
+        let samples: Vec<Sample> = (0..300)
+            .map(|i| {
+                let t = f64::from(i) * 0.1;
+                let ms = if t < 10.0 { 10.0 } else { 20.0 };
+                let passes = (i % 2 == 0)
+                    .then(|| vec![("stars", Some(1.0)), ("lens", None), ("bloom", Some(0.5))]);
+                sample(t, ms, passes)
+            })
+            .collect();
+        let w = windows(&samples);
+        let all = w["all"].as_ref().unwrap();
+        let first = w["first10s"].as_ref().unwrap();
+        let last = w["last10s"].as_ref().unwrap();
+        assert_eq!(all.frames, 300);
+        assert_eq!(first.frames, 100);
+        assert_eq!(last.frames, 101); // t ≥ 29.9 − 10
+        assert_eq!(first.frame_ms.unwrap().p95, 10.0);
+        assert_eq!(last.frame_ms.unwrap().mean, 20.0);
+        assert_eq!(
+            all.passes["lens"],
+            PassStats {
+                mean: None,
+                valid: 0,
+                runs: 150
+            }
         );
+        assert_eq!(all.passes["stars"].mean, Some(1.0));
+        assert_eq!(all.passes["stars"].valid, 150);
+        assert!(all.comets_cpu_ms.is_none());
+        let v = serde_json::to_value(all).unwrap();
+        assert_eq!(v["passes"]["lens"]["mean"], serde_json::Value::Null);
+        assert_eq!(v["comets_cpu_ms"], serde_json::Value::Null);
+        assert_eq!(v["interval_ms"]["count"], 299);
+        assert!(windows(&[])["all"].is_none());
+    }
+
+    /// The JSON is B8's reader schema: `{size, frames, sustained_s, bookmarks: [{name,
+    /// lens_scale, windows: {all|first10s|last10s: {...}}}]}`.
+    #[test]
+    fn bench_json_has_the_schema_b8_reads() {
+        let samples = vec![sample(0.0, 12.0, Some(vec![("stars", Some(1.0))]))];
+        let file = BenchFile {
+            size: [1920, 1080],
+            frames: 120,
+            sustained_s: Some(60.0),
+            bookmarks: vec![BookmarkResult {
+                name: "start".to_owned(),
+                lens_scale: 0.5,
+                windows: windows(&samples),
+            }],
+        };
+        let v = serde_json::to_value(&file).unwrap();
+        assert_eq!(v["size"], serde_json::json!([1920, 1080]));
+        assert_eq!(v["sustained_s"], 60.0);
+        let w = &v["bookmarks"][0]["windows"];
+        for key in ["all", "first10s", "last10s"] {
+            for field in [
+                "frame_ms",
+                "interval_ms",
+                "gpu_frame_ms",
+                "cpu_ms",
+                "passes",
+                "snapshot_cpu_ms",
+                "comets_cpu_ms",
+            ] {
+                assert!(w[key].get(field).is_some(), "{key}.{field}");
+            }
+        }
+        assert_eq!(w["all"]["gpu_frame_ms"]["p95"], 11.0);
+        assert_eq!(w["all"]["passes"]["stars"]["runs"], 1);
+        let line = report(&file.bookmarks[0], UVec2::new(1920, 1080));
         assert!(
-            text.ends_with("GPU passes (mean ms): lens 12.00, tonemap n/a"),
-            "{text}"
+            line.contains("GPU passes (mean duration ms): stars 1.00"),
+            "{line}"
         );
     }
 }

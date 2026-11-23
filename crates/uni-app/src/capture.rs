@@ -1,18 +1,23 @@
-//! Headless --capture mode: renders bookmarks to PNG plus JSON metrics (M0 Task 11).
+//! Headless `--capture`: renders bookmarks to PNG plus the capture JSON v2 (M1 Task B9 Step 2),
+//! and with `--hdr` the pre-bloom HDR sidecar.
 //!
-//! For each bookmark, `--frames` frames are rendered one at a time (each waits for the GPU),
-//! the last one is saved as `<out>/<name>.png`, and `<out>/<name>.json` records its size, the
-//! GPU time of each pass and of the whole frame, the CPU time to update and encode it, the star
-//! count, the lens scale and the epoch (design §8, "Headless capture"). The internal render
-//! resolution equals `--size`, so the tonemap reads the HDR target 1:1. A GPU time the device
-//! did not measure validly is `null` in the JSON and "n/a" on the terminal, never 0 (review
-//! I5). Any uncaptured GPU error fails the run, so a broken frame is never published (m6).
+//! Per bookmark: the world goes to its epoch, every comet is settled there (A4 ruling: captures
+//! settle per bookmark, so they do not depend on the frames before), the camera is placed (its
+//! anchor and `look_at` resolved, A6), a snapshot notes any unnamed near star and a zero tick
+//! registers it (A4 parked item; the frames then draw it with its id).
+//! - **Auto exposure** (review I16, round 2): frames render with `settle` until the resolved
+//!   scene and star EV each move less than [`SETTLE_EV`] between frames (at least
+//!   `--frames` − 2 frames, at most [`MAX_SETTLE_FRAMES`]), then [`MANUAL_FRAMES`] frames in
+//!   Manual at the settled EVs. The last is captured, so the written exposure is exactly the
+//!   captured frame's.
+//! - **Manual** (the bookmark's, or the debug grid's): `--frames` frames; the last is captured.
 //!
-//! With `--sky v1` the scene is the sky v1 stack (`Scene::new_v1`): auto-exposure runs with
-//! `settle` (each frame jumps to the metered target, which the resolve reads one frame after the
-//! meter, so the default 4 frames are settled from the second on), and the JSON adds `sky` and
-//! the `ev100` [scene, star] the GPU resolved for the captured frame. Without the flag the run and
-//! its files are as before.
+//! The internal render size equals `--size`, so the tonemap reads `hdr` 1:1. GPU times are per
+//! pass **durations** (`scene::pass_durations`; `null` = no valid measurement, never 0; review
+//! I5). Any uncaptured GPU error fails the run (review m6). `<name>.json` holds the M0 keys plus
+//! `ev100`, `honesty`, `projected`, `metrics`, `regions`, `samples`, `features`, `flux`, `notes`,
+//! and with `--hdr` the `hdr` header of `<name>.hdr.bin` (f32 LE RGBA, rows top-down, the
+//! pre-exposed HDR target copied just before bloom); `hud` with `--hud`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,30 +26,39 @@ use std::time::Instant;
 use anyhow::Context as _;
 use glam::UVec2;
 use uni_core::Epoch;
-use uni_data::CatalogStar;
 use uni_gfx::{CAPTURE_FORMAT, CaptureTarget, GpuContext};
+use uni_post::ExposureMode;
 use uni_ui::Hud;
 
+use crate::measure::{self, Measurements};
 use crate::scene::{
-    CAPTURE_LENS_SCALE, Perf, Scene, SkyCatalog, SkyExposure, SkyMode, apply_bookmark,
-    default_controls, frame_ctx, hud_data,
+    CAPTURE_LENS_SCALE, Frame, Perf, Scene, StarCatalog, ViewChoices, apply_bookmark,
+    default_controls, hud_data, pass_durations,
 };
-use crate::world::{World, baked_dir, iso_utc, load_sky_v1_stars, sky_path};
+use crate::world::{self, Assets, World, baked_dir, iso_utc};
 
 /// Default capture size (brief).
 pub const DEFAULT_SIZE: UVec2 = UVec2::new(1920, 1080);
-/// Default frames rendered per bookmark before the capture (brief).
+/// Default frames rendered per Manual bookmark, and the least an Auto bookmark renders.
 pub const DEFAULT_FRAMES: u32 = 4;
-/// Epoch of a bookmark that sets none: J2000.0, so captures never depend on the clock.
-const DEFAULT_EPOCH: Epoch = Epoch::J2000;
-/// Frame time handed to the features in captures [s]; nothing moves, so it only fills
+/// Auto exposure has settled when the scene and star EV each move less than this between two
+/// frames [EV] (brief).
+pub const SETTLE_EV: f32 = 0.05;
+/// Most settle frames per Auto bookmark (brief).
+pub const MAX_SETTLE_FRAMES: u32 = 16;
+/// Manual frames at the settled EVs after settling (brief: the last two).
+pub const MANUAL_FRAMES: u32 = 2;
+/// The world's epoch before the first bookmark: the baked data's start date (no comet settles).
+const START_EPOCH_UTC: &str = "2026-11-20T00:00:00Z";
+/// Frame time handed to the features in captures [s]; time is paused, so it only fills
 /// `CameraUniform::time`.
 const CAPTURE_DT_S: f64 = 1.0 / 60.0;
-/// Physical pixels per egui point for `--hud` (lead ruling: 1:1, the capture is 1920×1080
-/// logical = physical).
+/// Physical pixels per egui point for `--hud` (lead ruling: 1:1).
 const HEADLESS_HUD_PIXELS_PER_POINT: f32 = 1.0;
+/// `hdr.layout` (B8's reader requires the prefix "f32 LE RGBA").
+pub const HDR_LAYOUT: &str = "f32 LE RGBA, rows top-down";
 
-/// `universe --capture <bookmarks.ron> --out <dir> [--size WxH] [--frames N] [--hud]`.
+/// `universe --capture <bookmarks.ron> --out <dir> [--size WxH] [--frames N] [--hud] [--hdr]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptureArgs {
     pub bookmarks: PathBuf,
@@ -52,8 +66,8 @@ pub struct CaptureArgs {
     pub size: UVec2,
     pub frames: u32,
     pub hud: bool,
-    /// `--sky`: the M0 stack (default) or sky v1.
-    pub sky: SkyMode,
+    /// Also write `<name>.hdr.bin` (33.2 MB at 1920×1080).
+    pub hdr: bool,
 }
 
 /// Why a capture run failed. The binary exits with 2 for [`CaptureError::MissingData`] and
@@ -71,65 +85,62 @@ impl From<anyhow::Error> for CaptureError {
     }
 }
 
-/// `<name>.json`: the capture's metrics.
+/// The `hdr` header of a capture JSON (B8's reader).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct HdrHeader {
+    /// The sidecar's file name, relative to the JSON's directory.
+    pub file: String,
+    /// The HDR target's (internal) size.
+    pub width: u32,
+    pub height: u32,
+    /// The capture camera's vertical field of view [rad] (B8's `flux` needs Ω_c).
+    pub fov_y_rad: f64,
+    /// Exposure factors [scene, star]: pre-exposed value = luminance [cd/m²] × pre.
+    pub pre: [f32; 2],
+    pub ev100: [f32; 2],
+    pub layout: &'static str,
+}
+
+/// `hud` (with `--hud`): what the HUD showed. HUD v0 has no cards (C4).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct HudInfo {
+    pub card_rows: Vec<String>,
+    pub panels: Vec<String>,
+}
+
+/// `<name>.json`: the capture's metrics (JSON v2).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CaptureMetrics {
     pub name: String,
     pub width: u32,
     pub height: u32,
-    /// Pass name → GPU milliseconds, `null` where the device returned no valid measurement;
-    /// empty without timestamp queries (Review Focus 4).
+    /// Pass name → GPU duration [ms] (differences of the timer's stamps), `null` where the
+    /// device returned no valid measurement; empty without timestamp queries.
     pub gpu_ms: BTreeMap<String, Option<f32>>,
     /// Whole-frame GPU milliseconds (between the timer's frame brackets), `null` if not
     /// measured or invalid.
     pub gpu_frame_ms: Option<f32>,
-    /// CPU milliseconds to update and encode the captured frame.
+    /// CPU milliseconds to build (snapshot included) and encode the captured frame.
     pub cpu_ms: f32,
     pub star_count: u32,
-    /// Lens tracer resolution scale used.
     pub lens_scale: f32,
     /// The bookmark's epoch, `YYYY-MM-DDThh:mm:ssZ` (UTC, whole seconds).
     pub epoch_utc: String,
-    /// `"v1"` with `--sky v1`; left out of the JSON for the M0 sky.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sky: Option<&'static str>,
-    /// Sky v1: the [scene, star] EV100 the GPU resolved for the captured frame (read back after
-    /// its wait); left out for the M0 sky, whose exposure is the bookmark's.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// [scene, star] EV100 of the captured frame.
     pub ev100: Option<[f32; 2]>,
-}
-
-/// The baked star catalogue, or [`CaptureError::MissingData`] (headless runs never render an
-/// empty sky silently).
-pub fn load_stars() -> Result<Vec<CatalogStar>, CaptureError> {
-    let (stars, sky_warnings) = World::load_sky(&sky_path());
-    if !sky_warnings.is_empty() {
-        return Err(CaptureError::MissingData(format!(
-            "{} (bake it with `cargo run -p uni-bake -- bsc5 ...`, see data/manifest.toml)",
-            sky_warnings.join("; ")
-        )));
-    }
-    Ok(stars)
-}
-
-/// The star catalogue `sky` draws headless, or [`CaptureError::MissingData`]: BSC5 for the M0
-/// sky ([`load_stars`]); AT-HYG as `uni_sim::World::star_data()` for sky v1. A headless sky v1
-/// run without AT-HYG stops rather than fall back to BSC5 (as the window does), so a capture
-/// named sky v1 never shows another catalogue.
-pub fn load_catalog(sky: SkyMode) -> Result<SkyCatalog, CaptureError> {
-    match sky {
-        SkyMode::M0 => load_stars().map(SkyCatalog::Bsc5),
-        SkyMode::V1 => {
-            let (stars, warnings) = load_sky_v1_stars(&baked_dir());
-            if stars.is_empty() {
-                return Err(CaptureError::MissingData(format!(
-                    "{} (bake it with `cargo run -p uni-bake -- athyg ...`, see data/manifest.toml)",
-                    warnings.join("; ")
-                )));
-            }
-            Ok(SkyCatalog::AtHyg(stars))
-        }
-    }
+    /// "auto" or "manual"; for auto, the frames it took to settle.
+    pub exposure: &'static str,
+    pub settle_frames: u32,
+    /// The honesty labels in effect (exact strings).
+    pub honesty: Vec<String>,
+    #[serde(flatten)]
+    pub measured: Measurements,
+    /// Data and pass warnings in effect (a missing map, a camera inside a body, ...).
+    pub notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr: Option<HdrHeader>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hud: Option<HudInfo>,
 }
 
 /// A headless GPU that can render `size` (`flag` names the option in the error).
@@ -159,101 +170,193 @@ pub fn submit_and_wait(
     Ok(())
 }
 
+/// The world and its assets for a headless run, or [`CaptureError::MissingData`] without
+/// AT-HYG (every M1 bookmark draws the AT-HYG sky; a headless run never shows the BSC5
+/// fallback silently).
+pub fn load_world() -> Result<(World, Assets), CaptureError> {
+    let epoch = Epoch::parse_iso_utc(START_EPOCH_UTC)
+        .context("internal: bad start epoch")
+        .map_err(CaptureError::Failed)?;
+    let (world, assets) = world::load(&baked_dir(), epoch);
+    for w in &assets.warnings {
+        log::warn!("baked data: {w}");
+    }
+    if assets.athyg_missing() {
+        return Err(CaptureError::MissingData(format!(
+            "{} (bake it with `cargo run -p uni-bake -- athyg ...`, see data/manifest.toml)",
+            assets.warnings.join("; ")
+        )));
+    }
+    Ok((world, assets))
+}
+
 /// Renders every bookmark in `args.bookmarks` into `args.out`.
 pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
-    let catalog = load_catalog(args.sky)?;
     let bookmarks = uni_nav::load_bookmarks(&args.bookmarks)?;
     check_names(&bookmarks)?;
+    let (mut world, assets) = load_world()?;
     std::fs::create_dir_all(&args.out)
         .with_context(|| format!("creating {}", args.out.display()))?;
 
     let gpu = headless_gpu(args.size, "--size")?;
-    // Internal resolution = output size: the tonemap reads the HDR target 1:1.
-    let mut scene = Scene::for_sky(
+    let mut scene = Scene::new(
         &gpu,
         args.size,
         CAPTURE_FORMAT,
-        args.sky,
-        &catalog,
+        StarCatalog::AtHyg(world.sim.star_data()),
+        &assets,
         CAPTURE_LENS_SCALE,
     )?;
-    drop(catalog);
     let target = CaptureTarget::new(&gpu.device, args.size);
     let mut hud = args
         .hud
         .then(|| Hud::new_headless(&gpu, CAPTURE_FORMAT, HEADLESS_HUD_PIXELS_PER_POINT));
-    let mut world = World::new(DEFAULT_EPOCH);
-    world.time_rate = 0.0; // a capture is a still frame
+    let size = scene.renderer.targets().size;
 
     let mut frame_index = 0_u64;
     for b in &bookmarks {
-        world.epoch = DEFAULT_EPOCH;
         let mut controls = default_controls(CAPTURE_LENS_SCALE);
-        let view = apply_bookmark(b, &mut world, &mut controls)?;
-        let sky_exposure = SkyExposure::from_bookmark(b);
+        let applied = apply_bookmark(b, &mut world, &mut controls)?;
+        world.set_time_rate(0.0); // a capture is a still frame
+        let settle_start = Instant::now();
+        world.sim.settle_comets();
+        let comets_settle_ms = settle_start.elapsed().as_secs_f32() * 1e3;
+        // Note any unnamed near star, then register it (one zero tick) before the frames.
+        let _ = world.sim.snapshot(&applied.view, size);
+        world.advance(0.0);
         scene.set_lens_scale(controls.lens_scale);
-        let size = scene.renderer.targets().size;
+        let mut choice = applied.choice;
+        let auto = choice.mode() == ExposureMode::Auto;
 
-        let mut cpu_ms = 0.0;
-        for f in 0..args.frames {
-            let start = Instant::now();
-            // Sky v1 settles: each frame jumps to the metered target (a capture is a still).
-            let fe = scene.set_exposure(&controls, sky_exposure, true);
-            let ctx = frame_ctx(
-                &world,
-                &view,
-                size,
-                size,
-                fe.exposure,
-                frame_index,
-                CAPTURE_DT_S,
-            );
-            let mut cmds = vec![scene.render(&gpu, &ctx, &target.view)];
-            if let Some(hud) = hud.as_mut().filter(|_| f + 1 == args.frames) {
-                // The previous frame's GPU timings (the captured frame's are not measured yet).
-                let perf = Perf::from_renderer(&scene.renderer, &gpu, 0.0, cpu_ms);
-                let data = hud_data(
+        let job = FrameJob {
+            gpu: &gpu,
+            target: &target,
+            assets: &assets,
+            view: &applied.view,
+            size,
+            name: &b.name,
+            hdr: args.hdr,
+        };
+
+        let mut settle_frames = 0;
+        let last = if auto {
+            let min = args.frames.saturating_sub(MANUAL_FRAMES).max(2);
+            let mut prev: Option<[f32; 2]> = None;
+            for i in 0..MAX_SETTLE_FRAMES {
+                render_one(
+                    &job,
+                    &mut scene,
                     &world,
-                    &ctx,
-                    perf,
-                    0.0,
-                    scene.star_count,
-                    &[],
-                    fe.settings.as_ref(),
-                );
-                let mut enc = gpu
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("capture hud"),
-                    });
-                cmds.extend(hud.draw_headless(
-                    &gpu,
-                    &mut enc,
-                    &target.view,
-                    target.size.to_array(),
-                    &data,
-                    &mut controls,
-                ));
-                cmds.push(enc.finish());
+                    hud.as_mut(),
+                    &controls,
+                    choice,
+                    true,
+                    false,
+                    frame_index,
+                )?;
+                frame_index += 1;
+                settle_frames = i + 1;
+                let now = scene.resolved_ev100();
+                let still = match (prev, now) {
+                    (Some(p), Some(n)) => {
+                        (n[0] - p[0]).abs() < SETTLE_EV && (n[1] - p[1]).abs() < SETTLE_EV
+                    }
+                    _ => false,
+                };
+                if still && settle_frames >= min {
+                    break;
+                }
+                prev = now;
             }
-            cpu_ms = start.elapsed().as_secs_f32() * 1e3;
-            // One frame at a time, so every frame's GPU timings are read back: after the wait,
-            // `poll_timings` resolves the finished frame's queries and makes its timings the
-            // latest (the captured frame's, after the last one).
-            submit_and_wait(&gpu, cmds, &format!("capture frame of {:?}", b.name))?;
-            scene.renderer.poll_timings(&gpu);
-            frame_index += 1;
-        }
+            let ev = scene
+                .resolved_ev100()
+                .context("auto exposure resolved nothing to settle on")?;
+            controls.scene_ev100 = ev[0];
+            controls.star_ev100 = ev[1];
+            choice.exposure = ExposureMode::Manual;
+            let mut last = None;
+            for f in 0..MANUAL_FRAMES {
+                last = Some(render_one(
+                    &job,
+                    &mut scene,
+                    &world,
+                    hud.as_mut(),
+                    &controls,
+                    choice,
+                    false,
+                    f + 1 == MANUAL_FRAMES,
+                    frame_index,
+                )?);
+                frame_index += 1;
+            }
+            last
+        } else {
+            let mut last = None;
+            for f in 0..args.frames {
+                last = Some(render_one(
+                    &job,
+                    &mut scene,
+                    &world,
+                    hud.as_mut(),
+                    &controls,
+                    choice,
+                    false,
+                    f + 1 == args.frames,
+                    frame_index,
+                )?);
+                frame_index += 1;
+            }
+            last
+        };
+        let (frame, cpu_ms) = last.context("no frame rendered")?;
+
         let png = args.out.join(format!("{}.png", b.name));
         target.save_png(&gpu, &png)?;
+        let world_img = scene.world_tap.take(&gpu)?;
+        let hdr_img = scene.hdr_tap.take(&gpu)?;
+        let ev100 = scene.resolved_ev100();
+        let ev = ev100.unwrap_or([
+            frame.settings.manual.scene_ev100,
+            frame.settings.manual.star_ev100,
+        ]);
 
+        let hdr = match &hdr_img {
+            Some(img) => {
+                let file = format!("{}.hdr.bin", b.name);
+                let path = args.out.join(&file);
+                std::fs::write(&path, img.to_le_bytes())
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Some(HdrHeader {
+                    file,
+                    width: img.size.x,
+                    height: img.size.y,
+                    fov_y_rad: applied.view.fov_y_rad,
+                    pre: ev.map(uni_gfx::exposure_scale),
+                    ev100: ev,
+                    layout: HDR_LAYOUT,
+                })
+            }
+            None => None,
+        };
+        let measured = measure::measure(&measure::Input {
+            name: &b.name,
+            world: &world,
+            frame: &frame,
+            ev100: ev,
+            world_hdr: world_img.as_ref(),
+            v_lim: scene.v_lim(),
+            comets_settle_ms,
+            rings: assets.rings.as_ref(),
+        });
+        let mut notes = assets.warnings.clone();
+        notes.extend(scene.notices.iter().cloned());
+        notes.extend(scene.pass_warnings());
+        notes.extend(frame.coverage.warning().map(str::to_owned));
         let metrics = CaptureMetrics {
             name: b.name.clone(),
             width: target.size.x,
             height: target.size.y,
-            gpu_ms: scene
-                .renderer
-                .gpu_ms()
+            gpu_ms: pass_durations(&scene.renderer.gpu_ms())
                 .into_iter()
                 .map(|(pass, ms)| (pass.to_owned(), ms))
                 .collect(),
@@ -261,15 +364,95 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             cpu_ms,
             star_count: scene.star_count,
             lens_scale: controls.lens_scale,
-            epoch_utc: iso_utc(world.epoch),
-            sky: (scene.sky() == SkyMode::V1).then_some("v1"),
-            ev100: scene.resolved_ev100(),
+            epoch_utc: iso_utc(world.epoch()),
+            ev100,
+            exposure: if auto { "auto" } else { "manual" },
+            settle_frames,
+            honesty: frame.labels.clone(),
+            measured,
+            notes,
+            hdr,
+            hud: args.hud.then(|| HudInfo {
+                card_rows: Vec::new(),
+                panels: vec!["status".to_owned(), "warnings".to_owned()],
+            }),
         };
         let json_path = args.out.join(format!("{}.json", b.name));
         write_metrics(&json_path, &metrics)?;
         println!("{}", summary(&png, &metrics));
     }
     Ok(())
+}
+
+/// What every frame of one bookmark shares.
+struct FrameJob<'a> {
+    gpu: &'a GpuContext,
+    target: &'a CaptureTarget,
+    assets: &'a Assets,
+    view: &'a uni_core::CameraView,
+    size: UVec2,
+    name: &'a str,
+    hdr: bool,
+}
+
+/// One capture frame: build, render (the HUD and the taps on the `captured` one), wait for the
+/// GPU and read the frame's timings. Returns the frame and its CPU time [ms].
+#[allow(clippy::too_many_arguments)]
+fn render_one(
+    job: &FrameJob<'_>,
+    scene: &mut Scene,
+    world: &World,
+    hud: Option<&mut Hud>,
+    controls: &uni_ui::HudControls,
+    choice: ViewChoices,
+    settle: bool,
+    captured: bool,
+    frame_index: u64,
+) -> anyhow::Result<(Frame, f32)> {
+    let gpu = job.gpu;
+    let start = Instant::now();
+    let frame = scene.prepare(
+        world,
+        job.view,
+        job.size,
+        job.size,
+        controls,
+        choice,
+        settle,
+        frame_index,
+        CAPTURE_DT_S,
+    );
+    scene.world_tap.arm(captured);
+    scene.hdr_tap.arm(captured && job.hdr);
+    let mut cmds = vec![scene.render(gpu, &frame, &job.target.view)];
+    scene.world_tap.arm(false);
+    scene.hdr_tap.arm(false);
+    if let Some(hud) = hud.filter(|_| captured) {
+        let perf = Perf::from_renderer(&scene.renderer, gpu, 0.0, 0.0);
+        let mut notices = job.assets.warnings.clone();
+        notices.extend(scene.notices.iter().cloned());
+        notices.extend(scene.pass_warnings());
+        let data = hud_data(world, &frame, perf, 0.0, scene.star_count, &notices);
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("capture hud"),
+            });
+        let mut c = *controls;
+        cmds.extend(hud.draw_headless(
+            gpu,
+            &mut enc,
+            &job.target.view,
+            job.target.size.to_array(),
+            &data,
+            &mut c,
+        ));
+        cmds.push(enc.finish());
+    }
+    let cpu_ms = start.elapsed().as_secs_f32() * 1e3;
+    submit_and_wait(gpu, cmds, &format!("capture frame of {:?}", job.name))?;
+    scene.renderer.poll_timings(gpu);
+    Ok((frame, cpu_ms))
 }
 
 /// Bookmark names become file names: each must be a plain, unique file stem.
@@ -332,10 +515,12 @@ fn summary(png: &Path, m: &CaptureMetrics) -> String {
         format!("; EV100 scene {scene:.2}, stars {star:.2}")
     });
     format!(
-        "captured {} ({}×{}): {gpu}; CPU {:.2} ms; {} stars; lens scale {}{ev}",
+        "captured {} ({}×{}, {} {}): {gpu}; CPU {:.2} ms; {} stars; lens scale {}{ev}",
         png.display(),
         m.width,
         m.height,
+        m.exposure,
+        m.settle_frames,
         m.cpu_ms,
         m.star_count,
         m.lens_scale
@@ -346,10 +531,9 @@ fn summary(png: &Path, m: &CaptureMetrics) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn metrics_json_has_the_brief_fields() {
-        let m = CaptureMetrics {
-            name: "bh-shadow-30M".to_owned(),
+    fn metrics() -> CaptureMetrics {
+        CaptureMetrics {
+            name: "bh-shadow-30M-grid".to_owned(),
             width: 1920,
             height: 1080,
             gpu_ms: BTreeMap::from([
@@ -359,13 +543,24 @@ mod tests {
             ]),
             gpu_frame_ms: Some(4.0),
             cpu_ms: 1.5,
-            star_count: 9096,
+            star_count: 333_294,
             lens_scale: 1.0,
             epoch_utc: "2026-11-20T00:00:00Z".to_owned(),
-            sky: None,
-            ev100: None,
-        };
-        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+            ev100: Some([0.0, -4.0]),
+            exposure: "manual",
+            settle_frames: 0,
+            honesty: vec!["Lens background: M0 debug grid".to_owned()],
+            measured: Measurements::default(),
+            notes: Vec::new(),
+            hdr: None,
+            hud: None,
+        }
+    }
+
+    /// The JSON v2 keys B8's readers and the sheet expect (B9 Step 2).
+    #[test]
+    fn metrics_json_has_the_v2_fields() {
+        let v: serde_json::Value = serde_json::to_value(metrics()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
@@ -373,49 +568,52 @@ mod tests {
             [
                 "cpu_ms",
                 "epoch_utc",
+                "ev100",
+                "exposure",
+                "features",
+                "flux",
                 "gpu_frame_ms",
                 "gpu_ms",
                 "height",
+                "honesty",
                 "lens_scale",
+                "metrics",
                 "name",
+                "notes",
+                "projected",
+                "regions",
+                "samples",
+                "settle_frames",
                 "star_count",
                 "width"
             ]
         );
-        assert_eq!(v["gpu_ms"]["lens"], 3.5);
-        assert_eq!(v["gpu_ms"]["stars"], 0.25);
         // Review I5: an invalid measurement is null, not 0.
         assert_eq!(v["gpu_ms"]["tonemap"], serde_json::Value::Null);
-        assert_eq!(v["gpu_frame_ms"], 4.0);
-        assert_eq!(v["width"], 1920);
-        assert_eq!(v["epoch_utc"], "2026-11-20T00:00:00Z");
-    }
-
-    /// Sky v1 adds `sky` and the resolved `ev100`; the M0 JSON keeps exactly the keys above.
-    #[test]
-    fn sky_v1_metrics_add_sky_and_ev100() {
-        let m = CaptureMetrics {
-            name: "sky-orion".to_owned(),
-            width: 4,
-            height: 3,
-            gpu_ms: BTreeMap::new(),
-            gpu_frame_ms: None,
-            cpu_ms: 0.5,
-            star_count: 329_768,
-            lens_scale: 1.0,
-            epoch_utc: String::new(),
-            sky: Some("v1"),
-            ev100: Some([-4.0, -4.0]),
-        };
+        assert_eq!(v["ev100"], serde_json::json!([0.0, -4.0]));
+        let mut m = metrics();
+        m.hdr = Some(HdrHeader {
+            file: "x.hdr.bin".to_owned(),
+            width: 1920,
+            height: 1080,
+            fov_y_rad: 1.0,
+            pre: [1.0, 2.0],
+            ev100: [0.0, -1.0],
+            layout: HDR_LAYOUT,
+        });
+        m.hud = Some(HudInfo {
+            card_rows: Vec::new(),
+            panels: vec!["status".to_owned()],
+        });
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
-        assert_eq!(v["sky"], "v1");
-        assert_eq!(v["ev100"], serde_json::json!([-4.0, -4.0]));
-        assert_eq!(v.as_object().unwrap().len(), 11);
-        let line = summary(Path::new("out/sky-orion.png"), &m);
+        assert_eq!(v["hdr"]["file"], "x.hdr.bin");
         assert!(
-            line.ends_with("329768 stars; lens scale 1; EV100 scene -4.00, stars -4.00"),
-            "{line}"
+            v["hdr"]["layout"]
+                .as_str()
+                .unwrap()
+                .starts_with("f32 LE RGBA")
         );
+        assert_eq!(v["hud"]["card_rows"], serde_json::json!([]));
     }
 
     #[test]
@@ -424,26 +622,12 @@ mod tests {
             "uni-app-{}-metrics_are_written_as_json.json",
             std::process::id()
         ));
-        let m = CaptureMetrics {
-            name: "x".to_owned(),
-            width: 2,
-            height: 1,
-            gpu_ms: BTreeMap::new(),
-            gpu_frame_ms: None,
-            cpu_ms: 0.0,
-            star_count: 0,
-            lens_scale: 0.5,
-            epoch_utc: "2000-01-01T11:58:55Z".to_owned(),
-            sky: None,
-            ev100: None,
-        };
-        write_metrics(&path, &m).unwrap();
+        write_metrics(&path, &metrics()).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["gpu_ms"], serde_json::json!({}));
-        assert_eq!(v["gpu_frame_ms"], serde_json::Value::Null);
-        assert_eq!(v["lens_scale"], 0.5);
+        assert_eq!(v["lens_scale"], 1.0);
+        assert_eq!(v["gpu_frame_ms"], 4.0);
     }
 
     #[test]
@@ -454,54 +638,27 @@ mod tests {
         for bad in ["", ".hidden", "a/b", "..", "a b", "c:\\x", "naïve"] {
             assert!(!is_file_stem(bad), "{bad}");
         }
-        let marks = uni_nav::load_bookmarks(&crate::world::m0_bookmarks_path()).unwrap();
-        check_names(&marks).unwrap();
-        let mut twice = marks.clone();
-        twice.push(marks[0].clone());
-        assert!(check_names(&twice).is_err());
+        for file in [
+            crate::world::m1_bookmarks_path(),
+            crate::world::m0_bookmarks_path(),
+            crate::world::bookmarks_path("m1-bench.ron"),
+        ] {
+            let marks = uni_nav::load_bookmarks(&file).unwrap();
+            check_names(&marks).unwrap();
+            let mut twice = marks.clone();
+            twice.push(marks[0].clone());
+            assert!(check_names(&twice).is_err());
+        }
         assert!(check_names(&[]).is_err());
     }
 
     #[test]
-    fn summary_reports_missing_timestamps() {
-        let m = CaptureMetrics {
-            name: "x".to_owned(),
-            width: 4,
-            height: 3,
-            gpu_ms: BTreeMap::new(),
-            gpu_frame_ms: None,
-            cpu_ms: 0.5,
-            star_count: 7,
-            lens_scale: 1.0,
-            epoch_utc: String::new(),
-            sky: None,
-            ev100: None,
-        };
-        let line = summary(Path::new("out/x.png"), &m);
-        assert!(line.contains("GPU ms n/a"), "{line}");
-        assert!(line.contains("4×3"), "{line}");
-    }
-
-    #[test]
     fn summary_shows_invalid_timings_as_na() {
-        let m = CaptureMetrics {
-            name: "x".to_owned(),
-            width: 4,
-            height: 3,
-            gpu_ms: BTreeMap::from([("lens".to_owned(), Some(2.5)), ("tonemap".to_owned(), None)]),
-            gpu_frame_ms: None,
-            cpu_ms: 0.5,
-            star_count: 7,
-            lens_scale: 1.0,
-            epoch_utc: String::new(),
-            sky: None,
-            ev100: None,
-        };
-        let line = summary(Path::new("out/x.png"), &m);
-        assert!(
-            line.contains("frame n/a, lens 2.50, tonemap n/a GPU ms"),
-            "{line}"
-        );
-        assert!(!line.contains("0.00"), "{line}");
+        let line = summary(Path::new("out/x.png"), &metrics());
+        assert!(line.contains("tonemap n/a"), "{line}");
+        assert!(!line.contains("0.00 "), "{line}");
+        let mut m = metrics();
+        m.gpu_ms.clear();
+        assert!(summary(Path::new("x.png"), &m).contains("GPU ms n/a"));
     }
 }

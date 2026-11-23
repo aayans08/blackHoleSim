@@ -1,99 +1,164 @@
-//! World state: epoch, time rate, frame tree, lenses and sky loading (M0 Task 11).
+//! World state for the app: a thin adapter over [`uni_sim::world::World`] (M1 Task B9).
 //!
-//! M0 has two bodies: the Sun, fixed at the Solar System barycentre (SSB), and the test black
-//! hole TestBH-1. Everything is in the ICRS root frame, SI units, f64.
+//! uni-sim owns the Solar System (Standish planets, Meeus Pluto, the moons' theories), the
+//! comets and asteroids, the AT-HYG stars, the frame tree and TestBH-1 (10 M☉ at SSB +
+//! (1000 AU, 0, 0), as in M0). This module loads its baked data ([`load`]), keeps what the
+//! renderer needs beside it (fact sheets, Saturn's ring profile, the map index: [`Assets`]),
+//! and adds the few things the app asks of the world: the epoch and time rate, the lenses as
+//! seen from the camera, the nearest body for the HUD, and object lookup for bookmark anchors
+//! ([`uni_nav::ObjectLookup`]).
 
 use std::path::{Path, PathBuf};
 
-use glam::{DQuat, DVec3};
-use uni_core::{AU, Epoch, FrameMotion, FrameTree, Lens, M_SUN, ROOT_FRAME, UniversePos};
-use uni_data::{CatalogStar, DataError, Star3};
+use uni_core::{Epoch, FrameId, ROOT_FRAME, UniversePos};
+use uni_data::{BodyFacts, CatalogStar, DataError, MapInfo, RingProfile};
 use uni_gfx::LensView;
+use uni_sim::registry::ObjectId;
+use uni_sim::world::{World as SimWorld, WorldData};
 
-/// Name of the M0 test black hole.
-pub const TEST_BH_NAME: &str = "TestBH-1";
-/// TestBH-1's mass [M☉]: a typical stellar-mass black hole (design §9, M0 "test location").
-pub const TEST_BH_MASS_SUN: f64 = 10.0;
-/// TestBH-1's position: SSB + (1000 AU, 0, 0), far enough that the Sun's gravity is
-/// irrelevant and the sky views from the SSB do not show it.
-pub const TEST_BH_DISTANCE_AU: f64 = 1000.0;
-/// TestBH-1's dimensionless spin a/M. 0 (Schwarzschild) in M0; Kerr arrives in M3.
-pub const TEST_BH_SPIN: f64 = 0.0;
-/// Name of the Sun, which M0 places at the SSB (its ~1 R☉ wobble about the SSB is ignored).
-pub const SUN_NAME: &str = "Sun";
+/// Name of the test black hole (uni-sim's `TEST_BH_NAME`).
+#[cfg(test)]
+pub const TEST_BH_NAME: &str = uni_sim::world::TEST_BH_NAME;
 
-/// Simulation state the app renders: the epoch, how fast it runs, the frame tree and the lenses.
+/// The world the app renders (see the module docs).
 pub struct World {
-    pub epoch: Epoch,
-    /// Simulated seconds per real second; 0 is paused.
-    pub time_rate: f64,
-    pub frames: FrameTree,
-    pub lenses: Vec<Lens>,
+    pub sim: SimWorld,
+}
+
+/// What the renderer needs beside the world: the files `World::new` consumes or does not read.
+pub struct Assets {
+    /// `body_facts.ron` (display names and p_V for the bodies pass).
+    pub facts: Vec<BodyFacts>,
+    /// `saturn_rings.ron`; `None` when missing (the ring pass is then not built, ruling A.3).
+    pub rings: Option<RingProfile>,
+    /// `maps/index.ron`; empty when missing (every body then draws uniform albedo).
+    pub maps: Vec<MapInfo>,
+    /// Where the map files are.
+    pub map_dir: PathBuf,
+    /// One line per missing or unreadable file (uni-sim's, then the map index's), for the HUD.
+    pub warnings: Vec<String>,
+}
+
+impl Assets {
+    /// Whether AT-HYG loaded: uni-sim warns about `athyg_m10.bin` otherwise.
+    pub fn athyg_missing(&self) -> bool {
+        self.warnings.iter().any(|w| w.contains("athyg_m10.bin"))
+    }
+}
+
+/// Loads every baked file from `dir` (normally [`baked_dir`]) and builds the world at `epoch`.
+/// Never panics: a missing file is one warning in [`Assets::warnings`].
+pub fn load(dir: &Path, epoch: Epoch) -> (World, Assets) {
+    let data = uni_sim::world::load_world_data(dir);
+    let map_dir = dir.join("maps");
+    let mut warnings = data.warnings.clone();
+    let maps = match uni_data::load_map_index(&map_dir.join("index.ron")) {
+        Ok(m) => m,
+        Err(e) => {
+            warnings.push(format!(
+                "Surface maps unavailable ({}): every body draws uniform albedo",
+                data_error(&e)
+            ));
+            Vec::new()
+        }
+    };
+    if data.rings.is_none() {
+        warnings.push("Saturn's ring profile missing: rings not drawn".to_owned());
+    }
+    let assets = Assets {
+        facts: data.facts.clone(),
+        rings: data.rings.clone(),
+        maps,
+        map_dir,
+        warnings,
+    };
+    (World::new(data, epoch), assets)
+}
+
+/// A short reason for a data error.
+fn data_error(e: &DataError) -> String {
+    match e {
+        DataError::NotFound(p) => format!("{} not found", p.display()),
+        DataError::BadFormat(why) => format!("bad format: {why}"),
+        DataError::Io(err) => err.to_string(),
+    }
+}
+
+/// No baked files at all: the planets, the Sun, the Moon, the Galilean and Saturnian moons
+/// from their theories, and TestBH-1; no stars, comets or asteroids.
+#[cfg(test)]
+pub fn empty_data() -> WorldData {
+    WorldData {
+        stars: Vec::new(),
+        star_names: None,
+        sats: Vec::new(),
+        comets: Vec::new(),
+        asteroids: Vec::new(),
+        asteroid_names: Vec::new(),
+        exo: Vec::new(),
+        facts: Vec::new(),
+        rings: None,
+        warnings: Vec::new(),
+    }
 }
 
 impl World {
-    /// The M0 world at `epoch`, running in real time: the Sun at the SSB and TestBH-1, a
-    /// 10 M☉ Schwarzschild hole held in a fixed frame at SSB + (1000 AU, 0, 0).
-    pub fn new(epoch: Epoch) -> Self {
-        let mut frames = FrameTree::new();
-        frames.add(
-            ROOT_FRAME,
-            TEST_BH_NAME,
-            FrameMotion::Fixed {
-                origin: UniversePos::from_meters(DVec3::new(TEST_BH_DISTANCE_AU * AU, 0.0, 0.0)),
-                rotation: DQuat::IDENTITY,
-            },
-        );
-        let test_bh = Lens {
-            name: TEST_BH_NAME.to_owned(),
-            pos: UniversePos::default(), // placed from its frame below
-            mass_kg: TEST_BH_MASS_SUN * M_SUN,
-            spin: TEST_BH_SPIN,
-        };
-        let mut world = World {
-            epoch,
-            time_rate: 1.0,
-            frames,
-            lenses: vec![test_bh],
-        };
-        world.place_lenses();
-        world
-    }
-
-    /// Advances the epoch by `dt_real_s` real seconds at the current time rate, and moves the
-    /// lenses with their frames.
-    pub fn advance(&mut self, dt_real_s: f64) {
-        let dt = dt_real_s * self.time_rate;
-        if dt.is_finite() && dt != 0.0 {
-            self.epoch = self.epoch.add_seconds(dt);
-            self.place_lenses();
+    /// The world over `data` at `epoch`, its clock running at rate 1.
+    pub fn new(data: WorldData, epoch: Epoch) -> Self {
+        Self {
+            sim: SimWorld::new(data, epoch),
         }
     }
 
-    /// Puts each lens at the origin of the frame named after it, at the current epoch.
-    fn place_lenses(&mut self) {
-        for lens in &mut self.lenses {
-            if let Some(id) = self.frames.find(&lens.name) {
-                lens.pos = self.frames.origin_in_root(id, self.epoch);
+    /// A world with no baked data ([`empty_data`]) at `epoch`: fast, for tests.
+    #[cfg(test)]
+    pub fn bare(epoch: Epoch) -> Self {
+        Self::new(empty_data(), epoch)
+    }
+
+    /// The epoch of the cached states.
+    pub fn epoch(&self) -> Epoch {
+        self.sim.epoch()
+    }
+
+    /// Jumps to `epoch` and refreshes the cached states (one tick of zero wall time).
+    pub fn set_epoch(&mut self, epoch: Epoch) {
+        self.sim.time.set_epoch(epoch);
+        self.sim.tick(0.0);
+    }
+
+    /// Simulated seconds per real second (0 while paused).
+    pub fn time_rate(&self) -> f64 {
+        if self.sim.time.is_paused() {
+            0.0
+        } else {
+            self.sim.time.rate()
+        }
+    }
+
+    /// Sets the time rate; 0 pauses (the rate itself is then left as it was).
+    pub fn set_time_rate(&mut self, rate: f64) {
+        if rate == 0.0 {
+            if !self.sim.time.is_paused() {
+                self.sim.time.toggle_pause();
             }
+        } else {
+            if self.sim.time.is_paused() {
+                self.sim.time.toggle_pause();
+            }
+            self.sim.time.set_rate(rate);
         }
     }
 
-    /// The nearest body to `cam` and its centre distance [m]. M0 considers the Sun at the SSB
-    /// and every lens; ties go to the Sun.
-    pub fn nearest(&self, cam: &UniversePos) -> (String, f64) {
-        let sun = (SUN_NAME, cam.delta_from(UniversePos::default()).length());
-        let lenses = self
-            .lenses
-            .iter()
-            .map(|l| (l.name.as_str(), cam.delta_from(l.pos).length()));
-        let (name, dist) = lenses.fold(sun, |best, c| if c.1 < best.1 { c } else { best });
-        (name.to_owned(), dist)
+    /// Advances by `dt_real_s` of wall time (A4's tick: states, near stars, comet catch-up).
+    pub fn advance(&mut self, dt_real_s: f64) {
+        self.sim.tick(dt_real_s);
     }
 
     /// Every lens as seen from `cam`: lens − camera [m] in root axes, mass and spin.
     pub fn lens_views(&self, cam: &UniversePos) -> Vec<LensView> {
-        self.lenses
+        self.sim
+            .lenses()
             .iter()
             .map(|l| LensView {
                 rel_pos_m: l.pos.delta_from(*cam),
@@ -103,13 +168,60 @@ impl World {
             .collect()
     }
 
-    /// Loads the baked star catalogue at `path`. Never panics: a missing or corrupt file gives
-    /// an empty sky and one warning for the HUD (Review Focus 3).
-    pub fn load_sky(path: &Path) -> (Vec<CatalogStar>, Vec<String>) {
-        match uni_data::load_bsc5(path) {
-            Ok(stars) => (stars, Vec::new()),
-            Err(e) => (Vec::new(), vec![sky_warning(&e)]),
+    /// The object with the nearest surface to `cam` (uni-sim's rule: bodies, TestBH-1's horizon,
+    /// near stars' photospheres) and the distance from `cam` to its centre [m]; ("—", ∞) when
+    /// there is none.
+    pub fn nearest(&self, cam: &UniversePos) -> (String, f64) {
+        match self.sim.nearest_surface(cam) {
+            Some((id, _)) => (
+                self.name(id).to_owned(),
+                cam.delta_from(self.sim.position(id)).length(),
+            ),
+            None => ("\u{2014}".to_owned(), f64::INFINITY),
         }
+    }
+
+    /// The display name of object `id` ("" for an unknown id).
+    pub fn name(&self, id: ObjectId) -> &str {
+        self.sim
+            .objects()
+            .get(id as usize)
+            .map_or("", |o| o.name.as_str())
+    }
+
+    /// The name of the body whose frame is `frame` (A4's frames are body-centred), for F12's
+    /// anchored bookmark (A6 ruling I2).
+    pub fn frame_body_name(&self, frame: FrameId) -> Option<String> {
+        if frame == ROOT_FRAME {
+            return None;
+        }
+        self.sim
+            .objects()
+            .iter()
+            .find(|o| o.frame == Some(frame))
+            .map(|o| o.name.clone())
+    }
+
+    /// Centre of object `name` (case-insensitive), root frame.
+    pub fn position_of(&self, name: &str) -> Option<UniversePos> {
+        self.sim.find(name).map(|id| self.sim.position(id))
+    }
+}
+
+impl uni_nav::ObjectLookup for World {
+    fn find_object(&self, name: &str) -> Option<(UniversePos, FrameId)> {
+        let id = self.sim.find(name)?;
+        let frame = self.sim.objects()[id as usize].frame.unwrap_or(ROOT_FRAME);
+        Some((self.sim.position(id), frame))
+    }
+}
+
+/// Loads the baked BSC5 catalogue at `path` (the window's fallback sky without AT-HYG).
+/// Never panics: a missing or corrupt file gives an empty sky and one warning.
+pub fn load_bsc5(path: &Path) -> (Vec<CatalogStar>, Vec<String>) {
+    match uni_data::load_bsc5(path) {
+        Ok(stars) => (stars, Vec::new()),
+        Err(e) => (Vec::new(), vec![sky_warning(&e)]),
     }
 }
 
@@ -133,7 +245,7 @@ pub fn iso_utc(epoch: Epoch) -> String {
 }
 
 /// The baked Yale Bright Star Catalogue, `<data dir>/baked/bsc5.bin` (uni-data, Task 7).
-pub fn sky_path() -> PathBuf {
+pub fn bsc5_path() -> PathBuf {
     baked_dir().join("bsc5.bin")
 }
 
@@ -142,138 +254,103 @@ pub fn baked_dir() -> PathBuf {
     uni_data::data_dir().join("baked")
 }
 
-/// `bookmarks/m0.ron` in the workspace: the M0 capture sheet and the windowed start view.
+/// `<workspace>/bookmarks/<file>`.
+pub fn bookmarks_path(file: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bookmarks")
+        .join(file)
+}
+
+/// `bookmarks/m1.ron`: the M1 capture set and the window's start view.
+pub fn m1_bookmarks_path() -> PathBuf {
+    bookmarks_path("m1.ron")
+}
+
+/// `bookmarks/m0.ron`: the M0 capture set (still captured at each gate for GPU errors).
+#[cfg(test)]
 pub fn m0_bookmarks_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bookmarks/m0.ron")
-}
-
-/// `bookmarks/sky-v1.ron` in the workspace: the `--sky v1` capture set and its windowed start
-/// view.
-pub fn sky_v1_bookmarks_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bookmarks/sky-v1.ron")
-}
-
-/// The epoch the `--sky v1` star catalogue's uni-sim world is built at: the baked data's start
-/// date, at which `comets_2026.ron` needs no comet settling (uni-sim `World::new`), so building
-/// the world costs no comet integration. The stars it yields do not depend on it.
-const SIM_WORLD_EPOCH_UTC: &str = "2026-11-20T00:00:00Z";
-
-/// The 3-D star catalogue of `--sky v1`, built as B9 will: `uni_sim::World::star_data()` of a
-/// uni-sim world over the baked data in `dir` (`load_world_data`), i.e. AT-HYG followed by the
-/// archive-only exoplanet hosts. The world is dropped afterwards; only its stars are kept.
-///
-/// Never panics. Without AT-HYG (missing or unreadable `athyg_m10.bin`) it returns no stars and
-/// uni-sim's warning for that file; the caller falls back to BSC5 or stops. The warnings about
-/// the other baked files are logged only (the sky v1 stack draws none of them).
-pub fn load_sky_v1_stars(dir: &Path) -> (Vec<Star3>, Vec<String>) {
-    let data = uni_sim::world::load_world_data(dir);
-    if data.stars.is_empty() {
-        let mut warnings: Vec<String> = data
-            .warnings
-            .iter()
-            .filter(|w| w.contains("athyg_m10.bin"))
-            .cloned()
-            .collect();
-        if warnings.is_empty() {
-            warnings.push(format!(
-                "athyg_m10.bin in {} holds no stars: no AT-HYG sky",
-                dir.display()
-            ));
-        }
-        return (Vec::new(), warnings);
-    }
-    for w in &data.warnings {
-        log::info!("sky v1 world data: {w}");
-    }
-    let Some(epoch) = Epoch::parse_iso_utc(SIM_WORLD_EPOCH_UTC) else {
-        return (
-            Vec::new(),
-            vec![format!(
-                "internal error: bad epoch {SIM_WORLD_EPOCH_UTC:?}: no AT-HYG sky"
-            )],
-        );
-    };
-    let world = uni_sim::world::World::new(data, epoch);
-    (world.star_data().to_vec(), Vec::new())
+    bookmarks_path("m0.ron")
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use uni_core::{gravitational_radius, radec_to_icrs};
-    use uni_nav::Bookmark;
+    use glam::DVec3;
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+    use uni_core::{AU, M_SUN, gravitational_radius};
 
-    #[test]
-    fn nearest_is_test_bh_at_start() {
-        let world = World::new(Epoch::J2000);
-        let bh = &world.lenses[0];
-        let m = gravitational_radius(10.0 * M_SUN);
-        let cam = bh.pos.offset(DVec3::new(-60.0 * m, 0.0, 0.0));
-        let (name, dist) = world.nearest(&cam);
-        assert_eq!(name, "TestBH-1");
-        assert!((dist - 60.0 * m).abs() <= 1.0, "{dist} m vs {} m", 60.0 * m);
+    /// The full baked world, loaded once per test binary and shared (AT-HYG and the satellite
+    /// elements take about a second to load in a debug build). Tests lock it and set their own
+    /// epoch.
+    pub(crate) fn full_world() -> MutexGuard<'static, (World, Assets)> {
+        static WORLD: OnceLock<Mutex<(World, Assets)>> = OnceLock::new();
+        WORLD
+            .get_or_init(|| {
+                let epoch = Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap();
+                Mutex::new(load(&baked_dir(), epoch))
+            })
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     #[test]
-    fn bookmarks_file_parses() {
-        let marks = uni_nav::load_bookmarks(&m0_bookmarks_path()).expect("bookmarks/m0.ron loads");
-        let names: Vec<&str> = marks.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "start",
-                "sky-orion",
-                "sky-galactic-center",
-                "sky-zoom-sirius",
-                "bh-shadow-30M",
-                "bh-oblique-15M",
-            ]
-        );
+    fn committed_data_loads_without_warnings() {
+        let guard = full_world();
+        let (world, assets) = &*guard;
+        assert!(assets.warnings.is_empty(), "{:?}", assets.warnings);
+        assert!(!assets.athyg_missing());
+        assert!(assets.rings.is_some());
+        assert!(!assets.maps.is_empty());
+        assert!(!assets.facts.is_empty());
+        assert!(world.sim.star_data().len() >= 329_768);
+        for name in [
+            "Sun",
+            "Earth",
+            "Moon",
+            "Saturn",
+            "Titan",
+            "Io",
+            TEST_BH_NAME,
+        ] {
+            assert!(world.sim.find(name).is_some(), "{name}");
+        }
     }
 
     #[test]
-    fn missing_catalog_warns_not_panics() {
-        // Review Focus 3: a missing data file gives an empty sky and one warning.
-        let (stars, warnings) = World::load_sky(Path::new("/nonexistent"));
+    fn missing_data_warns_not_panics() {
+        // Review Focus 3: every missing file is a warning, never a panic.
+        let (world, assets) = load(Path::new("/nonexistent"), Epoch::J2000);
+        assert!(assets.athyg_missing());
+        assert!(assets.rings.is_none());
+        assert!(assets.maps.is_empty());
+        assert!(assets.warnings.iter().any(|w| w.contains("Surface maps")));
+        assert!(world.sim.star_data().is_empty());
+        assert!(world.sim.find("Earth").is_some());
+    }
+
+    #[test]
+    fn missing_or_corrupt_bsc5_warns_not_panics() {
+        let (stars, warnings) = load_bsc5(Path::new("/nonexistent"));
         assert!(stars.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-    }
-
-    #[test]
-    fn corrupt_catalog_warns_not_panics() {
         let path = std::env::temp_dir().join(format!(
             "uni-app-{}-corrupt_catalog_warns_not_panics",
             std::process::id()
         ));
         std::fs::write(&path, [0_u8; 32]).unwrap();
-        let (stars, warnings) = World::load_sky(&path);
+        let (stars, warnings) = load_bsc5(&path);
         let _ = std::fs::remove_file(&path);
         assert!(stars.is_empty());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("unreadable"), "{warnings:?}");
-    }
-
-    #[test]
-    fn committed_catalog_loads_without_warnings() {
-        let (stars, warnings) = World::load_sky(&sky_path());
+        let (stars, warnings) = load_bsc5(&bsc5_path());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(stars.len(), 9096);
     }
 
     #[test]
-    fn nearest_is_the_sun_near_the_ssb() {
-        let world = World::new(Epoch::J2000);
-        let cam = UniversePos::from_meters(DVec3::new(0.0, 3.0 * AU, 4.0 * AU));
-        let (name, dist) = world.nearest(&cam);
-        assert_eq!(name, "Sun");
-        assert!((dist - 5.0 * AU).abs() < 1e-3, "{dist}");
-    }
-
-    #[test]
-    fn test_bh_is_10_solar_masses_1000_au_out_with_no_spin() {
-        let world = World::new(Epoch::J2000);
-        assert_eq!(world.lenses.len(), 1);
-        let bh = &world.lenses[0];
+    fn test_bh_is_10_solar_masses_1000_au_out_and_the_nearest_near_it() {
+        let world = World::bare(Epoch::J2000);
+        let bh = &world.sim.lenses()[0];
         assert_eq!(bh.name, TEST_BH_NAME);
         assert_eq!(bh.mass_kg, 10.0 * M_SUN);
         assert_eq!(bh.spin, 0.0);
@@ -281,33 +358,50 @@ mod tests {
             bh.pos.delta_from(UniversePos::default()),
             DVec3::new(1000.0 * AU, 0.0, 0.0)
         );
-        let frame = world.frames.find(TEST_BH_NAME).expect("TestBH-1 frame");
-        assert_eq!(world.frames.origin_in_root(frame, world.epoch), bh.pos);
-    }
-
-    #[test]
-    fn lens_views_are_lens_minus_camera() {
-        let world = World::new(Epoch::J2000);
-        let cam = world.lenses[0].pos.offset(DVec3::new(-100.0, 20.0, 3.0));
+        let m = gravitational_radius(bh.mass_kg);
+        let cam = bh.pos.offset(DVec3::new(-60.0 * m, 0.0, 0.0));
+        let (name, dist) = world.nearest(&cam);
+        assert_eq!(name, TEST_BH_NAME);
+        assert!((dist - 60.0 * m).abs() <= 1.0, "{dist}");
         let views = world.lens_views(&cam);
         assert_eq!(views.len(), 1);
-        assert_eq!(views[0].rel_pos_m, DVec3::new(100.0, -20.0, -3.0));
-        assert_eq!(views[0].mass_kg, 10.0 * M_SUN);
+        assert!((views[0].rel_pos_m - DVec3::new(60.0 * m, 0.0, 0.0)).length() < 1e-3);
     }
 
     #[test]
-    fn advance_scales_real_time_by_the_rate() {
-        let mut world = World::new(Epoch::J2000);
+    fn epoch_and_rate_follow_the_clock() {
+        let mut world = World::bare(Epoch::J2000);
+        assert_eq!(world.time_rate(), 1.0);
         world.advance(2.0);
-        assert_eq!(world.epoch.seconds_since(Epoch::J2000), 2.0);
-        world.time_rate = 0.0;
+        assert_eq!(world.epoch().seconds_since(Epoch::J2000), 2.0);
+        world.set_time_rate(0.0);
+        assert_eq!(world.time_rate(), 0.0);
         world.advance(5.0);
-        world.time_rate = -10.0;
+        assert_eq!(world.epoch().seconds_since(Epoch::J2000), 2.0);
+        world.set_time_rate(-10.0);
         world.advance(0.5);
-        assert_eq!(world.epoch.seconds_since(Epoch::J2000), -3.0);
-        world.time_rate = 1.0;
-        world.advance(f64::NAN);
-        assert_eq!(world.epoch.seconds_since(Epoch::J2000), -3.0);
+        assert_eq!(world.epoch().seconds_since(Epoch::J2000), -3.0);
+        let t = Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap();
+        let earth_then = {
+            world.set_epoch(t);
+            world.position_of("Earth").unwrap()
+        };
+        world.set_epoch(Epoch::J2000);
+        assert_ne!(world.position_of("Earth").unwrap(), earth_then);
+        world.set_epoch(t);
+        assert_eq!(world.position_of("Earth").unwrap(), earth_then);
+    }
+
+    #[test]
+    fn object_lookup_names_frames_and_centres() {
+        use uni_nav::ObjectLookup as _;
+        let world = World::bare(Epoch::J2000);
+        let (pos, frame) = world.find_object("mars").unwrap();
+        assert_eq!(pos, world.position_of("Mars").unwrap());
+        assert_ne!(frame, ROOT_FRAME);
+        assert_eq!(world.frame_body_name(frame).as_deref(), Some("Mars"));
+        assert_eq!(world.frame_body_name(ROOT_FRAME), None);
+        assert!(world.find_object("Vulcan").is_none());
     }
 
     #[test]
@@ -323,217 +417,11 @@ mod tests {
         assert_eq!(iso_utc(Epoch::J2000), "2000-01-01T11:58:55Z");
     }
 
-    // ---- bookmarks/m0.ron says what its comments say -----------------------------------
-
-    fn bookmark(name: &str) -> Bookmark {
-        uni_nav::load_bookmarks(&m0_bookmarks_path())
-            .expect("bookmarks/m0.ron loads")
-            .into_iter()
-            .find(|b| b.name == name)
-            .unwrap_or_else(|| panic!("no bookmark {name}"))
-    }
-
-    /// Camera forward (−Z), right (+X) and up (+Y) in ICRS axes.
-    fn axes(b: &Bookmark) -> (DVec3, DVec3, DVec3) {
-        let q = b.view.orient;
-        assert!(
-            (q.length() - 1.0).abs() < 1e-12,
-            "{}: |q| = {}",
-            b.name,
-            q.length()
-        );
-        (q * DVec3::NEG_Z, q * DVec3::X, q * DVec3::Y)
-    }
-
-    fn angle(a: DVec3, b: DVec3) -> f64 {
-        a.cross(b).length().atan2(a.dot(b))
-    }
-
-    /// North up: the camera's right axis is level (no +z part) and its up axis leans north.
-    fn assert_north_up(b: &Bookmark) {
-        let (_, right, up) = axes(b);
-        assert!(right.z.abs() < 1e-12, "{}: right {right}", b.name);
-        assert!(up.z > 0.0, "{}: up {up}", b.name);
-    }
-
-    /// Hole direction from the bookmark's camera, and its distance in M.
-    fn hole_from(b: &Bookmark) -> (DVec3, f64) {
-        let world = World::new(Epoch::J2000);
-        let bh = &world.lenses[0];
-        let d = bh.pos.delta_from(b.view.pos);
-        (d.normalize(), d.length() / gravitational_radius(bh.mass_kg))
-    }
-
     #[test]
-    fn every_bookmark_is_at_2026_11_20() {
-        for b in uni_nav::load_bookmarks(&m0_bookmarks_path()).unwrap() {
-            assert_eq!(
-                b.epoch_utc.as_deref(),
-                Some("2026-11-20T00:00:00Z"),
-                "{}",
-                b.name
-            );
-            assert!(Epoch::parse_iso_utc(b.epoch_utc.as_deref().unwrap()).is_some());
-        }
-    }
-
-    #[test]
-    fn sky_bookmarks_look_at_their_targets_from_the_ssb() {
-        let deg = f64::to_radians;
-        for (name, ra, dec, fov) in [
-            ("sky-orion", 83.8, -1.2, 60.0),
-            ("sky-galactic-center", 266.405, -28.936, 60.0),
-            ("sky-zoom-sirius", 101.2872, -16.7161, 2.0),
-        ] {
-            let b = bookmark(name);
-            assert_eq!(b.view.pos.delta_from(UniversePos::default()), DVec3::ZERO);
-            assert!((b.view.fov_y_rad - deg(fov)).abs() < 1e-15, "{name}");
-            let (fwd, _, _) = axes(&b);
-            let a = angle(fwd, radec_to_icrs(deg(ra), deg(dec)));
-            assert!(a < 1e-12, "{name}: {a} rad off target");
-            assert_north_up(&b);
-            assert_eq!(b.lens_scale, None, "{name}");
-        }
-    }
-
-    #[test]
-    fn start_is_60m_out_with_the_hole_15_deg_right_of_centre() {
-        let b = bookmark("start");
-        let (dir, r) = hole_from(&b);
-        assert!((r - 60.0).abs() < 1e-6, "r = {r} M");
-        let (fwd, right, up) = axes(&b);
-        assert!((angle(fwd, dir) - 15_f64.to_radians()).abs() < 1e-6);
-        assert!(dir.dot(right) > 0.0, "the hole is right of centre");
-        assert!(dir.dot(up).abs() < 1e-6, "on the horizontal midline");
-        assert_north_up(&b);
-        assert!((b.view.fov_y_rad - 60_f64.to_radians()).abs() < 1e-15);
-    }
-
-    #[test]
-    fn shadow_bookmark_is_a_static_observer_at_30m_looking_at_the_hole() {
-        let b = bookmark("bh-shadow-30M");
-        let (dir, r) = hole_from(&b);
-        assert!((r - 30.0).abs() < 1e-6, "r = {r} M");
-        let (fwd, _, _) = axes(&b);
-        // 1e-7 rad is 0.03 px at 1080 rows and 60°: the shadow is centred.
-        assert!(angle(fwd, dir) < 1e-7, "{} rad", angle(fwd, dir));
-        assert_north_up(&b);
-        assert!((b.view.fov_y_rad - 60_f64.to_radians()).abs() < 1e-15);
-        assert_eq!(b.lens_scale, Some(1.0));
-    }
-
-    // ---- bookmarks/sky-v1.ron says what its comments say -----------------------------
-
-    fn sky_v1_marks() -> Vec<Bookmark> {
-        uni_nav::load_bookmarks(&sky_v1_bookmarks_path()).expect("bookmarks/sky-v1.ron loads")
-    }
-
-    #[test]
-    fn sky_v1_bookmarks_parse_and_copy_the_m0_sky_views() {
-        let marks = sky_v1_marks();
-        let names: Vec<&str> = marks.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "sky-wide-galactic-center",
-                "sky-wide-anticenter",
-                "sky-orion",
-                "sky-galactic-center",
-                "sky-zoom-sirius",
-            ]
-        );
-        // The three M0 sky views are copied unchanged.
-        for name in ["sky-orion", "sky-galactic-center", "sky-zoom-sirius"] {
-            let copy = marks.iter().find(|b| b.name == name).unwrap();
-            assert_eq!(copy, &bookmark(name), "{name}");
-        }
-        for b in &marks {
-            assert_eq!(
-                b.epoch_utc.as_deref(),
-                Some("2026-11-20T00:00:00Z"),
-                "{}",
-                b.name
-            );
-            assert_eq!(b.view.pos.delta_from(UniversePos::default()), DVec3::ZERO);
-            assert_eq!(b.lens_scale, None, "{}", b.name);
-            // Auto exposure with eye-adapted stars (the defaults), unless a field says otherwise.
-            assert_eq!((b.exposure, b.eye_adapted), (None, None), "{}", b.name);
-        }
-    }
-
-    #[test]
-    fn sky_v1_wide_views_look_at_the_centre_and_anticentre() {
-        let marks = sky_v1_marks();
-        let find = |name: &str| marks.iter().find(|b| b.name == name).unwrap().clone();
-        // The Galactic anticentre (l 180°, b 0°) is minus the galactic x axis, the first row of
-        // the ICRS → Galactic rotation (ESA 1997).
-        let anticentre = -DVec3::from_array(uni_core::ICRS_TO_GALACTIC[0]);
-        for (name, target) in [
-            (
-                "sky-wide-galactic-center",
-                radec_to_icrs(266.405_f64.to_radians(), (-28.936_f64).to_radians()),
-            ),
-            ("sky-wide-anticenter", anticentre),
-        ] {
-            let b = find(name);
-            assert!(
-                (b.view.fov_y_rad - 90_f64.to_radians()).abs() < 1e-15,
-                "{name}"
-            );
-            let (fwd, _, _) = axes(&b);
-            let a = angle(fwd, target);
-            assert!(a < 1e-12, "{name}: {a} rad off target");
-            assert_north_up(&b);
-        }
-        // The anticentre field holds Orion's belt (RA 83.8°, Dec −1.2°) inside its 45° half
-        // height, and the wide centre view shares sky-galactic-center's orientation.
-        let (fwd, _, _) = axes(&find("sky-wide-anticenter"));
-        let belt = radec_to_icrs(83.8_f64.to_radians(), (-1.2_f64).to_radians());
-        assert!(angle(fwd, belt) < 45_f64.to_radians());
-        assert_eq!(
-            find("sky-wide-galactic-center").view.orient,
-            bookmark("sky-galactic-center").view.orient
-        );
-    }
-
-    /// The committed AT-HYG bake loads through a uni-sim world: its 329 768 stars (A7) plus the
-    /// archive-only exoplanet hosts, with no warning.
-    #[test]
-    fn committed_athyg_loads_through_the_sim_world() {
-        let athyg = uni_data::load_athyg(&baked_dir().join("athyg_m10.bin")).unwrap();
-        let (stars, warnings) = load_sky_v1_stars(&baked_dir());
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(athyg.len(), 329_768);
-        assert!(stars.len() >= athyg.len(), "{}", stars.len());
-        assert_eq!(&stars[..athyg.len()], &athyg[..]);
-    }
-
-    #[test]
-    fn sim_world_epoch_parses() {
-        assert!(Epoch::parse_iso_utc(SIM_WORLD_EPOCH_UTC).is_some());
-    }
-
-    /// Review Focus 3: no AT-HYG gives no stars and one warning naming the file, never a panic.
-    #[test]
-    fn missing_athyg_gives_no_stars_and_a_warning() {
-        let (stars, warnings) = load_sky_v1_stars(Path::new("/nonexistent"));
-        assert!(stars.is_empty());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("athyg_m10.bin"), "{warnings:?}");
-    }
-
-    #[test]
-    fn oblique_bookmark_is_15m_out_with_the_hole_20_deg_left() {
-        let b = bookmark("bh-oblique-15M");
-        let (dir, r) = hole_from(&b);
-        assert!((r - 15.0).abs() < 1e-6, "r = {r} M");
-        let (fwd, right, up) = axes(&b);
-        assert!((angle(fwd, dir) - 20_f64.to_radians()).abs() < 1e-6);
-        assert!(dir.dot(right) < 0.0, "the hole is left of centre");
-        assert!(dir.dot(up).abs() < 1e-6, "on the horizontal midline");
-        // Turned about its own up axis while looking down at the hole, so the horizon tilts;
-        // up still leans north.
-        assert!(up.z > 0.0, "up {up}");
-        assert!((b.view.fov_y_rad - 60_f64.to_radians()).abs() < 1e-15);
+    fn bookmark_files_parse() {
+        let m0 = uni_nav::load_bookmarks(&m0_bookmarks_path()).expect("bookmarks/m0.ron loads");
+        assert_eq!(m0.len(), 6);
+        let m1 = uni_nav::load_bookmarks(&m1_bookmarks_path()).expect("bookmarks/m1.ron loads");
+        assert_eq!(m1.len(), 19);
     }
 }
