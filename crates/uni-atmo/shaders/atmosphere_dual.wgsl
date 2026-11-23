@@ -1,11 +1,10 @@
 enable dual_source_blending;
 // atmo/atmosphere_dual.wgsl: the dual-source variant's colour pipeline (review I7). Source 0 is
-// the inscattered light x E_sun x scene_pre(), source 1 the transmittance; the blend is
-// dst * T + src. Needs wgpu::Features::DUAL_SOURCE_BLENDING; ShaderLib::compose hoists the
-// `enable` above to the top of the composed source. The lens-mask write is
+// the inscattered light x E_sun x the Sun's colour x the exposure, source 1 the transmittance;
+// the blend is dst * T + src (src factor One, dst factor Src1), so the scene behind is
+// attenuated per channel. Needs wgpu::Features::DUAL_SOURCE_BLENDING; ShaderLib::compose hoists
+// the `enable` above to the top of the composed source. The lens-mask write is
 // atmosphere_mask.wgsl (dual-source blending allows one colour target).
-//
-// B0 stub: valid and neutral (adds nothing, transmittance 1). B3 writes the real pass.
 
 #import "atmo/atmosphere_common.wgsl"
 
@@ -18,7 +17,7 @@ struct AtmoBlendOut {
 fn fs_dual(@builtin(position) pos: vec4<f32>) -> AtmoBlendOut {
     let s = atmo_segment(pos.xy);
     return AtmoBlendOut(
-        vec4<f32>(min(s.inscatter * scene_pre(), vec3<f32>(HDR_MAX)), 0.0),
+        vec4<f32>(atmo_light(s.inscatter), 0.0),
         vec4<f32>(s.transmittance, 1.0),
     );
 }
