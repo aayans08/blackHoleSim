@@ -1,12 +1,14 @@
-// rel/debug_background.wgsl: the M0 background while a lens is traced (DebugSkyBackground in
+// rel/debug_background.wgsl: the M0 debug-grid background, kept in M1 as the opt-in lens
+// environment uni_rel::LensEnv::DebugGrid (ruling 14; DebugSkyBackground in
 // crates/uni-rel/src/background.rs).
 //
-// One compute pass over the whole frame, run BEFORE the lens pass (uni-gfx targets.rs, pass
-// contract): it writes the unlensed debug grid into every hdr pixel. The lens pass then
-// overwrites only the pixels it traces, with the same grid seen through the lens, so outside
-// the lens rectangle (where the deflection is under half a pixel) the grid continues unlensed and
-// the edge is invisible. The host runs it only while the lens is traced; elsewhere the cleared
-// black is space, and the stars are the sky.
+// One compute pass over the whole frame, pass 3 of the M1 order (uni-gfx targets.rs), long
+// before the lens pass: it writes the unlensed debug grid into every hdr pixel. Bodies then draw
+// over it, and the lens pass overwrites only the sky pixels it traces with the same grid seen
+// through the lens, so outside the lens rectangle (where the deflection is under half a pixel)
+// the grid continues unlensed and the edge is invisible. The host runs it only with
+// LensEnv::DebugGrid while the lens is traced; with LensEnv::Band the band pass draws the sky
+// around the lens instead. Display-referred: the app runs Manual exposure while it is selected.
 
 #import "common/camera.wgsl"
 #import "rel/debug_sky.wgsl"

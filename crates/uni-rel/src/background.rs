@@ -1,16 +1,16 @@
-//! The M0 background while a lens is traced: the unlensed debug grid over the whole frame.
+//! The M0 debug-grid background, kept in M1 as an opt-in lens environment (ruling 14): the
+//! unlensed debug grid over the whole frame.
 //!
-//! [`DebugSkyBackground`] runs first in the pass order (uni-gfx `targets` pass contract). While
-//! the lens environment is [`LensEnv::DebugGrid`] and the lens is traced
-//! ([`LensCoverage::Traced`]) it writes the debug grid
-//! (`shaders/debug_sky.wgsl`) into every `hdr` pixel; the lens pass then overwrites only its
-//! traced rectangle with the same grid seen through the lens. Everywhere else (no lens on
-//! screen, a lens beyond the trace reach, or inside a horizon) it writes nothing, so the cleared
-//! black is space and the catalogue stars are the sky. The HUD's "Lens background: M0 debug
-//! grid" label is shown under exactly the same condition.
-//!
-//! M1's Milky Way band replaces the role of this feature: a real environment drawn first, which
-//! the lens then samples with its exit directions instead of `debug_sky`.
+//! [`DebugSkyBackground`] is pass 3 (uni-gfx `targets` pass contract), before the opaque passes.
+//! While the lens environment is [`LensEnv::DebugGrid`] and the lens is traced
+//! ([`LensCoverage::Traced`]) it writes the debug grid (`shaders/debug_sky.wgsl`) into every
+//! `hdr` pixel; the lens pass then overwrites only its traced rectangle with the same grid seen
+//! through the lens. Everywhere else (the [`LensEnv::Band`] environment, no lens on screen, a
+//! lens beyond the trace reach, or inside a horizon) it writes nothing. With `Band` the band pass
+//! draws the sky around the lens rectangle instead, from the same cubemap the lens samples. The
+//! HUD's "Lens background: M0 debug grid" label is shown under exactly the condition the grid
+//! draws ([`lens_labels`]). The grid is display-referred, so the app runs Manual exposure
+//! whenever `DebugGrid` is selected (M1 frame contract).
 
 use anyhow::Context as _;
 use uni_gfx::{
@@ -45,11 +45,18 @@ pub fn debug_background_draws(coverage: LensCoverage, env: LensEnv) -> bool {
 
 /// Which lens honesty labels the HUD shows for this coverage and environment: (the debug-grid
 /// label "Lens background: M0 debug grid", the unlensed-stars label "Stars near the hole are not
-/// yet lensed (M3)"). The debug label only while the grid draws ([`debug_background_draws`]);
-/// the unlensed-stars label whenever the lens is traced (Task B7).
+/// yet lensed (M3)"; the strings live in uni-ui, C4).
+/// - The debug label exactly while the grid draws ([`debug_background_draws`]): `DebugGrid`
+///   and `Traced`.
+/// - The unlensed-stars label whenever the lens is traced, in either environment: the star
+///   pass draws catalogue stars at their unlensed positions over the traced pixels (× (1 − r)),
+///   so stars are not lensed until M3. Outside `Traced` no pixel is lensed (from inside a
+///   horizon the frame is black; beyond the reach `BEYOND_REACH_WARNING` says so).
 pub fn lens_labels(coverage: LensCoverage, env: LensEnv) -> (bool, bool) {
-    let _ = (coverage, env);
-    todo!("B7")
+    (
+        debug_background_draws(coverage, env),
+        coverage == LensCoverage::Traced,
+    )
 }
 
 /// Group 1 of `cs_background`: the params uniform and the hdr storage texture.
@@ -303,16 +310,21 @@ mod tests {
         ));
     }
 
-    /// Review I3: the grid is the lens's environment, so it is drawn exactly when the lens is
-    /// traced, never in sky views or beyond the trace reach; and only while the debug grid is
-    /// the selected environment (B0 signature, M1).
+    /// Review I3 and B7: the grid is the lens's environment only while it is the selected one
+    /// ([`LensEnv::DebugGrid`]), and it is drawn exactly when the lens is traced, never in sky
+    /// views, beyond the trace reach or inside a horizon. With [`LensEnv::Band`] the band pass
+    /// draws the sky around the lens instead.
     #[test]
-    fn grid_background_only_while_the_lens_is_traced() {
+    fn debug_background_only_in_debug_mode() {
         assert!(debug_background_draws(
             LensCoverage::Traced,
             LensEnv::DebugGrid
         ));
         assert!(!debug_background_draws(LensCoverage::Traced, LensEnv::Band));
+        assert!(!debug_background_draws(
+            LensCoverage::Unlensed,
+            LensEnv::DebugGrid
+        ));
         for c in [
             LensCoverage::Unlensed,
             LensCoverage::BeyondReach,
@@ -320,6 +332,36 @@ mod tests {
         ] {
             for env in [LensEnv::DebugGrid, LensEnv::Band] {
                 assert!(!debug_background_draws(c, env), "{c:?} {env:?}");
+            }
+        }
+    }
+
+    /// B7: "Lens background: M0 debug grid" exactly while the grid draws (DebugGrid and Traced);
+    /// "Stars near the hole are not yet lensed (M3)" whenever the lens is traced, in either
+    /// environment, because the star pass draws catalogue stars unlensed over the traced pixels.
+    #[test]
+    fn lens_labels_by_mode() {
+        for env in [LensEnv::DebugGrid, LensEnv::Band] {
+            let (debug, unlensed_stars) = lens_labels(LensCoverage::Traced, env);
+            assert_eq!(debug, env == LensEnv::DebugGrid, "{env:?}");
+            assert!(unlensed_stars, "{env:?}");
+            for c in [
+                LensCoverage::Unlensed,
+                LensCoverage::BeyondReach,
+                LensCoverage::InsideHorizon,
+            ] {
+                assert_eq!(lens_labels(c, env), (false, false), "{c:?} {env:?}");
+            }
+        }
+        // The debug label follows the background pass exactly.
+        for c in [
+            LensCoverage::Unlensed,
+            LensCoverage::Traced,
+            LensCoverage::BeyondReach,
+            LensCoverage::InsideHorizon,
+        ] {
+            for env in [LensEnv::DebugGrid, LensEnv::Band] {
+                assert_eq!(lens_labels(c, env).0, debug_background_draws(c, env));
             }
         }
     }

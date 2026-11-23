@@ -1,10 +1,11 @@
 //! uni-rel: gravitational lensing. M0: brute-force Schwarzschild (Binet RK4) ground-truth tracer,
 //! and the debug-grid background it lenses. M1 (Task B7): the lens environment is the Milky Way
-//! band's cubemap ([`LensEnv::Band`]), with the M0 debug grid kept as an opt-in environment
-//! ([`LensEnv::DebugGrid`], ruling 14) for the shadow regression bookmark.
-//!
-//! Task B0 changed the constructors and `debug_background_draws` to take the environment and
-//! added the [`probes`] stub; B7 owns this crate's files.
+//! band's cubemap ([`LensEnv::Band`]): escaped rays sample it at their exit direction as sky
+//! light at star exposure, with a mip level from the spread of neighbouring exit directions. The
+//! M0 debug grid stays an opt-in environment ([`LensEnv::DebugGrid`], ruling 14) for the shadow
+//! regression bookmark. Traced pixels write `lens_mask = (captured, 0, 1, 0)`, and pixels a body
+//! drew (depth ≠ 0) are never lensed. [`gpu_probes`] checks the lens's environment lookup on the
+//! GPU (probe `lens_env`).
 
 pub mod background;
 pub mod binet;
