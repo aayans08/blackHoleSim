@@ -32,11 +32,6 @@ pub use sats::{SatRecord, load_sat_elements};
 pub use smallbody::{AsteroidRecord, Comet, load_asteroids, load_comets};
 pub use texture::{TexFile, TexFormat, load_tex, write_tex};
 
-// A0b pre-adds every Wave A manifest entry (review I8), so a crate can be declared before the task
-// that uses it lands. This line keeps `cargo::unused_dependencies` quiet until then; the lead
-// deletes it once `ron` is used.
-use ron as _;
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

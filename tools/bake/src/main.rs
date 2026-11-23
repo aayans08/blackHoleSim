@@ -14,7 +14,11 @@
 // intel_tex_2 0.5.0's prebuilt ISPC objects (kernel_ispc.o, kernel_astc_ispc.o) carry no platform
 // load command, so Apple ld prints "no platform load command found in …, assuming: macOS" on every
 // link, which is the right platform here. Measured on the M3 in A0b; rustc reports linker stderr
-// as `linker_messages` warnings. Link failures are still errors.
+// as `linker_messages` warnings. Re-observed in A10c with `cargo build -p uni-bake`: the lint
+// fires once, for the link of the `uni-bake` bin (the final `cc` step; the rlib[5]/[6] objects of
+// intel_tex_2 are named in the message), and carries no source span. It belongs to no module
+// (only `bc.rs` uses intel_tex_2) and cannot be allowed on an item, so the crate-level allow is
+// the narrowest that works. Link failures are still errors.
 #![allow(linker_messages)]
 
 mod athyg;
@@ -32,18 +36,6 @@ mod sbdb;
 use anyhow::{Context, bail};
 use std::ffi::OsString;
 use std::path::PathBuf;
-
-// A0b pre-adds every Wave A manifest entry (review I8), so a crate can be declared before the task
-// that uses it lands. These lines keep `cargo::unused_dependencies` quiet until then; the lead
-// deletes each one once its crate is used.
-use bytemuck as _;
-use glam as _;
-use image as _;
-use intel_tex_2 as _;
-use rayon as _;
-use ron as _;
-use serde as _;
-use serde_json as _;
 
 const USAGE: &str = "usage: uni-bake <subcommand> [options]
   bsc5 --input <catalog.gz> --out <bsc5.bin>
