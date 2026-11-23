@@ -1,10 +1,12 @@
 //! The Milky Way band v0 and the environment cubemap: passes "band-update" and "band" (Task B5).
 //!
-//! **Cubemap.** [`BandCubemap`] renders the galaxy model's band into a 6 × 256² Rgba16Float
-//! cubemap with 5 mips ([`ENV_SIZE`], [`ENV_MIPS`], [`ENV_FORMAT`]). Each texel of mip 0 holds
-//! `gal_band_radiance(cam_gc, dir_gc, v_lim)` (uni-procgen's WGSL twin `procgen/galaxy.wgsl`)
+//! **Cubemap.** [`BandCubemap`] renders the galaxy model's band into a 6 × 512² Rgba16Float
+//! cubemap with 6 mips ([`ENV_SIZE`], [`ENV_MIPS`], [`ENV_FORMAT`]). Each texel of mip 0 holds
+//! `gal_band_radiance(cam_gc, dir_gc, v_lim, footprint)` (uni-procgen's WGSL twin
+//! `procgen/galaxy.wgsl`; the footprint is the texel's angular size, [`texel_footprint_rad`], so
+//! the model's procedural detail stops at the texel)
 //! through the texel's centre, as luminance in units of `uni_gfx::ENV_UNIT_CD_M2` (1e-4 cd/m²,
-//! review m10; absolute, not pre-exposed) clamped to [`ENV_MAX_UNITS`]. Mips 1–4 are 2 × 2 box
+//! review m10; absolute, not pre-exposed) clamped to [`ENV_MAX_UNITS`]. Mips 1–5 are 2 × 2 box
 //! means. Directions are root (ICRS) axes and faces follow the WebGPU convention
 //! (`uni_gfx::env::cube_dir`); the model's galactocentric frame is reached with
 //! `uni_core::icrs_to_galactic`. The CPU twin of one texel is [`band_texel`]. The lens pass
@@ -45,10 +47,12 @@ use wgpu::util::DeviceExt as _;
 
 use crate::{BAND_DRAW_WGSL, BAND_UPDATE_WGSL};
 
-/// Edge of each cubemap face [texels] (B5 brief): 90° / 256 = 0.35° per texel.
-pub const ENV_SIZE: u32 = 256;
-/// Mip levels of the cubemap (256 → 16; B5 brief).
-pub const ENV_MIPS: u32 = 5;
+/// Edge of each cubemap face [texels]: 90° / 512 = 0.18° per texel, about 2 px at a 90° field
+/// over 1080 lines. B5's brief had 256 (0.35°, 4–6 px per texel), too coarse for the galaxy
+/// model's dust detail (Task B4L); the face costs 4× as much to build, once in the Solar System.
+pub const ENV_SIZE: u32 = 512;
+/// Mip levels of the cubemap (512 → 16, as B5's 256 → 16).
+pub const ENV_MIPS: u32 = 6;
 /// Texel format of the cubemap (B5 brief; `uni_gfx::EnvMap`).
 pub const ENV_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Largest value written into a texel [`ENV_UNIT_CD_M2` units]: `HDR_MAX`, 6 cd/m², below f16's
@@ -190,6 +194,17 @@ fn texel_uv(x: u32, y: u32) -> Vec2 {
     (Vec2::new(x as f32, y as f32) + 0.5) / ENV_SIZE as f32
 }
 
+/// Angular size [rad] of a mip-0 texel in unit direction `dir` (root axes): a face is the
+/// gnomonic projection of the sky onto the plane at distance 1, whose texels span 2/N there and
+/// shrink on the sky by m² (m the direction's major-axis component), so 2m²/N (the geometry of
+/// `cube_dir`; uni-rel's `lens_env_lod` uses the same). The band's detail fades out below it.
+/// Twin of `band_texel_footprint` in band_update.wgsl.
+pub fn texel_footprint_rad(dir: Vec3) -> f32 {
+    let a = dir.abs();
+    let m = a.x.max(a.y).max(a.z);
+    2.0 * m * m / ENV_SIZE as f32
+}
+
 /// The face and uv a cube sample in direction `dir` reads: the inverse of `cube_dir` (the
 /// Vulkan specification's "Cube Map Face Selection" table, which WebGPU follows; the major axis
 /// picks the face).
@@ -217,7 +232,7 @@ fn cube_face_uv(dir: Vec3) -> (u32, Vec2) {
 
 /// The environment cubemap and its update pass (`RenderFeature` named "band-update").
 ///
-/// Group 0 is unused. Group 1 is `band_galaxy`, `band_params` and mip 0 as storage for
+/// Group 0 is unused. Group 1 is `galaxy`, `band_params` and mip 0 as storage for
 /// `cs_band_update`; `band_params`, mip n − 1 and mip n for each `cs_band_downsample` level.
 pub struct BandCubemap {
     env: Arc<EnvMap>,
@@ -698,7 +713,8 @@ impl RenderFeature for BandDraw {
 
 /// The band radiance the update pass writes at texel `uv` of cube face `face` for a camera at
 /// `cam_icrs_pc` [pc, ICRS, origin SSB]: `model.band_radiance` in the direction
-/// `uni_gfx::env::cube_dir(face, uv)` (root axes, rotated into galactic axes), in cd/m², linear
+/// `uni_gfx::env::cube_dir(face, uv)` (root axes, rotated into galactic axes), at the texel's
+/// footprint [`texel_footprint_rad`], in cd/m², linear
 /// Rec. 709 (not divided by `ENV_UNIT_CD_M2`). CPU twin of `cs_band_update` in band_update.wgsl,
 /// which stores it ÷ `ENV_UNIT_CD_M2`, clamped to [`ENV_MAX_UNITS`] (probe `band_update`).
 pub fn band_texel(
@@ -708,10 +724,16 @@ pub fn band_texel(
     uv: Vec2,
     v_lim: f32,
 ) -> Vec3 {
-    let dir_gc = icrs_to_galactic(cube_dir(face, uv).as_dvec3());
+    let dir = cube_dir(face, uv);
+    let dir_gc = icrs_to_galactic(dir.as_dvec3());
     let cam_gc = model.icrs_pc_to_galactocentric(cam_icrs_pc);
     model
-        .band_radiance(cam_gc, dir_gc, f64::from(v_lim))
+        .band_radiance(
+            cam_gc,
+            dir_gc,
+            f64::from(v_lim),
+            f64::from(texel_footprint_rad(dir)),
+        )
         .as_vec3()
 }
 
@@ -734,7 +756,7 @@ const MIP_TOLERANCE: f64 = 1e-3;
 struct BandProbeRay {
     /// xyz: camera, galactocentric [pc]; w: v_lim [V mag].
     cam_v_lim: [f32; 4],
-    /// xyz: unit direction, galactic axes; w: 0.
+    /// xyz: unit direction, galactic axes; w: footprint [rad] (the detail's band limit).
     dir: [f32; 4],
 }
 
@@ -751,7 +773,7 @@ const BAND_RADIANCE_PROBE_WGSL: &str = r#"// probe/band_radiance.wgsl: `universe
 struct BandProbeRay {
     // xyz: camera, galactocentric [pc]; w: v_lim [V mag].
     cam_v_lim: vec4<f32>,
-    // xyz: unit direction, galactic axes; w: 0.
+    // xyz: unit direction, galactic axes; w: footprint [rad] (the detail's band limit).
     dir: vec4<f32>,
 }
 
@@ -761,6 +783,8 @@ struct BandProbeIn {
 }
 
 @group(0) @binding(0) var<storage, read> probe_in: BandProbeIn;
+// procgen/galaxy.wgsl reads the importer's `galaxy`; the probe fills it from its input.
+var<private> galaxy: GalaxyGpu;
 // rgb: band radiance [cd/m²]; w: 0.
 @group(0) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
 
@@ -771,7 +795,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     galaxy = probe_in.galaxy;
     let ray = probe_in.rays[gid.x];
-    let rgb = gal_band_radiance(ray.cam_v_lim.xyz, ray.dir.xyz, ray.cam_v_lim.w);
+    let rgb = gal_band_radiance(ray.cam_v_lim.xyz, ray.dir.xyz, ray.cam_v_lim.w, ray.dir.w);
     probe_out[gid.x] = vec4<f32>(rgb, 0.0);
 }
 "#;
@@ -830,13 +854,24 @@ fn lb_dir(l_deg: f64, b_deg: f64) -> DVec3 {
 }
 
 /// The 64 rays of the `band_radiance` probe: from the Sun at V = 10, the band's plane at 8
-/// longitudes × 5 latitudes; from the Sun at V = 6.5, both poles, Baade's window and 5 others;
-/// from 1 kpc above the disk at V = 12, 8 rays down onto it; from the bar's edge at V = 12, 8
-/// rays across the bulge.
+/// longitudes × 5 latitudes; from the Sun at V = 6.5, both poles, Baade's window, the Coalsack,
+/// Ophiuchus and 3 others; from 1 kpc above the disk at V = 12, 8 rays down onto it; from the
+/// bar's edge at V = 12, 8 rays across the bulge. Footprints alternate between a face-centre
+/// texel's (2/N) and 0 (every octave of the detail).
 fn band_probe_rays(model: &GalaxyModel) -> Vec<BandProbeRay> {
-    let ray = |cam: DVec3, dir: DVec3, v_lim: f32| BandProbeRay {
-        cam_v_lim: [cam.x as f32, cam.y as f32, cam.z as f32, v_lim],
-        dir: [dir.x as f32, dir.y as f32, dir.z as f32, 0.0],
+    let texel = 2.0 / ENV_SIZE as f32;
+    let mut k = 0;
+    let mut ray = |cam: DVec3, dir: DVec3, v_lim: f32| {
+        k += 1;
+        BandProbeRay {
+            cam_v_lim: [cam.x as f32, cam.y as f32, cam.z as f32, v_lim],
+            dir: [
+                dir.x as f32,
+                dir.y as f32,
+                dir.z as f32,
+                if k % 2 == 0 { texel } else { 0.0 },
+            ],
+        }
     };
     let sun = model.sun_galactocentric_pc();
     let mut rays = Vec::with_capacity(64);
@@ -850,8 +885,8 @@ fn band_probe_rays(model: &GalaxyModel) -> Vec<BandProbeRay> {
         (0.0, -90.0),
         (1.0, -3.9),
         (-10.0, 5.0),
-        (30.0, 40.0),
-        (200.0, -60.0),
+        (301.5, -0.5),
+        (354.0, 15.5),
         (300.0, 20.0),
         (120.0, -15.0),
     ] {
@@ -875,7 +910,9 @@ fn band_probe_rays(model: &GalaxyModel) -> Vec<BandProbeRay> {
 /// texels near the other edges and one inside, so a flipped or swapped axis shows.
 fn cube_sample_picks() -> Vec<(u32, u32, u32)> {
     (0..FACES)
-        .flat_map(|face| [(0, 0), (255, 9), (9, 255), (131, 77)].map(|(x, y)| (face, x, y)))
+        .flat_map(|face| {
+            [(0, 0), (ENV_SIZE - 1, 9), (9, ENV_SIZE - 1), (131, 77)].map(|(x, y)| (face, x, y))
+        })
         .collect()
 }
 
@@ -964,6 +1001,7 @@ fn check_band_radiance(
                 Vec3::from_slice(&r.cam_v_lim[..3]).as_dvec3(),
                 Vec3::from_slice(&r.dir[..3]).as_dvec3(),
                 f64::from(r.cam_v_lim[3]),
+                f64::from(r.dir[3]),
             );
             let gpu = Vec3::from_slice(&g[..3]).as_dvec3();
             (gpu - cpu).abs().max_element() / cpu.max_element()
@@ -1550,13 +1588,14 @@ mod tests {
         assert!(dir.angle_between(gc_icrs) < 1e-6, "{dir} vs {gc_icrs}");
 
         let got = band_texel(&model, DVec3::ZERO, face, uv, 10.0);
+        let fp = f64::from(texel_footprint_rad(dir.as_vec3()));
         let want = model
-            .band_radiance(sun, icrs_to_galactic(dir), 10.0)
+            .band_radiance(sun, icrs_to_galactic(dir), 10.0, fp)
             .as_vec3();
         assert!(rel_err(got, want) < 1e-6, "{got} vs {want}");
         // Exactly toward the centre (galactic +x) the radiance differs only by the texel
         // direction's f32 rounding.
-        let centre = model.band_radiance(sun, DVec3::X, 10.0).as_vec3();
+        let centre = model.band_radiance(sun, DVec3::X, 10.0, fp).as_vec3();
         assert!(rel_err(got, centre) < 1e-4, "{got} vs {centre}");
 
         // A camera off the SSB, with another star limit.
@@ -1567,6 +1606,7 @@ mod tests {
                 model.icrs_pc_to_galactocentric(cam),
                 icrs_to_galactic(dir),
                 8.0,
+                fp,
             )
             .as_vec3();
         assert!(rel_err(got, want) < 1e-6, "{got} vs {want}");
@@ -1577,7 +1617,8 @@ mod tests {
         let ngp_icrs = DVec3::from_array(ICRS_TO_GALACTIC[2]);
         let (face, uv) = cube_face_uv(ngp_icrs.as_vec3());
         let ngp = band_texel(&model, DVec3::ZERO, face, uv, 10.0);
-        let pole = model.band_radiance(sun, DVec3::Z, 10.0).as_vec3();
+        let fp_pole = f64::from(texel_footprint_rad(cube_dir(face, uv)));
+        let pole = model.band_radiance(sun, DVec3::Z, 10.0, fp_pole).as_vec3();
         assert!(rel_err(ngp, pole) < 1e-4, "{ngp} vs {pole}");
         assert!(
             luminance(centre) > 2.0 * luminance(ngp),
@@ -1644,7 +1685,7 @@ mod tests {
             ])
         );
         for (name, slot) in [
-            ("band_galaxy", (1, 0)),
+            ("galaxy", (1, 0)),
             ("band_params", (1, 1)),
             ("band_out", (1, 2)),
             ("band_mip_src", (1, 3)),
@@ -1765,7 +1806,12 @@ mod tests {
             let dir = Vec3::from_slice(&r.dir[..3]);
             assert!((dir.length() - 1.0).abs() < 1e-6);
             let cam = Vec3::from_slice(&r.cam_v_lim[..3]).as_dvec3();
-            let rgb = model.band_radiance(cam, dir.as_dvec3(), f64::from(r.cam_v_lim[3]));
+            let rgb = model.band_radiance(
+                cam,
+                dir.as_dvec3(),
+                f64::from(r.cam_v_lim[3]),
+                f64::from(r.dir[3]),
+            );
             assert!(rgb.min_element() > 0.0 && rgb.is_finite(), "{r:?}: {rgb}");
         }
     }

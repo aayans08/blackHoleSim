@@ -23,18 +23,38 @@
 //! **Band** [cd/m², linear Rec.709]: the light of stars fainter than the catalogue limit, summed
 //! along the ray through the dust (see [`GalaxyModel::band_radiance`]).
 //!
+//! **Detail** (Task B4L; on screen as "Milky Way detail: procedural (real dust map in M4)"): the
+//! smooth model above is the *mean*; three seeded, deterministic fields break it up, each keeping
+//! its mean so the calibrated extinction and light stay what the smooth model says:
+//! - the dust is clumpy: κ × D(p), D log-normal with σ_ln = [`DUST_LN_SIGMA`] (the 3-D density of
+//!   supersonic interstellar turbulence is log-normal, Padoan, Nordlund & Jones 1997) on an fBm of
+//!   value noise from the turbulent outer scale [`DUST_NOISE_SCALE_PC`] down to sub-pc;
+//! - the thin disk's light is clumped into star clouds on the scale of star complexes,
+//!   [`STAR_NOISE_SCALE_PC`] (Efremov 1995), with σ_ln = [`STAR_LN_SIGMA`];
+//! - twelve named local dust clouds ([`NAMED_CLOUDS`]: the Cygnus and Aquila rifts, Ophiuchus, the
+//!   Pipe, the Coalsack, Taurus, …) sit where they are on the sky at their measured distances
+//!   (Zucker et al. 2020), as Gaussian ellipsoids broken up by their own fBm. They make the Great
+//!   Rift run from Cygnus to Sagittarius north of the plane, branching and breaking up.
+//!
+//! The fields are fixed in the galaxy (they move with parallax), but their shapes are made up:
+//! only the named clouds' positions, distances and sizes are real, and those approximately. Each
+//! field fades out the octaves finer than the footprint of the sample (the environment cube's
+//! texel), and lowers its log-normal mean term with the variance it keeps, so a coarse sample is
+//! the mean of fine ones.
+//!
 //! v0 approximations, all on purpose and labelled on screen as "galaxy model v0": every component
 //! uses the local mean V luminosity per star (local M/L_V = 0.043 / 0.0519 = 0.83), so the old
 //! thick disk, halo and bar, which lack the local young bright stars, are too bright per star;
-//! extinction is grey (no reddening) and ignored in the faint-star cut; the dust is a smooth
-//! layer, with none of the discrete local clouds that shape the real band (see `DUST_Z_MID_PC`);
-//! the arms are smooth log spirals with no Local (Orion) arm; the stellar disks have no warp or
-//! flare, and there is no nuclear star cluster.
+//! extinction is grey (no reddening) and ignored in the faint-star cut; the smooth dust layer
+//! is the mean of the real one, and its clumps and clouds are procedural except for the named
+//! clouds' places (see `DUST_Z_MID_PC` and **Detail**); the arms are smooth log spirals with no
+//! Local (Orion) arm; the stellar disks have no warp or flare, and there is no nuclear star
+//! cluster.
 
 use std::f64::consts::{LN_10, PI, TAU};
 
-use glam::{DVec2, DVec3};
-use uni_core::{M_V_SUN, blackbody_linear_srgb, icrs_to_galactic, star_illuminance_lux};
+use glam::{DVec2, DVec3, UVec3};
+use uni_core::{M_V_SUN, blackbody_linear_srgb, icrs_to_galactic, pcg3d, star_illuminance_lux};
 
 use crate::lf;
 
@@ -202,6 +222,172 @@ const BAND_SERIES_MAX_DTAU: f64 = 1e-3;
 /// Optical depth per magnitude of extinction: e^{−τ} = 10^{−0.4 A} (Pogson's magnitude scale).
 const TAU_PER_MAG: f64 = 0.4 * LN_10;
 
+// ---- Detail (Task B4L) ------------------------------------------------------------------------
+// Three mean-preserving log-normal fields and twelve named clouds (module doc, **Detail**). The
+// noise is value noise on the integer lattice, hashed with pcg3d (Jarzynski & Olano 2020; the
+// engine's one integer hash, `uni_core::pcg3d`, copied bit for bit as `gal_pcg3d` in WGSL), in
+// coordinates relative to the Sun so the f32 twin keeps its digits near the camera.
+
+/// Octave lacunarity: each octave's wavelength is the previous one ÷ 2.03, a non-integer ratio so
+/// the octaves' lattices never line up (common fBm practice, as in the owner-approved preview's
+/// `fbm`).
+const NOISE_LACUNARITY: f64 = 2.03;
+/// Amplitude ratio of successive octaves (fBm gain 0.8, Hurst exponent −log₂ 0.8 ≈ 0.32). A
+/// procedural choice: rough enough that the projected dust keeps structure at every scale, in the
+/// spirit of the shallow k^−2.65 power spectrum of dust emission (Miville-Deschênes et al. 2010,
+/// A&A 518, L104), not fitted to it.
+const NOISE_GAIN: f64 = 0.7;
+/// Each octave fades out as its wavelength λ shrinks from 1/0.3 to 1/0.6 of the sample's footprint
+/// (the preview's `fbm` band limit): finer structure would only alias between texels.
+const NOISE_LOD_FADE: [f64; 2] = [0.3, 0.6];
+/// Variance of one octave of value noise at a uniformly random point. The 8 lattice values are
+/// independent and uniform on [−1, 1) (variance 1/3); with smoothstep weights s(u) = 3u² − 2u³
+/// per axis, E[(1 − s)² + s²] = 26/35 for u uniform, so Var = (26/35)³ / 3 = 0.1367
+/// (`value_noise_variance_matches_theory` samples it).
+const VALUE_NOISE_VAR: f64 = (26.0 / 35.0) * (26.0 / 35.0) * (26.0 / 35.0) / 3.0;
+/// The octaves rotate by this axis and angle between levels (a generic, non-axis-aligned
+/// rotation, so the value-noise lattice leaves no axis-aligned streaks): axis (2, 3, 6)/7, 0.9 rad.
+const NOISE_ROT_AXIS: [f64; 3] = [2.0 / 7.0, 3.0 / 7.0, 6.0 / 7.0];
+const NOISE_ROT_ANGLE: f64 = 0.9;
+
+/// σ of ln D, the clumpy dust's log-normal factor (mean 1). Supersonic isothermal turbulence gives
+/// a log-normal density with σ_ln² = ln(1 + b²𝓜²) (Padoan, Nordlund & Jones 1997, MNRAS 288, 145;
+/// b ≈ 0.3–1, Federrath, Klessen & Schmidt 2008, ApJ 688, L79), 1 to 2 for the Mach numbers 𝓜 ≈
+/// 3–10 of the cold ISM; 1.2 is a choice in that range.
+const DUST_LN_SIGMA: f64 = 1.6;
+/// Wavelength of the dust field's largest octave [pc]: the turbulent outer scale of the ISM,
+/// ~100 pc (Haverkorn et al. 2008, ApJ 680, 362, from Faraday rotation in interarm regions).
+const DUST_NOISE_SCALE_PC: f64 = 100.0;
+/// Octaves of the dust field: 100 pc down to 100/2.03⁷ = 0.7 pc (only near the camera; farther
+/// away the footprint fades the fine ones).
+const DUST_NOISE_OCTAVES: u32 = 8;
+/// σ of ln S, the thin disk's star-cloud factor (mean 1): a procedural choice, mild enough that the
+/// band's large-scale light stays the smooth model's.
+const STAR_LN_SIGMA: f64 = 0.5;
+/// Wavelength of the star field's largest octave [pc]: star complexes, the largest groupings of
+/// young stars, are ~600 pc across (Efremov 1995, AJ 110, 2757).
+const STAR_NOISE_SCALE_PC: f64 = 600.0;
+/// Octaves of the star field: 600, 296 and 146 pc.
+const STAR_NOISE_OCTAVES: u32 = 3;
+/// σ of ln of the named clouds' internal structure (mean 1): a procedural choice that breaks each
+/// Gaussian envelope into cores, filaments and holes. Column-density PDFs of nearby clouds are
+/// log-normal with σ_ln ≈ 0.3–0.6 above A_V ≈ 1 (Kainulainen et al. 2009, A&A 508, L35); the
+/// larger value here also stands for the envelope's own patchiness.
+const CLOUD_LN_SIGMA: f64 = 1.2;
+/// Wavelength of the cloud field's largest octave [pc] and its octaves (8 pc to 0.1 pc): about a
+/// cloud's own size, so each envelope breaks into several pieces.
+const CLOUD_NOISE_SCALE_PC: f64 = 8.0;
+const CLOUD_NOISE_OCTAVES: u32 = 7;
+/// No noise within this distance of the camera [pc]: the Sun sits in the Local Bubble, a cavity
+/// ~100 pc across almost free of dust (Lallement et al. 2003, A&A 411, 447), so the smooth mean
+/// there is already more than the real dust.
+const NOISE_MIN_PC: f64 = 30.0;
+/// The dust and star fields are evaluated only on steps whose smooth optical depth reaches this
+/// (elsewhere there is too little dust to clump visibly, and the thin disk is far from the ray):
+/// even a 3σ clump (D ≈ e^4.8) then changes the step's transmission by under 10 %, and the
+/// field's mean is the smooth value anyway.
+const NOISE_MIN_DTAU: f64 = 1e-3;
+/// The march stops once the optical depth behind the camera passes this: e^−15 = 3 × 10⁻⁷, so
+/// everything farther adds under 3 × 10⁻⁵ of the band (16× below the cube's f16 rounding), even
+/// toward the bulge behind the plane's lane, where the foreground is faintest
+/// (`band_march_stops_only_when_nothing_is_left`; at τ = 12 that ray was off by 5 × 10⁻⁵). Most of the cube's in-plane texels stop well
+/// before 30 kpc.
+const BAND_TAU_STOP: f64 = 15.0;
+/// Seeds of the three fields (third pcg3d lane offsets; arbitrary odd constants).
+const DUST_SEED: u32 = 0x2545_F491;
+const STAR_SEED: u32 = 0x9E37_79B9;
+const CLOUD_SEED: u32 = 0x85EB_CA6B;
+/// Octave k of a field hashes with seed + k × this (an arbitrary odd-free constant, so octaves
+/// never share lattice values).
+const OCTAVE_SEED_STEP: u32 = 0x68E3_1DA4;
+/// A named cloud is skipped for a ray that passes more than √50 = 7.1 σ from its centre (its
+/// column is then below e^−25 of the peak).
+const CLOUD_Q_MAX: f64 = 50.0;
+/// A named cloud's column below this optical depth is left out of the march.
+const CLOUD_MIN_TAU: f64 = 1e-4;
+/// A named cloud whose peak lies more than this many of its σ along the ray behind the camera is
+/// skipped: less than 1e-9 of its column is ahead (a ray toward Ophiuchus runs back through
+/// Taurus, its antipode).
+const CLOUD_BEHIND_SIGMAS: f64 = 6.0;
+
+/// One named local dust cloud, a Gaussian ellipsoid: its centre at Galactic (l, b) [deg] and
+/// distance [pc] from the Sun, its σ along its long and short axes on the sky [deg] (the long axis
+/// `pa_deg` from the +l direction toward +b), its σ along the line of sight [pc], and A_V [mag]
+/// through its centre from the Sun before the internal structure.
+struct NamedCloud {
+    l_deg: f64,
+    b_deg: f64,
+    d_pc: f64,
+    sigma_long_deg: f64,
+    sigma_short_deg: f64,
+    pa_deg: f64,
+    sigma_r_pc: f64,
+    a_v_mag: f64,
+}
+
+/// Number of named clouds (`GalaxyGpu::clouds` holds four vec4s per cloud).
+pub const NAMED_CLOUD_COUNT: usize = 12;
+
+/// The named clouds. Distances are the dust-based Gaia DR2 ones of Zucker et al. 2020 (A&A 633,
+/// A51, Table A.1; the median of each cloud's sightlines, whose (l, b) also place and size it);
+/// the Aquila Rift's is Straižys, Černis & Bartašiūtė 2003 (A&A 405, 585: 225 ± 55 pc). Sizes and
+/// position angles are read off those sightlines and the well-known shapes on the sky
+/// (approximate). A_V through the centre is a v0 choice of 1.5–3 mag, the order of the cloud
+/// envelopes those distances were measured through (0.15 < E(B−V) < 5 mag, Zucker et al. 2020
+/// §2.1); dense cores far above that are left to the internal structure.
+const NAMED_CLOUDS: [NamedCloud; NAMED_CLOUD_COUNT] = [
+    // Cygnus Rift (Northern Coalsack ≈ 560 pc at l 91–93°, b +3.5…+4.3°; North America ≈ 790 pc
+    // at l 82–86°, b −2.2…0°): the northern end of the Great Rift.
+    cloud(80.0, 1.5, 650.0, 8.0, 2.5, 0.0, 80.0, 3.0),
+    // Serpens–Aquila (W40, Serpens Main and Low: 440–560 pc at l 28–33°, b +2.6…+5.2°).
+    cloud(30.0, 3.5, 480.0, 3.5, 1.5, 0.0, 50.0, 3.0),
+    // Aquila Rift (Straižys et al. 2003; Zucker et al. 2020's sightlines at l 16–22°, b +9…+17°):
+    // from l 40°, b 0° up toward Ophiuchus.
+    cloud(27.0, 7.0, 225.0, 10.0, 3.0, 149.0, 30.0, 2.0),
+    // Ophiuchus (ρ Oph and its streamers: 118–167 pc, median 139 pc, at l 349–359°, b +12…+18°).
+    cloud(354.0, 15.5, 139.0, 4.5, 2.5, 0.0, 15.0, 2.5),
+    // Pipe Nebula (B59 at l 356.9°, b +7.3°: 180 pc), its stem running toward l 1°, b +4°.
+    cloud(359.3, 5.5, 180.0, 3.5, 0.8, 155.0, 15.0, 2.0),
+    // Lupus clouds (108–239 pc, median ~160 pc, at l 339–347°, b +6…+17°).
+    cloud(341.0, 12.0, 160.0, 4.5, 3.5, 90.0, 20.0, 1.5),
+    // Corona Australis (147–165 pc at l 359.5–0.8°, b −17.8…−21.0°).
+    cloud(0.0, -19.5, 155.0, 2.5, 1.0, 160.0, 15.0, 2.0),
+    // The Coalsack (182–193 pc at l 300–303°, b −2.6…+3.1°).
+    cloud(301.5, -0.5, 188.0, 2.6, 2.2, 0.0, 15.0, 1.8),
+    // Chamaeleon (161–210 pc at l 297.5–303.3°, b −14.2…−16.7°).
+    cloud(300.0, -15.5, 190.0, 3.0, 1.5, 0.0, 20.0, 1.5),
+    // Taurus (129–170 pc, median 145 pc, at l 166–176°, b −12…−19°).
+    cloud(172.0, -15.0, 145.0, 6.0, 3.5, 0.0, 20.0, 2.0),
+    // Perseus (256–331 pc, median 295 pc, at l 157–161°, b −16…−18°).
+    cloud(159.0, -17.5, 295.0, 2.5, 1.0, 20.0, 30.0, 2.0),
+    // Aquila South (123–143 pc at l 37–39°, b −15…−19°).
+    cloud(38.0, -17.0, 132.0, 2.0, 1.5, 0.0, 15.0, 1.5),
+];
+
+/// [`NamedCloud`] in the order of its fields (a `const fn` so the table reads as rows).
+#[allow(clippy::too_many_arguments)]
+const fn cloud(
+    l_deg: f64,
+    b_deg: f64,
+    d_pc: f64,
+    sigma_long_deg: f64,
+    sigma_short_deg: f64,
+    pa_deg: f64,
+    sigma_r_pc: f64,
+    a_v_mag: f64,
+) -> NamedCloud {
+    NamedCloud {
+        l_deg,
+        b_deg,
+        d_pc,
+        sigma_long_deg,
+        sigma_short_deg,
+        pa_deg,
+        sigma_r_pc,
+        a_v_mag,
+    }
+}
+
 /// The Milky Way model v0. Construct it with [`GalaxyModel::milky_way`]; the CPU twin of
 /// `galaxy.wgsl`. Its parameter groups are `GalaxyGpu`'s fields, in f64 and in the same order, so
 /// each Rust function reads the same numbers as its WGSL twin.
@@ -222,6 +408,12 @@ pub struct GalaxyModel {
     color_old: DVec3,
     color_bar: DVec3,
     lf: [[f64; 3]; lf::LF_BINS],
+    detail_sigma: [f64; 4],
+    detail_scale: [f64; 4],
+    detail_octaves: [u32; 4],
+    detail_seed: [u32; 4],
+    noise_rot: [[f64; 4]; 3],
+    clouds: [[f64; 4]; 4 * NAMED_CLOUD_COUNT],
 }
 
 /// The model's parameters for the GPU: vec4-sized members only, laid out like `GalaxyGpu` in
@@ -261,6 +453,20 @@ pub struct GalaxyGpu {
     pub color_bar: [f32; 4],
     /// Per luminosity-function bin: x_bright, x_faint, light weight, 0 (`lf::faint_bins`).
     pub lf: [[f32; 4]; lf::LF_BINS],
+    /// Detail (B4L): σ_ln of the dust, star and cloud fields; fBm gain.
+    pub detail_sigma: [f32; 4],
+    /// 1 / largest wavelength [1/pc] of the dust, star and cloud fields; no noise nearer than w [pc].
+    pub detail_scale: [f32; 4],
+    /// Octaves of the dust, star and cloud fields; number of named clouds.
+    pub detail_octaves: [u32; 4],
+    /// Seeds of the dust, star and cloud fields; 0.
+    pub detail_seed: [u32; 4],
+    /// Rows of the rotation between octaves; w of row 0: the lacunarity; w of row 1: z☉ [pc] (the
+    /// Sun is at (−R₀, 0, z☉)); w of row 2: 0.
+    pub noise_rot: [[f32; 4]; 3],
+    /// Per named cloud, four vec4s: centre − Sun [pc] and peak A_V rate [mag/pc]; then the rows of
+    /// its whitening matrix W (W (x − c) has unit σ on every axis) [1/pc], w = 0.
+    pub clouds: [[f32; 4]; 4 * NAMED_CLOUD_COUNT],
 }
 
 /// `ShaderLib` path of the WGSL twin (B5 imports it and binds `GalaxyGpu` at its own group).
@@ -324,6 +530,22 @@ impl GalaxyModel {
             color_old: color(OLD_TEMP_K),
             color_bar: color(BAR_TEMP_K),
             lf: lf::faint_bins(),
+            detail_sigma: [DUST_LN_SIGMA, STAR_LN_SIGMA, CLOUD_LN_SIGMA, NOISE_GAIN],
+            detail_scale: [
+                1.0 / DUST_NOISE_SCALE_PC,
+                1.0 / STAR_NOISE_SCALE_PC,
+                1.0 / CLOUD_NOISE_SCALE_PC,
+                NOISE_MIN_PC,
+            ],
+            detail_octaves: [
+                DUST_NOISE_OCTAVES,
+                STAR_NOISE_OCTAVES,
+                CLOUD_NOISE_OCTAVES,
+                NAMED_CLOUD_COUNT as u32,
+            ],
+            detail_seed: [DUST_SEED, STAR_SEED, CLOUD_SEED, 0],
+            noise_rot: noise_rotation(),
+            clouds: [[0.0; 4]; 4 * NAMED_CLOUD_COUNT],
         };
         // Total star density at the Sun = the luminosity function's count.
         let sun_shape = g.components(g.sun, g.arm_strength(g.sun));
@@ -331,6 +553,23 @@ impl GalaxyModel {
         // A_V rate in the dust midplane directly below the Sun = DUST_A_V_SUN_MAG_PER_PC.
         let plane = DVec3::new(g.sun.x, g.sun.y, DUST_Z_MID_PC);
         g.dust[0] = DUST_A_V_SUN_MAG_PER_PC / g.extinction(plane, g.arm_strength(plane));
+        for (k, c) in NAMED_CLOUDS.iter().enumerate() {
+            g.clouds[4 * k..4 * k + 4].copy_from_slice(&cloud_gpu(c));
+        }
+        g
+    }
+
+    /// The smooth model v0 alone: [`Self::milky_way`] with the detail switched off (every
+    /// log-normal σ and every named cloud's extinction 0), so its band is the mean the detail
+    /// varies about.
+    pub fn milky_way_smooth() -> Self {
+        let mut g = Self::milky_way();
+        g.detail_sigma[0] = 0.0;
+        g.detail_sigma[1] = 0.0;
+        g.detail_sigma[2] = 0.0;
+        for k in 0..NAMED_CLOUD_COUNT {
+            g.clouds[4 * k][3] = 0.0;
+        }
         g
     }
 
@@ -362,17 +601,52 @@ impl GalaxyModel {
     }
 
     /// Band radiance [cd/m², linear Rec.709] seen from `cam_gc_pc` along `dir_gc`, from stars
-    /// fainter than `v_lim`; the CPU twin of `gal_band_radiance`.
+    /// fainter than `v_lim`, for a sample whose footprint on the sky is `footprint_rad` [rad]
+    /// (the detail's octaves finer than it fade out; 0 keeps them all); the CPU twin of
+    /// `gal_band_radiance`.
     ///
     /// ∫ j(s) f_faint(s) e^{−τ(s)} ds from 1 pc to 30 kpc in 128 log-spaced steps: j is the light
     /// at the step's geometric midpoint, f_faint = [`lf::faint_light_fraction`]`(s, v_lim)` keeps
     /// only stars fainter than the catalogue limit (brighter ones are drawn one by one), and
     /// within a step the dust attenuates exactly as a uniform slab: ∫₀^Δs e^{−κt} dt =
     /// (1 − e^{−κΔs}) / κ.
-    pub fn band_radiance(&self, cam_gc_pc: DVec3, dir_gc: DVec3, v_lim: f64) -> DVec3 {
+    ///
+    /// Detail (module doc): on each step from `NOISE_MIN_PC` on whose smooth optical depth reaches
+    /// `NOISE_MIN_DTAU`, the dust is × D and the thin disk's light × S (log-normal, mean 1); each
+    /// named cloud adds its exact Gaussian column between the step's ends, τ_c [Φ(s₁) − Φ(s₀)]
+    /// with Φ the normal CDF along the ray, τ_c being its whole column on this ray × its own
+    /// log-normal structure at the ray's closest approach.
+    pub fn band_radiance(
+        &self,
+        cam_gc_pc: DVec3,
+        dir_gc: DVec3,
+        v_lim: f64,
+        footprint_rad: f64,
+    ) -> DVec3 {
+        self.band_march(cam_gc_pc, dir_gc, v_lim, footprint_rad, BAND_TAU_STOP)
+    }
+
+    /// [`Self::band_radiance`], stopping once the optical depth passes `tau_stop`.
+    fn band_march(
+        &self,
+        cam_gc_pc: DVec3,
+        dir_gc: DVec3,
+        v_lim: f64,
+        footprint_rad: f64,
+        tau_stop: f64,
+    ) -> DVec3 {
         let dir = dir_gc.normalize_or_zero();
         let x_lim = 10_f64.powf(-0.4 * v_lim);
         let ratio = BAND_S_MAX_PC / BAND_S_MIN_PC;
+        let footprint = footprint_rad.max(0.0);
+        // Noise and clouds work relative to the Sun (f32 precision near the camera on the GPU).
+        let cam_rel = cam_gc_pc - self.sun;
+        let clouds = self.ray_clouds(cam_rel, dir, footprint);
+        let mut cloud_tau0 = clouds.column_to(BAND_S_MIN_PC);
+        let [sigma_dust, sigma_star, _, _] = self.detail_sigma;
+        let [k_dust, k_star, _, _] = self.detail_octaves;
+        let [seed_dust, seed_star, _, _] = self.detail_seed;
+        let [f_dust, f_star, _, noise_min_pc] = self.detail_scale;
         let mut s0 = BAND_S_MIN_PC;
         let mut tau = 0.0_f64;
         let mut sum = DVec3::ZERO;
@@ -383,9 +657,22 @@ impl GalaxyModel {
             let p = cam_gc_pc + dir * s;
             let arms = self.arm_strength(p);
             let [thin, thick, halo, bar] = self.components(p, arms);
-            let rgb =
-                thin * self.color_thin + (thick + halo) * self.color_old + bar * self.color_bar;
-            let dtau = self.extinction(p, arms) * TAU_PER_MAG * ds;
+            let mut dtau = self.extinction(p, arms) * TAU_PER_MAG * ds;
+            let mut star_clouds = 1.0;
+            if s > noise_min_pc && dtau >= NOISE_MIN_DTAU {
+                let q = cam_rel + dir * s;
+                let fp = footprint * s;
+                let (n, kept) = self.fbm(q, f_dust, k_dust, seed_dust, fp);
+                dtau *= (sigma_dust * n - 0.5 * sigma_dust * sigma_dust * kept).exp();
+                let (n, kept) = self.fbm(q, f_star, k_star, seed_star, fp);
+                star_clouds = (sigma_star * n - 0.5 * sigma_star * sigma_star * kept).exp();
+            }
+            let cloud_tau1 = clouds.column_to(s1);
+            dtau += cloud_tau1 - cloud_tau0;
+            cloud_tau0 = cloud_tau1;
+            let rgb = thin * star_clouds * self.color_thin
+                + (thick + halo) * self.color_old
+                + bar * self.color_bar;
             // Below dτ = 10⁻³ the series 1 − dτ/2 + dτ²/6 (error < 5·10⁻¹¹), where the GPU's f32
             // 1 − e^{−dτ} would lose digits.
             let path = if dtau < BAND_SERIES_MAX_DTAU {
@@ -397,6 +684,9 @@ impl GalaxyModel {
             sum += rgb * (faint * (-tau).exp() * path);
             tau += dtau;
             s0 = s1;
+            if tau > tau_stop {
+                break;
+            }
         }
         sum * (self.norm[3] * self.light[0])
     }
@@ -421,7 +711,92 @@ impl GalaxyModel {
             color_old: rgb(self.color_old),
             color_bar: rgb(self.color_bar),
             lf: self.lf.map(|[a, b, w]| f([a, b, w, 0.0])),
+            detail_sigma: f(self.detail_sigma),
+            detail_scale: f(self.detail_scale),
+            detail_octaves: self.detail_octaves,
+            detail_seed: self.detail_seed,
+            noise_rot: self.noise_rot.map(f),
+            clouds: self.clouds.map(f),
         }
+    }
+
+    /// fBm of value noise at `q` [pc, relative to the Sun]: octave k has wavelength
+    /// λ_k = λ₀ / 2.03^k (`inv_scale` = 1/λ₀), amplitude gain^k, and its lattice rotated by the
+    /// octave rotation k times; `octaves` of them, each × (1 − smoothstep(0.3, 0.6, fp/λ_k)) for a
+    /// footprint of `fp_pc` [pc]. Returns (n, kept): n scaled so that with every octave kept its
+    /// variance is 1, and kept = the share of that variance the footprint keeps (Σ w²a² / Σ a²).
+    /// Twin of `gal_fbm`.
+    // `!(x > 0)` on purpose: a NaN weight stops the loop, as in the WGSL twin.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn fbm(&self, q: DVec3, inv_scale: f64, octaves: u32, seed: u32, fp_pc: f64) -> (f64, f64) {
+        let gain = self.detail_sigma[3];
+        let lacunarity = self.noise_rot[0][3];
+        let rot = self.noise_rot.map(|r| DVec3::new(r[0], r[1], r[2]));
+        // Σ a_k² over all the octaves: a geometric series.
+        let g2 = gain * gain;
+        let total = (1.0 - g2.powi(octaves as i32)) / (1.0 - g2);
+        let mut p = q * inv_scale;
+        let mut inv_lambda = inv_scale;
+        let mut amp = 1.0;
+        let (mut sum, mut kept) = (0.0, 0.0);
+        for k in 0..octaves {
+            let w = 1.0 - smoothstep(NOISE_LOD_FADE[0], NOISE_LOD_FADE[1], fp_pc * inv_lambda);
+            if !(w > 0.0) {
+                break;
+            }
+            sum += w * amp * value_noise(p, seed.wrapping_add(k.wrapping_mul(OCTAVE_SEED_STEP)));
+            kept += w * w * amp * amp;
+            p = DVec3::new(rot[0].dot(p), rot[1].dot(p), rot[2].dot(p)) * lacunarity;
+            inv_lambda *= lacunarity;
+            amp *= gain;
+        }
+        (sum / (total * VALUE_NOISE_VAR).sqrt(), kept / total)
+    }
+
+    /// The named clouds along the ray from `cam_rel` [pc, relative to the Sun] in unit direction
+    /// `dir`, for a footprint of `footprint` [rad]. Twin of the cloud set-up in
+    /// `gal_band_radiance`.
+    // `!(x > 0)` and `!(q < max)` on purpose: a NaN skips the cloud, as in the WGSL twin.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn ray_clouds(&self, cam_rel: DVec3, dir: DVec3, footprint: f64) -> RayClouds {
+        let mut out = RayClouds::default();
+        let [_, _, sigma, _] = self.detail_sigma;
+        let [_, _, inv_scale, _] = self.detail_scale;
+        let [_, _, octaves, count] = self.detail_octaves;
+        let [_, _, seed, _] = self.detail_seed;
+        for k in 0..(count as usize).min(NAMED_CLOUD_COUNT) {
+            let c = &self.clouds[4 * k..4 * k + 4];
+            let kappa0 = c[0][3];
+            if !(kappa0 > 0.0) {
+                continue;
+            }
+            let row = |i: usize| DVec3::new(c[i][0], c[i][1], c[i][2]);
+            let v = DVec3::new(c[0][0], c[0][1], c[0][2]) - cam_rel;
+            let dw = DVec3::new(row(1).dot(dir), row(2).dot(dir), row(3).dot(dir));
+            let vw = DVec3::new(row(1).dot(v), row(2).dot(v), row(3).dot(v));
+            let a = dw.length_squared();
+            let s_mid = dw.dot(vw) / a;
+            let q = (vw - dw * s_mid).length_squared();
+            if !(q < CLOUD_Q_MAX) || s_mid * a.sqrt() < -CLOUD_BEHIND_SIGMAS {
+                continue;
+            }
+            let mut tau = kappa0 * (-0.5 * q).exp() * (TAU / a).sqrt() * TAU_PER_MAG;
+            let s_near = s_mid.max(0.0);
+            let (n, kept) = self.fbm(
+                cam_rel + dir * s_near,
+                inv_scale,
+                octaves,
+                seed.wrapping_add(k as u32),
+                footprint * s_near.max(1.0),
+            );
+            tau *= (sigma * n - 0.5 * sigma * sigma * kept).exp();
+            if tau >= CLOUD_MIN_TAU {
+                out.tau[k] = tau;
+                out.s_mid[k] = s_mid;
+                out.sqrt_a[k] = a.sqrt();
+            }
+        }
+        out
     }
 
     /// How close `p` is to a spiral arm's centre line: 1 on it, falling as a Gaussian in the
@@ -500,6 +875,128 @@ fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Rows of the octave rotation (Rodrigues' formula about `NOISE_ROT_AXIS` by
+/// `NOISE_ROT_ANGLE`); row 0's w carries the lacunarity, row 1's z☉ (`GalaxyGpu::noise_rot`).
+fn noise_rotation() -> [[f64; 4]; 3] {
+    let [x, y, z] = NOISE_ROT_AXIS;
+    let (s, c) = NOISE_ROT_ANGLE.sin_cos();
+    let t = 1.0 - c;
+    [
+        [
+            t * x * x + c,
+            t * x * y - s * z,
+            t * x * z + s * y,
+            NOISE_LACUNARITY,
+        ],
+        [
+            t * x * y + s * z,
+            t * y * y + c,
+            t * y * z - s * x,
+            Z_SUN_PC,
+        ],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c, 0.0],
+    ]
+}
+
+/// Unit vector toward Galactic (l, b) [deg]; also the galactocentric axes.
+fn galactic_dir(l_deg: f64, b_deg: f64) -> DVec3 {
+    let (l, b) = (l_deg.to_radians(), b_deg.to_radians());
+    DVec3::new(b.cos() * l.cos(), b.cos() * l.sin(), b.sin())
+}
+
+/// A named cloud packed for `GalaxyGpu::clouds`: (centre − Sun, κ₀), then the rows of W.
+///
+/// The cloud's axes are e_r (toward it from the Sun) and, on the sky, e_l and e_b (toward +l and
+/// +b) turned by its position angle; W = Σ eᵢ/σᵢ as rows, so the extinction rate is
+/// κ₀ exp(−|W (x − c)|²/2). κ₀ = A_V / (√(2π) σ_r) gives A_V on the line from the Sun through c.
+fn cloud_gpu(c: &NamedCloud) -> [[f64; 4]; 4] {
+    let (l, b) = (c.l_deg.to_radians(), c.b_deg.to_radians());
+    let e_r = galactic_dir(c.l_deg, c.b_deg);
+    let e_l = DVec3::new(-l.sin(), l.cos(), 0.0);
+    let e_b = DVec3::new(-b.sin() * l.cos(), -b.sin() * l.sin(), b.cos());
+    let (sp, cp) = c.pa_deg.to_radians().sin_cos();
+    let e_long = e_l * cp + e_b * sp;
+    let e_short = e_b * cp - e_l * sp;
+    let sigma_long = c.d_pc * c.sigma_long_deg.to_radians();
+    let sigma_short = c.d_pc * c.sigma_short_deg.to_radians();
+    let centre = e_r * c.d_pc;
+    let kappa0 = c.a_v_mag / ((TAU).sqrt() * c.sigma_r_pc);
+    let row = |e: DVec3, sigma: f64| [e.x / sigma, e.y / sigma, e.z / sigma, 0.0];
+    [
+        [centre.x, centre.y, centre.z, kappa0],
+        row(e_r, c.sigma_r_pc),
+        row(e_long, sigma_long),
+        row(e_short, sigma_short),
+    ]
+}
+
+/// One octave of value noise at `p` [lattice units]: the 8 lattice values around it, uniform on
+/// [−1, 1) from `pcg3d(cell, cell, cell ^ seed)` (24 bits of the first lane), blended with
+/// smoothstep weights. Continuous across cells, so the f32 twin agrees where the two round the
+/// cell index differently. Twin of `gal_value_noise`.
+fn value_noise(p: DVec3, seed: u32) -> f64 {
+    let cell = p.floor();
+    let f = p - cell;
+    let u = f * f * (DVec3::splat(3.0) - 2.0 * f);
+    let base = [
+        cell.x as i32 as u32,
+        cell.y as i32 as u32,
+        cell.z as i32 as u32,
+    ];
+    let corner = |dx: u32, dy: u32, dz: u32| {
+        let h = pcg3d(UVec3::new(
+            base[0].wrapping_add(dx),
+            base[1].wrapping_add(dy),
+            base[2].wrapping_add(dz) ^ seed,
+        ));
+        f64::from(h.x >> 8) * (2.0 / 16_777_216.0) - 1.0
+    };
+    let lerp = |a: f64, b: f64, t: f64| a + t * (b - a);
+    let x00 = lerp(corner(0, 0, 0), corner(1, 0, 0), u.x);
+    let x10 = lerp(corner(0, 1, 0), corner(1, 1, 0), u.x);
+    let x01 = lerp(corner(0, 0, 1), corner(1, 0, 1), u.x);
+    let x11 = lerp(corner(0, 1, 1), corner(1, 1, 1), u.x);
+    lerp(lerp(x00, x10, u.y), lerp(x01, x11, u.y), u.z)
+}
+
+/// erf(x) by Abramowitz & Stegun 1964, *Handbook of Mathematical Functions*, eq. 7.1.26 (after
+/// Hastings 1955), |error| ≤ 1.5e-7: the formula the GPU twin `gal_erf` can afford.
+#[allow(clippy::excessive_precision)] // A&S's published digits.
+fn erf(x: f64) -> f64 {
+    let a = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * a);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let y = 1.0 - poly * (-a * a).exp();
+    if x >= 0.0 { y } else { -y }
+}
+
+/// The named clouds one ray meets: per cloud its whole column τ_c [optical depth], the distance
+/// s_m of its density peak along the ray, and √a, the inverse of its σ along the ray (τ_c = 0 for
+/// a cloud the ray misses).
+#[derive(Default)]
+struct RayClouds {
+    tau: [f64; NAMED_CLOUD_COUNT],
+    s_mid: [f64; NAMED_CLOUD_COUNT],
+    sqrt_a: [f64; NAMED_CLOUD_COUNT],
+}
+
+impl RayClouds {
+    /// The clouds' optical depth from −∞ to `s` along the ray: Σ τ_c Φ((s − s_m)√a), Φ the normal
+    /// CDF ½(1 + erf(x/√2)). Differences of it give a step's exact Gaussian column.
+    fn column_to(&self, s: f64) -> f64 {
+        (0..NAMED_CLOUD_COUNT)
+            .filter(|&k| self.tau[k] > 0.0)
+            .map(|k| {
+                let x = (s - self.s_mid[k]) * self.sqrt_a[k];
+                self.tau[k] * 0.5 * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))
+            })
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +1071,7 @@ mod tests {
     fn band_brighter_toward_centre() {
         let g = GalaxyModel::milky_way();
         let sun = g.sun_galactocentric_pc();
-        let band = |dir: DVec3| luminance(g.band_radiance(sun, dir, 10.0));
+        let band = |dir: DVec3| luminance(g.band_radiance(sun, dir, 10.0, 0.0));
         let centre = band(lb_dir(0.0, -5.0));
         let anticentre = band(lb_dir(180.0, 0.0));
         let ngp = band(DVec3::Z);
@@ -592,7 +1089,7 @@ mod tests {
     fn band_south_not_dimmer() {
         let g = GalaxyModel::milky_way();
         let sun = g.sun_galactocentric_pc();
-        let band = |dir: DVec3| luminance(g.band_radiance(sun, dir, 10.0));
+        let band = |dir: DVec3| luminance(g.band_radiance(sun, dir, 10.0, 0.0));
         let south = band(lb_dir(0.0, -5.0));
         let north = band(lb_dir(0.0, 5.0));
         assert!(south >= 0.9 * north, "south {south} north {north}");
@@ -641,7 +1138,7 @@ mod tests {
         for cam in cams {
             for l in (0..360).step_by(30) {
                 for b in [-90.0, -45.0, -5.0, 0.0, 5.0, 45.0, 90.0] {
-                    let rgb = g.band_radiance(cam, lb_dir(l as f64, b), 10.0);
+                    let rgb = g.band_radiance(cam, lb_dir(l as f64, b), 10.0, 0.0);
                     assert!(
                         rgb.is_finite() && rgb.min_element() >= 0.0,
                         "{cam} {l} {b}: {rgb}"
@@ -685,10 +1182,16 @@ mod tests {
         assert!((mass / BAR_MASS_MSUN - 1.0).abs() < 0.02, "{mass:e} M☉");
     }
 
+    /// galaxy.wgsl with the module-scope `galaxy` its importers declare (its contract), so it
+    /// parses and validates on its own.
+    fn galaxy_wgsl_with_decl() -> String {
+        format!("{GALAXY_WGSL_SRC}\n@group(0) @binding(0) var<uniform> galaxy: GalaxyGpu;\n")
+    }
+
     #[test]
     fn galaxy_gpu_layout_matches_wgsl() {
-        let module = naga::front::wgsl::parse_str(GALAXY_WGSL_SRC)
-            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(GALAXY_WGSL_SRC)));
+        let module = naga::front::wgsl::parse_str(&galaxy_wgsl_with_decl())
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&galaxy_wgsl_with_decl())));
         let mut layouter = naga::proc::Layouter::default();
         layouter.update(module.to_ctx()).unwrap();
         let (handle, ty) = module
@@ -720,6 +1223,12 @@ mod tests {
             ("color_old", offset_of!(GalaxyGpu, color_old)),
             ("color_bar", offset_of!(GalaxyGpu, color_bar)),
             ("lf", offset_of!(GalaxyGpu, lf)),
+            ("detail_sigma", offset_of!(GalaxyGpu, detail_sigma)),
+            ("detail_scale", offset_of!(GalaxyGpu, detail_scale)),
+            ("detail_octaves", offset_of!(GalaxyGpu, detail_octaves)),
+            ("detail_seed", offset_of!(GalaxyGpu, detail_seed)),
+            ("noise_rot", offset_of!(GalaxyGpu, noise_rot)),
+            ("clouds", offset_of!(GalaxyGpu, clouds)),
         ]
         .into_iter()
         .map(|(n, o)| (n.to_owned(), o))
@@ -730,14 +1239,14 @@ mod tests {
     /// CLAUDE.md §3: every WGSL file is validated by a naga test in the crate that owns it.
     #[test]
     fn galaxy_wgsl_validates() {
-        let module = naga::front::wgsl::parse_str(GALAXY_WGSL_SRC)
-            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(GALAXY_WGSL_SRC)));
+        let module = naga::front::wgsl::parse_str(&galaxy_wgsl_with_decl())
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&galaxy_wgsl_with_decl())));
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::default(),
         )
         .validate(&module)
-        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(GALAXY_WGSL_SRC)));
+        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&galaxy_wgsl_with_decl())));
         for name in [
             "gal_density",
             "gal_luminosity",
@@ -752,5 +1261,228 @@ mod tests {
                 "galaxy.wgsl has no fn {name}"
             );
         }
+    }
+
+    // ---- Detail (B4L) ----------------------------------------------------------------------
+
+    /// `n` deterministic points spread over a 4 kpc cube around the Sun (splitmix64).
+    fn sample_points(n: usize) -> Vec<DVec3> {
+        let mut counter = 0x5EED_u64;
+        let mut unit = || {
+            counter += 1;
+            (uni_core::splitmix64(counter) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| DVec3::new(unit(), unit(), unit()) * 4000.0 - 2000.0)
+            .collect()
+    }
+
+    /// One value-noise octave has mean 0 and the variance (26/35)³/3 the docs derive.
+    #[test]
+    fn value_noise_variance_matches_theory() {
+        let pts = sample_points(200_000);
+        let v: Vec<f64> = pts.iter().map(|p| value_noise(*p * 0.137, 7)).collect();
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / v.len() as f64;
+        assert!(mean.abs() < 0.01, "mean {mean}");
+        assert!(
+            (var / VALUE_NOISE_VAR - 1.0).abs() < 0.03,
+            "var {var} vs {VALUE_NOISE_VAR}"
+        );
+        assert!(v.iter().all(|x| (-1.0..1.0).contains(x)));
+    }
+
+    /// With every octave kept the fBm has unit variance and `kept` = 1; a coarse footprint drops
+    /// octaves, and the variance left matches `kept`. The log-normal factors built from it keep a
+    /// mean of 1 either way (the dust's σ_ln 1.6 is the hardest case).
+    #[test]
+    fn fbm_variance_and_lognormal_mean() {
+        let g = GalaxyModel::milky_way();
+        let pts = sample_points(40_000);
+        let sigma = DUST_LN_SIGMA;
+        for fp in [0.0, 30.0] {
+            let nk: Vec<(f64, f64)> = pts
+                .iter()
+                .map(|p| {
+                    g.fbm(
+                        *p,
+                        1.0 / DUST_NOISE_SCALE_PC,
+                        DUST_NOISE_OCTAVES,
+                        DUST_SEED,
+                        fp,
+                    )
+                })
+                .collect();
+            let kept = nk[0].1;
+            assert!(nk.iter().all(|(_, k)| *k == kept));
+            let var = nk.iter().map(|(n, _)| n * n).sum::<f64>() / nk.len() as f64;
+            assert!(
+                (var / kept - 1.0).abs() < 0.1,
+                "fp {fp}: var {var} kept {kept}"
+            );
+            let mean = nk
+                .iter()
+                .map(|(n, k)| (sigma * n - 0.5 * sigma * sigma * k).exp())
+                .sum::<f64>()
+                / nk.len() as f64;
+            assert!((mean - 1.0).abs() < 0.12, "fp {fp}: mean D {mean}");
+            if fp == 0.0 {
+                assert!((kept - 1.0).abs() < 1e-12, "{kept}");
+            } else {
+                assert!(kept < 0.9, "fp {fp}: kept {kept}");
+            }
+        }
+    }
+
+    /// A ray from the Sun through a named cloud's centre crosses exactly its A_V (internal
+    /// structure off), and that column dims the band behind it: the Coalsack's 1.8 mag leaves
+    /// under half of the smooth band at its centre.
+    #[test]
+    fn named_cloud_columns_and_the_coalsack() {
+        let mut g = GalaxyModel::milky_way();
+        g.detail_sigma[2] = 0.0;
+        for (k, c) in NAMED_CLOUDS.iter().enumerate() {
+            let rc = g.ray_clouds(DVec3::ZERO, galactic_dir(c.l_deg, c.b_deg), 0.0);
+            let want = c.a_v_mag * TAU_PER_MAG;
+            assert!(
+                (rc.tau[k] / want - 1.0).abs() < 1e-9,
+                "cloud {k}: {} vs {want}",
+                rc.tau[k]
+            );
+            assert!(
+                (rc.s_mid[k] / c.d_pc - 1.0).abs() < 1e-9,
+                "cloud {k}: {}",
+                rc.s_mid[k]
+            );
+            // The whole column lies ahead of the camera.
+            assert!(
+                rc.column_to(1.0) < 1e-6 * want,
+                "cloud {k}: {}",
+                rc.column_to(1.0)
+            );
+            assert!((rc.column_to(1e5) - rc.tau.iter().sum::<f64>()).abs() < 1e-9);
+        }
+        let smooth = GalaxyModel::milky_way_smooth();
+        let sun = g.sun_galactocentric_pc();
+        let coalsack = lb_dir(301.5, -0.5);
+        let dim = luminance(g.band_radiance(sun, coalsack, 10.0, 0.0));
+        let mean = luminance(smooth.band_radiance(sun, coalsack, 10.0, 0.0));
+        assert!(dim < 0.5 * mean, "Coalsack {dim} vs smooth {mean}");
+    }
+
+    /// The detail varies the band about the smooth model's: over the band (|b| ≤ 15°, all l) the
+    /// mean luminance stays within a factor 2 of the smooth one (clumpy dust lets more light
+    /// through on average than smooth dust of the same mean, so it is brighter, not darker), and
+    /// neighbouring samples 0.5° apart differ, where the smooth band is nearly flat.
+    #[test]
+    fn detail_varies_the_band_about_its_mean() {
+        let g = GalaxyModel::milky_way();
+        let smooth = GalaxyModel::milky_way_smooth();
+        let sun = g.sun_galactocentric_pc();
+        let fp = 2.0 / 512.0;
+        let (mut sum_d, mut sum_s, mut step_d, mut step_s) = (0.0, 0.0, 0.0, 0.0);
+        let mut n = 0.0;
+        for l in (0..360).step_by(15) {
+            for b in [-15.0, -8.0, -3.0, 0.0, 3.0, 8.0, 15.0] {
+                let band = |m: &GalaxyModel, dl: f64| {
+                    luminance(m.band_radiance(sun, lb_dir(f64::from(l) + dl, b), 10.0, fp))
+                };
+                let (d0, d1) = (band(&g, 0.0), band(&g, 0.5));
+                let (s0, s1) = (band(&smooth, 0.0), band(&smooth, 0.5));
+                sum_d += d0;
+                sum_s += s0;
+                step_d += (d1 / d0).ln().abs();
+                step_s += (s1 / s0).ln().abs();
+                n += 1.0;
+            }
+        }
+        let ratio = sum_d / sum_s;
+        assert!(
+            (1.0..2.0).contains(&ratio),
+            "detailed / smooth mean band {ratio}"
+        );
+        assert!(step_d / n > 0.05, "detail barely varies: {}", step_d / n);
+        assert!(step_d > 5.0 * step_s, "detail {step_d} vs smooth {step_s}");
+    }
+
+    /// Stopping the march at τ = 15 changes the band by under 3 × 10⁻⁵ anywhere, the plane's lane
+    /// toward the bulge (where it stops soonest) included, from the Sun and from the bar's edge.
+    #[test]
+    fn band_march_stops_only_when_nothing_is_left() {
+        let g = GalaxyModel::milky_way();
+        let fp = 2.0 / 512.0;
+        let cams = [g.sun_galactocentric_pc(), DVec3::new(-1500.0, 600.0, 120.0)];
+        let mut stopped = 0;
+        for cam in cams {
+            for l in (0..360).step_by(20) {
+                for b in [-4.0, -1.0, 0.0, 0.5, 2.0, 6.0] {
+                    let d = lb_dir(f64::from(l), b);
+                    let full = g.band_march(cam, d, 10.0, fp, f64::INFINITY);
+                    let cut = g.band_radiance(cam, d, 10.0, fp);
+                    let rel = (cut - full).abs().max_element() / full.max_element();
+                    assert!(rel < 3e-5, "{cam} l {l} b {b}: {rel}");
+                    stopped += i32::from(cut != full);
+                }
+            }
+        }
+        assert!(stopped > 20, "the stop never fires: {stopped}");
+    }
+
+    /// `gal_pcg3d` in galaxy.wgsl is common/hash.wgsl's `pcg3d` (the engine's one integer hash,
+    /// probed bit-exact against `uni_core::pcg3d` under `universe --selftest`) line for line.
+    #[test]
+    fn gal_pcg3d_is_the_engine_hash() {
+        let engine = include_str!("../../uni-gfx/shaders/common/hash.wgsl");
+        let body = |src: &str, name: &str| -> Vec<String> {
+            let start = src
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("fn {name}"));
+            src[start..]
+                .lines()
+                .skip(1)
+                .take_while(|l| *l != "}")
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+        let ours = body(GALAXY_WGSL_SRC, "gal_pcg3d");
+        assert!(ours.len() > 8, "{ours:?}");
+        assert_eq!(ours, body(engine, "pcg3d"));
+    }
+
+    /// The detail constants of galaxy.wgsl equal their Rust twins.
+    #[test]
+    fn detail_constants_match_wgsl() {
+        let module = naga::front::wgsl::parse_str(&galaxy_wgsl_with_decl())
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&galaxy_wgsl_with_decl())));
+        let lit = |name: &str| -> naga::Literal {
+            let (_, c) = module
+                .constants
+                .iter()
+                .find(|(_, c)| c.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("const {name}"));
+            match module.global_expressions[c.init] {
+                naga::Expression::Literal(l) => l,
+                ref e => panic!("{name}: {e:?}"),
+            }
+        };
+        let f = |name: &str, want: f64| match lit(name) {
+            naga::Literal::F32(v) => assert_eq!(v, want as f32, "{name}"),
+            l => panic!("{name}: {l:?}"),
+        };
+        let u = |name: &str, want: u32| match lit(name) {
+            naga::Literal::U32(v) => assert_eq!(v, want, "{name}"),
+            l => panic!("{name}: {l:?}"),
+        };
+        f("GAL_NOISE_FADE_START", NOISE_LOD_FADE[0]);
+        f("GAL_NOISE_FADE_END", NOISE_LOD_FADE[1]);
+        f("GAL_VALUE_NOISE_VAR", VALUE_NOISE_VAR);
+        f("GAL_CLOUD_Q_MAX", CLOUD_Q_MAX);
+        f("GAL_CLOUD_MIN_TAU", CLOUD_MIN_TAU);
+        f("GAL_NOISE_MIN_DTAU", NOISE_MIN_DTAU);
+        f("GAL_BAND_TAU_STOP", BAND_TAU_STOP);
+        f("GAL_CLOUD_BEHIND_SIGMAS", CLOUD_BEHIND_SIGMAS);
+        u("GAL_OCTAVE_SEED_STEP", OCTAVE_SEED_STEP);
+        u("GAL_MAX_CLOUDS", NAMED_CLOUD_COUNT as u32);
     }
 }

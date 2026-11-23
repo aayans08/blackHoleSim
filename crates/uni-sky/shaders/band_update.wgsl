@@ -8,8 +8,9 @@
 // order, root = ICRS axes); the galaxy model works in galactocentric axes (galaxy.wgsl), so each
 // direction is rotated ICRS → Galactic first.
 //
-// Per galaxy.wgsl's contract the importer declares GalaxyGpu at its own group and copies it into
-// `galaxy` before calling any gal_* function. Group 0 is unused (the pass needs no camera).
+// Per galaxy.wgsl's contract the importer declares the module-scope `galaxy: GalaxyGpu` the gal_*
+// functions read: here the uniform at group 1, binding 0, read in place (B4L; no per-invocation
+// copy). Group 0 is unused (the pass needs no camera).
 // Two entry points with separate bind group layouts in Rust (band.rs):
 // - cs_band_update: bindings 0, 1, 2 (galaxy, params, mip 0 as storage);
 // - cs_band_downsample: bindings 1, 3, 4 (params, mip n − 1 read, mip n as storage).
@@ -36,7 +37,8 @@ const BAND_ENV_UNIT_CD_M2: f32 = 1.0e-4;
 // Twin of uni_sky::band::ENV_MAX_UNITS (= uni_gfx::HDR_MAX).
 const BAND_ENV_MAX_UNITS: f32 = 60000.0;
 
-@group(1) @binding(0) var<uniform> band_galaxy: GalaxyGpu;
+// The galaxy model, read in place by every gal_* function (procgen/galaxy.wgsl's contract).
+@group(1) @binding(0) var<uniform> galaxy: GalaxyGpu;
 @group(1) @binding(1) var<uniform> band_params: BandUpdateParams;
 // Mip 0 of every face (a 2D-array view of the cube).
 @group(1) @binding(2) var band_out: texture_storage_2d_array<rgba16float, write>;
@@ -48,6 +50,15 @@ const BAND_ENV_MAX_UNITS: f32 = 60000.0;
 fn band_icrs_to_gal(dir: vec3<f32>) -> vec3<f32> {
     let m = band_params.icrs_to_gal;
     return vec3<f32>(dot(m[0].xyz, dir), dot(m[1].xyz, dir), dot(m[2].xyz, dir));
+}
+
+// Angular size [rad] of a mip-0 texel in unit direction `dir`: 2m²/N, m the major-axis component
+// (gnomonic faces; uni-rel's lens_env_lod uses the same geometry). The galaxy model's detail
+// fades out below it. Twin of band.rs `texel_footprint_rad`.
+fn band_texel_footprint(dir: vec3<f32>, face_texels: f32) -> f32 {
+    let a = abs(dir);
+    let m = max(a.x, max(a.y, a.z));
+    return 2.0 * m * m / face_texels;
 }
 
 // Luminance [cd/m²] → texel units, never negative, clamped to BAND_ENV_MAX_UNITS (twin of
@@ -64,12 +75,12 @@ fn cs_band_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= size.x || gid.y >= size.y || gid.z >= band_params.faces.y) {
         return;
     }
-    galaxy = band_galaxy;
     let face = band_params.faces.x + gid.z;
     let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
-    let dir_gc = band_icrs_to_gal(cube_dir(face, uv));
+    let dir = cube_dir(face, uv);
+    let dir_gc = band_icrs_to_gal(dir);
     let cam = band_params.cam_gc_v_lim;
-    let rgb = gal_band_radiance(cam.xyz, dir_gc, cam.w);
+    let rgb = gal_band_radiance(cam.xyz, dir_gc, cam.w, band_texel_footprint(dir, f32(size.x)));
     textureStore(band_out, gid.xy, face, vec4<f32>(band_env_units(rgb), 1.0));
 }
 
