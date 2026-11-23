@@ -158,8 +158,10 @@ doc comment; every feature must follow it)**
 - *Band-order deviation (ruling 4).* The band is drawn after the opaque passes and the meter, not first as the
   design (§5.3) puts the background. The band is sky light at star exposure, so it must not be metered, and
   drawing it after the bodies with (1 − g) composites it correctly behind partly transparent atmospheres and
-  rings. It draws only where there is no body (depth test `GreaterEqual` at depth 0) and honours `lens_mask` as
-  above.
+  rings. Since B9c (lead ruling) the band and the catalogue stars (3-D and the BSC5 fallback) have NO depth test
+  and no depth attachment: their only occlusion is the `lens_mask` factors, so an anti-aliased body edge (g =
+  coverage) keeps its (1 − coverage) share of sky. Every opaque writer must therefore write `g`. Reflected-body
+  point sprites keep their true-depth `Greater` test.
 - *Internal vs output size.* `FrameCtx.viewport` is the internal render size, and `Renderer::render` keeps the
   targets at it. `FrameCtx.output_size` is the swapchain or capture size. The tonemap reads `hdr` 1:1 when the
   two are equal (captures, `--bench`) and bilinearly upscales otherwise (the window: about 1080 lines at the

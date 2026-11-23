@@ -96,8 +96,8 @@
 //! | 8 | `atmosphere` (reads `depth`; dual-source variant: two pipelines, grey-transmittance variant: one) | uni-atmo | hdr, g, a | none attached |
 //! | 9 | `histogram` (the exposure meter; reads `hdr` and `lens_mask.a`) | uni-post | meter state | — |
 //! | 10 | `lens` (reads `depth`; skips pixels with depth ≠ 0) | uni-rel | hdr (sky, star exposure), r, g = 0, b | — |
-//! | 11 | `band` | uni-sky | hdr (sky) × (1 − r)(1 − g)(1 − b) | test `GreaterEqual` at depth 0 (ruling 4) |
-//! | 12 | `stars` | uni-sky | hdr (sky) × (1 − r)(1 − g) | test `GreaterEqual` at depth 0 |
+//! | 11 | `band` | uni-sky | hdr (sky) × (1 − r)(1 − g)(1 − b) | none: no depth attachment (B9c ruling) |
+//! | 12 | `stars` | uni-sky | hdr (sky) × (1 − r)(1 − g) | none: no depth attachment (B9c ruling) |
 //! | 13 | `points` (bodies, the Sun and near stars as points) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
 //! | 14 | `asteroids` (Wave C) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
 //! | 15 | `bloom` (input clamped to `BLOOM_INPUT_MAX`) | uni-post | hdr | — |
@@ -107,8 +107,9 @@
 //! **The band is drawn after the opaque passes and the meter** (ruling 4, a deliberate deviation
 //! from design §5.3, where the background comes first). The band is sky light at star exposure,
 //! so it must not be metered; and drawing it after the bodies with (1 − g) composites it
-//! correctly behind partly transparent atmospheres and rings. It draws only where there is no
-//! body (depth at the far plane) and honours `lens_mask` as above.
+//! correctly behind partly transparent atmospheres and rings. Since B9c (lead ruling) the band and
+//! the catalogue stars have no depth test: `lens_mask` alone occludes them, so an anti-aliased body
+//! edge (g = coverage) keeps its (1 − coverage) share of sky. Every opaque writer must write `g`.
 
 use glam::UVec2;
 
