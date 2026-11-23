@@ -12,9 +12,10 @@
 //   (constant, 1 - constant) with the constant = strength makes hdr = mix(hdr, bloom, strength).
 // No threshold. Every step is normalised, so the chain conserves energy away from the edges.
 //
-// Task B9p (performance, no change to the result beyond rounding): the first downsample read each
-// window's 36 texels one by one (4.4 ms at 1920 x 1080; now 0.26 ms), and the tents took 9 taps
-// (u_1 0.20 -> 0.08 ms, composite 0.76 -> 0.38 ms).
+// Task B9p (performance; the same result up to rounding for finite, non-negative hdr, which the
+// frame contract guarantees; see down_first for NaN and negative input): the first downsample
+// read each window's 36 texels one by one (4.4 ms at 1920 x 1080; now 0.26 ms), and the tents
+// took 9 taps (u_1 0.20 -> 0.08 ms, composite 0.76 -> 0.38 ms).
 //
 // CPU twin: uni_post::bloom::bloom_reference (crates/uni-post/src/bloom.rs), the same texels and
 // weights (the GPU groups some sums differently: bilinear taps, the 2 x 2-tap tent);
@@ -95,10 +96,13 @@ fn first_tap_exact(p: vec2<f32>, last: vec2<i32>) -> vec3<f32> {
 // {0, 2}) are each the mean of four taps = the mean of their 4 x 4 texels, combined with the
 // Karis average. Task B9p: the 13 taps are bilinear (4.4 ms when every thread read its 36 texels
 // one by one into a private array; 0.26 ms at 1920 x 1080 now), which equals clamping each texel
-// first whenever no tap's mean has a channel above BLOOM_INPUT_MAX / 4 (then no texel is above
-// BLOOM_INPUT_MAX) or below 0 (pre-exposed light is not negative). Otherwise, decided once after
-// all 13 taps are issued (a test per tap serialised the fetches: +0.3 to 0.6 ms), every tap is
-// redone texel by texel with the clamp (first_tap_exact).
+// first whenever every texel is finite and non-negative (pre-exposed light is, by the frame
+// contract) and no tap's mean has a channel above BLOOM_INPUT_MAX / 4 (then no texel is above
+// BLOOM_INPUT_MAX). A tap mean below 0 takes the exact path; a NaN tap, which min/max skip, and a
+// negative texel inside a non-negative mean are floored per tap at 0, not per texel (B9p review
+// m2), so neither spreads. Otherwise, decided once after all 13 taps are issued (a test per tap
+// serialised the fetches: +0.3 to 0.6 ms), every tap is redone texel by texel with the clamp
+// (first_tap_exact).
 fn down_first(dst: vec2<u32>) -> vec3<f32> {
     let last = vec2<i32>(textureDimensions(bloom_src)) - vec2<i32>(1);
     let texel = 1.0 / vec2<f32>(textureDimensions(bloom_src));
@@ -158,6 +162,25 @@ fn down_first(dst: vec2<u32>) -> vec3<f32> {
         k = first_tap_exact(p + vec2<f32>(1.0, -1.0), last);
         l = first_tap_exact(p + vec2<f32>(-1.0, 1.0), last);
         m = first_tap_exact(p + vec2<f32>(1.0, 1.0), last);
+    } else {
+        // The fast path keeps bloom_input's floor per tap (B9p review m2): a NaN texel makes its
+        // tap NaN, which min/max leave out of lo and hi, and Metal's max returns the other
+        // operand, so the tap enters the chain as 0 instead of spreading NaN over the bloom; a
+        // negative mean cannot reach here (lo < 0 takes the exact path).
+        let z = vec3<f32>(0.0);
+        a = max(a, z);
+        b = max(b, z);
+        c = max(c, z);
+        d = max(d, z);
+        e = max(e, z);
+        f = max(f, z);
+        g = max(g, z);
+        h = max(h, z);
+        i = max(i, z);
+        j = max(j, z);
+        k = max(k, z);
+        l = max(l, z);
+        m = max(m, z);
     }
     let centre = (j + k + l + m) * 0.25;
     let tl = (a + b + d + e) * 0.25;

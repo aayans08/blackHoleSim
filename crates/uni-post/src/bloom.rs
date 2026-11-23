@@ -20,7 +20,9 @@
 //! The GPU (`bloom.wgsl`, task B9p) computes the same texels and weights with fewer fetches:
 //! level 1 from 13 bilinear taps wherever the input clamp changes nothing in a window (no tap's
 //! mean above [`BLOOM_INPUT_MAX`]/4 or below 0), texel by texel where it does; each 3 × 3 tent as
-//! 2 × 2 bilinear taps. The twin below keeps the texel-by-texel form.
+//! 2 × 2 bilinear taps. The twin below keeps the texel-by-texel form. The two agree for finite,
+//! non-negative input (the frame contract's pre-exposed light); otherwise the fast path floors
+//! each tap at 0 rather than each texel, so a NaN or negative texel never spreads.
 //!
 //! Each step is normalised, so away from the frame's edges every level carries the input's
 //! energy, and averaging the L levels conserves it (`bloom_impulse_energy_conserved`): bloom
