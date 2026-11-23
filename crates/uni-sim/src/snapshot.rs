@@ -2,13 +2,13 @@
 //! camera-relative in f64 [m], ICRS axes.
 //!
 //! Each Solar System body is in `bodies` when it projects to at least [`POINT_LOD_PX`], else
-//! in `points` (when on screen), never both (Review Focus 4). The Sun and the registry stars
-//! (named stars, exoplanet hosts) within 0.1 pc go to `star_surfaces` or `points` the same
-//! way. An unnamed catalogue star within 0.1 pc goes to `points` (with no id) at every
-//! distance: [`StarSurfaceView::id`] is not optional (A0b stub; review I1, escalated), so it
-//! cannot be resolved, but it is drawn once, from f64 positions, and never by the star pass.
-//! Every near star's catalogue index goes to `suppressed_stars`. Points and picks off screen
-//! are left out.
+//! in `points` (when on screen), never both (Review Focus 4). The Sun and the catalogue stars
+//! within 0.1 pc go to `star_surfaces` or `points` the same way, drawn once from f64
+//! positions, and every near star's catalogue index goes to `suppressed_stars`, so the star
+//! pass skips it. An unnamed catalogue star becomes a registry object at the [`World::tick`]
+//! after the first snapshot that finds it near (review I1); in that one snapshot it is a point
+//! without an id at any size, since [`StarSurfaceView::id`] names an object. Points and picks
+//! off screen are left out.
 
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2, Vec3};
 use uni_core::{
@@ -279,7 +279,8 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     }
 
     // Catalogue stars within 0.1 pc: drawn here instead of by the star pass. An unnamed one
-    // (no object id) stays a point even where it would resolve (module doc).
+    // not registered yet (no object id until the next tick) is a point even where it would
+    // resolve (module doc).
     for &(index, id) in &near {
         let star = world.star_data()[index as usize];
         let rel = world.star_position(index).delta_from(cam);

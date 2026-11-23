@@ -3,10 +3,13 @@
 //!
 //! **Registry.** Object ids index [`World::objects`] in this order: the ephemeris bodies (Sun,
 //! planets, Pluto, moons; parents first), comets, the asteroids that are objects (H ≤ 10, or
-//! with a sheet in `body_facts.ron`), TestBH-1, then exoplanet hosts and named stars. Unnamed
-//! catalogue stars are not objects (plan A4's registry list). Within 0.1 pc the snapshot still
-//! takes one out of the star pass and draws it as a point, but never as a star surface: the
-//! A0b stub's `StarSurfaceView::id` is not optional, and `nearest_surface` cannot name it.
+//! with a sheet in `body_facts.ron`), TestBH-1, then exoplanet hosts and named stars, all built
+//! by [`World::new`]. Unnamed catalogue stars are not objects (plan A4's registry list) until a
+//! camera comes within 0.1 pc of one: a snapshot or `nearest_surface` notes it, and the next
+//! [`World::tick`] appends it as a `Star` named "AT-HYG <id>" (review I1), so it can be drawn
+//! as a star surface (`StarSurfaceView::id` names an object) and its photosphere can be the
+//! nearest surface. The registry only grows; an id, once given, never changes. Until that tick
+//! (one frame) the star is a point without an id.
 //!
 //! **Frames.** ROOT (SSB, ICRS) → `Sun` → each planet → each moon, every one a
 //! `FrameMotion::Custom` that translates only (ICRS axes); TestBH-1 sits in a fixed frame under
@@ -20,28 +23,31 @@
 //! **Comets** (lead ruling after A3) move two-body from an osculating conic that follows the
 //! shown date: once the date is more than 30 days from a comet's conic epoch, the comet is
 //! re-osculated with `uni_physics::smallbody::osculate_at` (planet-perturbed) from whichever of
-//! its catalogue conic and its current conic is nearer in time. No comet is shown from its
-//! catalogue conic for a date far from it (review I3):
-//! - [`World::new`] settles every comet at the start date: one integration each, spread over
-//!   the CPU cores with `std::thread::scope` (ruling 3), longest first.
-//! - A tick settles them all again when the clock is slow (|rate| ≤ `SETTLE_MAX_RATE`, or
-//!   paused) and a comet's conic is more than `SETTLE_BACKLOG_S` from the date. That happens
-//!   only after a date jump or at the end of a faster warp, never while a slow rate is steady.
-//! - Otherwise a tick runs short steps for the stale comets nearest the Sun while it is under
-//!   `REOSC_TICK_BUDGET_S` of wall time, and at least one. A step integrates at most 30 days and
-//!   at most `REOSC_DYN_FRACTION` of the comet's dynamical time (about 50 of the integrator's
-//!   steps), so one step stays cheap near perihelion. Under a warp faster than the steps keep
-//!   up with, comets lag the date (nearest the Sun first to catch up) until the warp ends.
+//! its catalogue conic, the conics it reached before and its current conic is nearest in time.
+//! No comet is shown from its catalogue conic for the start date (review I3), and no frame
+//! waits for a whole integration (review r1 N1):
+//! - [`World::new`] settles every comet at the start date ([`World::settle_comets`]): one
+//!   integration each, spread over the CPU cores with `std::thread::scope` (ruling 3), longest
+//!   first. That is a one-off start-up cost, listed there.
+//! - A tick never settles. It runs a fixed number of short steps (`REOSC_STEPS_PER_TICK`, at
+//!   most `REOSC_STEPS_PER_COMET` per comet) for the stale comets nearest the Sun, on scoped
+//!   threads. A step integrates `REOSC_CHUNK_STEPS` of the integrator's RK4 steps (at most 16
+//!   days), so its cost stays near 0.1 ms with optimised physics, near perihelion too. The work
+//!   per tick does not depend on wall time, so the comets' state does not depend on the
+//!   machine (review r1 N2).
+//! - After a date jump, or under a warp faster than the steps keep up with, the comets lag the
+//!   date and catch up over the following ticks, nearest the Sun first. A comet keeps the
+//!   conics it reached (`CHECKPOINT_SPACING_S` apart), so returning to a date it has been at,
+//!   such as the start date after a warp, needs at most a year of integration, usually none.
+//!   Captures call [`World::settle_comets`] after setting a bookmark's epoch.
 //!
-//! Chunked steps cost < 10 m against one integration. Perturbed motion is followed only
+//! Chunked steps cost metres at most against one integration. Perturbed motion is followed only
 //! within `PERTURBED_SPAN_S` of the catalogue epoch; beyond it the comet is two-body from the
 //! conic at that edge.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use glam::{DQuat, DVec3, UVec2};
 use uni_core::{
@@ -53,7 +59,7 @@ use uni_data::{
     AsteroidRecord, BodyFacts, Comet, DataError, ExoSystem, FLAG_EXO_HOST, FLAG_FROM_ARCHIVE,
     FLAG_NO_VELOCITY, RingProfile, STAR3_EPOCH_JD_TDB, SatRecord, Star3, StarNames,
 };
-use uni_physics::bodies::by_naif;
+use uni_physics::bodies::{by_naif, system_gm_m3s2};
 use uni_physics::calc::hill_radius;
 use uni_physics::ephemeris::Ephemeris;
 use uni_physics::frames::ecliptic_j2000_to_icrs;
@@ -61,7 +67,7 @@ use uni_physics::kepler::{Conic, perifocal_to_reference, solve_kepler};
 use uni_physics::photometry::star_radius_m;
 use uni_physics::sat_elements::SatElements;
 use uni_physics::smallbody::{conic_from_perihelion, heliocentric_state_icrs, osculate_at};
-use uni_physics::standish::{self, Validity};
+use uni_physics::standish::{self, Planet, Validity};
 use uni_physics::{pluto, rotation};
 
 use crate::honesty::HonestyFlag;
@@ -140,11 +146,12 @@ const DWARF_PLANET_SPKIDS: [u32; 4] = [20_000_001, 20_136_108, 20_136_199, 20_13
 
 /// Saturn's ring radii [m] unless [`World::set_ring_profile`] gives others: the span of A8's
 /// `saturn_rings.ron`, so `RingView` covers exactly the radii of the profile B2 draws (review
-/// I2). A8 fitted that span to Solar System Scope's ring texture by setting its B ring's outer
-/// edge to 117 680 km and its A ring's to 136 775 km (NSSDCA Saturnian Rings Fact Sheet,
-/// https://nssdc.gsfc.nasa.gov/planetary/factsheet/satringfact.html): 69 934–140 972 km.
-/// `WorldData` has no ring field (A0b stub), so the test `saturn_carries_its_rings` pins these
-/// to the baked file, and a re-bake that moves them fails there.
+/// I2). A8's bake (`tools/bake/src/rings.rs`) fitted that span to Solar System Scope's ring
+/// texture by placing the texture's Cassini-division drop at the Huygens gap, 117 680 km, and
+/// its A ring's outer edge at 136 775 km, both the M1 plan's values (NSSDCA's Saturnian Rings
+/// Fact Sheet gives 117 507 km and 136 780 km): 69 934–140 972 km. `WorldData` has no ring
+/// field (A0b stub), so the test `saturn_carries_its_rings` pins these to the baked file, and a
+/// re-bake that moves them fails there.
 const SATURN_RINGS_DEFAULT_M: (f64, f64) = (69_933_828.337_874_65, 140_972_084.468_664_85);
 /// NAIF id of Saturn, whose rings the snapshot reports.
 pub(crate) const SATURN: i32 = 699;
@@ -155,36 +162,44 @@ const CHARON: i32 = 901;
 /// A comet is re-osculated once the shown date is this far from its conic's epoch (lead ruling
 /// after A3: "e.g. when the shown date moves > 30 days from the last osculation epoch").
 const REOSC_INTERVAL_S: f64 = 30.0 * DAY;
-/// Longest perturbed integration one tick step runs [s]: the re-osculation interval, so a
-/// comet far from the Sun that went stale at real-time rates needs one step.
-pub(crate) const REOSC_CHUNK_S: f64 = 30.0 * DAY;
-/// A tick step also integrates at most this fraction of the comet's dynamical time √(r³/GM☉)
-/// at the step's start. `uni_physics::smallbody`'s RK4 step is 10⁻³ of that time (less near a
-/// planet; at most 2 days), so a step takes at most about 50 RK4 steps away from the planets,
-/// fewer beyond 4.7 AU where the 30-day limit applies: in 0.05 dynamical times even a radial
-/// plunge changes r by under 8 %. Without it a 30-day step near a perihelion took about 8 ms in
-/// the debug build (review I3); with it Halley's slowest step took 1.6 ms.
-pub(crate) const REOSC_DYN_FRACTION: f64 = 0.05;
+/// `uni_physics::smallbody`'s RK4 step rule, repeated here (its private `STEP_ETA` and
+/// `MAX_STEP_S`) to size the tick steps: η = 10⁻³ of the shortest local dynamical time
+/// √(d³/GM) about the Sun and the eight planetary systems, at most 2 days
+/// ([`smallbody_rk4_step_s`]).
+pub(crate) const SMALLBODY_STEP_ETA: f64 = 1.0e-3;
+/// See [`SMALLBODY_STEP_ETA`].
+pub(crate) const SMALLBODY_MAX_STEP_S: f64 = 2.0 * DAY;
+/// A tick step integrates this many of `uni_physics::smallbody`'s RK4 steps, sized at its
+/// start: `REOSC_CHUNK_STEPS ·` [`smallbody_rk4_step_s`], so 16 days at most. One RK4 step costs
+/// 16 Standish planet states; measured on the M3 over the baked catalogue's first steps (review
+/// r1 N1), a step of about 45 RK4 steps took 1.25 ms in the debug build and 0.40 ms with
+/// uni-physics and uni-core at opt-level 3. Eight keep a step near 0.09 ms there, near a planet
+/// too, so a tick's comet work stays inside its share of the frame budget (ruling 3).
+pub(crate) const REOSC_CHUNK_STEPS: f64 = 8.0;
+/// Longest tick step [s] (far from the Sun, where the 2-day RK4 step applies).
+pub(crate) const REOSC_CHUNK_S: f64 = REOSC_CHUNK_STEPS * SMALLBODY_MAX_STEP_S;
 /// Shortest tick step [s], so a comet at r → 0 still moves on.
 pub(crate) const REOSC_MIN_CHUNK_S: f64 = 60.0;
-/// Wall time [s] a tick may spend starting comet steps; it always runs at least one while a
-/// comet is stale, so they progress on any machine. Part of the plan's "everything else ≤ 0.5
-/// ms" CPU budget (ruling 3); the release cost is measured at the gate.
-const REOSC_TICK_BUDGET_S: f64 = 0.25e-3;
-/// A tick settles every comet at once, as `World::new` does, while the clock runs at most this
-/// fast [sim s per real s] (or is paused) and some comet's conic is more than
-/// [`SETTLE_BACKLOG_S`] from the date. At 10⁵ the baked catalogue's 512 comets go stale at
-/// 512 × 10⁵ s / 30 days ≈ 20 per wall second and need about 30 short steps per wall second
-/// (1.5 per comet on 2026-11-20: 255 of them are within 4.7 AU of the Sun, where a 30-day
-/// re-osculation takes several steps), half of what one step per tick at 60 fps gives, so a
-/// settle does not repeat while a slow rate holds. At 10⁶ they need 300 per second.
-const SETTLE_MAX_RATE: f64 = 1.0e5;
-/// The backlog [s] that makes a slow tick settle: three re-osculation intervals. At
-/// [`SETTLE_MAX_RATE`] the tick steps keep the conics near 30 days from the date (even if all
-/// 512 comets went stale on one tick, about 780 steps at one per tick take 13 s, while the
-/// date moves 15 days), so in practice only a date jump or the end of a faster warp passes it;
-/// if the steps fell behind at a slow rate anyway, the settle would catch them up.
-const SETTLE_BACKLOG_S: f64 = 3.0 * REOSC_INTERVAL_S;
+/// Most comet steps one tick runs, in all (review r1 N1: a tick never integrates a whole
+/// re-osculation, so a date jump or the end of a warp never stalls a frame). A fixed count, not
+/// a wall-time budget, so the comets' state after a run of ticks is the same on every machine and
+/// in every run (review r1 N2). They run on up to [`std::thread::available_parallelism`] scoped
+/// threads (ruling 3), [`REOSC_STEPS_PER_COMET`] at most for each comet. On the M3's 8 cores,
+/// with every workspace crate at opt-level 3 in the test build (review r1 N1; the release
+/// build is the gate's to measure), 24 one-step jobs took 0.41 ms of wall time and a whole
+/// catch-up tick after a 30-year jump 0.47 ms; 16 jobs took 0.35 ms. A catalogue whose conics
+/// all went stale at once catches up at about 24 × 8 = 192 RK4 steps per tick, nearest the Sun
+/// first: Halley's 34 years from 1986 to 2020 took 331 ticks (5.5 s at 60 fps).
+const REOSC_STEPS_PER_TICK: usize = 24;
+/// Most steps one comet takes per tick; they run one after another on one thread.
+const REOSC_STEPS_PER_COMET: usize = 3;
+/// A comet keeps the conics it was re-osculated to, at least this far apart [s]. A date it
+/// has reached is then at most this far from one of them, so returning to it (the start date
+/// after a warp or a jump) needs at most a year of integration, and none for a date it was
+/// kept at (the start date's conic is kept whenever the catalogue epoch is a year or more
+/// away, as for every baked comet). Within the ±200-year perturbed span that is at most 401
+/// conics (80 B each with the epoch, 32 kB) per comet.
+const CHECKPOINT_SPACING_S: f64 = YEAR_S;
 
 /// The local dynamical time √(r³/GM☉) [s] at `r_m` from the Sun: the time scale that sets
 /// `uni_physics::smallbody`'s RK4 step (DE440 GM☉; Kepler's third law: one radian of a
@@ -193,12 +208,36 @@ fn dynamical_time_s(r_m: f64) -> f64 {
     (r_m.powi(3) / uni_physics::bodies::GM_SUN_DE440_M3S2).sqrt()
 }
 
+/// `uni_physics::smallbody`'s RK4 step [s] for a small body at heliocentric `r` [m] (ICRS) at
+/// `t`: η times the least of √(|r|³/GM☉) and, for each planetary system's barycentre at
+/// distance d, √(d³/GM) with its DE440 system GM (positions from Standish, as the integrator
+/// takes them), at most 2 days. A NaN r (a broken conic) gives the 2-day step: `min` drops a
+/// NaN.
+pub(crate) fn smallbody_rk4_step_s(r: DVec3, t: Epoch) -> f64 {
+    let mut t_dyn = dynamical_time_s(r.length());
+    for planet in Planet::ALL {
+        let gm = system_gm_m3s2(planet.barycentre_id()).unwrap_or(0.0);
+        if gm > 0.0 {
+            let d = (standish::heliocentric_state_icrs(planet, t).0 - r).length();
+            t_dyn = t_dyn.min((d.powi(3) / gm).sqrt());
+        }
+    }
+    (SMALLBODY_STEP_ETA * t_dyn).min(SMALLBODY_MAX_STEP_S)
+}
+
+/// The span [s] of a tick step from heliocentric `r` [m] at `t` ([`REOSC_CHUNK_STEPS`]).
+pub(crate) fn short_span_s(r: DVec3, t: Epoch) -> f64 {
+    (REOSC_CHUNK_STEPS * smallbody_rk4_step_s(r, t))
+        .min(REOSC_CHUNK_S)
+        .max(REOSC_MIN_CHUNK_S)
+}
+
 /// How far one comet re-osculation step integrates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chunk {
     /// All the way to the date, in one integration ([`World::settle_comets`]).
     Whole,
-    /// At most [`REOSC_CHUNK_S`] and [`REOSC_DYN_FRACTION`] of the dynamical time (ticks).
+    /// At most [`short_span_s`] (ticks).
     Short,
 }
 /// Perturbed motion is followed this far from a comet's catalogue epoch [s]. Beyond it the
@@ -455,9 +494,12 @@ fn asteroid_display_name(full: &str) -> &str {
 /// doc).
 #[derive(Clone, Debug)]
 struct CometOrbit {
-    /// SBDB's elements (J2000 ecliptic) at their osculation epoch.
-    catalogue: Conic,
+    /// The epoch of SBDB's elements, the centre of the perturbed span.
     catalogue_epoch: Epoch,
+    /// Conics this comet has held, sorted by epoch and at least [`CHECKPOINT_SPACING_S`]
+    /// apart, starting with SBDB's (J2000 ecliptic). A re-osculation starts from the nearest
+    /// of them and the current conic.
+    checkpoints: Vec<(Epoch, Conic)>,
     /// The conic used now, osculating at `osc_epoch`.
     osc: Conic,
     osc_epoch: Epoch,
@@ -473,8 +515,8 @@ impl CometOrbit {
             conic_from_perihelion(c.q_au, c.e, c.i_deg, c.node_deg, c.argp_deg, c.tp_jd_tdb);
         let catalogue_epoch = epoch_from_jd(c.epoch_jd_tdb);
         CometOrbit {
-            catalogue,
             catalogue_epoch,
+            checkpoints: vec![(catalogue_epoch, catalogue)],
             osc: catalogue,
             osc_epoch: catalogue_epoch,
             magnitude: c.m1.zip(c.k1),
@@ -494,39 +536,79 @@ impl CometOrbit {
         !self.failed && self.target(t).seconds_since(self.osc_epoch).abs() > REOSC_INTERVAL_S
     }
 
-    /// The integration a re-osculation toward `t` needs [s]: from the nearer of the catalogue
-    /// and current conics (what [`World::settle_comets`] orders its work by).
+    /// The conic a re-osculation toward `target` starts from: the nearest in time of the
+    /// checkpoints and the current conic (the current one on a tie).
+    fn start_for(&self, target: Epoch) -> (Epoch, Conic) {
+        let gap = |e: Epoch| target.seconds_since(e).abs();
+        let at = self.checkpoints.partition_point(|(e, _)| e.seconds_since(target) < 0.0);
+        let mut best = (self.osc_epoch, self.osc);
+        for &(e, c) in self.checkpoints[at.saturating_sub(1)..].iter().take(2) {
+            if gap(e) < gap(best.0) {
+                best = (e, c);
+            }
+        }
+        best
+    }
+
+    /// The integration a re-osculation toward `t` needs [s], from [`CometOrbit::start_for`]
+    /// (what [`World::settle_comets`] orders its work by).
     fn work_span_s(&self, t: Epoch) -> f64 {
         let target = self.target(t);
-        let from_osc = target.seconds_since(self.osc_epoch).abs();
-        from_osc.min(target.seconds_since(self.catalogue_epoch).abs())
+        target.seconds_since(self.start_for(target).0).abs()
+    }
+
+    /// Takes the checkpoint nearest the shown date when it is within [`REOSC_INTERVAL_S`] of
+    /// it, which needs no integration; returns whether the conic changed.
+    fn adopt(&mut self, t: Epoch) -> bool {
+        if !self.needs_work(t) {
+            return false;
+        }
+        let target = self.target(t);
+        let (epoch, conic) = self.start_for(target);
+        let near = target.seconds_since(epoch).abs() <= REOSC_INTERVAL_S;
+        if near && epoch != self.osc_epoch {
+            (self.osc, self.osc_epoch) = (conic, epoch);
+            return true;
+        }
+        false
+    }
+
+    /// Keeps the current conic as a checkpoint when no checkpoint is within
+    /// [`CHECKPOINT_SPACING_S`] of it.
+    fn remember(&mut self) {
+        let e = self.osc_epoch;
+        let at = self.checkpoints.partition_point(|(c, _)| c.seconds_since(e) < 0.0);
+        let near = |k: usize| {
+            self.checkpoints
+                .get(k)
+                .is_some_and(|(c, _)| e.seconds_since(*c).abs() < CHECKPOINT_SPACING_S)
+        };
+        if !(near(at) || (at > 0 && near(at - 1))) {
+            self.checkpoints.insert(at, (e, self.osc));
+        }
     }
 
     /// One re-osculation toward the shown date, as far as `chunk` allows; returns whether the
-    /// conic changed. Starts from whichever of the catalogue and current conics is nearer the
-    /// date, and stops within [`REOSC_INTERVAL_S`] of it.
+    /// conic changed. Starts from [`CometOrbit::start_for`], and stops within
+    /// [`REOSC_INTERVAL_S`] of the date.
     fn step(&mut self, t: Epoch, chunk: Chunk) -> bool {
         if !self.needs_work(t) {
             return false;
         }
         let target = self.target(t);
-        let from_osc = target.seconds_since(self.osc_epoch).abs();
-        let from_catalogue = target.seconds_since(self.catalogue_epoch).abs();
-        if from_catalogue < from_osc {
-            self.osc = self.catalogue;
-            self.osc_epoch = self.catalogue_epoch;
-            if from_catalogue <= REOSC_INTERVAL_S {
+        let (start_epoch, start) = self.start_for(target);
+        if start_epoch != self.osc_epoch {
+            self.osc = start;
+            self.osc_epoch = start_epoch;
+            if target.seconds_since(start_epoch).abs() <= REOSC_INTERVAL_S {
                 return true;
             }
         }
         let max_span_s = match chunk {
             Chunk::Whole => f64::INFINITY,
             Chunk::Short => {
-                let r = heliocentric_state_icrs(&self.osc, self.osc_epoch).0.length();
-                // A NaN r (a broken conic) gives the 30-day step: `min` drops a NaN.
-                (REOSC_DYN_FRACTION * dynamical_time_s(r))
-                    .min(REOSC_CHUNK_S)
-                    .max(REOSC_MIN_CHUNK_S)
+                let r = heliocentric_state_icrs(&self.osc, self.osc_epoch).0;
+                short_span_s(r, self.osc_epoch)
             }
         };
         let span = target
@@ -537,6 +619,7 @@ impl CometOrbit {
         if next.q_m.is_finite() && next.q_m > 0.0 && next.e.is_finite() {
             self.osc = next;
             self.osc_epoch = to;
+            self.remember();
         } else {
             self.failed = true;
         }
@@ -632,6 +715,9 @@ pub struct World {
     pub(crate) star_index: StarIndex,
     /// The registry object of a star, by star index.
     pub(crate) star_objects: HashMap<u32, ObjectId>,
+    /// Unnamed catalogue stars a snapshot or [`World::nearest_surface`] found within 0.1 pc,
+    /// registered as objects at the next tick (review I1).
+    unnamed_near: Mutex<Vec<u32>>,
     exo: Vec<ExoSystem>,
     lenses: Vec<Lens>,
     /// Saturn's ring radii (inner, outer) [m].
@@ -669,6 +755,7 @@ impl World {
             archive_teff: HashMap::new(),
             star_index: StarIndex::new(&[]),
             star_objects: HashMap::new(),
+            unnamed_near: Mutex::new(Vec::new()),
             exo: Vec::new(),
             lenses: Vec::new(),
             ring_m: SATURN_RINGS_DEFAULT_M,
@@ -1130,15 +1217,48 @@ impl World {
     }
 
     /// Catalogue stars within [`NEAR_STAR_PC`] of `pos`, nearest first, at most
-    /// [`MAX_NEAR_STARS`]: (star index, its registry object: a named star's or an exoplanet
-    /// host's, `None` for an unnamed star).
+    /// [`MAX_NEAR_STARS`]: (star index, its registry object, `None` for an unnamed star not
+    /// registered yet). Each such unnamed star is registered at the next tick (review I1).
     pub(crate) fn near_stars(&self, pos: &UniversePos) -> Vec<(u32, Option<ObjectId>)> {
         let p_pc = pos.delta_from(UniversePos::default()) / PC;
-        self.star_index
+        let near: Vec<(u32, Option<ObjectId>)> = self
+            .star_index
             .within(&self.stars, p_pc, self.star_years(), NEAR_STAR_PC, MAX_NEAR_STARS)
             .into_iter()
             .map(|(index, _)| (index, self.star_objects.get(&index).copied()))
-            .collect()
+            .collect();
+        if near.iter().any(|(_, id)| id.is_none()) {
+            let mut pending = self.unnamed_near.lock().unwrap_or_else(PoisonError::into_inner);
+            for &(index, _) in near.iter().filter(|(_, id)| id.is_none()) {
+                if !pending.contains(&index) {
+                    pending.push(index);
+                }
+            }
+        }
+        near
+    }
+
+    /// Registers the unnamed catalogue stars found near a camera since the last tick (review
+    /// I1): one `Star` object each, named "AT-HYG <id>" by its AT-HYG v4.0 id (the catalogue's
+    /// `id` column), so it can become a star surface and its photosphere a nearest surface.
+    /// Ids already handed out never change; the registry only grows.
+    fn register_near_stars(&mut self) {
+        let pending = std::mem::take(
+            self.unnamed_near
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        for index in pending {
+            let Some(star) = self.stars.get(index as usize) else {
+                continue;
+            };
+            if self.star_objects.contains_key(&index) {
+                continue;
+            }
+            let name = format!("AT-HYG {}", star.athyg_id());
+            let id = self.push_star(index, ObjectKind::Star, &[&name]);
+            self.star_objects.insert(index, id);
+        }
     }
 
     /// Re-evaluates every cached position at `self.epoch`: one source evaluation per body.
@@ -1185,29 +1305,38 @@ impl World {
         sum
     }
 
-    /// Short comet re-osculation steps at the cached epoch while under `budget_s` of wall time,
-    /// and at least one while any comet is stale; each is for the stale comet nearest the Sun
-    /// (by its cached position; ties to the lower index), whose cached position then follows
-    /// its new conic.
-    fn reosculate_comets(&mut self, budget_s: f64) {
+    /// This tick's comet work at the cached epoch (review r1 N1): every stale comet with a
+    /// checkpoint within 30 days of the date takes it (no integration); then at most
+    /// [`REOSC_STEPS_PER_TICK`] short steps, for the stale comets nearest the Sun (by cached
+    /// position; ties to the lower index), each taking `REOSC_STEPS_PER_TICK / n` steps (n
+    /// stale comets), at least one and at most [`REOSC_STEPS_PER_COMET`]. The changed comets'
+    /// cached positions then follow their new conics. Which comets step, and how far, depends
+    /// only on the world's state, never on the machine (review r1 N2).
+    fn reosculate_comets(&mut self) {
         let t = self.epoch;
         let sun = self.sun.map_or(UniversePos::default(), |s| self.cached[s as usize]);
-        let clock = Instant::now();
-        loop {
-            let nearest = (0..self.comets.len())
-                .filter(|&k| self.comets[k].needs_work(t))
-                .map(|k| {
-                    let id = self.comet_objects[k] as usize;
-                    (self.cached[id].delta_from(sun).length_squared(), k)
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            let Some((_, k)) = nearest else { break };
-            if self.comets[k].step(t, Chunk::Short) {
+        for k in 0..self.comets.len() {
+            if self.comets[k].adopt(t) {
                 self.place_comet(k, sun);
             }
-            if clock.elapsed().as_secs_f64() >= budget_s {
-                break;
-            }
+        }
+        let mut stale: Vec<(f64, usize)> = (0..self.comets.len())
+            .filter(|&k| self.comets[k].needs_work(t))
+            .map(|k| {
+                let id = self.comet_objects[k] as usize;
+                (self.cached[id].delta_from(sun).length_squared(), k)
+            })
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        stale.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        stale.truncate(REOSC_STEPS_PER_TICK);
+        let steps = (REOSC_STEPS_PER_TICK / stale.len()).clamp(1, REOSC_STEPS_PER_COMET);
+        let jobs: Vec<(usize, usize)> = stale.iter().map(|&(_, k)| (k, steps)).collect();
+        run_comet_jobs(&mut self.comets, &jobs, t, Chunk::Short);
+        for (k, _) in jobs {
+            self.place_comet(k, sun);
         }
     }
 
@@ -1218,17 +1347,49 @@ impl World {
             self.cached[self.comet_objects[k] as usize] = add_rel(sun, helio);
         }
     }
+}
 
-    /// The largest gap [s] between a comet's conic epoch and its re-osculation target at the
-    /// cached epoch, over the comets that can still be re-osculated.
-    fn comet_backlog_s(&self) -> f64 {
-        let t = self.epoch;
-        self.comets
-            .iter()
-            .filter(|c| !c.failed)
-            .map(|c| c.target(t).seconds_since(c.osc_epoch).abs())
-            .fold(0.0, f64::max)
+/// Runs comet re-osculation `jobs` (comet index, most steps) toward `t`, each job's steps one
+/// after another on one thread, the jobs handed out in order (one at a time, from a shared
+/// queue) to up to [`std::thread::available_parallelism`] threads: the calling thread and
+/// scoped helpers (ruling 3). The result does not depend on the thread count or on which thread
+/// ran a job. A helper's panic is re-raised.
+fn run_comet_jobs(comets: &mut [CometOrbit], jobs: &[(usize, usize)], t: Epoch, chunk: Chunk) {
+    let mut slots: Vec<Option<&mut CometOrbit>> = comets.iter_mut().map(Some).collect();
+    // Reversed, so `pop` hands out the first job first. A repeated index runs once.
+    let queue: Vec<(&mut CometOrbit, usize)> = jobs
+        .iter()
+        .rev()
+        .filter_map(|&(k, steps)| Some((slots.get_mut(k)?.take()?, steps)))
+        .collect();
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(queue.len());
+    let queue = Mutex::new(queue);
+    let work = || {
+        loop {
+            let job = queue.lock().unwrap_or_else(PoisonError::into_inner).pop();
+            let Some((comet, steps)) = job else { break };
+            for _ in 0..steps {
+                if !comet.step(t, chunk) {
+                    break;
+                }
+            }
+        }
+    };
+    if workers <= 1 {
+        work();
+        return;
     }
+    std::thread::scope(|scope| {
+        let helpers: Vec<_> = (1..workers).map(|_| scope.spawn(&work)).collect();
+        work();
+        for helper in helpers {
+            if let Err(panic) = helper.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
 }
 
 /// An exoplanet host built from the archive's RA, Dec, distance, V and T_eff (review I11):
@@ -1280,22 +1441,19 @@ fn mean_radius(radii: DVec3) -> f64 {
 
 impl World {
     /// Advances time by `dt_real_s` of wall time and refreshes the cached states. Also picks
-    /// up an epoch set directly on [`World::time`], and keeps the comets' conics near the date
-    /// (module doc), paused or not: a settle after a date jump or a fast warp while the clock
-    /// is slow, else short steps within this tick's wall-time budget.
+    /// up an epoch set directly on [`World::time`], registers the unnamed stars a camera came
+    /// within 0.1 pc of, and moves the comets' conics toward the date by a fixed amount of work,
+    /// paused or not (module doc). It never runs a whole settle: after a date jump the comets
+    /// catch up over the following ticks, nearest the Sun first.
     pub fn tick(&mut self, dt_real_s: f64) {
         self.time.advance(dt_real_s);
+        self.register_near_stars();
         let t = self.time.epoch();
         if t != self.epoch {
             self.epoch = t;
             self.refresh_states();
         }
-        let slow = self.time.is_paused() || self.time.rate().abs() <= SETTLE_MAX_RATE;
-        if slow && self.comet_backlog_s() > SETTLE_BACKLOG_S {
-            self.settle_comets();
-        } else {
-            self.reosculate_comets(REOSC_TICK_BUDGET_S);
-        }
+        self.reosculate_comets();
     }
 
     /// The epoch of the cached states: `time.epoch()` as of the last [`World::tick`].
@@ -1384,8 +1542,9 @@ impl World {
 
     /// The nearest body surface and the distance to it [m] (negative inside): every Solar
     /// System body (triaxial bodies along the direction to `pos`), TestBH-1's horizon, and the
-    /// photospheres of registry stars within 0.1 pc. An unnamed star has no [`ObjectId`] to
-    /// report, so its photosphere is not offered (the A0b signature; review I1).
+    /// photospheres of catalogue stars within 0.1 pc. An unnamed star found here for the first
+    /// time has no [`ObjectId`] yet; it is registered at the next [`World::tick`] and offered
+    /// from then on (review I1).
     pub fn nearest_surface(&self, pos: &UniversePos) -> Option<(ObjectId, f64)> {
         self.nearest_surface_among(pos, &self.near_stars(pos))
     }
@@ -1523,17 +1682,19 @@ impl World {
         }
     }
 
-    /// Re-osculates every comet that needs it at [`World::epoch`] now: one perturbed
-    /// integration per comet, from the nearer of its catalogue and current conics, spread over
-    /// the CPU cores with `std::thread::scope` (ruling 3). The longest integrations are handed
-    /// out first, one comet at a time, so one slow comet does not hold back a whole share.
-    /// [`World::new`] and slow ticks after a date jump or a fast warp call it (module doc);
-    /// captures may call it to be sure.
+    /// Re-osculates every comet that needs it at [`World::epoch`] now, blocking: one perturbed
+    /// integration per comet, from the nearest in time of its catalogue conic, the conics it
+    /// reached before and its current conic, spread over the CPU cores with
+    /// `std::thread::scope` (ruling 3). The longest integrations are handed out first, one comet
+    /// at a time, so one slow comet does not hold back a whole share. [`World::new`] calls it;
+    /// [`World::tick`] never does. A capture calls it after setting each bookmark's epoch, so
+    /// its comets do not depend on the frames before it (review r1 N2).
     ///
     /// The cost grows with the integration: the baked catalogue's 512 comets all have epochs at
-    /// least a year from 2026-11-20, 6694 comet-years in all, which took 230 s of CPU (34 ms
-    /// per comet-year; 3D/Biela's 194 years alone 9.1 s) and 29 s on the M3's 8 cores in the
-    /// debug build, where uni-physics is not optimised. Release is unmeasured.
+    /// least a year from 2026-11-20, 6694 comet-years in all. On the M3's 8 cores that settle
+    /// took 29 s in the debug build (230 s of CPU; 3D/Biela's 194 years alone 9.1 s) and 7.4 s
+    /// with uni-physics and uni-core at opt-level 3; a 30-year jump took 42 s and 10.9 s.
+    /// The release build is the gate's to measure.
     pub fn settle_comets(&mut self) {
         let t = self.epoch;
         let mut work: Vec<(f64, usize)> = self
@@ -1543,35 +1704,11 @@ impl World {
             .filter(|(_, c)| c.needs_work(t))
             .map(|(k, c)| (c.work_span_s(t), k))
             .collect();
-        if work.is_empty() {
-            return;
-        }
         work.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let next = AtomicUsize::new(0);
-        let (comets, work, next) = (&self.comets, &work, &next);
-        let settled: Vec<(usize, CometOrbit)> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..cores.min(work.len()))
-                .map(|_| {
-                    scope.spawn(move || {
-                        let mut done = Vec::new();
-                        while let Some(&(_, k)) = work.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let mut comet = comets[k].clone();
-                            while comet.step(t, Chunk::Whole) {}
-                            done.push((k, comet));
-                        }
-                        done
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
-                .collect()
-        });
+        let jobs: Vec<(usize, usize)> = work.iter().map(|&(_, k)| (k, usize::MAX)).collect();
+        run_comet_jobs(&mut self.comets, &jobs, t, Chunk::Whole);
         let sun = self.sun.map_or(UniversePos::default(), |s| self.cached[s as usize]);
-        for (k, comet) in settled {
-            self.comets[k] = comet;
+        for (k, _) in jobs {
             self.place_comet(k, sun);
         }
     }
@@ -2236,50 +2373,86 @@ mod tests {
         assert!(shift > 0.01, "perturbations move Halley by {shift} of r");
     }
 
-    /// Review I3: a date jump is settled at the next tick while the clock is slow. Under a fast
-    /// warp the comets follow in short budgeted steps instead (at least one per tick), and the
-    /// tick after the warp ends settles them.
-    #[test]
-    fn comets_settle_after_date_jumps_and_fast_warps() {
-        let (halley, neowise) = halley_and_neowise();
-        let t0 = date("1986-03-13T00:00:00Z");
-        let mut world = World::new(WorldData { comets: vec![halley, neowise], ..empty_data() }, t0);
-        let (h, n) = (comet_index(&world, "1P/Halley"), comet_index(&world, "C/2020 F3 (NEOWISE)"));
-        let (osc_1986, epoch_1986) = (world.comets[h].osc, world.comets[h].osc_epoch);
-        // A 34-year jump at real time: settled by the next tick.
-        world.time.set_epoch(date("2020-07-15T03:00:00Z"));
-        world.tick(1.0 / 60.0);
-        let t1 = world.epoch();
-        assert!(world.comets.iter().all(|c| !c.needs_work(t1)), "settled after the jump");
-        // NEOWISE is nine days from its catalogue epoch: its catalogue conic, no integration.
-        assert_eq!(world.comets[n].osc_epoch, world.comets[n].catalogue_epoch);
-        // Halley went on from its 1986 conic (nearer than 1968's) in one integration.
-        let want = heliocentric_state_icrs(&osculate_at(&osc_1986, epoch_1986, t1), t1).0;
-        let err = (helio(&world, "1P/Halley") - want).length();
-        assert!(err < 1.0, "{err} m");
-        // A fast warp (×10¹⁰: 5.3 years per tick): no settle, but at least one short step.
-        world.time.set_rate(1.0e10);
-        let before: Vec<Epoch> = world.comets.iter().map(|c| c.osc_epoch).collect();
-        world.tick(1.0 / 60.0);
-        let t2 = world.epoch();
-        assert!((t2.seconds_since(t1) / YEAR_S - 5.28).abs() < 0.01);
-        assert!(world.comets.iter().any(|c| c.needs_work(t2)), "not settled under a fast warp");
-        let stepped = world.comets.iter().zip(&before).filter(|(c, e)| c.osc_epoch != **e).count();
-        assert!(stepped >= 1, "a step every tick");
-        // The warp ends: the next tick settles.
-        world.time.set_rate(1.0);
-        world.tick(1.0 / 60.0);
-        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())), "settled");
-        // Paused, a jump also settles at the next tick.
-        world.time.toggle_pause();
-        world.time.set_epoch(date("1996-01-01T00:00:00Z"));
-        world.tick(1.0 / 60.0);
-        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())), "settled");
+    /// Ticks until Halley (comet `h`) needs no work; returns how many it took.
+    fn tick_until_settled(world: &mut World, h: usize) -> usize {
+        let mut ticks = 0;
+        while world.comets[h].needs_work(world.epoch()) {
+            world.tick(1.0 / 60.0);
+            ticks += 1;
+            assert!(ticks < 20_000, "no convergence");
+        }
+        ticks
     }
 
-    /// Review I3: a budgeted (per-tick) step integrates at most `REOSC_DYN_FRACTION` of the
-    /// dynamical time at its start, so a step near perihelion stays short and cheap; far out it
-    /// is the full 30 days. Chunked steps reproduce one integration to the same epoch.
+    /// Review r1 N1: a tick never settles. After a date jump each tick moves a comet's conic
+    /// by at most `REOSC_STEPS_PER_COMET` short steps, at real time, paused or under a warp, so
+    /// the comets catch up over the following ticks and end within metres of one integration. A
+    /// return to a date reached before needs no integration, and a date near one needs a few
+    /// steps (checkpoints). Review r1 N2: the same ticks give the same conics, bit for bit.
+    #[test]
+    fn comets_catch_up_after_date_jumps_without_stalling() {
+        let (halley, neowise) = halley_and_neowise();
+        let t0 = date("1986-03-13T00:00:00Z");
+        let data = || WorldData { comets: vec![halley.clone(), neowise.clone()], ..empty_data() };
+        let mut world = World::new(data(), t0);
+        let (h, n) = (comet_index(&world, "1P/Halley"), comet_index(&world, "C/2020 F3 (NEOWISE)"));
+        let (osc_1986, epoch_1986) = (world.comets[h].osc, world.comets[h].osc_epoch);
+        assert!(epoch_1986.seconds_since(t0).abs() < 1e-3, "settled at construction");
+        let most = REOSC_STEPS_PER_COMET as f64 * REOSC_CHUNK_S * (1.0 + 1e-12);
+        // Every history below, replayed on a second world, gives bit-identical conics.
+        let history = |world: &mut World| {
+            // A 34-year jump at real time: one tick moves Halley by at most three steps.
+            world.time.set_epoch(date("2020-07-15T03:00:00Z"));
+            let before = world.comets[h].osc_epoch;
+            world.tick(1.0 / 60.0);
+            let moved = world.comets[h].osc_epoch.seconds_since(before);
+            assert!(moved > 0.0 && moved <= most, "{} days", moved / DAY);
+            assert!(world.comets[h].needs_work(world.epoch()), "a tick never settles");
+            // NEOWISE is nine days from its catalogue epoch: its catalogue conic, at once.
+            assert_eq!(world.comets[n].osc_epoch, world.comets[n].catalogue_epoch);
+            let ticks = 1 + tick_until_settled(world, h);
+            // A fast warp (×10¹⁰: 5.3 years per tick) leaves it behind by design.
+            world.time.set_rate(1.0e10);
+            let before = world.comets[h].osc_epoch;
+            world.tick(1.0 / 60.0);
+            let moved = world.comets[h].osc_epoch.seconds_since(before);
+            assert!(moved > 0.0 && moved <= most, "{} days under the warp", moved / DAY);
+            assert!(world.comets[h].needs_work(world.epoch()));
+            // Back to the start date, paused: the checkpoint, no integration.
+            world.time.set_rate(1.0);
+            world.time.toggle_pause();
+            world.time.set_epoch(t0);
+            world.tick(1.0 / 60.0);
+            assert!(!world.comets[h].needs_work(world.epoch()));
+            assert_eq!((world.comets[h].osc_epoch, world.comets[h].osc), (epoch_1986, osc_1986));
+            // To 1996, inside the span caught up above: a few steps from the nearest checkpoint.
+            world.time.set_epoch(date("1996-01-01T00:00:00Z"));
+            let near = tick_until_settled(world, h);
+            assert!(near <= 6, "{near} ticks from a checkpoint");
+            ticks
+        };
+        let ticks = history(&mut world);
+        // The chunked catch-up to 2020 matches one integration from the 1986 conic.
+        world.time.set_epoch(date("2020-07-15T03:00:00Z"));
+        world.tick(1.0 / 60.0);
+        tick_until_settled(&mut world, h);
+        let (osc, at) = (world.comets[h].osc, world.comets[h].osc_epoch);
+        let one = osculate_at(&osc_1986, epoch_1986, at);
+        let err = (heliocentric_state_icrs(&osc, at).0 - heliocentric_state_icrs(&one, at).0)
+            .length();
+        assert!(err < 10.0, "{err} m after {ticks} ticks");
+        println!("Halley 1986 → 2020 caught up in {ticks} ticks, {err:.2} m from one run");
+        let mut again = World::new(data(), t0);
+        history(&mut again);
+        again.time.set_epoch(date("2020-07-15T03:00:00Z"));
+        again.tick(1.0 / 60.0);
+        tick_until_settled(&mut again, h);
+        assert_eq!((again.comets[h].osc_epoch, again.comets[h].osc), (at, osc), "deterministic");
+    }
+
+    /// Review I3, r1 N1: a tick step integrates `REOSC_CHUNK_STEPS` of the integrator's steps
+    /// at its start, so a step near perihelion stays short and cheap; far out it is the full
+    /// 16 days. Chunked steps reproduce one integration to the same epoch.
     #[test]
     fn comet_steps_stay_short_near_the_sun() {
         let (halley, _) = halley_and_neowise();
@@ -2287,35 +2460,50 @@ mod tests {
         let mut comet = CometOrbit::new(&halley);
         let t = date("1986-03-13T00:00:00Z");
         let (mut steps, mut shortest, mut longest) = (0, f64::INFINITY, 0.0_f64);
-        let mut slowest = 0.0_f64;
+        let (mut slowest, mut total) = (0.0_f64, 0.0);
         loop {
             let start = comet.osc_epoch;
-            let r = heliocentric_state_icrs(&comet.osc, start).0.length();
-            let limit = (REOSC_DYN_FRACTION * dynamical_time_s(r)).min(REOSC_CHUNK_S);
+            let r = heliocentric_state_icrs(&comet.osc, start).0;
+            let limit = short_span_s(r, start);
+            // At most eight of the integrator's RK4 steps by the Sun's dynamical time alone
+            // (A3's step rule); a planet can only shorten them.
+            let sun_rk4 = (SMALLBODY_STEP_ETA * dynamical_time_s(r.length())).min(2.0 * DAY);
+            assert!(limit <= (8.0 * sun_rk4).max(REOSC_MIN_CHUNK_S) * (1.0 + 1e-12));
             let clock = std::time::Instant::now();
             if !comet.step(t, Chunk::Short) {
                 break;
             }
-            slowest = slowest.max(clock.elapsed().as_secs_f64());
+            let took = clock.elapsed().as_secs_f64();
+            (slowest, total) = (slowest.max(took), total + took);
             let span = comet.osc_epoch.seconds_since(start).abs();
-            assert!(span <= limit.max(REOSC_MIN_CHUNK_S) * (1.0 + 1e-12), "{span} s > {limit} s");
+            assert!(span <= limit * (1.0 + 1e-9), "{span} s > {limit} s");
             (shortest, longest) = (shortest.min(span), longest.max(span));
             steps += 1;
-            assert!(steps < 10_000, "no convergence");
+            assert!(steps < 20_000, "no convergence");
         }
         assert!(t.seconds_since(comet.osc_epoch).abs() <= REOSC_INTERVAL_S);
-        assert_eq!(longest, REOSC_CHUNK_S, "30-day steps far from the Sun");
-        assert!(shortest < 3.0 * DAY, "{} days near perihelion", shortest / DAY);
+        assert_eq!(longest, REOSC_CHUNK_S, "16-day steps far from the Sun");
+        assert!(shortest < 0.5 * DAY, "{} days near perihelion", shortest / DAY);
+        // 0.05 AU from Jupiter's barycentre its pull sets the step, as in the integrator:
+        // √(d³/GM_J) = 63 days there, against 4.3 years for the Sun at 5.2 AU.
+        let jupiter = standish::heliocentric_state_icrs(Planet::Jupiter, t).0;
+        let close = jupiter + DVec3::new(0.0, 0.05 * AU, 0.0);
+        let gm = system_gm_m3s2(Planet::Jupiter.barycentre_id()).expect("Jupiter's GM");
+        let want = SMALLBODY_STEP_ETA * ((0.05 * AU).powi(3) / gm).sqrt();
+        assert!((smallbody_rk4_step_s(close, t) / want - 1.0).abs() < 1e-9);
+        assert!(short_span_s(close, t) < 0.1 * short_span_s(jupiter * 1.1, t));
         let one = osculate_at(&catalogue, epoch_from_jd(halley.epoch_jd_tdb), comet.osc_epoch);
         let err = (heliocentric_state_icrs(&comet.osc, t).0 - heliocentric_state_icrs(&one, t).0)
             .length();
-        // Each restart's conic round trip costs ≈ 2 cm.
+        // Each restart's conic round trip costs ≈ 2 cm; the steps' own rounding of the RK4
+        // grid adds a little (A3's integrator error is < 1 km over these 18 years).
         assert!(err < 10.0, "{steps} chunks vs one integration: {err} m");
         println!(
-            "Halley 1968 → 1986 in {steps} short steps ({:.2}–{:.0} days), slowest {:.2} ms \
-             (debug build)",
+            "Halley 1968 → 1986 in {steps} short steps ({:.2}–{:.0} days), {err:.2} m from one \
+             integration, mean {:.3} ms, slowest {:.3} ms (unoptimised uni-sim test build)",
             shortest / DAY,
             longest / DAY,
+            total / f64::from(steps) * 1e3,
             slowest * 1e3
         );
     }
@@ -2470,37 +2658,80 @@ mod tests {
         assert_eq!(world.find("Hygiea"), None, "no H: not H ≤ 10");
     }
 
-    /// Plan A4 (review I1): an unnamed catalogue star (no registry object) within 0.1 pc is
-    /// taken out of the star pass and drawn by the snapshot from f64 positions, once. It stays a
-    /// point even where it would resolve: `StarSurfaceView::id` is not optional (A0b stub,
-    /// escalated). Beyond 0.1 pc the star pass draws it.
+    /// Plan A4 (review I1): an unnamed catalogue star within 0.1 pc leaves the star pass and is
+    /// drawn by the snapshot from f64 positions, once. The first snapshot that finds it near
+    /// draws it as a point without an id; the next tick registers it ("AT-HYG <id>"), and from
+    /// then on it resolves into `star_surfaces` at ≥ `POINT_LOD_PX` and its photosphere is the
+    /// nearest surface. Beyond 0.1 pc the star pass draws it and it is never registered.
     #[test]
-    fn unnamed_near_star_leaves_the_star_pass() {
+    fn unnamed_near_star_resolves_after_a_tick() {
         let mut data = empty_data();
-        data.stars = vec![Star3::new([2.0, 0.0, 0.0], 4.83, [0.0; 3], 0.65, 1, 0)];
-        let world = fake_world(vec![(10, None, DVec3::ZERO)], data);
+        data.stars = vec![
+            Star3::new([2.0, 0.0, 0.0], 4.83, [0.0; 3], 0.65, 4711, 0),
+            Star3::new([-3.0, 0.0, 0.0], 4.83, [0.0; 3], 0.65, 4712, 0),
+        ];
+        let mut world = fake_world(vec![(10, None, DVec3::ZERO)], data);
+        let objects = world.objects().len();
         assert!(world.objects().iter().all(|o| o.catalog_index.is_none()), "not an object");
         let centre = world.star_position(0);
         let radius = world.star_radius_m(0);
         assert!((radius / R_SUN_M - 1.0).abs() < 0.2, "{radius} m");
-        for (d, resolves) in [(0.05 * PC, false), (0.5 * AU, true)] {
-            let view = looking_at(centre.offset(DVec3::new(0.0, d, 0.0)), centre, 60.0);
-            let px = proj_radius_px(radius, d, view.fov_y_rad, f64::from(VIEWPORT.y));
-            assert_eq!(px >= POINT_LOD_PX, resolves, "{px} px");
-            let snap = world.snapshot(&view, VIEWPORT);
-            assert_eq!(snap.suppressed_stars, vec![0], "d = {d:e} m");
-            assert!(snap.star_surfaces.is_empty(), "no object id to resolve it under");
-            let points: Vec<_> = snap.points.iter().filter(|p| p.id.is_none()).collect();
-            assert_eq!(points.len(), 1, "d = {d:e} m");
-            assert!((points[0].rel_pos_m - DVec3::new(0.0, -d, 0.0)).length() < 1.0);
-            // The catalogue holds M_V as f32.
-            let want = luminous_intensity_cd(f64::from(4.83_f32)) / (d * d);
-            assert!((points[0].illuminance_lux / want - 1.0).abs() < 1e-9);
-        }
-        let far = looking_at(centre.offset(DVec3::new(0.0, 0.2 * PC, 0.0)), centre, 60.0);
-        let snap = world.snapshot(&far, VIEWPORT);
+        let at = |d: f64| looking_at(centre.offset(DVec3::new(0.0, d, 0.0)), centre, 60.0);
+        // Never near: the star pass draws it, and nothing is registered.
+        let snap = world.snapshot(&at(0.2 * PC), VIEWPORT);
         assert!(snap.suppressed_stars.is_empty(), "the star pass draws it");
         assert!(snap.points.iter().all(|p| p.id.is_some()));
+        world.tick(1.0 / 60.0);
+        assert_eq!(world.objects().len(), objects);
+        // 0.5 AU (8.7 px): resolved size, but no object yet, so a point without an id.
+        let d = 0.5 * AU;
+        let px = proj_radius_px(radius, d, 60f64.to_radians(), f64::from(VIEWPORT.y));
+        assert!(px >= POINT_LOD_PX, "{px} px");
+        let snap = world.snapshot(&at(d), VIEWPORT);
+        assert_eq!(snap.suppressed_stars, vec![0]);
+        assert!(snap.star_surfaces.is_empty(), "registered at the next tick");
+        let points: Vec<_> = snap.points.iter().filter(|p| p.id.is_none()).collect();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].rel_pos_m - DVec3::new(0.0, -d, 0.0)).length() < 1.0);
+        // The catalogue holds M_V as f32.
+        let intensity = luminous_intensity_cd(f64::from(4.83_f32));
+        assert!((points[0].illuminance_lux / (intensity / (d * d)) - 1.0).abs() < 1e-9);
+        // The tick registers it, under its AT-HYG id; ids given before do not move.
+        world.tick(1.0 / 60.0);
+        assert_eq!(world.objects().len(), objects + 1);
+        let id = id_of(&world, "at-hyg 4711");
+        assert_eq!(id as usize, objects);
+        let info = &world.objects()[id as usize];
+        assert_eq!((info.kind, info.catalog_index), (ObjectKind::Star, Some(0)));
+        assert_eq!(info.radii_m, DVec3::splat(radius));
+        assert_eq!(world.position(id), centre);
+        // Now it resolves, drawn once, and its photosphere is the nearest surface.
+        let snap = world.snapshot(&at(d), VIEWPORT);
+        assert_eq!(snap.suppressed_stars, vec![0]);
+        assert_eq!(snap.star_surfaces.len(), 1);
+        let surface = &snap.star_surfaces[0];
+        assert_eq!((surface.id, surface.catalog_index), (id, Some(0)));
+        assert_eq!((surface.radius_m, surface.proj_radius_px), (radius, px));
+        assert!((surface.luminous_intensity_cd / intensity - 1.0).abs() < 1e-12);
+        assert!(snap.points.iter().all(|p| p.id.is_some()), "never also a point");
+        let (near_id, altitude) = snap.nearest_surface.expect("a surface");
+        assert_eq!(near_id, id);
+        assert!((altitude - (d - radius)).abs() < 1.0, "{altitude}");
+        // 0.05 pc: a point again, now with its id.
+        let snap = world.snapshot(&at(0.05 * PC), VIEWPORT);
+        assert!(snap.star_surfaces.is_empty());
+        assert_eq!(snap.points.iter().filter(|p| p.id == Some(id)).count(), 1);
+        // `nearest_surface` notes a star too; a second notice registers it only once.
+        let other = world.star_position(1).offset(DVec3::new(AU, 0.0, 0.0));
+        let sun = id_of(&world, "Sun");
+        assert_eq!(world.nearest_surface(&other).map(|(s, _)| s), Some(sun), "not yet");
+        world.snapshot(&looking_along(other, DVec3::X), VIEWPORT);
+        world.tick(1.0 / 60.0);
+        assert_eq!(world.objects().len(), objects + 2);
+        let second = id_of(&world, "AT-HYG 4712");
+        let (s, altitude) = world.nearest_surface(&other).expect("a surface");
+        assert_eq!(s, second);
+        assert!((altitude - (AU - world.star_radius_m(1))).abs() < 1.0);
     }
 
     /// Altitude over an oblate body follows the ellipsoid: 100 km over the Earth's pole and
@@ -2580,18 +2811,43 @@ mod tests {
         let t0 = std::time::Instant::now();
         world.tick(1.0 / 60.0);
         let tick = t0.elapsed().as_secs_f64();
-        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())));
-        // A one-year jump back: the next tick settles every comet (review I3). The cost grows
-        // with the jump (34 ms of CPU per comet-year here); a 30-year jump took 42 s.
-        world.time.set_epoch(date("2025-11-20T00:00:00Z"));
+        let start = world.epoch();
+        assert!(world.comets.iter().all(|c| !c.needs_work(start)));
+        // Review r1 N1: no tick settles. After a 30-year jump back, and after a warp to the end
+        // of every comet's perturbed span, each tick steps at most REOSC_STEPS_PER_TICK comets.
+        // The first tick after the jump refreshes every state; the timed ones after it (zero
+        // wall time, so the date stays) do the comet work alone.
+        let catch_up = |world: &mut World| {
+            world.tick(1.0 / 60.0);
+            let mut slowest: f64 = 0.0;
+            for _ in 0..30 {
+                let before: Vec<Epoch> = world.comets.iter().map(|c| c.osc_epoch).collect();
+                let t0 = std::time::Instant::now();
+                world.tick(0.0);
+                slowest = slowest.max(t0.elapsed().as_secs_f64());
+                let moved = world.comets.iter().zip(&before).filter(|(c, e)| c.osc_epoch != **e);
+                assert!(moved.count() <= REOSC_STEPS_PER_TICK);
+            }
+            assert!(world.comets.iter().any(|c| c.needs_work(world.epoch())), "never settled");
+            slowest
+        };
+        world.time.set_epoch(date("1996-11-20T00:00:00Z"));
+        let jump = catch_up(&mut world);
+        world.time.set_rate(1.0e12);
+        world.tick(1.0 / 60.0);
+        world.time.set_rate(1.0);
+        let warp = catch_up(&mut world);
+        // Back to the start date: every comet takes its start-date checkpoint in one tick.
+        world.time.set_epoch(start);
         let t0 = std::time::Instant::now();
         world.tick(1.0 / 60.0);
-        let jump = t0.elapsed().as_secs_f64();
-        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())));
+        let back = t0.elapsed().as_secs_f64();
+        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())), "checkpoints");
         println!(
             "{} objects ({} cached, {} comets); load {:.0} ms, World::new {:.0} ms (comets \
-             settled), tick {:.2} ms, tick after a one-year jump {:.0} ms, worst snapshot {:.2} \
-             ms (debug build)",
+             settled), tick {:.2} ms, slowest tick after a 30-year jump {:.2} ms and after a \
+             warp past 200 years {:.2} ms, tick back to the start date {:.2} ms, worst snapshot \
+             {:.2} ms (unoptimised uni-sim test build)",
             world.objects().len(),
             world.cached.len(),
             world.comets.len(),
@@ -2599,9 +2855,11 @@ mod tests {
             built * 1e3,
             tick * 1e3,
             jump * 1e3,
+            warp * 1e3,
+            back * 1e3,
             worst * 1e3
         );
+        assert!(back < 0.1, "{back} s");
         assert!(worst < 0.25, "{worst} s");
     }
 }
-
