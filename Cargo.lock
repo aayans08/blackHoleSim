@@ -2781,6 +2781,7 @@ name = "uni-sim"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "log",
  "ron",
  "serde",
  "uni-core",
