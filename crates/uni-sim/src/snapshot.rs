@@ -2,9 +2,13 @@
 //! camera-relative in f64 [m], ICRS axes.
 //!
 //! Each Solar System body is in `bodies` when it projects to at least [`POINT_LOD_PX`], else
-//! in `points` (when on screen), never both (Review Focus 4). The Sun and registry stars within
-//! 0.1 pc go to `star_surfaces` or `points` the same way, and those stars' catalogue indices to
-//! `suppressed_stars`. Points and picks off screen are left out.
+//! in `points` (when on screen), never both (Review Focus 4). The Sun and the registry stars
+//! (named stars, exoplanet hosts) within 0.1 pc go to `star_surfaces` or `points` the same
+//! way. An unnamed catalogue star within 0.1 pc goes to `points` (with no id) at every
+//! distance: [`StarSurfaceView::id`] is not optional (A0b stub; review I1, escalated), so it
+//! cannot be resolved, but it is drawn once, from f64 positions, and never by the star pass.
+//! Every near star's catalogue index goes to `suppressed_stars`. Points and picks off screen
+//! are left out.
 
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2, Vec3};
 use uni_core::{
@@ -208,9 +212,10 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     let sun_pos = world.sun.map(|s| world.cached[s as usize]);
     let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
     let sun_cd = sun_intensity_cd();
+    let near = world.near_stars(&cam);
     let mut snap = Snapshot {
         dominant_frame: world.dominant_frame(&cam),
-        nearest_surface: world.nearest_surface(&cam),
+        nearest_surface: world.nearest_surface_among(&cam, &near),
         ..Snapshot::default()
     };
     let pick = |snap: &mut Snapshot, id: ObjectId, rel: DVec3, kind: ObjectKind| {
@@ -273,17 +278,18 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         });
     }
 
-    // Registry stars within 0.1 pc: drawn here instead of by the star pass.
-    for (index, id) in world.near_stars(&cam) {
+    // Catalogue stars within 0.1 pc: drawn here instead of by the star pass. An unnamed one
+    // (no object id) stays a point even where it would resolve (module doc).
+    for &(index, id) in &near {
         let star = world.star_data()[index as usize];
         let rel = world.star_position(index).delta_from(cam);
         let d = rel.length();
-        let radius = world.objects[id as usize].radii_m.x;
+        let radius = world.star_radius_m(index);
         let px = proj_radius_px(radius, d, fov, height);
         let teff = world.star_teff_k(index);
         let intensity = luminous_intensity_cd(f64::from(star.abs_mag_v));
-        if px >= POINT_LOD_PX {
-            snap.star_surfaces.push(StarSurfaceView {
+        match id {
+            Some(id) if px >= POINT_LOD_PX => snap.star_surfaces.push(StarSurfaceView {
                 id,
                 catalog_index: Some(index),
                 rel_pos_m: rel,
@@ -292,14 +298,16 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                 teff_k: teff,
                 luminous_intensity_cd: intensity,
                 proj_radius_px: px,
-            });
-        } else if proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) {
-            snap.points.push(PointView {
-                id: Some(id),
-                rel_pos_m: rel,
-                illuminance_lux: intensity / (d * d),
-                color: blackbody_linear_srgb(teff),
-            });
+            }),
+            _ if proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) => {
+                snap.points.push(PointView {
+                    id,
+                    rel_pos_m: rel,
+                    illuminance_lux: intensity / (d * d),
+                    color: blackbody_linear_srgb(teff),
+                });
+            }
+            _ => {}
         }
         snap.suppressed_stars.push(index);
     }
