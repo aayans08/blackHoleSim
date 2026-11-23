@@ -3,9 +3,10 @@
 // while the camera is inside an atmosphere shell (lead's r0 ruling), with vertex depth from the
 // true distance and compare Greater, so bodies in front hide them.
 //
-// The splat itself (projection, E/Ω(θ) × star_pre(), M0's PSF, the 2-px minimum footprint, the
-// cull) is `splat_vertex` and `psf_weight` from sky/stars3d.wgsl, imported here, so a point and
-// a star of equal illuminance and direction leave the same energy. This pass binds only group 1's
+// The splat itself (projection, E/Ω(θ) × star_pre(), M0's PSF core with B4L's eye halo, the 2-px
+// minimum footprint, the cull) is `splat_vertex` and `psf_weight` from sky/stars3d.wgsl, imported
+// here, so a point and a star of equal illuminance and direction leave the same energy. This
+// pass binds only group 1's
 // `lens_mask` (binding 1, M0's declaration in sky/stars.wgsl, which stars3d.wgsl imports), its
 // own instances (binding 6) and its uniform (binding 7); bindings 0 and 2–5 are the star passes'
 // and unused here.

@@ -10,9 +10,12 @@
 //      where the sector centre comes relative to an anchor near the camera and the uniform
 //      carries camera − anchor (both f64 differences on the CPU, then f32; design §5.2);
 //   3. m = M_V + 5 log10 d − 5, E = 10^(−0.4 (m + 13.99)) lx (Allen 1973);
-//   4. splat_vertex: M0's PSF (imported) sizing at E × twinkle / Ω(θ) × star_pre(), culled below
+//   4. splat_vertex: the eye PSF sizing at E × twinkle / Ω(θ) × star_pre(), culled below
 //      VISIBILITY_CUTOFF (the twinkle is 1 in space; under an atmosphere it follows Young's 1967
-//      scintillation index on a TDB clock, see twinkle_factor);
+//      scintillation index on a TDB clock, see twinkle_factor). The PSF is M0's erf-integrated
+//      core (imported) holding 1 − STARS3D_HALO_FRACTION of the light plus, on every star, the
+//      eye's glare halo (B4L): a Moffat (α = 0.1°) fitted to the CIE general disability glare
+//      equation over 0.3°–3° (stars3d.rs STARS3D_HALO_FRACTION);
 //   5. for a drawn splat only, the colour from B−V through the Planck table, boosted by
 //      vivid_color when the option is on.
 // The fragment stage integrates the PSF over its pixel (erf differences, so the footprint sums
@@ -20,14 +23,14 @@
 //
 //   hdr value = E / Ω(θ) × star_pre() × (1 − r)(1 − g) × PSF weight,  Ω(θ) = Ω_c·cos³θ.
 //
-// M0's PSF is used as M0 wrote it, not copied (review r0 I3): this file imports M0's
-// sky/stars.wgsl for its PSF constants, psf_erf, pixel_coverage, moffat, halo_weight,
-// pixel_solid_angle_off_axis, MIN_CLIP_W, CULLED and its `lens_mask` declaration (group 1,
-// binding 1), which both 3-D passes read. The import also brings M0's own pass (StarInstance,
+// M0's PSF core is used as M0 wrote it, not copied (review r0 I3): this file imports M0's
+// sky/stars.wgsl for its PSF constants, psf_erf, pixel_coverage, pixel_solid_angle_off_axis,
+// MIN_CLIP_W, CULLED and its `lens_mask` declaration (group 1, binding 1), which both 3-D
+// passes read. The 3-D halo is B4L's own (stars3d_moffat, stars3d_halo_weight), not M0's glare. The import also brings M0's own pass (StarInstance,
 // `stars` at binding 0, VsOut, vs_main, fs_main), which no 3-D entry point uses, so wgpu leaves
 // it out of the 3-D pipelines; this file's bindings take 2–5 and the point pass's 6–7, so no two
-// globals of a composed module share a slot. The one PSF function of B4's own is
-// stars3d_footprint_radius_px: M0's footprint_radius_px with the 2-px minimum (review m16).
+// globals of a composed module share a slot. stars3d_footprint_radius_px is M0's
+// footprint_radius_px with the 3-D halo and the 2-px minimum (review m16).
 //
 // CPU twins: crates/uni-sky/src/stars3d.rs (and psf.rs, stars.rs for M0's PSF and solid angle).
 // `shader_constants_match_cpu` keeps the constants equal; `stars3d_points_layouts_match_wgsl`
@@ -84,6 +87,16 @@ struct BvColourLut {
 // CULLED are M0's, from sky/stars.wgsl; crates/uni-sky/src/psf.rs gives their sources.
 // The 3-D pass's smallest footprint radius (review m16; M0's 3 px is unchanged).
 const STARS3D_MIN_RADIUS_PX: f32 = 2.0;
+// The eye's glare halo on every 3-D star (B4L): its share of the light, Moffat α [px] and β.
+// A Moffat with α = 0.1° = 1.8 px at the reference 0.0556° per pixel, β and h fitted to the CIE
+// general disability glare equation (Vos & van den Berg 1999, CIE 146:2002) over 0.3°–3°;
+// sources and fit in stars3d.rs STARS3D_HALO_FRACTION.
+const STARS3D_HALO_FRACTION: f32 = 0.239;
+const STARS3D_HALO_ALPHA_PX: f32 = 1.8;
+const STARS3D_HALO_BETA: f32 = 1.36;
+// The halo's part of a footprint ends at the display's black, AgX's 2^−12.47393 (stars3d.rs
+// STARS3D_HALO_CUTOFF); the core keeps M0's VISIBILITY_CUTOFF.
+const STARS3D_HALO_CUTOFF: f32 = 1.76e-4;
 // 1 km/s in pc per Julian year (IAU 1976 year, IAU 2012 B2 parsec).
 const PC_PER_YR_PER_KMS: f32 = 1.02271217e-6;
 // log10(2) and log2(10): WGSL has log2 and exp2 only.
@@ -97,17 +110,52 @@ const MAX_SPLAT_ENERGY: f32 = 1.0e30;
 const BV_LUT_LEN: u32 = 128u;
 const BV_LUT_MIN: f32 = -0.4;
 const BV_LUT_MAX: f32 = 2.0;
-// Saturation factor of "Vivid star colours · non-physical" (the owner-approved preview's 1.6).
-const VIVID_SATURATION: f32 = 1.6;
+// Saturation factor of "Vivid star colours · non-physical" (stars3d.rs VIVID_SATURATION: the
+// preview's 1.6 times the 1.28 its tone curve added after AgX, rounded up; B4L).
+const VIVID_SATURATION: f32 = 2.2;
 // The twinkle hash's third lane.
 const TWINKLE_SEED: u32 = 0x7f4a7c15u;
 // An unused entry of StarsParams.suppressed.
 const NO_STAR: u32 = 0xffffffffu;
 
-// Footprint radius [px]: where the core and the halo have both fallen below VISIBILITY_CUTOFF,
-// clamped to [STARS3D_MIN_RADIUS_PX, MAX_RADIUS_PX]. M0's footprint_radius_px (sky/stars.wgsl)
-// but for the minimum, which M0 fixes at its own 3 px, so it cannot be called with 2 px.
-// footprint_matches_m0_above_three_px holds the two together above 3 px. Twin of
+// The 3-D halo's Moffat profile with unit energy over the plane [1/px²] (Moffat 1969, A&A 3,
+// 455): (β − 1)/(πα²)(1 + r²/α²)^(−β). Twin of `uni_sky::stars3d::stars3d_moffat`.
+fn stars3d_moffat(r: f32) -> f32 {
+    let a2 = STARS3D_HALO_ALPHA_PX * STARS3D_HALO_ALPHA_PX;
+    return (STARS3D_HALO_BETA - 1.0) / (PI * a2) * pow(1.0 + r * r / a2, -STARS3D_HALO_BETA);
+}
+
+// The windowed halo's energy inside a footprint of `radius` px: (β − 1) [F(u)] from u = 1 to
+// 1 + R²/α², F(u) = k² u^(1−β)/(1 − β) − 2km u^(2−β)/(2 − β) + m² u^(3−β)/(3 − β), m = α²/R²,
+// k = 1 + m. The vertex stage computes it once per splat. Twin of
+// `uni_sky::stars3d::stars3d_halo_energy`.
+fn stars3d_halo_energy(radius: f32) -> f32 {
+    let b = STARS3D_HALO_BETA;
+    let a2 = STARS3D_HALO_ALPHA_PX * STARS3D_HALO_ALPHA_PX;
+    let m = a2 / (radius * radius);
+    let k = 1.0 + m;
+    let u = 1.0 + radius * radius / a2;
+    let f_edge = k * k * pow(u, 1.0 - b) / (1.0 - b) - 2.0 * k * m * pow(u, 2.0 - b) / (2.0 - b)
+        + m * m * pow(u, 3.0 - b) / (3.0 - b);
+    let f_centre = k * k / (1.0 - b) - 2.0 * k * m / (2.0 - b) + m * m / (3.0 - b);
+    return (b - 1.0) * (f_edge - f_centre);
+}
+
+// Halo weight of a pixel whose centre is r px from the star, given inv_energy =
+// 1 / stars3d_halo_energy(radius): stars3d_moffat × the window (1 − r²/R²)², smoothly 0 at the
+// footprint radius, renormalised to unit energy inside it (no ring where the radius is
+// clamped). Twin of `uni_sky::stars3d::stars3d_halo_weight`.
+fn stars3d_halo_weight(r: f32, radius: f32, inv_energy: f32) -> f32 {
+    if (!(r < radius)) {
+        return 0.0;
+    }
+    let window = 1.0 - (r * r) / (radius * radius);
+    return stars3d_moffat(r) * window * window * inv_energy;
+}
+
+// Footprint radius [px]: where the core has fallen below VISIBILITY_CUTOFF and the 3-D halo
+// below STARS3D_HALO_CUTOFF, clamped to [STARS3D_MIN_RADIUS_PX, MAX_RADIUS_PX]: M0's
+// footprint_radius_px (sky/stars.wgsl) with the 3-D halo and the 2-px minimum. Twin of
 // `uni_sky::stars3d::footprint_radius_px`.
 fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     var r = STARS3D_MIN_RADIUS_PX;
@@ -115,10 +163,10 @@ fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     if (core_peak > VISIBILITY_CUTOFF) {
         r = max(r, CORE_SIGMA_PX * sqrt(2.0 * log(core_peak / VISIBILITY_CUTOFF)));
     }
-    let halo_peak = halo_fraction * energy * moffat(0.0);
-    if (halo_peak > VISIBILITY_CUTOFF) {
-        let q = pow(halo_peak / VISIBILITY_CUTOFF, 1.0 / HALO_BETA);
-        r = max(r, HALO_ALPHA_PX * sqrt(q - 1.0));
+    let halo_peak = halo_fraction * energy * stars3d_moffat(0.0);
+    if (halo_peak > STARS3D_HALO_CUTOFF) {
+        let q = pow(halo_peak / STARS3D_HALO_CUTOFF, 1.0 / STARS3D_HALO_BETA);
+        r = max(r, STARS3D_HALO_ALPHA_PX * sqrt(q - 1.0));
     }
     return min(r, MAX_RADIUS_PX);
 }
@@ -127,7 +175,7 @@ fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
 // `uni_sky::stars3d::star_is_visible`.
 fn star_is_visible(energy: f32, halo_fraction: f32) -> bool {
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
-    let halo_peak = halo_fraction * energy * moffat(0.0);
+    let halo_peak = halo_fraction * energy * stars3d_moffat(0.0);
     return core_peak > VISIBILITY_CUTOFF || halo_peak > VISIBILITY_CUTOFF;
 }
 
@@ -239,8 +287,8 @@ struct SplatOut {
     @location(0) @interpolate(flat) centre_px: vec2<f32>,
     // Pre-exposed hdr value per unit PSF weight, before the lens mask: colour·E/Ω(θ)·star_pre().
     @location(1) @interpolate(flat) radiance: vec3<f32>,
-    // x: halo share h; y: footprint radius R [px].
-    @location(2) @interpolate(flat) halo: vec2<f32>,
+    // x: halo share h; y: footprint radius R [px]; z: 1 / the windowed halo's energy inside R.
+    @location(2) @interpolate(flat) halo: vec3<f32>,
 }
 
 fn culled_splat() -> SplatOut {
@@ -248,7 +296,7 @@ fn culled_splat() -> SplatOut {
     out.pos = CULLED;
     out.centre_px = vec2<f32>(0.0);
     out.radiance = vec3<f32>(0.0);
-    out.halo = vec2<f32>(0.0);
+    out.halo = vec3<f32>(0.0);
     return out;
 }
 
@@ -276,9 +324,9 @@ fn splat_vertex(
     let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
     // Display-normalised energy: the footprint's sum of pre-exposed hdr values.
     let energy = min(lux * twinkle * star_pre() / omega, MAX_SPLAT_ENERGY);
-    // The halo share follows the steady illuminance, so it does not switch on and off at the
-    // twinkle rate (review r0 M7).
-    let h = select(0.0, HALO_ENERGY_FRACTION, lux > HALO_MIN_LUX);
+    // Every star has the eye's halo (B4L): the PSF is linear, so its shape never depends on the
+    // star's light (nor switches at the twinkle rate, review r0 M7).
+    let h = STARS3D_HALO_FRACTION;
     if (!star_is_visible(energy, h)) {
         return out_culled;
     }
@@ -292,17 +340,19 @@ fn splat_vertex(
     out.pos = vec4<f32>(ndc + splat_corner(vi) * (radius + 0.5) * 2.0 / size, depth, 1.0);
     out.centre_px = centre;
     out.radiance = colour * energy;
-    out.halo = vec2<f32>(h, radius);
+    out.halo = vec3<f32>(h, radius, 1.0 / stars3d_halo_energy(radius));
     return out;
 }
 
-// PSF weight of pixel `pix` (integer index) for a splat centred at `centre` with halo (h, R):
-// (1 − h)·Gaussian core integrated over the pixel + h·Moffat halo at the pixel's centre.
-fn psf_weight(pix: vec2<f32>, centre: vec2<f32>, halo: vec2<f32>) -> f32 {
+// PSF weight of pixel `pix` (integer index) for a splat centred at `centre` with halo
+// (h, R, 1/energy): (1 − h)·Gaussian core integrated over the pixel + h·windowed 3-D Moffat halo
+// at the pixel's centre.
+fn psf_weight(pix: vec2<f32>, centre: vec2<f32>, halo: vec3<f32>) -> f32 {
     let edge = pix - centre;
     var weight = (1.0 - halo.x) * pixel_coverage(edge.x) * pixel_coverage(edge.y);
     if (halo.x > 0.0) {
-        weight += halo.x * halo_weight(length(pix + vec2<f32>(0.5) - centre), halo.y);
+        let r = length(pix + vec2<f32>(0.5) - centre);
+        weight += halo.x * stars3d_halo_weight(r, halo.y, halo.z);
     }
     return weight;
 }

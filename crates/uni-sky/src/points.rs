@@ -1,7 +1,8 @@
 //! Unresolved bodies, the Sun and near stars drawn as points, pass "points" (Task B4).
 //!
 //! The same PSF as the star pass (`splat_vertex` in `stars3d.wgsl`, which `points.wgsl`
-//! imports: M0's energy-normalised core and halo, the 2-px minimum footprint, the same cull),
+//! imports: M0's energy-normalised core with the eye's glare halo of Task B4L, the 2-px minimum
+//! footprint, the same cull),
 //! from an instance buffer rebuilt per frame from the app's `Vec<PointSprite>`, written
 //! × `star_pre()` × (1 − r) (review m6), with vertex depth from the true distance and compare
 //! `Greater`, so bodies in front hide them. A point and a star of equal illuminance and direction

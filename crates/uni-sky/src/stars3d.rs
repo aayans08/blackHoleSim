@@ -11,13 +11,18 @@
 //! 4. scales E by the twinkle factor (only under an atmosphere, [`StarInput::scintillation`]):
 //!    log-normal, with Young's (1967) naked-eye scintillation index at the zenith, on a TDB
 //!    clock ([`scintillation_index`], [`twinkle_clock`]; approximate, see there);
-//! 5. splats it with M0's energy-normalised PSF (`crate::psf`: erf-integrated Gaussian core,
-//!    Moffat halo above 1e-6 lx of steady light) at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as
-//!    M0 (`crate::stars`), culls it when no pixel would rise above `psf::VISIBILITY_CUTOFF`
-//!    ([`star_is_visible`]), and sizes its quad with [`footprint_radius_px`]: M0's rule with a
-//!    2-px minimum ([`STARS3D_MIN_RADIUS_PX`], review m16). The PSF's WGSL is M0's own:
-//!    `stars3d.wgsl` imports M0's `stars.wgsl` and lays its group-1 bindings out around M0's
-//!    two (review r0 I3; see [`LENS_MASK_BINDING`]);
+//! 5. splats it with an energy-normalised eye PSF at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as
+//!    M0 (`crate::stars`): M0's erf-integrated Gaussian core (`crate::psf`) holding
+//!    1 − [`STARS3D_HALO_FRACTION`] of the light, plus, for every star, the eye's glare halo,
+//!    a Moffat β = 1.5 profile fitted to the CIE general disability glare equation (Task B4L;
+//!    see [`STARS3D_HALO_FRACTION`]). The PSF is linear, so a bright star is not given a bigger
+//!    image: its halo simply rises above the display's black over more pixels (radius ∝ E^⅓),
+//!    and the brightest stars glow while faint ones stay points. It culls the splat when no
+//!    pixel would rise above `psf::VISIBILITY_CUTOFF` ([`star_is_visible`]), and sizes its quad
+//!    with [`footprint_radius_px`] (M0's rule with this halo and a 2-px minimum,
+//!    [`STARS3D_MIN_RADIUS_PX`], review m16). The core's WGSL is M0's own: `stars3d.wgsl`
+//!    imports M0's `stars.wgsl` and lays its group-1 bindings out around M0's two (review r0 I3;
+//!    see [`LENS_MASK_BINDING`]);
 //! 6. for a drawn star only, reads the colour from B−V through a 128-entry Planck table
 //!    (`uni_core::bv_to_teff`, then `uni_core::blackbody_linear_srgb`, luminance 1), boosted by
 //!    [`vivid_color`] while [`StarInput::vivid_colours`] is on.
@@ -56,16 +61,47 @@ use uni_gfx::{
 use wgpu::util::DeviceExt as _;
 
 use crate::STARS3D_WGSL;
-use crate::psf::{
-    CORE_SIGMA_PX, HALO_ALPHA_PX, HALO_BETA, MAX_RADIUS_PX, VISIBILITY_CUTOFF, halo_fraction,
-    moffat,
-};
+use crate::psf::{CORE_SIGMA_PX, MAX_RADIUS_PX, VISIBILITY_CUTOFF};
 use crate::sectors::{SectorTable, centres_rel, sector_centre_pc, sector_of};
 use crate::stars::pixel_solid_angle;
 
 /// Smallest footprint radius of a 3-D star's quad [px] (review m16). M0's
 /// `psf::MIN_RADIUS_PX` (3 px) is unchanged.
 pub const STARS3D_MIN_RADIUS_PX: f32 = 2.0;
+
+/// Share of every 3-D star's light in the eye's glare halo (Task B4L), with
+/// [`STARS3D_HALO_ALPHA_PX`] and [`STARS3D_HALO_BETA`].
+///
+/// The eye's stray-light point-spread function beyond 0.1° is the CIE general disability glare
+/// equation (Vos & van den Berg 1999, CIE 135/1; CIE 146:2002; used as the eye's glare PSF by
+/// Bará & Bao-Varela 2023, Int. J. Sustainable Lighting, arXiv:2212.09103): L_veil/E_glare =
+/// 10/θ³ + (5/θ² + 0.1 p/θ)(1 + (A/62.5)⁴) + 0.0025 p [sr⁻¹], θ in degrees, valid 0.1°–100°;
+/// here for a 25-year-old (A = 25) of average pigmentation (p = 0.5). The halo is a Moffat
+/// profile (Moffat 1969) h·(β − 1)/(πα²)·(1 + θ²/α²)^(−β), its width fixed at α = 0.1°, where
+/// the equation starts and the eye's optical core (≈ 1′) has long ended, and β and h fitted to
+/// the equation (minimax in log) over 0.3°–3°, where a bright star's glow shows: β = 1.36,
+/// h = 0.239, within ±11 % of the equation there (0.73× at 0.2°; `halo_follows_the_cie_glare_
+/// equation`). It holds 0.165 of the light between 0.1° and 3° (the equation: 0.219) and 0.053
+/// inside 0.1° (the equation says nothing there); the equation's light beyond 3° (0.055, a veil
+/// tens of degrees wide) is left to uni-post's bloom. A β = 1.5 fit to the 10/θ³ term alone
+/// gave half the equation's glow at 2°.
+///
+/// The halo is fixed in display pixels, as the eye looking at the screen would see it, at the
+/// reference display of the default view: a 60° field over 1080 lines, 0.0556° per pixel, so
+/// α = 0.1° = 1.8 px. Every star has it (the PSF is linear); a faint star's halo stays below
+/// the display's black.
+pub const STARS3D_HALO_FRACTION: f32 = 0.239;
+/// Moffat width α of the 3-D halo [px]: 0.1° at 0.0556° per pixel ([`STARS3D_HALO_FRACTION`]).
+pub const STARS3D_HALO_ALPHA_PX: f32 = 1.8;
+/// Moffat exponent β of the 3-D halo, fitted with [`STARS3D_HALO_FRACTION`].
+pub const STARS3D_HALO_BETA: f32 = 1.36;
+/// The halo's part of a footprint ends where the halo falls to the display's black: AgX maps
+/// everything at or below 2^−12.47393 = 1.76e-4 (its log2 range's floor, Sobotka; uni-post's
+/// `AGX_MIN_EV`) to code 0. The halo is lowered to 0 at the radius and renormalised inside, so
+/// the star's energy is kept and no edge shows; cutting it at `psf::VISIBILITY_CUTOFF` instead
+/// (2.55 stops lower, which the core keeps) would draw 12-px quads around V = 5 stars whose
+/// halos nobody can see, and cost the stars pass ~3× the fragments.
+pub const STARS3D_HALO_CUTOFF: f32 = 1.76e-4;
 
 /// 1 km/s in pc per Julian year: 10³ m × 365.25 d × 86 400 s (IAU 1976 Julian year) ÷ 1 pc
 /// (IAU 2012 B2) = 1.0227 × 10⁻⁶ (brief).
@@ -87,9 +123,13 @@ pub(crate) const UNKNOWN_BV: f32 = 0.65;
 /// Absolute magnitude packed for a star with a non-finite position or magnitude: its
 /// illuminance underflows to 0 in f32, so the vertex stage culls it and its slot stays valid.
 pub(crate) const INVISIBLE_ABS_MAG: f32 = 1.0e30;
-/// Saturation factor of the vivid colours about the luminance axis: 1.6, the owner-approved look
-/// preview's value (`.superpowers/look-preview/v2/parts/78-frame.js`, `uSat`).
-pub(crate) const VIVID_SATURATION: f32 = 1.6;
+/// Saturation factor of the vivid colours about the luminance axis. The owner-approved look
+/// preview used 1.6 (`.superpowers/look-preview/v2/parts/78-frame.js`, `uSat`), but its tone
+/// curve then added 1.28× saturation after AgX (`50-sky.js`, `tone`); the engine's AgX
+/// (uni-post) has no such boost and pulls bright colours toward white, so the engine's star
+/// colours need the product, about 2.2 (Task B4L, judged on captures). Non-physical and
+/// labelled "Vivid star colours · non-physical"; the luminance is kept exactly.
+pub(crate) const VIVID_SATURATION: f32 = 2.2;
 /// Young's (1967) scintillation coefficient [cm^(2/3) s^(1/2)]: a star's relative rms intensity
 /// through an aperture D [cm] at air mass X from altitude h, averaged over t [s], is
 /// σ_I = 0.09·D^(−2/3)·X^1.75·e^(−h/8000 m)·(2t)^(−1/2) (Young 1967, AJ 72, 747, in the form
@@ -723,26 +763,69 @@ pub(crate) fn star_lux(v_mag: f32) -> f32 {
     (-0.4 * LOG2_10 * (v_mag + LUX_ZERO_POINT_MAG)).exp2()
 }
 
+/// The 3-D halo's Moffat profile with unit energy over the plane [1/px²]:
+/// (β − 1)/(πα²)·(1 + r²/α²)^(−β) with [`STARS3D_HALO_ALPHA_PX`] and [`STARS3D_HALO_BETA`]
+/// (Moffat 1969, A&A 3, 455). Twin of `stars3d_moffat` in `stars3d.wgsl`.
+pub fn stars3d_moffat(r_px: f32) -> f32 {
+    let a2 = STARS3D_HALO_ALPHA_PX * STARS3D_HALO_ALPHA_PX;
+    (STARS3D_HALO_BETA - 1.0) / (std::f32::consts::PI * a2)
+        * (1.0 + r_px * r_px / a2).powf(-STARS3D_HALO_BETA)
+}
+
+/// Halo weight of a pixel whose centre is `r_px` from the star, for a footprint of `radius_px`,
+/// given `inv_energy` = 1 / [`stars3d_halo_energy`]`(radius_px)` (the vertex stage computes it
+/// once per splat): [`stars3d_moffat`] × the window (1 − r²/R²)², which takes it smoothly to 0
+/// at the radius, renormalised to unit energy inside R. (M0's `psf::halo_weight` lowers its
+/// profile by the value at R instead; where the radius is clamped and the halo is still bright
+/// there, that leaves a visible ring, as Sirius showed at a 2° field.) Sampled at pixel centres
+/// the weights sum to 1 within 1.2 % for any radius ≥ 2 px and sub-pixel position
+/// (`stars3d_halo_conserves_energy`), so the star's total stays within 0.3 %. Twin of
+/// `stars3d_halo_weight` in `stars3d.wgsl`.
+pub fn stars3d_halo_weight(r_px: f32, radius_px: f32, inv_energy: f32) -> f32 {
+    if !(r_px < radius_px) {
+        return 0.0;
+    }
+    let window = 1.0 - (r_px * r_px) / (radius_px * radius_px);
+    stars3d_moffat(r_px) * window * window * inv_energy
+}
+
+/// The windowed halo's energy inside a footprint of `radius_px`: with A = α², m = A/R²,
+/// k = 1 + m and u = 1 + r²/A, ∫₀^R 2πr I(r)(1 − r²/R²)² dr = (β − 1) [F(u)]₁^(1+R²/A),
+/// F(u) = k² u^(1−β)/(1 − β) − 2km u^(2−β)/(2 − β) + m² u^(3−β)/(3 − β), which tends to 1 as
+/// R → ∞ (`halo_energy_closed_form`). Twin of `stars3d_halo_energy` in `stars3d.wgsl`.
+pub fn stars3d_halo_energy(radius_px: f32) -> f32 {
+    let b = STARS3D_HALO_BETA;
+    let a2 = STARS3D_HALO_ALPHA_PX * STARS3D_HALO_ALPHA_PX;
+    let m = a2 / (radius_px * radius_px);
+    let k = 1.0 + m;
+    let f = |u: f32| {
+        k * k * u.powf(1.0 - b) / (1.0 - b) - 2.0 * k * m * u.powf(2.0 - b) / (2.0 - b)
+            + m * m * u.powf(3.0 - b) / (3.0 - b)
+    };
+    (b - 1.0) * (f(1.0 + radius_px * radius_px / a2) - f(1.0))
+}
+
 /// Footprint (quad) radius [px] of a 3-D star or point sprite with display-normalised energy
-/// `energy` and halo share `halo_fraction`: M0's `psf::footprint_radius_px` (the distance where
-/// both the core and the halo have fallen below `psf::VISIBILITY_CUTOFF`) with the minimum
-/// [`STARS3D_MIN_RADIUS_PX`] instead of M0's 3 px. Above 3 px the two agree exactly, so B9's
-/// flux radii (Rigel 13.5 px, the Sun from α Cen 21.0 px) are unchanged. Stars whose core peak
-/// is below 113 × the cutoff keep the 2-px minimum; the shaded pixels then reach at least 2 px
-/// from the centre, which holds ≥ 99.6 % of the σ = 0.65 px core (erf(2/(0.65√2))²), and every
-/// pixel beyond is below the cutoff. Twin of `stars3d_footprint_radius_px` in `stars3d.wgsl`
-/// (named apart from M0's `footprint_radius_px`, which the shader imports with M0's PSF). NaN
-/// gives the minimum.
+/// `energy` and halo share `halo_fraction`: the distance where the core has fallen below
+/// `psf::VISIBILITY_CUTOFF` (M0's rule) and the 3-D halo below [`STARS3D_HALO_CUTOFF`], clamped
+/// to [[`STARS3D_MIN_RADIUS_PX`], `psf::MAX_RADIUS_PX`] (64 px: the windowed halo fades
+/// smoothly to it, so even a star whose glow would reach black farther out, Sirius at a 2°
+/// field, shows no edge). The core falls to its cutoff at
+/// σ·√(2 ln(peak/cutoff)); the halo, peak h·E·I(0), at α·√((peak/cutoff)^(1/β) − 1). Stars
+/// whose core peak is below 113 × the cutoff keep the 2-px minimum; the shaded pixels then reach
+/// at least 2 px from the centre, which holds ≥ 99.6 % of the σ = 0.65 px core
+/// (erf(2/(0.65√2))²), and every pixel beyond is below the cutoff. Twin of
+/// `stars3d_footprint_radius_px` in `stars3d.wgsl`. NaN gives the minimum.
 pub fn footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     let mut r = STARS3D_MIN_RADIUS_PX;
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
     if core_peak > VISIBILITY_CUTOFF {
         r = r.max(CORE_SIGMA_PX * (2.0 * (core_peak / VISIBILITY_CUTOFF).ln()).sqrt());
     }
-    let halo_peak = halo_fraction * energy * moffat(0.0);
-    if halo_peak > VISIBILITY_CUTOFF {
-        let q = (halo_peak / VISIBILITY_CUTOFF).powf(1.0 / HALO_BETA);
-        r = r.max(HALO_ALPHA_PX * (q - 1.0).sqrt());
+    let halo_peak = halo_fraction * energy * stars3d_moffat(0.0);
+    if halo_peak > STARS3D_HALO_CUTOFF {
+        let q = (halo_peak / STARS3D_HALO_CUTOFF).powf(1.0 / STARS3D_HALO_BETA);
+        r = r.max(STARS3D_HALO_ALPHA_PX * (q - 1.0).sqrt());
     }
     r.min(MAX_RADIUS_PX)
 }
@@ -754,7 +837,7 @@ pub fn footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
 /// Twin of `star_is_visible` in `stars3d.wgsl`. NaN is invisible.
 pub fn star_is_visible(energy: f32, halo_fraction: f32) -> bool {
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
-    let halo_peak = halo_fraction * energy * moffat(0.0);
+    let halo_peak = halo_fraction * energy * stars3d_moffat(0.0);
     core_peak > VISIBILITY_CUTOFF || halo_peak > VISIBILITY_CUTOFF
 }
 
@@ -789,7 +872,7 @@ pub fn visible_star_count(
                 && lux > 0.0
                 && star_is_visible(
                     (lux * pre / omega).min(MAX_SPLAT_ENERGY),
-                    halo_fraction(lux),
+                    STARS3D_HALO_FRACTION,
                 )
         })
         .count();
@@ -1060,8 +1143,8 @@ pub(crate) mod twin {
         let cos_theta = -view_dir.z / view_dir.length();
         let omega = pixel_solid_angle_off_axis(view.fov_y, size.y, cos_theta);
         let energy = (lux * twinkle * view.star_pre / omega).min(MAX_SPLAT_ENERGY);
-        // From the steady illuminance (review r0 M7).
-        let h = halo_fraction(lux);
+        // The eye's halo is part of every star's PSF (B4L), whatever it twinkles to.
+        let h = STARS3D_HALO_FRACTION;
         if !star_is_visible(energy, h) {
             return None;
         }
@@ -1215,7 +1298,7 @@ mod tests {
     use super::*;
     use crate::psf::{
         CORE_SIGMA_PX, HALO_ALPHA_PX, HALO_BETA, HALO_ENERGY_FRACTION, HALO_MIN_LUX, MAX_RADIUS_PX,
-        MIN_RADIUS_PX, VISIBILITY_CUTOFF,
+        MIN_RADIUS_PX, VISIBILITY_CUTOFF, pixel_coverage,
     };
     use crate::stars::{DEFAULT_STAR_EV100, MIN_CLIP_W, pixel_solid_angle};
     use crate::{POINTS_WGSL, STARS3D_WGSL};
@@ -1348,40 +1431,155 @@ mod tests {
         assert!(!star_is_visible(f32::NAN, 0.0));
         assert_eq!(footprint_radius_px(faintest, 0.0), STARS3D_MIN_RADIUS_PX);
         // Through the vertex twin: on the axis at the default exposure the faintest drawn star
-        // has a 2 px quad radius, and one 0.01 % fainter is culled.
+        // (its core holding 1 − h of the light) has a 2 px quad radius, and one 0.01 % fainter
+        // is culled.
         let view = ViewTwin::looking(Vec3::X, 60.0, Vec2::new(1920.0, 1080.0), DEFAULT_STAR_EV100);
-        let lux = threshold * pixel_solid_angle(view.fov_y, view.size.y) / view.star_pre;
+        let lux = threshold * pixel_solid_angle(view.fov_y, view.size.y)
+            / (view.star_pre * (1.0 - STARS3D_HALO_FRACTION));
         let s = splat(&view, Vec3::X, lux * 1.0001, 1.0, Vec3::ONE, 0.0).expect("visible");
         assert_eq!(s.radius_px, 2.0);
         assert!(splat(&view, Vec3::X, lux * 0.9999, 1.0, Vec3::ONE, 0.0).is_none());
-        // Sirius (V = −1.46): M0's 18.31 px glare footprint.
+        // Sirius (V = −1.46): its eye halo reaches the display's black at R = 42.5 px (B4L; M0's
+        // 2 % glare stopped at 18.31 px).
         let s = splat(&view, Vec3::X, star_lux(-1.46), 1.0, Vec3::ONE, 0.0).expect("visible");
-        assert!(s.radius_px > 2.0);
-        assert!((s.radius_px - 18.31).abs() < 0.01, "{}", s.radius_px);
+        assert_eq!(s.halo_fraction, STARS3D_HALO_FRACTION);
+        let halo_at_r = s.energy * s.halo_fraction * stars3d_moffat(s.radius_px);
+        assert!(
+            (halo_at_r / STARS3D_HALO_CUTOFF - 1.0).abs() < 1e-3,
+            "{halo_at_r}"
+        );
+        assert!((s.radius_px - 42.51).abs() < 0.05, "{}", s.radius_px);
     }
 
-    /// Above M0's 3-px minimum the 3-D footprint is M0's (B9's flux radii come from it); below,
-    /// it falls to 2 px.
+    /// Without a halo the 3-D footprint is M0's above M0's 3-px minimum and falls to 2 px below
+    /// it; with the eye's halo it is where the core or the halo falls to the cutoff.
     #[test]
-    fn footprint_matches_m0_above_three_px() {
-        for h in [0.0, HALO_ENERGY_FRACTION] {
-            let mut energy = 1e-5;
-            while energy < 1e10 {
-                let m0 = crate::psf::footprint_radius_px(energy, h);
-                let r = footprint_radius_px(energy, h);
-                if m0 > MIN_RADIUS_PX {
-                    assert_eq!(r, m0, "energy {energy}, halo {h}");
-                } else {
-                    assert!((STARS3D_MIN_RADIUS_PX..=MIN_RADIUS_PX).contains(&r));
-                }
-                energy *= 1.5;
+    fn footprint_matches_m0_rule() {
+        let mut energy = 1e-5;
+        while energy < 1e10 {
+            let m0 = crate::psf::footprint_radius_px(energy, 0.0);
+            let r = footprint_radius_px(energy, 0.0);
+            if m0 > MIN_RADIUS_PX {
+                assert_eq!(r, m0, "energy {energy}");
+            } else {
+                assert!((STARS3D_MIN_RADIUS_PX..=MIN_RADIUS_PX).contains(&r));
             }
+            let h = STARS3D_HALO_FRACTION;
+            let r = footprint_radius_px(energy, h);
+            let core_peak = (1.0 - h) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
+            let core_at = |x: f32| core_peak * (-0.5 * (x / CORE_SIGMA_PX).powi(2)).exp();
+            let halo_at = |x: f32| h * energy * stars3d_moffat(x);
+            if r > STARS3D_MIN_RADIUS_PX && r < MAX_RADIUS_PX {
+                // At R one of the two meets its cutoff and neither is above it.
+                let (c, hl) = (
+                    core_at(r) / VISIBILITY_CUTOFF,
+                    halo_at(r) / STARS3D_HALO_CUTOFF,
+                );
+                assert!(
+                    (c.max(hl) - 1.0).abs() < 2e-3,
+                    "{energy}: core {c} halo {hl}"
+                );
+            }
+            energy *= 1.5;
         }
         assert_eq!(footprint_radius_px(f32::NAN, 0.0), STARS3D_MIN_RADIUS_PX);
         assert_eq!(
-            footprint_radius_px(1e30, HALO_ENERGY_FRACTION),
+            footprint_radius_px(1e30, STARS3D_HALO_FRACTION),
             MAX_RADIUS_PX
         );
+    }
+
+    /// The 3-D halo is the CIE general disability glare equation (Vos & van den Berg 1999, CIE
+    /// 146:2002; A = 25 yr, p = 0.5) at the reference display (0.0556° per pixel): per
+    /// steradian, h·I(r)/Ω_px is within 12 % of 10/θ³ + (5/θ² + 0.1p/θ)(1 + (A/62.5)⁴) + 0.0025p
+    /// from 0.3° to 3° (the fit's range), and holds 0.165 of the light between 0.1° and 3°
+    /// against the equation's 0.219.
+    #[test]
+    fn halo_follows_the_cie_glare_equation() {
+        let deg_per_px = 60.0_f64 / 1080.0;
+        let px_sr = (deg_per_px.to_radians()).powi(2);
+        let cie = |t: f64| {
+            let (age, p) = (25.0_f64, 0.5_f64);
+            10.0 / t.powi(3)
+                + (5.0 / t.powi(2) + 0.1 * p / t) * (1.0 + (age / 62.5).powi(4))
+                + 0.0025 * p
+        };
+        for i in 0..=20 {
+            let theta = 0.3 * 10f64.powf(f64::from(i) / 20.0);
+            let r = (theta / deg_per_px) as f32;
+            let ours = f64::from(STARS3D_HALO_FRACTION * stars3d_moffat(r)) / px_sr;
+            assert!(
+                (ours / cie(theta) - 1.0).abs() < 0.12,
+                "{theta}°: {ours} vs {}",
+                cie(theta)
+            );
+        }
+        // Light between 0.1° and 3°: the unwindowed Moffat's (1 + R²/α²)^(1−β) differences.
+        let alpha = f64::from(STARS3D_HALO_ALPHA_PX) * deg_per_px;
+        let beyond = |t: f64| (1.0 + (t / alpha).powi(2)).powf(1.0 - f64::from(STARS3D_HALO_BETA));
+        let ours = f64::from(STARS3D_HALO_FRACTION) * (beyond(0.1) - beyond(3.0));
+        assert!((ours - 0.165).abs() < 0.005, "{ours}");
+    }
+
+    /// The windowed halo's closed-form energy matches a numerical integral of I(r)(1 − r²/R²)².
+    #[test]
+    fn halo_energy_closed_form() {
+        for radius in [2.0_f32, 3.0, 10.0, 32.75, 64.0] {
+            let n = 200_000;
+            let dr = f64::from(radius) / f64::from(n);
+            let numeric: f64 = (0..n)
+                .map(|i| {
+                    let r = (f64::from(i) + 0.5) * dr;
+                    let w = 1.0 - (r * r) / f64::from(radius * radius);
+                    2.0 * std::f64::consts::PI
+                        * r
+                        * f64::from(stars3d_moffat(r as f32))
+                        * w
+                        * w
+                        * dr
+                })
+                .sum();
+            let closed = f64::from(stars3d_halo_energy(radius));
+            assert!(
+                (closed / numeric - 1.0).abs() < 2e-5,
+                "R {radius}: {closed} vs {numeric}"
+            );
+        }
+        assert!((stars3d_halo_energy(1e6) - 1.0).abs() < 1e-3);
+    }
+
+    /// The halo sampled at pixel centres sums to 1 within 1.2 % for every footprint radius from
+    /// 2 px and any sub-pixel position, and the whole PSF (core + halo) to 1 within 0.5 %.
+    #[test]
+    fn stars3d_halo_conserves_energy() {
+        for radius in [2.0_f32, 2.5, 3.0, 5.0, 10.0, 32.75, 64.0] {
+            let inv_energy = 1.0 / stars3d_halo_energy(radius);
+            for (sx, sy) in [(0.5, 0.5), (0.0, 0.0), (0.13, 0.91), (0.99, 0.37)] {
+                let n = radius.ceil() as i32 + 1;
+                let (mut halo, mut core) = (0.0_f32, 0.0_f32);
+                for dy in -n..=n {
+                    for dx in -n..=n {
+                        let (ex, ey) = (dx as f32 - sx, dy as f32 - sy);
+                        let r = Vec2::new(ex + 0.5, ey + 0.5).length();
+                        if r < radius + 0.5 {
+                            halo += stars3d_halo_weight(r, radius, inv_energy);
+                            core += pixel_coverage(ex, CORE_SIGMA_PX)
+                                * pixel_coverage(ey, CORE_SIGMA_PX);
+                        }
+                    }
+                }
+                assert!(
+                    (halo - 1.0).abs() < 0.012,
+                    "R {radius} ({sx}, {sy}): halo {halo}"
+                );
+                let h = STARS3D_HALO_FRACTION;
+                let total = (1.0 - h) * core + h * halo;
+                assert!(
+                    (total - 1.0).abs() < 0.005,
+                    "R {radius} ({sx}, {sy}): {total}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1393,20 +1591,21 @@ mod tests {
             .map(|s| f64::from(s.abs_mag_v) + 5.0 * pos_f64(s).length().log10() - 5.0)
             .collect();
         let below = |v: f64| apparent.iter().filter(|&&m| m < v).count() as u32;
-        // At the default star EV every V ≤ 10 star is drawn (the limit is V ≈ 13.9). The bake
-        // also holds 433 nearby stars fainter than that (apparent V up to 21), which are not.
+        // At the default star EV every V ≤ 10 star is drawn (the limit is V ≈ 13.6 with 24 % of
+        // the light in the eye's halo, B4L). The bake also holds 520 nearby stars fainter than
+        // that (apparent V up to 21), which are not.
         let n = visible_star_count(&stars, DEFAULT_STAR_EV100, fov, h);
         assert!(n >= below(10.0 + 1e-3), "{n}");
-        assert_eq!(stars.len() as u32 - n, 433);
+        assert_eq!(stars.len() as u32 - n, 520);
         let mut last = u32::MAX;
         for ev in [-4.0f32, 0.0, 2.0, 4.0, 6.0] {
             let n = visible_star_count(&stars, ev, fov, h);
             assert!(n <= last, "EV {ev}: {n} > {last}");
             last = n;
-            // Limiting V: the energy where the core peak meets the cutoff.
+            // Limiting V: the energy where the core peak, (1 − h) of the light, meets the cutoff.
             let omega = pixel_solid_angle(fov, h as f32);
             let lux_lim = VISIBILITY_CUTOFF * TAU * CORE_SIGMA_PX * CORE_SIGMA_PX * omega
-                / uni_gfx::exposure_scale(ev);
+                / (uni_gfx::exposure_scale(ev) * (1.0 - STARS3D_HALO_FRACTION));
             let v_lim = -2.5 * f64::from(lux_lim).log10() - 13.99;
             assert!(
                 below(v_lim - 0.01) <= n && n <= below(v_lim + 0.01),
@@ -1635,17 +1834,21 @@ mod tests {
         assert!(samples.iter().all(|&x| x > 0.0));
     }
 
-    /// Review r0 M7: the halo share follows the steady illuminance, so a star near
-    /// `HALO_MIN_LUX` keeps (or lacks) its halo while it twinkles.
+    /// Review r0 M7, B4L: the halo share never depends on the star's light or its twinkle (the
+    /// eye's PSF is linear), so no star's halo switches on or off, M0's 1e-6 lx threshold
+    /// included.
     #[test]
     fn halo_share_ignores_the_twinkle() {
         let view = ViewTwin::looking(Vec3::X, 60.0, Vec2::new(1920.0, 1080.0), -4.0);
         let above = HALO_MIN_LUX * 1.01;
         let s = splat(&view, Vec3::X, above, 0.5, Vec3::ONE, 0.0).expect("visible");
-        assert_eq!(s.halo_fraction, HALO_ENERGY_FRACTION);
+        assert_eq!(s.halo_fraction, STARS3D_HALO_FRACTION);
         let below = HALO_MIN_LUX * 0.99;
         let s = splat(&view, Vec3::X, below, 2.0, Vec3::ONE, 0.0).expect("visible");
-        assert_eq!(s.halo_fraction, 0.0);
+        assert_eq!(s.halo_fraction, STARS3D_HALO_FRACTION);
+        let faint = HALO_MIN_LUX * 1e-4;
+        let s = splat(&view, Vec3::X, faint, 1.0, Vec3::ONE, 0.0).expect("visible");
+        assert_eq!(s.halo_fraction, STARS3D_HALO_FRACTION);
         // The twinkle scales the light itself.
         let steady = splat(&view, Vec3::X, above, 1.0, Vec3::ONE, 0.0).unwrap();
         let dim = splat(&view, Vec3::X, above, 0.5, Vec3::ONE, 0.0).unwrap();
@@ -1975,12 +2178,13 @@ mod tests {
         }
     }
 
-    /// Review r0 I3: the 3-D passes run M0's PSF WGSL itself, not a copy of it. `stars3d.wgsl`
-    /// imports M0's `stars.wgsl`; neither 3-D shader defines a PSF constant or function of M0's
-    /// again; and the splat code calls M0's. Only the footprint radius is B4's own
-    /// (`stars3d_footprint_radius_px`, with review m16's 2-px minimum;
-    /// `footprint_matches_m0_above_three_px` ties it to M0's above 3 px), and the splat does not
-    /// call M0's 3-px one.
+    /// Review r0 I3: the 3-D passes run M0's PSF core WGSL itself, not a copy of it.
+    /// `stars3d.wgsl` imports M0's `stars.wgsl`; neither 3-D shader defines a PSF constant or
+    /// function of M0's again; and the splat code calls M0's core (`pixel_coverage`, `psf_erf`)
+    /// and solid angle. The footprint radius (`stars3d_footprint_radius_px`, review m16's 2-px
+    /// minimum; `footprint_matches_m0_rule`) and, since B4L, the eye's halo (`stars3d_moffat`,
+    /// `stars3d_halo_weight`) are the 3-D pass's own; the splat calls neither M0's 3-px footprint
+    /// nor M0's glare.
     #[test]
     fn splat_runs_m0_psf_wgsl() {
         let own = [
@@ -2031,17 +2235,22 @@ mod tests {
         };
         for (caller, callee) in [
             ("psf_weight", "pixel_coverage"),
-            ("psf_weight", "halo_weight"),
+            ("psf_weight", "stars3d_halo_weight"),
             ("pixel_coverage", "psf_erf"),
             ("splat_vertex", "pixel_solid_angle_off_axis"),
             ("splat_vertex", "star_is_visible"),
             ("splat_vertex", "stars3d_footprint_radius_px"),
-            ("stars3d_footprint_radius_px", "moffat"),
-            ("star_is_visible", "moffat"),
+            ("stars3d_footprint_radius_px", "stars3d_moffat"),
+            ("star_is_visible", "stars3d_moffat"),
+            ("stars3d_halo_weight", "stars3d_moffat"),
+            ("splat_vertex", "stars3d_halo_energy"),
         ] {
             assert!(fn_calls(caller, callee), "{caller} does not call {callee}");
         }
+        // The 3-D halo is the eye's (B4L), not M0's glare.
         assert!(!fn_calls("splat_vertex", "footprint_radius_px"));
+        assert!(!fn_calls("psf_weight", "halo_weight"));
+        assert!(!fn_calls("star_is_visible", "moffat"));
     }
 
     /// The value of `const name: f32 = <literal>;` (or u32) in `m`.
@@ -2078,6 +2287,10 @@ mod tests {
             ("BV_LUT_MIN", BV_LUT_MIN),
             ("BV_LUT_MAX", BV_LUT_MAX),
             ("VIVID_SATURATION", VIVID_SATURATION),
+            ("STARS3D_HALO_FRACTION", STARS3D_HALO_FRACTION),
+            ("STARS3D_HALO_ALPHA_PX", STARS3D_HALO_ALPHA_PX),
+            ("STARS3D_HALO_BETA", STARS3D_HALO_BETA),
+            ("STARS3D_HALO_CUTOFF", STARS3D_HALO_CUTOFF),
         ] {
             assert_eq!(wgsl_const(&m, name), naga::Literal::F32(cpu), "{name}");
         }
