@@ -96,7 +96,7 @@ use crate::registry::{
     NameTable, ObjectId, ObjectInfo, ObjectKind, Physical, Source, brdf_for, has_atmosphere,
 };
 use crate::snapshot::{self, Snapshot};
-use crate::starindex::{StarIndex, star_pos_pc};
+use crate::starindex::{StarIndex, catalogue_pos_pc, star_pos_pc, velocity_pc_per_yr};
 use crate::time::TimeController;
 
 /// Julian year [s]: 365.25 days of 86 400 s (IAU 1976 System of Astronomical Constants).
@@ -804,6 +804,18 @@ impl AsteroidOrbit {
     }
 }
 
+/// A star object as the snapshot reads it (B9g): its id, kind and catalogue index, and its
+/// catalogue position [pc] and velocity [pc/yr] decoded from the packed [`Star3`] once
+/// (`starindex::star_pos_from` gives `star_pos_pc`'s position from them, to the bit); `None`
+/// for an index outside the star data.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StarRow {
+    pub(crate) id: ObjectId,
+    pub(crate) kind: ObjectKind,
+    pub(crate) index: u32,
+    pub(crate) motion: Option<(DVec3, DVec3)>,
+}
+
 /// The simulated Solar System and sky.
 pub struct World {
     pub time: TimeController,
@@ -835,6 +847,9 @@ pub struct World {
     pub(crate) star_index: StarIndex,
     /// The registry object of a star, by star index.
     pub(crate) star_objects: HashMap<u32, ObjectId>,
+    /// Every star object (named stars, exoplanet hosts, registered near stars) in id order,
+    /// with its catalogue motion decoded once: the snapshot's named-star loop (B9g).
+    pub(crate) star_rows: Vec<StarRow>,
     /// Unnamed catalogue stars a snapshot or [`World::nearest_surface`] found within 0.1 pc,
     /// registered as objects at the next tick (review I1).
     unnamed_near: Mutex<Vec<u32>>,
@@ -882,6 +897,7 @@ impl World {
             archive_teff: HashMap::new(),
             star_index: StarIndex::new(&[]),
             star_objects: HashMap::new(),
+            star_rows: Vec::new(),
             unnamed_near: Mutex::new(Vec::new()),
             shown_comets: Mutex::new(Vec::new()),
             exo: Vec::new(),
@@ -1315,7 +1331,18 @@ impl World {
             mean_radius_m: radius,
             has_atmosphere: false,
         };
-        self.push(info, physical, names, &[])
+        let id = self.push(info, physical, names, &[]);
+        let motion = self
+            .stars
+            .get(index as usize)
+            .map(|s| (catalogue_pos_pc(s), velocity_pc_per_yr(s)));
+        self.star_rows.push(StarRow {
+            id,
+            kind,
+            index,
+            motion,
+        });
+        id
     }
 
     /// T_eff [K] of star `index`: the archive's for an archive-only host that has one, else
@@ -3791,19 +3818,64 @@ mod tests {
         let mut world = World::new(data, date("2026-11-20T00:00:00Z"));
         let built = clock.elapsed().as_secs_f64() - loaded;
         let earth = world.position(id_of(&world, "Earth"));
+        // B9 gate: `sky-orion-3d` (bookmarks/m1.ron #15), the Sun + 100 AU along the view,
+        // looking at RA 83.8°, Dec −1.2° (Orion), fov 60°: the view the bench flagged.
+        let (ra, dec) = (83.8_f64.to_radians(), (-1.2_f64).to_radians());
+        let orion = DVec3::new(dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin());
+        let sun = world.position(id_of(&world, "Sun"));
         let views = [
             looking_at(earth.offset(DVec3::new(6.0e7, 0.0, 0.0)), earth, 60.0),
             looking_along(earth.offset(DVec3::new(0.0, 0.0, 6.0 * AU)), DVec3::NEG_Z),
             looking_along(earth, DVec3::new(-0.0548, -0.8734, -0.4838)),
+            looking_along(sun.offset(orion * 100.0 * AU), orion),
         ];
         let mut worst: f64 = 0.0;
+        let mut steady = Vec::new();
         for view in &views {
             let t0 = std::time::Instant::now();
             let snap = world.snapshot(view, VIEWPORT);
             worst = worst.max(t0.elapsed().as_secs_f64());
             assert!(!snap.pick.is_empty());
             assert!(snap.pick.len() <= 2000 + world.objects().len());
+            // The steady per-frame cost: the mean of 50 more snapshots of the same view.
+            let t0 = std::time::Instant::now();
+            for _ in 0..50 {
+                std::hint::black_box(world.snapshot(view, VIEWPORT));
+            }
+            steady.push(t0.elapsed().as_secs_f64() / 50.0);
         }
+        // Where sky-orion-3d's time goes (B9g profile): the near-star search, the nearest
+        // surface, the dominant frame, each alone, 50 times.
+        let orion_view = &views[3];
+        let time = |f: &dyn Fn()| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..50 {
+                f();
+            }
+            t0.elapsed().as_secs_f64() / 50.0 * 1e3
+        };
+        let near = world.near_stars(&orion_view.pos);
+        let near_ms = time(&|| {
+            std::hint::black_box(world.near_stars(&orion_view.pos));
+        });
+        let surface_ms = time(&|| {
+            std::hint::black_box(world.nearest_surface_among(&orion_view.pos, &near));
+        });
+        let frame_ms = time(&|| {
+            std::hint::black_box(world.dominant_frame(&orion_view.pos));
+        });
+        println!(
+            "snapshot steady cost per view [ms]: Earth close {:.3}, ecliptic pole {:.3}, \
+             along the ecliptic {:.3}, sky-orion-3d {:.3} (near stars {near_ms:.3}, nearest \
+             surface {surface_ms:.3}, dominant frame {frame_ms:.3}; {} near stars) ({} uni-sim \
+             test build)",
+            steady[0] * 1e3,
+            steady[1] * 1e3,
+            steady[2] * 1e3,
+            steady[3] * 1e3,
+            near.len(),
+            profile()
+        );
         let t0 = std::time::Instant::now();
         world.tick(1.0 / 60.0);
         let tick = t0.elapsed().as_secs_f64();

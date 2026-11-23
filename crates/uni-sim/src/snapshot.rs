@@ -12,13 +12,15 @@
 
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2, Vec3};
 use uni_core::{
-    AU, CameraView, FrameId, PC, TEFF_SUN_K, blackbody_linear_srgb, star_illuminance_lux,
+    AU, CameraView, FrameId, PC, TEFF_SUN_K, UniversePos, blackbody_linear_srgb,
+    star_illuminance_lux,
 };
 use uni_physics::photometry::{
     Brdf, comet_total_v, disk_phase_function, planet_phase_correction, rho_from_geometric_albedo,
 };
 
 use crate::registry::{ObjectId, ObjectKind, Source};
+use crate::starindex::star_pos_from;
 use crate::world::{SATURN, World, luminous_intensity_cd, sun_intensity_cd};
 
 /// Below this projected radius [px] a body is drawn as a point.
@@ -214,15 +216,99 @@ fn angle(a: DVec3, b: DVec3) -> f64 {
     a.cross(b).length().atan2(a.dot(b))
 }
 
+/// The Sun's colour (linear sRGB, luminance 1), computed once: `blackbody_linear_srgb` integrates
+/// the CIE tables, a fixed cost every snapshot paid (B9g profile).
+fn sun_color() -> Vec3 {
+    static SUN_COLOR: std::sync::OnceLock<Vec3> = std::sync::OnceLock::new();
+    *SUN_COLOR.get_or_init(|| blackbody_linear_srgb(TEFF_SUN_K))
+}
+
+/// [`proj_radius_px`] with tan(fov/2) computed once per snapshot: the same operations in the
+/// same order, so the same result to the bit.
+fn proj_radius_px_tan(radius_m: f64, dist_m: f64, tan_half_fov: f64, height_px: f64) -> f64 {
+    if !(dist_m > radius_m) {
+        return f64::INFINITY;
+    }
+    let s = radius_m / dist_m;
+    0.5 * height_px * (s / (1.0 - s * s).sqrt()) / tan_half_fov
+}
+
+/// A conservative test that lets the named-star loop skip stars far off screen without the
+/// exact `UniversePos` arithmetic (B9g, `sky-orion-3d`: 7 866 named stars per snapshot, 822 of
+/// them on screen). A star is skipped only when its direction, from plain f64 metres, is more
+/// than the cone through the frame's corners plus [`StarCull::MARGIN_RAD`] from the view axis,
+/// and that f64 shortcut is good to [`StarCull::MAX_ERROR_RAD`] for it. Every other star takes
+/// the exact path, so the snapshot is the one the exact path alone gives
+/// (`build_matches_the_reference`).
+struct StarCull {
+    /// The camera's position from the SSB [m], in plain f64 (rounded far from the SSB).
+    cam_m: DVec3,
+    /// The view axis (the camera's −Z).
+    forward: DVec3,
+    /// cos(cone + margin); −2 (never skip) when cone + margin reaches π.
+    cos_limit: f64,
+}
+
+impl StarCull {
+    /// Added to the corner cone [rad]: ten times the largest shortcut error allowed, and far
+    /// more than the exact path's own rounding at the frame's edge.
+    const MARGIN_RAD: f64 = 1.0e-6;
+    /// The largest angular error [rad] of the f64 shortcut for which a star may be skipped.
+    const MAX_ERROR_RAD: f64 = 1.0e-7;
+
+    fn new(view: &CameraView, viewport: UVec2) -> Self {
+        let size = viewport.max(UVec2::ONE).as_dvec2();
+        let tan_half_y = (0.5 * view.fov_y_rad).tan();
+        // On screen (`Projector::screen`, `on_screen` with no margin) means |x| ≤ aspect·tan·(−z)
+        // and |y| ≤ tan·(−z) in camera space, so the angle from the axis is at most this.
+        let cone = (tan_half_y * (1.0 + (size.x / size.y).powi(2)).sqrt()).atan();
+        let limit = cone + Self::MARGIN_RAD;
+        StarCull {
+            cam_m: view.pos.delta_from(UniversePos::default()),
+            forward: view.orient.normalize() * DVec3::NEG_Z,
+            cos_limit: if limit < std::f64::consts::PI {
+                limit.cos()
+            } else {
+                -2.0
+            },
+        }
+    }
+
+    /// Whether the star at `pos_m` [m from the SSB] is certainly off screen.
+    fn off_screen(&self, pos_m: DVec3) -> bool {
+        let rel = pos_m - self.cam_m;
+        let d = rel.length();
+        // The shortcut's error [m]: a few ulps of the larger absolute position (`cam_m` and
+        // `pos_m` each rounded once, the difference once more), seen from distance d.
+        let error_m = 8.0 * f64::EPSILON * (pos_m.length() + self.cam_m.length());
+        d.is_finite()
+            && error_m <= Self::MAX_ERROR_RAD * d
+            && rel.dot(self.forward) < self.cos_limit * d
+    }
+}
+
+/// An object whose direction is more than asin(this) behind the camera's plane has no screen
+/// position: far above the rounding of `rel · forward` and of `Projector::screen`'s rotation
+/// (a few ulps of |rel|), so the shortcut never disagrees with `Projector::screen`.
+const BEHIND_COS: f64 = 1.0e-9;
+
 /// Builds the snapshot (see [`World::snapshot`]).
+///
+/// B9g (Wave B gate, snapshot CPU at `sky-orion-3d`) made it cheaper without changing what it
+/// returns: each object's screen position is computed once for its pick and its point; tan(fov/2),
+/// the Sun's colour and the stars' epoch offset once per snapshot; the body → Sun vector only for
+/// what is drawn; objects clearly behind the camera skip the rotation into camera space; and
+/// named stars and exoplanet hosts far off screen are skipped by a conservative cone test
+/// ([`StarCull`]). `build_matches_the_reference` compares it with the previous code bit for bit.
 pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapshot {
     let proj = Projector::new(view, viewport);
     let height = f64::from(viewport.y.max(1));
-    let fov = view.fov_y_rad;
+    let tan_half_fov = (0.5 * view.fov_y_rad).tan();
     let cam = view.pos;
     let sun_pos = world.sun.map(|s| world.cached[s as usize]);
-    let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
+    let sun_color = sun_color();
     let sun_cd = sun_intensity_cd();
+    let cull = StarCull::new(view, viewport);
     let near = world.near_stars(&cam);
     let mut snap = Snapshot {
         dominant_frame: world.dominant_frame(&cam),
@@ -231,8 +317,13 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     };
     // The comets drawn, so ticks re-osculate the stale ones first (review r2 P1).
     let mut shown_comets = Vec::new();
-    let pick = |snap: &mut Snapshot, id: ObjectId, rel: DVec3, kind: ObjectKind| {
-        if let Some(p) = proj.screen(rel).filter(|&p| proj.on_screen(p, 0.0)) {
+    // A pick for the object at `rel`, whose screen position is `screen` (`proj.screen(rel)`).
+    let pick = |snap: &mut Snapshot,
+                id: ObjectId,
+                rel: DVec3,
+                screen: Option<DVec2>,
+                kind: ObjectKind| {
+        if let Some(p) = screen.filter(|&p| proj.on_screen(p, 0.0)) {
             snap.pick.push(PickItem {
                 id,
                 screen_px: p.as_vec2(),
@@ -249,10 +340,17 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         if !rel.is_finite() {
             continue;
         }
-        pick(&mut snap, id, rel, info.kind);
         let d = rel.length();
-        let px = proj_radius_px(info.radii_m.max_element(), d, fov, height);
-        let on_screen = || proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX));
+        // Clearly behind the camera (|rel| ≫ the rounding of either test): no screen position,
+        // which `Projector::screen` would also find, at the cost of a full rotation.
+        let screen = if rel.dot(cull.forward) < -BEHIND_COS * d {
+            None
+        } else {
+            proj.screen(rel)
+        };
+        pick(&mut snap, id, rel, screen, info.kind);
+        let px = proj_radius_px_tan(info.radii_m.max_element(), d, tan_half_fov, height);
+        let on_screen = || screen.is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX));
         match world.physical[k].source {
             Source::BlackHole(_) | Source::Star => {}
             Source::Ephem if Some(id) == world.sun => {
@@ -268,12 +366,13 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                 }
             }
             source => {
-                let sun_rel = sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
+                let sun_rel = || sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
                 let lux = if px >= POINT_LOD_PX {
-                    snap.bodies.push(body_view(world, id, rel, sun_rel, px, &cam, sun_cd));
+                    let body = body_view(world, id, rel, sun_rel(), px, &cam, sun_cd);
+                    snap.bodies.push(body);
                     f64::INFINITY
                 } else if on_screen() {
-                    let lux = reflected_lux(world, id, rel, sun_rel, sun_cd);
+                    let lux = reflected_lux(world, id, rel, sun_rel(), sun_cd);
                     snap.points.push(PointView {
                         id: Some(id),
                         rel_pos_m: rel,
@@ -308,7 +407,7 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         let rel = world.star_position(index).delta_from(cam);
         let d = rel.length();
         let radius = world.star_radius_m(index);
-        let px = proj_radius_px(radius, d, fov, height);
+        let px = proj_radius_px_tan(radius, d, tan_half_fov, height);
         let teff = world.star_teff_k(index);
         let intensity = luminous_intensity_cd(f64::from(star.abs_mag_v));
         match id {
@@ -335,21 +434,28 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         snap.suppressed_stars.push(index);
     }
 
-    // Exoplanet hosts on screen, and the brightest named stars on screen.
+    // Exoplanet hosts on screen, and the brightest named stars on screen, in id order (the star
+    // objects are the ids after the cached ones: `World::star_rows`). A star's position is
+    // `World::star_position`'s, from the decoded motion, with the epoch offset taken once.
+    let years = world.star_years();
     let mut named = Vec::new();
-    for k in world.cached.len()..world.objects.len() {
-        let info = &world.objects[k];
-        let Some(index) = info.catalog_index else {
-            continue;
-        };
-        let rel = world.star_position(index).delta_from(cam);
-        match info.kind {
-            ObjectKind::ExoHost => pick(&mut snap, k as ObjectId, rel, info.kind),
+    for row in &world.star_rows {
+        let pos_m = row.motion.map(|(p, v)| star_pos_from(p, v, years) * PC);
+        let position = || pos_m.map_or(UniversePos::default(), UniversePos::from_meters);
+        match row.kind {
+            // A pick needs the star on screen, so the cull applies to both kinds.
+            _ if pos_m.is_some_and(|p| cull.off_screen(p)) => {}
+            ObjectKind::ExoHost => {
+                let rel = position().delta_from(cam);
+                pick(&mut snap, row.id, rel, proj.screen(rel), row.kind);
+            }
             ObjectKind::Star => {
-                if proj.screen(rel).is_some_and(|p| proj.on_screen(p, 0.0)) {
+                let rel = position().delta_from(cam);
+                let screen = proj.screen(rel);
+                if screen.is_some_and(|p| proj.on_screen(p, 0.0)) {
                     let d_pc = rel.length() / PC;
-                    let abs_mag = f64::from(world.star_data()[index as usize].abs_mag_v);
-                    named.push((abs_mag + 5.0 * (d_pc / 10.0).log10(), k as ObjectId, rel));
+                    let abs_mag = f64::from(world.star_data()[row.index as usize].abs_mag_v);
+                    named.push((abs_mag + 5.0 * (d_pc / 10.0).log10(), row.id, rel, screen));
                 }
             }
             _ => {}
@@ -360,8 +466,8 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         named.truncate(MAX_STAR_PICKS);
     }
     named.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    for (_, id, rel) in named {
-        pick(&mut snap, id, rel, ObjectKind::Star);
+    for (_, id, rel, screen) in named {
+        pick(&mut snap, id, rel, screen, ObjectKind::Star);
     }
     snap
 }
@@ -527,6 +633,245 @@ pub(crate) fn reflected_lux(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::starindex::star_pos_pc;
+
+    /// The snapshot as `build` made it before B9g's speed-up: the reference for
+    /// `build_matches_the_reference`.
+    pub(crate) fn build_reference(world: &World, view: &CameraView, viewport: UVec2) -> Snapshot {
+        let proj = Projector::new(view, viewport);
+        let height = f64::from(viewport.y.max(1));
+        let fov = view.fov_y_rad;
+        let cam = view.pos;
+        let sun_pos = world.sun.map(|s| world.cached[s as usize]);
+        let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
+        let sun_cd = sun_intensity_cd();
+        let near = world.near_stars(&cam);
+        let mut snap = Snapshot {
+            dominant_frame: world.dominant_frame(&cam),
+            nearest_surface: world.nearest_surface_among(&cam, &near),
+            ..Snapshot::default()
+        };
+        // The comets drawn, so ticks re-osculate the stale ones first (review r2 P1).
+        let mut shown_comets = Vec::new();
+        let pick = |snap: &mut Snapshot, id: ObjectId, rel: DVec3, kind: ObjectKind| {
+            if let Some(p) = proj.screen(rel).filter(|&p| proj.on_screen(p, 0.0)) {
+                snap.pick.push(PickItem {
+                    id,
+                    screen_px: p.as_vec2(),
+                    dist_m: rel.length(),
+                    priority: pick_priority(kind),
+                });
+            }
+        };
+
+        for k in 0..world.cached.len() {
+            let id = k as ObjectId;
+            let info = &world.objects[k];
+            let rel = world.cached[k].delta_from(cam);
+            if !rel.is_finite() {
+                continue;
+            }
+            pick(&mut snap, id, rel, info.kind);
+            let d = rel.length();
+            let px = proj_radius_px(info.radii_m.max_element(), d, fov, height);
+            let on_screen = || proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX));
+            match world.physical[k].source {
+                Source::BlackHole(_) | Source::Star => {}
+                Source::Ephem if Some(id) == world.sun => {
+                    if px >= POINT_LOD_PX {
+                        snap.sun_surface(world, id, rel, px, sun_cd);
+                    } else if on_screen() {
+                        snap.points.push(PointView {
+                            id: Some(id),
+                            rel_pos_m: rel,
+                            illuminance_lux: sun_cd / (d * d),
+                            color: sun_color,
+                        });
+                    }
+                }
+                source => {
+                    let sun_rel = sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
+                    let lux = if px >= POINT_LOD_PX {
+                        snap.bodies.push(body_view(world, id, rel, sun_rel, px, &cam, sun_cd));
+                        f64::INFINITY
+                    } else if on_screen() {
+                        let lux = reflected_lux(world, id, rel, sun_rel, sun_cd);
+                        snap.points.push(PointView {
+                            id: Some(id),
+                            rel_pos_m: rel,
+                            illuminance_lux: lux,
+                            color: sun_color,
+                        });
+                        lux
+                    } else {
+                        continue;
+                    };
+                    if let Source::Comet(c) = source {
+                        shown_comets.push((c, lux));
+                    }
+                }
+            }
+        }
+        world.note_shown_comets(shown_comets);
+        if let (Some(sun), Some(sun_pos)) = (world.sun, sun_pos) {
+            snap.sun = Some(SunLight {
+                rel_pos_m: sun_pos.delta_from(cam),
+                radius_m: world.objects[sun as usize].radii_m.x,
+                intensity_cd: sun_cd,
+                color: sun_color,
+            });
+        }
+
+        // Catalogue stars within 0.1 pc: drawn here instead of by the star pass. An unnamed one
+        // not registered yet (no object id until the next tick) is a point even where it would
+        // resolve (module doc).
+        for &(index, id) in &near {
+            let star = world.star_data()[index as usize];
+            let rel = world.star_position(index).delta_from(cam);
+            let d = rel.length();
+            let radius = world.star_radius_m(index);
+            let px = proj_radius_px(radius, d, fov, height);
+            let teff = world.star_teff_k(index);
+            let intensity = luminous_intensity_cd(f64::from(star.abs_mag_v));
+            match id {
+                Some(id) if px >= POINT_LOD_PX => snap.star_surfaces.push(StarSurfaceView {
+                    id,
+                    catalog_index: Some(index),
+                    rel_pos_m: rel,
+                    orient: DQuat::IDENTITY,
+                    radius_m: radius,
+                    teff_k: teff,
+                    luminous_intensity_cd: intensity,
+                    proj_radius_px: px,
+                }),
+                _ if proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) => {
+                    snap.points.push(PointView {
+                        id,
+                        rel_pos_m: rel,
+                        illuminance_lux: intensity / (d * d),
+                        color: blackbody_linear_srgb(teff),
+                    });
+                }
+                _ => {}
+            }
+            snap.suppressed_stars.push(index);
+        }
+
+        // Exoplanet hosts on screen, and the brightest named stars on screen.
+        let mut named = Vec::new();
+        for k in world.cached.len()..world.objects.len() {
+            let info = &world.objects[k];
+            let Some(index) = info.catalog_index else {
+                continue;
+            };
+            let rel = world.star_position(index).delta_from(cam);
+            match info.kind {
+                ObjectKind::ExoHost => pick(&mut snap, k as ObjectId, rel, info.kind),
+                ObjectKind::Star => {
+                    if proj.screen(rel).is_some_and(|p| proj.on_screen(p, 0.0)) {
+                        let d_pc = rel.length() / PC;
+                        let abs_mag = f64::from(world.star_data()[index as usize].abs_mag_v);
+                        named.push((abs_mag + 5.0 * (d_pc / 10.0).log10(), k as ObjectId, rel));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if named.len() > MAX_STAR_PICKS {
+            named.select_nth_unstable_by(MAX_STAR_PICKS, |a, b| a.0.total_cmp(&b.0));
+            named.truncate(MAX_STAR_PICKS);
+        }
+        named.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, id, rel) in named {
+            pick(&mut snap, id, rel, ObjectKind::Star);
+        }
+        snap
+    }
+
+    /// B9g: the faster `build` returns exactly what the previous code did (every f64 to the
+    /// bit: `Debug` prints the shortest string that round-trips), over the baked data, from
+    /// views that exercise each branch: bodies resolved and as points, the Sun as a surface and
+    /// as a point, near stars as surfaces, the named-star cull with wide, narrow and
+    /// panoramic fields (`sky-orion-3d` among them), and a camera far beyond the Galaxy.
+    #[test]
+    fn build_matches_the_reference() {
+        use crate::world::load_world_data;
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let epoch = uni_core::Epoch::parse_iso_utc("2026-11-20T00:00:00Z").expect("date");
+        let world = World::new(data, epoch);
+        let at = |name: &str| world.position(world.find(name).expect(name));
+        let look = |pos: UniversePos, dir: DVec3, fov_deg: f64, roll: f64| CameraView {
+            pos,
+            orient: DQuat::from_rotation_arc(DVec3::NEG_Z, dir.normalize())
+                * DQuat::from_rotation_z(roll),
+            fov_y_rad: fov_deg.to_radians(),
+            velocity_mps: DVec3::ZERO,
+        };
+        let (earth, sun, saturn) = (at("Earth"), at("Sun"), at("Saturn"));
+        let radec = |ra: f64, dec: f64| {
+            let (ra, dec) = (ra.to_radians(), dec.to_radians());
+            DVec3::new(dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin())
+        };
+        let orion = radec(83.8, -1.2);
+        let gc = radec(266.405, -28.936);
+        let alpha_cen = at("Rigil Kentaurus");
+        let views = [
+            // sky-orion-3d and sky-galactic-center (bookmarks/m1.ron #15, #16).
+            look(sun.offset(orion * 100.0 * AU), orion, 60.0, 0.0),
+            look(sun.offset(gc * 100.0 * AU), gc, 60.0, 0.3),
+            // Earth and the Moon from 60 000 km; Saturn and its moons; the Sun close up.
+            look(
+                earth.offset(DVec3::new(6.0e7, 0.0, 0.0)),
+                DVec3::NEG_X,
+                60.0,
+                0.0,
+            ),
+            look(saturn.offset(DVec3::new(0.0, 1.5e9, 3.0e8)), -DVec3::Y, 20.0, 1.0),
+            look(sun.offset(DVec3::new(3.0e9, 0.0, 0.0)), DVec3::NEG_X, 30.0, 0.0),
+            // Near α Cen (stars within 0.1 pc), a narrow and a panoramic field.
+            look(alpha_cen.offset(DVec3::new(1.0e12, 0.0, 0.0)), DVec3::NEG_X, 20.0, 0.0),
+            look(earth, orion, 1.0, 0.0),
+            look(earth, gc, 170.0, 2.0),
+            // From 1 Mpc: every star far from the camera's f64 shortcut's comfort.
+            look(
+                UniversePos::from_meters(DVec3::new(3.0857e22, 1.0e21, -2.0e21)),
+                -DVec3::X,
+                60.0,
+                0.0,
+            ),
+        ];
+        for (i, view) in views.iter().enumerate() {
+            for viewport in [UVec2::new(1920, 1080), UVec2::new(640, 1280)] {
+                let fast = build(&world, view, viewport);
+                let reference = build_reference(&world, view, viewport);
+                assert_eq!(
+                    format!("{fast:?}"),
+                    format!("{reference:?}"),
+                    "view {i} at {viewport}"
+                );
+            }
+        }
+        // The cull is exercised: from the Orion view it skips 2 624 of the 3 321 named stars
+        // (79 %; the frame's corner cone, 49.7° from the axis, holds 18 % of the sky, but the
+        // named stars crowd toward Orion and the Milky Way).
+        let orion_view = &views[0];
+        let cull = StarCull::new(orion_view, UVec2::new(1920, 1080));
+        let years = world.star_years();
+        let (mut named, mut skipped) = (0, 0);
+        for k in world.cached.len()..world.objects().len() {
+            let info = &world.objects()[k];
+            if info.kind != ObjectKind::Star {
+                continue;
+            }
+            let Some(s) = info.catalog_index.and_then(|i| world.star_data().get(i as usize))
+            else {
+                continue;
+            };
+            named += 1;
+            skipped += usize::from(cull.off_screen(star_pos_pc(s, years) * PC));
+        }
+        assert!(skipped * 10 > named * 7, "{skipped} of {named} skipped");
+    }
 
     #[test]
     fn proj_radius_uses_asin_tan() {

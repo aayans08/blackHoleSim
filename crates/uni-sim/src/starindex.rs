@@ -218,7 +218,18 @@ pub(crate) fn velocity_pc_per_yr(s: &Star3) -> DVec3 {
 /// star without a radial velocity moves tangentially only, because AT-HYG computed its velocity
 /// with no radial part (A7).
 pub(crate) fn star_pos_pc(s: &Star3, years: f64) -> DVec3 {
-    DVec3::from_array(s.pos_pc.map(f64::from)) + velocity_pc_per_yr(s) * years
+    star_pos_from(catalogue_pos_pc(s), velocity_pc_per_yr(s), years)
+}
+
+/// A star's catalogue position [pc, ICRS] as f64.
+pub(crate) fn catalogue_pos_pc(s: &Star3) -> DVec3 {
+    DVec3::from_array(s.pos_pc.map(f64::from))
+}
+
+/// [`star_pos_pc`] from the star's decoded catalogue position [pc] and velocity [pc/yr]: the
+/// same arithmetic, so the same result to the bit (the snapshot decodes them once, B9g).
+pub(crate) fn star_pos_from(pos_pc: DVec3, vel_pc_per_yr: DVec3, years: f64) -> DVec3 {
+    pos_pc + vel_pc_per_yr * years
 }
 
 #[cfg(test)]
