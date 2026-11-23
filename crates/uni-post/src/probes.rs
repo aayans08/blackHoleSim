@@ -31,7 +31,9 @@ use crate::exposure::{
     DEFAULT_ADAPT_TAU_S, ExposureMode, ExposureSettings, ExposureStateGpu, NIGHT_EV100,
     auto_exposure, next_adapted_ev, resolve_exposure,
 };
-use crate::histogram::{Histogram, Meter, meter_pixel, target_ev};
+use crate::histogram::{
+    Histogram, Meter, meter_pixel, meter_sample_count, meter_samples_pixel, target_ev,
+};
 
 /// Every uni-post probe, registering its shaders in `lib`.
 pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
@@ -73,10 +75,16 @@ fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
     let frame = lognormal_frame(size, scene_pre, star_pre);
 
     // CPU: the same f16 values, through the twins.
-    let total = size.x * size.y;
+    // One sample per 2×2 block (the block's top-left pixel), as cs_histogram takes it (B9h).
+    let total = meter_sample_count(size.x, size.y);
     let cpu = Histogram::from_luminances(
         frame
             .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                meter_samples_pixel(*i as u32 % size.x, *i as u32 / size.x)
+            })
+            .map(|(_, c)| c)
             .map(|c| meter_pixel(c.truncate().to_array(), c.w, scene_pre, star_pre)),
     )
     .meter(total)

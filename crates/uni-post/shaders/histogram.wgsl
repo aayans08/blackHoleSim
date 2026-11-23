@@ -2,7 +2,7 @@
 // contract: after the atmospheres, before any sky light or point source is written, so it meters
 // world light only.
 //
-// - cs_histogram: each pixel's world luminance, Rec. 709 Y of hdr / the pre-exposure it was
+// - cs_histogram: each 2×2 pixel block's top-left pixel's (B9h: one sample per block) world luminance, Rec. 709 Y of hdr / the pre-exposure it was
 //   written with [cd/m²] (meter_pre: scene_pre() for plain world light, see "Star share"), into
 //   256 log2 bins over [-10, 32] with workgroup-shared atomics, flushed to the global bins once
 //   per workgroup (bruop 2019, "Automatic Exposure Using a Luminance Histogram",
@@ -139,8 +139,13 @@ fn cs_histogram(
     atomicStore(&wg_packed[li], 0u);
     workgroupBarrier();
     let dims = textureDimensions(meter_hdr);
-    if (gid.x < dims.x && gid.y < dims.y) {
-        let p = vec2<i32>(gid.xy);
+    // One sample per 2×2 pixel block (B9h): thread (x, y) reads the block's top-left pixel
+    // (2x, 2y). A fixed corner, not a rotating one: the meter then needs no frame index, and
+    // its reading is a pure function of the frame (a rotating offset would make a 1-2 px body
+    // flicker in and out of the sample and the exposure loop with it). A workgroup covers
+    // 32 × 32 pixels, so its per-bin count is still at most 256.
+    if (gid.x * 2u < dims.x && gid.y * 2u < dims.y) {
+        let p = vec2<i32>(gid.xy * 2u);
         let s = textureLoad(meter_lens_mask, p, 0).a;
         // A NaN star share: the pixel's pre is unknown, so it is not metered.
         if (!is_nan(s)) {
@@ -166,7 +171,7 @@ fn bin_log2_l(bin: u32) -> f32 {
     return METER_LOG2_MIN + (f32(bin) + (steps + 0.5) / f32(METER_BIN_STEPS)) * METER_BIN_EV;
 }
 
-// The Meter of the bins in workgroup memory for a frame of total_px pixels: (lit_px, ev_avg,
+// The Meter of the bins in workgroup memory for a frame sampled at total_px pixels (one per 2×2 block): (lit_px, ev_avg,
 // ev_hi, 1), or (0, 0, 0, 1) when nothing is lit. Twin of `reduce` in histogram.rs.
 fn meter_reduce(total_px: u32) -> vec4<f32> {
     var lit = 0u;
@@ -214,6 +219,8 @@ fn cs_reduce(@builtin(local_invocation_index) li: u32) {
     workgroupBarrier();
     if (li == 0u) {
         let dims = textureDimensions(meter_hdr);
-        meter_state.meter = meter_reduce(dims.x * dims.y);
+        // The samples taken: one per 2×2 block, ceil(w/2) × ceil(h/2); lit_px scales by it, so
+        // the sampled lit count stands for the whole frame (×4 up to odd-edge rounding).
+        meter_state.meter = meter_reduce(((dims.x + 1u) / 2u) * ((dims.y + 1u) / 2u));
     }
 }

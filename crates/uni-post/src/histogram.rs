@@ -2,7 +2,7 @@
 //!
 //! Pass 9 of the M1 frame contract: after the atmospheres, before any sky light or point source
 //! is written, so it meters world light only. One compute pass with two dispatches:
-//! 1. `cs_histogram`: each pixel's world luminance, Rec. 709 Y of `hdr` ÷ the pre-exposure the
+//! 1. `cs_histogram`: each 2×2 block's top-left pixel's ([`METER_BLOCK`], task B9h) world luminance, Rec. 709 Y of `hdr` ÷ the pre-exposure the
 //!    pixel was written with [cd/m²] ([`meter_pixel`]: `scene_pre()` for plain world light; a
 //!    pixel clamped at `HDR_MAX` counts as at least `HDR_MAX / pre`), skipped below
 //!    [`METER_MIN_CD_M2`] (not lit), binned into
@@ -324,6 +324,25 @@ pub fn target_ev(m: Option<Meter>, compensation_ev: f32) -> f32 {
 const NAME: &str = "histogram";
 /// Workgroup edge of `cs_histogram`: 16 × 16 threads, one per bin when flushing.
 const WORKGROUP_EDGE: u32 = 16;
+
+/// The meter samples one pixel per `METER_BLOCK` × `METER_BLOCK` block (plan ladder step, task
+/// B9h): the block's top-left pixel, (2x, 2y). A fixed corner rather than a rotating offset: the
+/// reading stays a pure function of the frame, and a 1-2 px body cannot flicker in and out of
+/// the sample and drive the exposure loop. A workgroup of 16 × 16 threads therefore covers
+/// 32 × 32 pixels (per-bin count still ≤ 256, which the packed shared atomic needs).
+pub const METER_BLOCK: u32 = 2;
+
+/// The number of pixels the meter samples in a `width` × `height` frame, ceil(w/2) × ceil(h/2):
+/// the `total_px` that [`Histogram::meter`] takes for the sampled histogram, so `lit_px` scales
+/// the sampled lit count (× 4 up to odd-edge rounding) to the 1920 × 1080 reference.
+pub fn meter_sample_count(width: u32, height: u32) -> u32 {
+    width.div_ceil(METER_BLOCK) * height.div_ceil(METER_BLOCK)
+}
+
+/// Whether the meter samples pixel (x, y): the top-left of its 2×2 block.
+pub fn meter_samples_pixel(x: u32, y: u32) -> bool {
+    x % METER_BLOCK == 0 && y % METER_BLOCK == 0
+}
 /// Bind group indices: the renderer's group 0 (`scene_pre()`) and the meter's own.
 const CAMERA_GROUP: u32 = 0;
 const METER_GROUP: u32 = 1;
@@ -492,7 +511,7 @@ impl RenderFeature for ExposureMeter {
     /// and `lens_mask` from its own group.
     fn prepare(&mut self, _gpu: &GpuContext, _ctx: &FrameCtx, _targets: &FrameTargets) {}
 
-    /// One compute pass: `cs_histogram` over every pixel, then `cs_reduce` in one workgroup.
+    /// One compute pass: `cs_histogram` over one pixel per 2×2 block, then `cs_reduce` in one workgroup.
     fn encode(
         &mut self,
         gpu: &GpuContext,
@@ -518,8 +537,8 @@ impl RenderFeature for ExposureMeter {
         pass.set_bind_group(METER_GROUP, bind_group, &[]);
         pass.set_pipeline(&self.histogram);
         pass.dispatch_workgroups(
-            targets.size.x.div_ceil(WORKGROUP_EDGE),
-            targets.size.y.div_ceil(WORKGROUP_EDGE),
+            targets.size.x.div_ceil(WORKGROUP_EDGE * METER_BLOCK),
+            targets.size.y.div_ceil(WORKGROUP_EDGE * METER_BLOCK),
             1,
         );
         // Dispatches in one pass run in order (wgpu orders them through the bins buffer).
@@ -927,6 +946,32 @@ mod tests {
             let stops = (pre / scene).log2();
             assert!((stops - 19.0 * s).abs() < 1e-4, "s {s}: {stops} stops");
         }
+    }
+
+    #[test]
+    fn sampling_one_per_block_keeps_the_statistics() {
+        // B9h: lit_px = sampled lit count x reference / samples, so a uniformly lit frame reads
+        // the same lit_px whether metered at every pixel or one per 2x2 block.
+        assert_eq!(meter_sample_count(1920, 1080), 960 * 540);
+        assert_eq!(meter_sample_count(5, 3), 3 * 2);
+        let (w, h) = (6u32, 4u32);
+        let lit = |x: u32, y: u32| x >= 2 && y < 4 && (x + y) % 3 != 7;
+        let all = Histogram::from_luminances(
+            (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| lit(x, y)).map(|_| 100.0),
+        )
+        .meter(w * h)
+        .unwrap();
+        let sampled = Histogram::from_luminances(
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| meter_samples_pixel(x, y) && lit(x, y))
+                .map(|_| 100.0),
+        )
+        .meter(meter_sample_count(w, h))
+        .unwrap();
+        assert!((sampled.lit_px / all.lit_px - 1.0).abs() < 1e-6);
+        assert_eq!(sampled.ev_avg, all.ev_avg);
+        assert_eq!(sampled.ev_hi, all.ev_hi);
     }
 
     #[test]
