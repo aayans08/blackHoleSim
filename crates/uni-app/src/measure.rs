@@ -134,6 +134,9 @@ pub struct Input<'a> {
     pub comets_settle_ms: f32,
     /// Saturn's ring profile, for the paper exposure.
     pub rings: Option<&'a uni_data::RingProfile>,
+    /// The map index and directory, for the map samples' CPU twin.
+    pub maps: &'a [uni_data::MapInfo],
+    pub map_dir: &'a std::path::Path,
 }
 
 /// The capture camera: projection to framebuffer pixels and back.
@@ -373,6 +376,12 @@ pub fn measure(input: &Input<'_>) -> Measurements {
         }
         _ => {}
     }
+    m.samples = match input.name {
+        "earth-map-closeup" => map_samples(input, &cam, "Earth"),
+        "moon-full" => map_samples(input, &cam, "Moon"),
+        "mars-reference-angle" => map_samples(input, &cam, "Mars"),
+        _ => Vec::new(),
+    };
     m.flux = match input.name {
         "sky-orion-3d" => flux_entries(input, &cam, &["Rigel"]),
         "alpha-cen-sun" => flux_entries(input, &cam, &["Sun"]),
@@ -403,11 +412,21 @@ fn projected(world: &World, frame: &Frame, cam: &Cam, star_ev100: f32) -> Vec<Pr
                         .map(|s| s.proj_radius_px)
                 });
             let radius_px = resolved.unwrap_or_else(|| {
+                let reflected = world
+                    .sim
+                    .objects()
+                    .get(p.id as usize)
+                    .is_some_and(|o| crate::scene::is_reflected(o.kind));
+                let scale = if reflected {
+                    frame.reflected_scale
+                } else {
+                    1.0
+                };
                 let point = snap
                     .points
                     .iter()
                     .find(|q| q.id == Some(p.id))
-                    .map(|q| (q.rel_pos_m, q.illuminance_lux));
+                    .map(|q| (q.rel_pos_m, q.illuminance_lux * scale));
                 let star = || {
                     let i = world.sim.objects().get(p.id as usize)?.catalog_index?;
                     let s = world.sim.star_data().get(i as usize)?;
@@ -847,6 +866,192 @@ pub fn saturn_regions(cam: &Cam, s: &BodyView, lit_face: bool) -> Vec<(&'static 
     }
 }
 
+/// How many map samples a bookmark gets (plan: 16 points).
+const MAP_SAMPLES: usize = 16;
+/// A sample's map neighbourhood (5 × 5 texels of the 2k copy) must vary by less than this
+/// fraction of its mean; of those, the 16 flattest are kept ("low-gradient map areas"), so the
+/// GPU's filtering of the 8k map cannot move them much. (The Moon's map has its craters'
+/// shading baked in: its flattest 5 × 5 patches still vary by 15–20 %.)
+const MAP_FLAT_MAX: f32 = 0.30;
+
+/// One map of the 2k uncompressed copies: its texels (RGBA8 sRGB or R8) and calibration.
+struct CpuMap {
+    tex: uni_data::TexFile,
+    info: uni_data::MapInfo,
+}
+
+impl CpuMap {
+    fn load(input: &Input<'_>, naif: i32, kind: uni_data::MapKind) -> Option<Self> {
+        let info = input
+            .maps
+            .iter()
+            .find(|m| m.naif == naif && m.kind == kind)?
+            .clone();
+        let tex = uni_data::load_tex(&input.map_dir.join(&info.fallback_file)).ok()?;
+        Some(Self { tex, info })
+    }
+
+    /// The mean linear value (RGB, or R in x) of the 3 × 3 texels around `uv` (about one pixel's
+    /// footprint at these bookmarks) and the spread of the 5 × 5 around it (max − min of the
+    /// luminance, over their mean).
+    fn patch(&self, uv: glam::Vec2) -> (Vec3, f32) {
+        let (w, h) = (self.tex.width as i64, self.tex.height as i64);
+        let bpp = match self.tex.format {
+            uni_data::TexFormat::R8Unorm => 1,
+            _ => 4,
+        };
+        let cx = (f64::from(uv.x) * w as f64).floor() as i64;
+        let cy = (f64::from(uv.y) * h as f64).floor() as i64;
+        let (mut sum, mut sum5) = (Vec3::ZERO, 0.0_f32);
+        let (mut lo, mut hi) = (f32::INFINITY, 0.0_f32);
+        for dy in -2..=2 {
+            for dx in -2..=2 {
+                let x = (cx + dx).rem_euclid(w);
+                let y = (cy + dy).clamp(0, h - 1);
+                let i = ((y * w + x) * bpp) as usize;
+                let px = &self.tex.mips[0][i..i + bpp as usize];
+                let v = if bpp == 1 {
+                    Vec3::splat(f32::from(px[0]) / 255.0)
+                } else {
+                    Vec3::new(srgb(px[0]), srgb(px[1]), srgb(px[2]))
+                };
+                let y_lum = luminance(v);
+                if dx.abs() <= 1 && dy.abs() <= 1 {
+                    sum += v;
+                }
+                sum5 += y_lum;
+                lo = lo.min(y_lum);
+                hi = hi.max(y_lum);
+            }
+        }
+        let m = sum5 / 25.0;
+        (
+            sum / 9.0,
+            if m > 0.0 {
+                (hi - lo) / m
+            } else {
+                f32::INFINITY
+            },
+        )
+    }
+}
+
+/// sRGB code value → linear (IEC 61966-2-1 §5.2).
+fn srgb(code: u8) -> f32 {
+    let c = f64::from(code) / 255.0;
+    (if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }) as f32
+}
+
+/// `samples` for a mapped body (plan rows 3–5): 16 pixels in low-gradient map areas, lit and
+/// seen at μ₀, μ > 0.25, with the luminance the CPU twins expect there [cd/m²]: B1's
+/// reflectance (the 2k map copy × `albedo_scale`, Earth's clouds as areal cover, W-B2), A3's
+/// BRDF and phase correction, the sunlight at the body, and for a body with an atmosphere B3's
+/// ground lighting (sun transmittance and skylight, `ground_lighting`) and the view path
+/// (`segment_radiance`: transmittance and in-scatter; a sphere of the preset's radii). Eclipses
+/// are not modelled (none at these bookmarks).
+fn map_samples(input: &Input<'_>, cam: &Cam, name: &str) -> Vec<Sample> {
+    let world = input.world;
+    let Some(b) = body(world, &input.frame.snapshot, name) else {
+        return Vec::new();
+    };
+    let Some(naif) = b.naif else {
+        return Vec::new();
+    };
+    let Some(albedo) = CpuMap::load(input, naif, uni_data::MapKind::Albedo) else {
+        return Vec::new();
+    };
+    let clouds = CpuMap::load(input, naif, uni_data::MapKind::Clouds);
+    let preset = uni_atmo::preset_for(naif);
+    let sun_color = {
+        let c = uni_core::blackbody_linear_srgb(uni_core::TEFF_SUN_K);
+        c / luminance(c)
+    };
+    let phase = phase_rad(b);
+    let corr = uni_physics::photometry::planet_phase_correction(naif, b.brdf, phase)
+        .min(uni_sim::snapshot::MAX_PHASE_CORRECTION);
+    let e = b.sun_illuminance_lux;
+    let inv = b.orient.conjugate();
+    let mut found = Vec::new();
+    let step = 24.0;
+    let (w, h) = (cam.size.x, cam.size.y);
+    let mut y = step / 2.0;
+    while y < h {
+        let mut x = step / 2.0;
+        while x < w {
+            let p = DVec2::new(x.floor() + 0.5, y.floor() + 0.5);
+            x += step;
+            let dir = cam.ray(p);
+            let Some(t) = hit_body(b, dir) else { continue };
+            let xr = dir * t - b.rel_pos_m;
+            let pb = inv * xr;
+            let lon = pb.y.atan2(pb.x) as f32;
+            let lat = pb.z.atan2(pb.truncate().length()) as f32;
+            let normal = (b.orient * (pb / (b.radii_m * b.radii_m))).normalize();
+            let s = (b.sun_rel_m - xr).normalize();
+            let (mu0, mu) = (normal.dot(s), normal.dot(-dir));
+            if mu0 < 0.25 || mu < 0.25 {
+                continue;
+            }
+            let uv = uni_planet::equirect_uv(lon, lat, albedo.info.lon0_deg as f32);
+            let (texel, spread) = albedo.patch(uv);
+            if spread > MAP_FLAT_MAX {
+                continue;
+            }
+            let mut rho = texel * albedo.info.albedo_scale;
+            if let Some(cl) = &clouds {
+                let uvc = uni_planet::equirect_uv(lon, lat, cl.info.lon0_deg as f32);
+                let (cover, cspread) = cl.patch(uvc);
+                if cspread > MAP_FLAT_MAX && cover.x > 0.02 {
+                    continue;
+                }
+                let c = cover.x;
+                rho = (1.0 - c) * rho + Vec3::splat(c * cl.info.albedo_scale);
+            }
+            let refl = uni_physics::photometry::reflectance(b.brdf, mu0, mu.max(1e-4)) as f32;
+            let k = (e * corr) as f32 / std::f32::consts::PI;
+            let expected = match &preset {
+                Some(params) => {
+                    let (sun_t, sky) = uni_atmo::ground::ground_lighting(
+                        Some(params),
+                        params.bottom_radius_m,
+                        mu0,
+                    );
+                    let ground = rho * sun_color * k * (sun_t * refl + sky);
+                    let (insc, trans) = uni_atmo::segment_radiance(params, -b.rel_pos_m, dir, t, s);
+                    trans * ground + insc * sun_color * e as f32
+                }
+                None => rho * sun_color * k * refl,
+            };
+            found.push((
+                spread,
+                Sample {
+                    x: p.x,
+                    y: p.y,
+                    expected_cd_m2: expected.as_dvec3().to_array(),
+                    what: format!(
+                        "{name} lon {:.2}° lat {:.2}° (map spread {:.1} %)",
+                        lon.to_degrees(),
+                        lat.to_degrees(),
+                        100.0 * spread
+                    ),
+                },
+            ));
+        }
+        y += step;
+    }
+    // The flattest 16 (the plan's "low-gradient map areas").
+    found.sort_by(|a, b| a.0.total_cmp(&b.0));
+    found
+        .into_iter()
+        .take(MAP_SAMPLES)
+        .map(|(_, s)| s)
+        .collect()
+}
+
 /// `flux` entries for the named sources (re-review r2 NPA): a catalogue star (its position at
 /// the epoch, its V from the camera) or the Sun as a point sprite. `radius_px` is the footprint
 /// the shader used (`stars3d::footprint_radius_px` of its off-axis display energy, the 2-px
@@ -887,7 +1092,17 @@ fn flux_entries(input: &Input<'_>, cam: &Cam, names: &[&str]) -> Vec<FluxEntry> 
         }
     }
     for pt in &frame.snapshot.points {
-        if let Some((p, r)) = footprint(pt.rel_pos_m, pt.illuminance_lux) {
+        let reflected = pt
+            .id
+            .and_then(|id| world.sim.objects().get(id as usize))
+            .is_some_and(|o| crate::scene::is_reflected(o.kind));
+        let lux = pt.illuminance_lux
+            * if reflected {
+                frame.reflected_scale
+            } else {
+                1.0
+            };
+        if let Some((p, r)) = footprint(pt.rel_pos_m, lux) {
             others.push((p, r, None, pt.illuminance_lux));
         }
     }

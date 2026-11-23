@@ -236,6 +236,42 @@ pub struct Frame {
     pub snapshot_cpu_ms: f32,
     /// The lens coverage this frame.
     pub coverage: LensCoverage,
+    /// The factor on reflected-light points' illuminance ([`Scene::prepare`]'s exposure rule
+    /// for points beside a resolved body); 1 when none is resolved.
+    pub reflected_scale: f64,
+}
+
+/// W of the reflected-point rule: the largest `lod_exposure_mix(radius_px)` among the sunlit
+/// resolved bodies of `snapshot` (0 with none).
+pub fn resolved_weight(snapshot: &Snapshot) -> f32 {
+    snapshot
+        .bodies
+        .iter()
+        .filter(|b| b.sun_illuminance_lux > 0.0)
+        .map(|b| uni_planet::lod_exposure_mix(b.proj_radius_px))
+        .fold(0.0_f32, f32::max)
+}
+
+/// `pre_mix(star_pre, scene_pre, w) / star_pre` for the EVs `star_ev100`, `scene_ev100`
+/// (clamped as the resolve does): the factor on a reflected point's illuminance that the points
+/// pass, which multiplies by `star_pre`, turns into the blended exposure.
+pub fn point_exposure_factor(w: f32, star_ev100: f32, scene_ev100: f32) -> f64 {
+    let star_pre = uni_gfx::exposure_scale(clamp_ev(star_ev100, DEFAULT_STAR_EV100));
+    let scene_pre = uni_gfx::exposure_scale(clamp_ev(scene_ev100, DEFAULT_SCENE_EV100));
+    f64::from(uni_gfx::frame::pre_mix(star_pre, scene_pre, w) / star_pre)
+}
+
+/// Whether an object drawn as a point shines by reflected sunlight (a planet, moon, dwarf
+/// planet, asteroid or comet), not by its own light.
+pub fn is_reflected(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::Planet
+            | ObjectKind::DwarfPlanet
+            | ObjectKind::Moon
+            | ObjectKind::Asteroid
+            | ObjectKind::Comet
+    )
 }
 
 /// The renderer with its feature stack, plus the handles the app keeps to steer it.
@@ -606,11 +642,12 @@ impl Scene {
             vivid_colours: vivid,
             scintillation,
         });
+        let reflected_scale = self.reflected_point_scale(&snapshot, &settings);
         self.points.set(
             snapshot
                 .points
                 .iter()
-                .map(|p| self.point_sprite(world, p, vivid))
+                .map(|p| self.point_sprite(world, p, vivid, reflected_scale))
                 .collect(),
         );
         self.band.set(BandInput {
@@ -646,14 +683,52 @@ impl Scene {
             labels,
             snapshot_cpu_ms,
             coverage,
+            reflected_scale,
         }
+    }
+
+    /// The factor on a reflected-light point's illuminance that draws it at
+    /// `pre_mix(star_pre, scene_pre, W)` instead of `star_pre` (lead ruling at B9: a moon beside
+    /// a resolved, metered planet is otherwise drawn 15+ stops overexposed): W is the largest
+    /// `lod_exposure_mix(radius_px)` among the resolved bodies (0 with none, so a lone point
+    /// stays at star exposure like a star). The points pass multiplies by `star_pre`, so the
+    /// factor is `pre_mix(star_pre, scene_pre, W) / star_pre`; with eye-adapted stars not in
+    /// effect the two exposures are equal and it is 1. The exposures are this frame's in Manual
+    /// mode, and the last read-back scene EV in Auto (one frame late while adapting).
+    fn reflected_point_scale(&self, snapshot: &Snapshot, settings: &ExposureSettings) -> f64 {
+        if !settings.eye_adapted_in_effect() {
+            return 1.0;
+        }
+        let w = resolved_weight(snapshot);
+        if !(w > 0.0) {
+            return 1.0;
+        }
+        let scene_ev = match settings.mode {
+            ExposureMode::Manual => settings.manual.scene_ev100,
+            ExposureMode::Auto => self
+                .readback
+                .last_ev100()
+                .map_or(settings.manual.scene_ev100, |e| e[0]),
+        };
+        point_exposure_factor(w, settings.eye_star_ev100, scene_ev)
     }
 
     /// The point sprite of `p`: reflected light (a body) tinted by its map's mean albedo colour
     /// with its luminance kept (carry-over 6); starlight (the Sun, catalogue stars) in the star
     /// pass's colour and through `vivid_color` while vivid colours are on (B4 notes for B9).
-    fn point_sprite(&self, world: &World, p: &PointView, vivid: bool) -> PointSprite {
+    fn point_sprite(
+        &self,
+        world: &World,
+        p: &PointView,
+        vivid: bool,
+        reflected_scale: f64,
+    ) -> PointSprite {
         let info = p.id.and_then(|id| world.sim.objects().get(id as usize));
+        let scale = if info.is_some_and(|o| is_reflected(o.kind)) {
+            reflected_scale
+        } else {
+            1.0
+        };
         let solar = unit_luminance(p.color);
         let color = match info {
             Some(o) if matches!(o.kind, ObjectKind::Sun) => {
@@ -687,7 +762,7 @@ impl Scene {
         };
         PointSprite {
             rel_pos_m: p.rel_pos_m,
-            illuminance_lux: p.illuminance_lux,
+            illuminance_lux: p.illuminance_lux * scale,
             color,
         }
     }
@@ -1224,6 +1299,41 @@ mod tests {
         let u = uni_post::resolve_exposure(&night, Some(uni_post::NIGHT_EV100));
         assert_eq!(u.ev100[0], uni_post::NIGHT_EV100);
         assert_eq!(u.ev100[1], DEFAULT_STAR_EV100);
+    }
+
+    /// Lead ruling at B9: a reflected point beside a resolved body takes the body's blended
+    /// exposure (W = 1 from 4 px: scene exposure), and stays at star exposure with nothing
+    /// resolved.
+    #[test]
+    fn reflected_points_follow_the_resolved_bodies_exposure() {
+        assert_eq!(point_exposure_factor(0.0, -6.5, 13.0), 1.0);
+        let full = point_exposure_factor(1.0, -6.5, 13.0);
+        assert!((full.log2() - (-19.5)).abs() < 1e-4, "{}", full.log2());
+        let half = point_exposure_factor(0.5, -6.5, 13.0);
+        assert!((half.log2() - (-9.75)).abs() < 1e-4, "{}", half.log2());
+        // Jupiter resolved at 28.8 px: W = 1; from the SSB nothing is resolved: W = 0.
+        let mut world = World::bare(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        world.set_epoch(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        let j = world.position_of("Jupiter").unwrap();
+        let sun = world.position_of("Sun").unwrap().delta_from(j).normalize();
+        let pos = j.offset(sun * 5.0e9);
+        let fwd = -sun;
+        let right = fwd.cross(DVec3::Z).normalize();
+        let orient = DQuat::from_mat3(&glam::DMat3::from_cols(right, right.cross(fwd), -fwd));
+        let mut v = view_at(pos, orient);
+        v.fov_y_rad = 30_f64.to_radians();
+        let snap = world.sim.snapshot(&v, UVec2::new(1920, 1080));
+        assert_eq!(resolved_weight(&snap), 1.0);
+        let far = world.sim.snapshot(
+            &view_at(
+                UniversePos::from_meters(DVec3::new(0.0, 0.0, 1e15)),
+                DQuat::IDENTITY,
+            ),
+            UVec2::new(1920, 1080),
+        );
+        assert_eq!(resolved_weight(&far), 0.0);
+        assert!(is_reflected(ObjectKind::Moon) && !is_reflected(ObjectKind::Star));
+        assert!(!is_reflected(ObjectKind::Sun));
     }
 
     #[test]

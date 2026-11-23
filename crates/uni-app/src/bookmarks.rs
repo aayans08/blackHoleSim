@@ -1701,3 +1701,104 @@ fn intent_18_19_lens_bookmarks() {
         None,
     );
 }
+
+/// The capture JSON's CPU-side measurements for bookmark `name` (no GPU: no taps).
+fn measured(
+    world: &mut World,
+    assets: &crate::world::Assets,
+    name: &str,
+) -> crate::measure::Measurements {
+    let (_, a) = applied(world, name);
+    let controls = crate::scene::default_controls(1.0);
+    let settings = crate::scene::exposure_settings(&controls, a.choice, false, true);
+    let snapshot = world.sim.snapshot(&a.view, SIZE);
+    let ctx = crate::scene::frame_ctx(
+        world,
+        &a.view,
+        SIZE,
+        SIZE,
+        settings.manual,
+        0,
+        0.0,
+        &snapshot,
+    );
+    let frame = crate::scene::Frame {
+        coverage: uni_rel::lens_coverage(&ctx),
+        ctx,
+        snapshot,
+        settings,
+        labels: Vec::new(),
+        snapshot_cpu_ms: 0.0,
+        reflected_scale: 1.0,
+    };
+    crate::measure::measure(&crate::measure::Input {
+        name,
+        world,
+        frame: &frame,
+        ev100: [10.0, -6.5],
+        world_hdr: None,
+        v_lim: 10.0,
+        comets_settle_ms: 0.0,
+        rings: assets.rings.as_ref(),
+        maps: &assets.maps,
+        map_dir: &assets.map_dir,
+    })
+}
+
+/// Rows 3–5's 16 map samples and every bookmark's regions exist (B9 Step 2: the JSON the gate's
+/// HDR checks read), and each region has samples.
+#[test]
+fn capture_measurements_cover_the_plan_checks() {
+    let mut g = full_world();
+    let (world, assets) = &mut *g;
+    for name in ["earth-map-closeup", "moon-full", "mars-reference-angle"] {
+        let m = measured(world, assets, name);
+        assert_eq!(m.samples.len(), 16, "{name}");
+        assert!(
+            m.samples
+                .iter()
+                .all(|s| s.expected_cd_m2.iter().all(|c| *c > 0.0)),
+            "{name}"
+        );
+    }
+    for (name, regions) in [
+        ("earth-limb-dawn", &["limb_arc_high", "limb_arc_low"][..]),
+        ("mars-reference-angle", &["limb_haze"]),
+        (
+            "saturn-ring-plane",
+            &[
+                "ring_cassini",
+                "ring_b",
+                "globe_ring_shadow",
+                "globe_lit_ref",
+            ],
+        ),
+        (
+            "saturn-night-side",
+            &["ring_in_planet_shadow", "ring_lit_same_radius"],
+        ),
+        ("sun-closeup", &["mu_0p5", "disk_centre"]),
+        ("sun-granulation", &["granulation_patch"]),
+        ("venus-crescent", &["night_limb_haze"]),
+        ("titan-backlit", &["haze_ring"]),
+        ("sky-galactic-center", &["band_plane", "band_high_lat"]),
+    ] {
+        let m = measured(world, assets, name);
+        for r in regions {
+            let n = m.regions.get(*r).map_or(0, Vec::len);
+            assert!(
+                n > 0 && n <= crate::measure::MAX_REGION_SAMPLES,
+                "{name} {r}: {n}"
+            );
+        }
+    }
+    let m = measured(world, assets, "sky-orion-3d");
+    assert_eq!(m.flux.len(), 1);
+    assert_eq!(m.flux[0].name, "Rigel");
+    for n in ["Betelgeuse", "Rigel", "Bellatrix", "Alnilam"] {
+        assert!(m.projected.iter().any(|p| p.name == n), "{n}");
+    }
+    let m = measured(world, assets, "alpha-cen-sun");
+    assert_eq!(m.flux.len(), 1);
+    assert_eq!(m.flux[0].name, "Sun");
+}

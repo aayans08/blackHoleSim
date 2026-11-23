@@ -347,6 +347,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             v_lim: scene.v_lim(),
             comets_settle_ms,
             rings: assets.rings.as_ref(),
+            maps: &assets.maps,
+            map_dir: &assets.map_dir,
         });
         let mut notes = assets.warnings.clone();
         notes.extend(scene.notices.iter().cloned());
