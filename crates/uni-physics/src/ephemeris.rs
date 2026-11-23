@@ -722,7 +722,12 @@ mod tests {
                         continue;
                     }
                     let fwd = -dir;
-                    let up = (pole - pole.dot(fwd) * fwd).normalize();
+                    // At elevation ±90° the pole is along the view, so the projected pole is
+                    // zero and normalizing it gives NaN (review r2 minor): take any "up" normal
+                    // to the view there, since the error's size does not depend on the roll.
+                    let up = (pole - pole.dot(fwd) * fwd)
+                        .try_normalize()
+                        .unwrap_or_else(|| fwd.any_orthonormal_vector());
                     let right = fwd.cross(up);
                     let sun_in_image = sun - sun.dot(fwd) * fwd;
                     if view.lit_limb_left && sun_in_image.dot(right) > -0.95 * sun_in_image.length()
@@ -746,6 +751,8 @@ mod tests {
                         }
                         let (_, xm, ym) = project(model);
                         let px = (xm - x).hypot(ym - y);
+                        // A NaN would pass every comparison below as "in frame, under 1 px".
+                        assert!(px.is_finite(), "{}: non-finite pixel error", view.name);
                         stat.1 += 1;
                         if px >= 1.0 {
                             stat.2 += 1;
