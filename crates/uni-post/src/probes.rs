@@ -8,7 +8,8 @@
 //!   [`meter_pixel`], [`Histogram::meter`] and [`target_ev`]: lit_px ±0.1 %, ev_avg, ev_hi and
 //!   the target ±0.05 EV.
 //! - `exposure_resolve`: the resolve for 16 settings and states vs [`next_adapted_ev`] and
-//!   [`resolve_exposure`] (±1e-6 relative), and the read-back ring against the last of them.
+//!   [`resolve_exposure`] (±1e-5 relative, `RESOLVE_TOLERANCE`), and the read-back ring against
+//!   the last of them.
 //! - `bloom_impulse`: the whole bloom on impulses (one above `BLOOM_INPUT_MAX`) at strength 1
 //!   vs [`bloom_reference`]: every texel within 1 % of the peak, each channel's sum within 1 %.
 //!
@@ -54,8 +55,12 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
 const METER_EV_TOLERANCE: f32 = 0.05;
 /// Largest relative |GPU − CPU| of the meter's lit-pixel count.
 const LIT_TOLERANCE: f32 = 1e-3;
-/// Largest relative |GPU − CPU| of a resolved value (plan B6).
-const RESOLVE_TOLERANCE: f32 = 1e-6;
+/// Largest relative |GPU − CPU| of a resolved value. The plan's (B6) 1e-6 is below what Metal's
+/// fast-math `exp2`/`log2` reach: the GPU measured 2.3e-6 on the M3 (B9 selftest at 6cd81e9,
+/// case 9: 3.9982555 vs 3.9982586 EV, 3e-6 EV). Lead ruling "selftest tolerances" (Wave B
+/// gate): 1e-5, about 4× the measured error; at the EV100 limits (±40) that is at most 4e-4 EV,
+/// far below a visible 0.01 EV.
+const RESOLVE_TOLERANCE: f32 = 1e-5;
 /// Largest |GPU − CPU| of a bloom texel, relative to the channel's peak, and of a channel's sum
 /// (plan B6).
 const BLOOM_TOLERANCE: f32 = 0.01;

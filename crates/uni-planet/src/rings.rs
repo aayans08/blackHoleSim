@@ -655,8 +655,12 @@ fn cs_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// (a handful of f32 operations; a wrong lobe or sign errs by ≥ 0.01).
 const RING_TWIN_TOLERANCE: f32 = 1e-5;
 /// Largest |GPU − CPU| of the planet's shadow: the penumbra's fraction moves 1 per ~1e-3 rad of
-/// separation, so f32 differences of ~3e-8 rad in `atan2`/`asin` give ≤ 3e-5.
-const RING_SHADOW_TOLERANCE: f32 = 1e-4;
+/// separation, so exact f32 differences of ~3e-8 rad in `atan2`/`asin` would give ≤ 3e-5. On the
+/// M3 the GPU measured 2.8e-4 (B9 selftest, `universe --selftest` at 6cd81e9): Metal compiles
+/// with fast math, whose `asin`/`atan2`/`acos` are a few ulp off the CPU's correctly rounded
+/// ones, and the penumbra's steep slope amplifies that. Lead ruling "selftest tolerances" (Wave B
+/// gate): 1e-3, about 3.5× the measured error (a wrong umbra or penumbra errs by ≥ 0.01).
+const RING_SHADOW_TOLERANCE: f32 = 1e-3;
 
 /// Phase-function probe inputs: 64 scattering-angle cosines over [−1, 1], both faces.
 fn phase_probe_inputs() -> Vec<[f32; 4]> {
