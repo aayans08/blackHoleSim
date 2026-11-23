@@ -48,6 +48,8 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     ];
     results.extend(crate::star_surface::star_probes(gpu, lib));
     results.extend(crate::rings::ring_probes(gpu, lib));
+    // C1's comet probes (Task C0 hook; none until C1 lands).
+    results.extend(crate::comet::comet_probes(gpu, lib));
     results
 }
 

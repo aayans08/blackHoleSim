@@ -26,7 +26,7 @@ pub use context::{GpuContext, SurfaceState};
 pub use env::{ENV_UNIT_CD_M2, EnvMap};
 pub use frame::{
     CameraUniform, Exposure, ExposureUniform, FrameCtx, LensView, LightGpu, LightUniform,
-    LightView, MAX_LIGHTS, SIM_TIME_WRAP_S, exposure_scale,
+    LightView, MAX_LIGHTS, SIM_TIME_WRAP_S, exposure_scale, pre_mix,
 };
 pub use proj::reversed_z_infinite_proj;
 pub use renderer::{FrameBindings, RenderFeature, Renderer};

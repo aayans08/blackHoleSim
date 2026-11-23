@@ -9,15 +9,34 @@
 //! after the first snapshot that finds it near (review I1); in that one snapshot it is a point
 //! without an id at any size, since [`StarSurfaceView::id`] names an object. Points and picks
 //! off screen are left out.
+//!
+//! Comets (Task C0, lead rulings A.2): a comet is never in `bodies`. Its nucleus is a point
+//! below [`POINT_LOD_PX`] (when on screen, as any body), and the comet is in `comets`, which the
+//! comet pass (C1) draws, when it is active (heliocentric distance below [`COMET_ACTIVE_AU`]) or
+//! its nucleus is resolved, on screen or not (the comet pass culls its own coma and tails).
+//! Every comet in `comets` counts as drawn for the comets' catch-up order and
+//! `HonestyFlag::CometsCatchingUp`.
+//!
+//! `suppressed_asteroids` lists the asteroid record indices that uni-sim draws itself (the
+//! registry asteroids, plus SBDB's Pluto row, which the ephemeris draws), so the asteroid pass
+//! (C2) skips them; it is the same list every frame ([`World::suppressed_asteroid_records`]).
+//!
+//! `destinations` are the objects that carry a marker and can be aimed at (lead ruling B.3, for
+//! C3's aim and C5's markers), on screen or off it: always the Sun, the planets, the dwarf
+//! planets, the dominant planet's major moons ([`MAJOR_MOONS`]) and TestBH-1; any object that is
+//! selected or the goto target; and comets, asteroids and exoplanet hosts only as one of those or
+//! as one of the [`MAX_BRIGHT_DESTINATIONS`] brightest of their kind on screen.
 
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2, Vec3};
 use uni_core::{
-    AU, CameraView, FrameId, PC, TEFF_SUN_K, UniversePos, blackbody_linear_srgb,
+    AU, CameraView, Epoch, FrameId, PC, TEFF_SUN_K, UniversePos, blackbody_linear_srgb,
     star_illuminance_lux,
 };
+use uni_physics::kepler::Conic;
 use uni_physics::photometry::{
     Brdf, comet_total_v, disk_phase_function, planet_phase_correction, rho_from_geometric_albedo,
 };
+use uni_physics::smallbody::heliocentric_state_icrs;
 
 use crate::registry::{ObjectId, ObjectKind, Source};
 use crate::starindex::star_pos_from;
@@ -40,6 +59,20 @@ const MAX_STAR_PICKS: usize = 2000;
 pub const MAX_PHASE_CORRECTION: f64 = 10.0;
 /// Siblings and moons that may eclipse a body, after its parent (plan A4: up to 3).
 const MAX_OTHER_OCCLUDERS: usize = 3;
+/// A comet nearer the Sun than this [au] is active: it has a coma and tails (plan C1, "Only
+/// comets with r_h < 5 AU get a coma and tails"), so it is in [`Snapshot::comets`].
+pub const COMET_ACTIVE_AU: f64 = 5.0;
+/// Comets, asteroids and exoplanet hosts that are neither selected nor the goto target are
+/// destinations only as one of this many brightest of their kind on screen (lead ruling B.3).
+pub const MAX_BRIGHT_DESTINATIONS: usize = 6;
+/// NAIF ids of the major moons, those with their own NASA NSSDCA fact sheet (the moons of A9's
+/// `body_facts.ron`, from <https://nssdc.gsfc.nasa.gov/planetary/factsheet/>): the Moon, Phobos,
+/// Deimos, the four Galileans, Saturn's eight (Mimas … Iapetus), Uranus's five, Triton and
+/// Charon. The dominant planet's are always destinations (lead ruling B.3).
+pub const MAJOR_MOONS: [i32; 22] = [
+    301, 401, 402, 501, 502, 503, 504, 601, 602, 603, 604, 605, 606, 607, 608, 701, 702, 703, 704,
+    705, 801, 901,
+];
 
 /// Projected radius [px] of a sphere of `radius_m` at `dist_m`:
 /// (h/2)·tan(asin(R/d))/tan(fov/2); R ≥ d → +∞ (review m5).
@@ -142,6 +175,62 @@ pub struct PickItem {
     pub priority: u8,
 }
 
+/// A comet the comet pass draws (Task C0; see the module docs for which comets are listed).
+#[derive(Clone, Debug)]
+pub struct CometView {
+    pub id: ObjectId,
+    /// Registry name ([`crate::registry::ObjectInfo::name`]).
+    pub name: String,
+    /// The nucleus relative to the camera [m], ICRS axes.
+    pub nucleus_rel_m: DVec3,
+    /// Nucleus radius [m]: half SBDB's diameter, else `crate::ASSUMED_RADIUS_M`.
+    pub nucleus_radius_m: f64,
+    /// SBDB gives no diameter, so the radius is the assumed 2 km (card: "size assumed").
+    pub radius_assumed: bool,
+    /// SBDB primary SPK-ID (the same number as the comet's `ObjectInfo::naif`, which for a comet
+    /// is not a NAIF id: never look comets up in NAIF-keyed tables).
+    pub spkid: i32,
+    /// The Sun relative to the nucleus [m] (Sun − nucleus), ICRS axes.
+    pub sun_rel_m: DVec3,
+    /// Heliocentric velocity [m/s], ICRS axes, from the same conic as the position.
+    pub helio_vel_mps: DVec3,
+    /// Heliocentric distance r_h [au].
+    pub r_au: f64,
+    /// Distance from the camera Δ [au].
+    pub delta_au: f64,
+    /// Total (nucleus + coma) V from the camera, m = M1 + 5 log₁₀Δ + K1 log₁₀r (SBDB's law,
+    /// `photometry::comet_total_v`); `None` unless SBDB gives both M1 and K1.
+    pub total_v: Option<f64>,
+    pub m1: Option<f64>,
+    pub k1: Option<f64>,
+    /// The osculating conic the comet moves on now: heliocentric, J2000 ECLIPTIC (SBDB's frame;
+    /// lead ruling A.1), so states come from `uni_physics::smallbody::heliocentric_state_icrs`
+    /// and `dust::finson_probstein` takes it as is.
+    pub conic: Conic,
+    /// The conic's osculation epoch (the card's "two-body from epoch" note).
+    pub conic_epoch: Epoch,
+    /// Projected radius of the nucleus [internal px] (`proj_radius_px` of its radius): between
+    /// `POINT_LOD_PX` and `BLEND_LOD_PX` the nucleus is a world writer in the LOD band
+    /// (`pre_mix` exposure and `lens_mask.a`, as a body).
+    pub proj_radius_px: f64,
+}
+
+/// An object that carries a marker and can be aimed at (lead ruling B.3; see the module docs
+/// for the rule), on screen or not.
+#[derive(Clone, Copy, Debug)]
+pub struct Destination {
+    pub id: ObjectId,
+    pub kind: ObjectKind,
+    /// Relative to the camera [m], ICRS axes.
+    pub rel_pos_m: DVec3,
+    pub dist_m: f64,
+    /// Where its centre projects [internal px], also outside the viewport; `None` behind the
+    /// camera.
+    pub screen_px: Option<Vec2>,
+    /// Projected radius [internal px] of its largest radius.
+    pub proj_radius_px: f64,
+}
+
 /// Everything the renderer and the HUD need from the world this frame.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -155,6 +244,15 @@ pub struct Snapshot {
     /// The nearest surface and the distance to it [m].
     pub nearest_surface: Option<(ObjectId, f64)>,
     pub dominant_frame: FrameId,
+    /// The comets the comet pass draws, brightest `total_v` first (comets without one last), ties
+    /// by id (Task C0; module docs).
+    pub comets: Vec<CometView>,
+    /// Asteroid record indices (into `World::asteroid_records`) that uni-sim draws as bodies or
+    /// points (the registry asteroids) or that the ephemeris draws (SBDB's Pluto row), sorted:
+    /// the asteroid pass skips them (review I12). The same list every frame.
+    pub suppressed_asteroids: Vec<u32>,
+    /// The objects that carry a marker, in id order (lead ruling B.3; module docs).
+    pub destinations: Vec<Destination>,
 }
 
 /// The camera's projection into internal pixels (origin top left, y down; pixel i spans
@@ -238,8 +336,9 @@ fn proj_radius_px_tan(radius_m: f64, dist_m: f64, tan_half_fov: f64, height_px: 
 /// them on screen). A star is skipped only when its direction, from plain f64 metres, is more
 /// than the cone through the frame's corners plus [`StarCull::MARGIN_RAD`] from the view axis,
 /// and that f64 shortcut is good to [`StarCull::MAX_ERROR_RAD`] for it. Every other star takes
-/// the exact path, so the snapshot is the one the exact path alone gives
-/// (`build_matches_the_reference`).
+/// the exact path, so the snapshot is the one the exact path alone gives (B9g proved it bit for
+/// bit against the previous code; `star_cull_skips_most_named_stars_and_none_on_screen` keeps
+/// the cull's own check).
 struct StarCull {
     /// The camera's position from the SSB [m], in plain f64 (rounded far from the SSB).
     cam_m: DVec3,
@@ -292,6 +391,38 @@ impl StarCull {
 /// (a few ulps of |rel|), so the shortcut never disagrees with `Projector::screen`.
 const BEHIND_COS: f64 = 1.0e-9;
 
+/// The objects of one kind that may become destinations by brightness (lead ruling B.3):
+/// (illuminance at the camera [lx], +∞ for a resolved one; the destination).
+type BrightCandidates = Vec<(f64, Destination)>;
+
+/// Keeps the [`MAX_BRIGHT_DESTINATIONS`] brightest of `candidates` (ties by id).
+fn brightest(mut candidates: BrightCandidates) -> impl Iterator<Item = Destination> {
+    let order = |a: &(f64, Destination), b: &(f64, Destination)| {
+        b.0.total_cmp(&a.0).then(a.1.id.cmp(&b.1.id))
+    };
+    if candidates.len() > MAX_BRIGHT_DESTINATIONS {
+        candidates.select_nth_unstable_by(MAX_BRIGHT_DESTINATIONS, order);
+        candidates.truncate(MAX_BRIGHT_DESTINATIONS);
+    }
+    candidates.into_iter().map(|(_, d)| d)
+}
+
+/// The registry body whose moons are the dominant planet's: the body of `frame` if it is a
+/// planet or dwarf planet, its parent if it is a moon; `None` for the Sun's frame or ROOT.
+fn dominant_planet(world: &World, frame: FrameId) -> Option<ObjectId> {
+    let id = world
+        .ephem_order
+        .iter()
+        .copied()
+        .find(|&id| world.objects[id as usize].frame == Some(frame))?;
+    let info = &world.objects[id as usize];
+    match info.kind {
+        ObjectKind::Planet | ObjectKind::DwarfPlanet => Some(id),
+        ObjectKind::Moon => info.parent,
+        _ => None,
+    }
+}
+
 /// Builds the snapshot (see [`World::snapshot`]).
 ///
 /// B9g (Wave B gate, snapshot CPU at `sky-orion-3d`) made it cheaper without changing what it
@@ -299,7 +430,8 @@ const BEHIND_COS: f64 = 1.0e-9;
 /// the Sun's colour and the stars' epoch offset once per snapshot; the body → Sun vector only for
 /// what is drawn; objects clearly behind the camera skip the rotation into camera space; and
 /// named stars and exoplanet hosts far off screen are skipped by a conservative cone test
-/// ([`StarCull`]). `build_matches_the_reference` compares it with the previous code bit for bit.
+/// ([`StarCull`]). Task C0 added the comets, the suppressed asteroid records and the
+/// destinations (module docs).
 pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapshot {
     let proj = Projector::new(view, viewport);
     let height = f64::from(viewport.y.max(1));
@@ -313,25 +445,32 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     let mut snap = Snapshot {
         dominant_frame: world.dominant_frame(&cam),
         nearest_surface: world.nearest_surface_among(&cam, &near),
+        suppressed_asteroids: world.suppressed_asteroid_records().to_vec(),
         ..Snapshot::default()
     };
+    let home = dominant_planet(world, snap.dominant_frame);
+    // Selected or the goto target: always a destination.
+    let chosen = |id: ObjectId| world.selected == Some(id) || world.goto_target == Some(id);
+    // Comets, asteroids and exoplanet hosts on screen that may be destinations by brightness.
+    let (mut bright_comets, mut bright_asteroids, mut bright_hosts) = (
+        BrightCandidates::new(),
+        BrightCandidates::new(),
+        BrightCandidates::new(),
+    );
     // The comets drawn, so ticks re-osculate the stale ones first (review r2 P1).
     let mut shown_comets = Vec::new();
     // A pick for the object at `rel`, whose screen position is `screen` (`proj.screen(rel)`).
-    let pick = |snap: &mut Snapshot,
-                id: ObjectId,
-                rel: DVec3,
-                screen: Option<DVec2>,
-                kind: ObjectKind| {
-        if let Some(p) = screen.filter(|&p| proj.on_screen(p, 0.0)) {
-            snap.pick.push(PickItem {
-                id,
-                screen_px: p.as_vec2(),
-                dist_m: rel.length(),
-                priority: pick_priority(kind),
-            });
-        }
-    };
+    let pick =
+        |snap: &mut Snapshot, id: ObjectId, rel: DVec3, screen: Option<DVec2>, kind: ObjectKind| {
+            if let Some(p) = screen.filter(|&p| proj.on_screen(p, 0.0)) {
+                snap.pick.push(PickItem {
+                    id,
+                    screen_px: p.as_vec2(),
+                    dist_m: rel.length(),
+                    priority: pick_priority(kind),
+                });
+            }
+        };
 
     for k in 0..world.cached.len() {
         let id = k as ObjectId;
@@ -351,6 +490,10 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         pick(&mut snap, id, rel, screen, info.kind);
         let px = proj_radius_px_tan(info.radii_m.max_element(), d, tan_half_fov, height);
         let on_screen = || screen.is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX));
+        let sun_rel = || sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
+        // Illuminance at the camera of what this frame draws of the object [lx] (+∞ resolved);
+        // `None` when it draws nothing of it.
+        let mut drawn_lux = None;
         match world.physical[k].source {
             Source::BlackHole(_) | Source::Star => {}
             Source::Ephem if Some(id) == world.sun => {
@@ -365,12 +508,11 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                     });
                 }
             }
-            source => {
-                let sun_rel = || sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
-                let lux = if px >= POINT_LOD_PX {
-                    let body = body_view(world, id, rel, sun_rel(), px, &cam, sun_cd);
-                    snap.bodies.push(body);
-                    f64::INFINITY
+            // Never in `bodies` (lead ruling A.2a): the comet pass draws a resolved nucleus.
+            Source::Comet(c) => {
+                let resolved = px >= POINT_LOD_PX;
+                if resolved {
+                    drawn_lux = Some(f64::INFINITY);
                 } else if on_screen() {
                     let lux = reflected_lux(world, id, rel, sun_rel(), sun_cd);
                     snap.points.push(PointView {
@@ -379,17 +521,83 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                         illuminance_lux: lux,
                         color: sun_color,
                     });
-                    lux
-                } else {
-                    continue;
-                };
-                if let Source::Comet(c) = source {
+                    drawn_lux = Some(lux);
+                }
+                let active = sun_pos.is_some() && sun_rel().length() < COMET_ACTIVE_AU * AU;
+                if resolved || active {
+                    snap.comets
+                        .push(comet_view(world, id, c, rel, sun_rel(), px));
+                    // Every listed comet counts as drawn (carry-over 8).
+                    let lux = drawn_lux
+                        .unwrap_or_else(|| reflected_lux(world, id, rel, sun_rel(), sun_cd));
+                    shown_comets.push((c, lux));
+                } else if let Some(lux) = drawn_lux {
                     shown_comets.push((c, lux));
                 }
+            }
+            Source::Ephem | Source::Asteroid(_) => {
+                if px >= POINT_LOD_PX {
+                    let body = body_view(world, id, rel, sun_rel(), px, &cam, sun_cd);
+                    snap.bodies.push(body);
+                    drawn_lux = Some(f64::INFINITY);
+                } else if on_screen() {
+                    let lux = reflected_lux(world, id, rel, sun_rel(), sun_cd);
+                    snap.points.push(PointView {
+                        id: Some(id),
+                        rel_pos_m: rel,
+                        illuminance_lux: lux,
+                        color: sun_color,
+                    });
+                    drawn_lux = Some(lux);
+                }
+            }
+        }
+
+        // Destinations (lead ruling B.3); built only for the objects that may become one.
+        let dest = || Destination {
+            id,
+            kind: info.kind,
+            rel_pos_m: rel,
+            dist_m: d,
+            screen_px: screen.map(|p| p.as_vec2()),
+            proj_radius_px: px,
+        };
+        let always = match info.kind {
+            ObjectKind::Sun
+            | ObjectKind::Planet
+            | ObjectKind::DwarfPlanet
+            | ObjectKind::BlackHole => true,
+            ObjectKind::Moon => {
+                home.is_some()
+                    && info.parent == home
+                    && info.naif.is_some_and(|n| MAJOR_MOONS.contains(&n))
+            }
+            ObjectKind::Comet | ObjectKind::Asteroid | ObjectKind::Star | ObjectKind::ExoHost => {
+                false
+            }
+        };
+        if always || chosen(id) {
+            snap.destinations.push(dest());
+        } else if let Some(lux) = drawn_lux
+            && screen.is_some_and(|p| proj.on_screen(p, 0.0))
+        {
+            match info.kind {
+                ObjectKind::Comet => bright_comets.push((lux, dest())),
+                ObjectKind::Asteroid => bright_asteroids.push((lux, dest())),
+                _ => {}
             }
         }
     }
     world.note_shown_comets(shown_comets);
+    snap.comets.sort_by(|a, b| {
+        match (a.total_v, b.total_v) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then(a.id.cmp(&b.id))
+    });
     if let (Some(sun), Some(sun_pos)) = (world.sun, sun_pos) {
         snap.sun = Some(SunLight {
             rel_pos_m: sun_pos.delta_from(cam),
@@ -421,7 +629,10 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                 luminous_intensity_cd: intensity,
                 proj_radius_px: px,
             }),
-            _ if proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) => {
+            _ if proj
+                .screen(rel)
+                .is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) =>
+            {
                 snap.points.push(PointView {
                     id,
                     rel_pos_m: rel,
@@ -439,23 +650,43 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     // `World::star_position`'s, from the decoded motion, with the epoch offset taken once.
     let years = world.star_years();
     let mut named = Vec::new();
+    let star_destination = |id: ObjectId, kind: ObjectKind, rel: DVec3, screen: Option<DVec2>| {
+        let d = rel.length();
+        let radius = world.objects[id as usize].radii_m.max_element();
+        Destination {
+            id,
+            kind,
+            rel_pos_m: rel,
+            dist_m: d,
+            screen_px: screen.map(|p| p.as_vec2()),
+            proj_radius_px: proj_radius_px_tan(radius, d, tan_half_fov, height),
+        }
+    };
     for row in &world.star_rows {
         let pos_m = row.motion.map(|(p, v)| star_pos_from(p, v, years) * PC);
         let position = || pos_m.map_or(UniversePos::default(), UniversePos::from_meters);
+        // A chosen star is a destination wherever it is (added after this loop).
+        let apparent_v = |rel: DVec3| {
+            let abs_mag = f64::from(world.star_data()[row.index as usize].abs_mag_v);
+            abs_mag + 5.0 * (rel.length() / PC / 10.0).log10()
+        };
         match row.kind {
             // A pick needs the star on screen, so the cull applies to both kinds.
             _ if pos_m.is_some_and(|p| cull.off_screen(p)) => {}
             ObjectKind::ExoHost => {
                 let rel = position().delta_from(cam);
-                pick(&mut snap, row.id, rel, proj.screen(rel), row.kind);
+                let screen = proj.screen(rel);
+                pick(&mut snap, row.id, rel, screen, row.kind);
+                if !chosen(row.id) && screen.is_some_and(|p| proj.on_screen(p, 0.0)) {
+                    let lux = star_illuminance_lux(apparent_v(rel));
+                    bright_hosts.push((lux, star_destination(row.id, row.kind, rel, screen)));
+                }
             }
             ObjectKind::Star => {
                 let rel = position().delta_from(cam);
                 let screen = proj.screen(rel);
                 if screen.is_some_and(|p| proj.on_screen(p, 0.0)) {
-                    let d_pc = rel.length() / PC;
-                    let abs_mag = f64::from(world.star_data()[row.index as usize].abs_mag_v);
-                    named.push((abs_mag + 5.0 * (d_pc / 10.0).log10(), row.id, rel, screen));
+                    named.push((apparent_v(rel), row.id, rel, screen));
                 }
             }
             _ => {}
@@ -469,7 +700,65 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
     for (_, id, rel, screen) in named {
         pick(&mut snap, id, rel, screen, ObjectKind::Star);
     }
+
+    // A chosen star or exoplanet host is a destination on screen or off it.
+    let mut chosen_stars: Vec<ObjectId> = [world.selected, world.goto_target]
+        .into_iter()
+        .flatten()
+        .filter(|&id| (id as usize) >= world.cached.len() && (id as usize) < world.objects.len())
+        .collect();
+    chosen_stars.dedup();
+    for id in chosen_stars {
+        let rel = world.position(id).delta_from(cam);
+        if rel.is_finite() {
+            let kind = world.objects[id as usize].kind;
+            snap.destinations
+                .push(star_destination(id, kind, rel, proj.screen(rel)));
+        }
+    }
+    snap.destinations.extend(brightest(bright_comets));
+    snap.destinations.extend(brightest(bright_asteroids));
+    snap.destinations.extend(brightest(bright_hosts));
+    snap.destinations.sort_by_key(|d| d.id);
     snap
+}
+
+/// The comet pass's view of comet `id` (comet orbit `c`): `rel` camera → nucleus, `sun_rel`
+/// nucleus → Sun [m], `px` the nucleus's projected radius.
+fn comet_view(
+    world: &World,
+    id: ObjectId,
+    c: usize,
+    rel: DVec3,
+    sun_rel: DVec3,
+    px: f64,
+) -> CometView {
+    let (record, conic, conic_epoch) = world.comet_parts(c);
+    let helio_vel_mps = heliocentric_state_icrs(&conic, world.epoch).1;
+    let r_au = sun_rel.length() / AU;
+    let delta_au = rel.length() / AU;
+    let total_v = record
+        .m1
+        .zip(record.k1)
+        .map(|(m1, k1)| comet_total_v(m1, k1, r_au, delta_au));
+    CometView {
+        id,
+        name: world.objects[id as usize].name.clone(),
+        nucleus_rel_m: rel,
+        nucleus_radius_m: world.physical[id as usize].mean_radius_m,
+        radius_assumed: !record.diameter_km.is_some_and(|d| d.is_finite() && d > 0.0),
+        spkid: record.spkid,
+        sun_rel_m: sun_rel,
+        helio_vel_mps,
+        r_au,
+        delta_au,
+        total_v,
+        m1: record.m1,
+        k1: record.k1,
+        conic,
+        conic_epoch,
+        proj_radius_px: px,
+    }
 }
 
 impl Snapshot {
@@ -514,7 +803,11 @@ fn body_view(
         radii_m: info.radii_m,
         proj_radius_px: px,
         sun_rel_m: sun_rel,
-        sun_illuminance_lux: if r_sun > 0.0 { sun_cd / (r_sun * r_sun) } else { 0.0 },
+        sun_illuminance_lux: if r_sun > 0.0 {
+            sun_cd / (r_sun * r_sun)
+        } else {
+            0.0
+        },
         occluders: occluders(world, id, sun_rel, cam),
         ring,
         has_atmosphere: physical.has_atmosphere,
@@ -547,7 +840,9 @@ fn occluders(
     }
     let body_pos = world.cached[id as usize];
     let body_r = info.radii_m.max_element();
-    let sun_angle = (world.objects[sun as usize].radii_m.x / r_sun).min(1.0).asin();
+    let sun_angle = (world.objects[sun as usize].radii_m.x / r_sun)
+        .min(1.0)
+        .asin();
     // How far inside the eclipse limit occluder `o` is [rad]; `None` if it cannot eclipse.
     let margin = |o: ObjectId| -> Option<f64> {
         let w = world.cached[o as usize].delta_from(body_pos);
@@ -625,7 +920,10 @@ pub(crate) fn reflected_lux(
         .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
         .min(MAX_PHASE_CORRECTION);
     let ratio = physical.mean_radius_m / d;
-    rho * weight * (sun_cd / (r_sun * r_sun)) * ratio * ratio
+    rho * weight
+        * (sun_cd / (r_sun * r_sun))
+        * ratio
+        * ratio
         * disk_phase_function(brdf, phase)
         * correction
 }
@@ -635,229 +933,29 @@ mod tests {
     use super::*;
     use crate::starindex::star_pos_pc;
 
-    /// The snapshot as `build` made it before B9g's speed-up: the reference for
-    /// `build_matches_the_reference`. A verbatim copy of the old code, kept to prove the
-    /// speed-up changed nothing: remove it (and that test) after the Wave B gate, rather than
-    /// mirror later changes to `build` here (review B9g r0 minor 5).
-    pub(crate) fn build_reference(world: &World, view: &CameraView, viewport: UVec2) -> Snapshot {
-        let proj = Projector::new(view, viewport);
-        let height = f64::from(viewport.y.max(1));
-        let fov = view.fov_y_rad;
-        let cam = view.pos;
-        let sun_pos = world.sun.map(|s| world.cached[s as usize]);
-        let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
-        let sun_cd = sun_intensity_cd();
-        let near = world.near_stars(&cam);
-        let mut snap = Snapshot {
-            dominant_frame: world.dominant_frame(&cam),
-            nearest_surface: world.nearest_surface_among(&cam, &near),
-            ..Snapshot::default()
-        };
-        // The comets drawn, so ticks re-osculate the stale ones first (review r2 P1).
-        let mut shown_comets = Vec::new();
-        let pick = |snap: &mut Snapshot, id: ObjectId, rel: DVec3, kind: ObjectKind| {
-            if let Some(p) = proj.screen(rel).filter(|&p| proj.on_screen(p, 0.0)) {
-                snap.pick.push(PickItem {
-                    id,
-                    screen_px: p.as_vec2(),
-                    dist_m: rel.length(),
-                    priority: pick_priority(kind),
-                });
-            }
-        };
-
-        for k in 0..world.cached.len() {
-            let id = k as ObjectId;
-            let info = &world.objects[k];
-            let rel = world.cached[k].delta_from(cam);
-            if !rel.is_finite() {
-                continue;
-            }
-            pick(&mut snap, id, rel, info.kind);
-            let d = rel.length();
-            let px = proj_radius_px(info.radii_m.max_element(), d, fov, height);
-            let on_screen = || proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX));
-            match world.physical[k].source {
-                Source::BlackHole(_) | Source::Star => {}
-                Source::Ephem if Some(id) == world.sun => {
-                    if px >= POINT_LOD_PX {
-                        snap.sun_surface(world, id, rel, px, sun_cd);
-                    } else if on_screen() {
-                        snap.points.push(PointView {
-                            id: Some(id),
-                            rel_pos_m: rel,
-                            illuminance_lux: sun_cd / (d * d),
-                            color: sun_color,
-                        });
-                    }
-                }
-                source => {
-                    let sun_rel = sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
-                    let lux = if px >= POINT_LOD_PX {
-                        snap.bodies.push(body_view(world, id, rel, sun_rel, px, &cam, sun_cd));
-                        f64::INFINITY
-                    } else if on_screen() {
-                        let lux = reflected_lux(world, id, rel, sun_rel, sun_cd);
-                        snap.points.push(PointView {
-                            id: Some(id),
-                            rel_pos_m: rel,
-                            illuminance_lux: lux,
-                            color: sun_color,
-                        });
-                        lux
-                    } else {
-                        continue;
-                    };
-                    if let Source::Comet(c) = source {
-                        shown_comets.push((c, lux));
-                    }
-                }
-            }
-        }
-        world.note_shown_comets(shown_comets);
-        if let (Some(sun), Some(sun_pos)) = (world.sun, sun_pos) {
-            snap.sun = Some(SunLight {
-                rel_pos_m: sun_pos.delta_from(cam),
-                radius_m: world.objects[sun as usize].radii_m.x,
-                intensity_cd: sun_cd,
-                color: sun_color,
-            });
-        }
-
-        // Catalogue stars within 0.1 pc: drawn here instead of by the star pass. An unnamed one
-        // not registered yet (no object id until the next tick) is a point even where it would
-        // resolve (module doc).
-        for &(index, id) in &near {
-            let star = world.star_data()[index as usize];
-            let rel = world.star_position(index).delta_from(cam);
-            let d = rel.length();
-            let radius = world.star_radius_m(index);
-            let px = proj_radius_px(radius, d, fov, height);
-            let teff = world.star_teff_k(index);
-            let intensity = luminous_intensity_cd(f64::from(star.abs_mag_v));
-            match id {
-                Some(id) if px >= POINT_LOD_PX => snap.star_surfaces.push(StarSurfaceView {
-                    id,
-                    catalog_index: Some(index),
-                    rel_pos_m: rel,
-                    orient: DQuat::IDENTITY,
-                    radius_m: radius,
-                    teff_k: teff,
-                    luminous_intensity_cd: intensity,
-                    proj_radius_px: px,
-                }),
-                _ if proj.screen(rel).is_some_and(|p| proj.on_screen(p, POINT_MARGIN_PX)) => {
-                    snap.points.push(PointView {
-                        id,
-                        rel_pos_m: rel,
-                        illuminance_lux: intensity / (d * d),
-                        color: blackbody_linear_srgb(teff),
-                    });
-                }
-                _ => {}
-            }
-            snap.suppressed_stars.push(index);
-        }
-
-        // Exoplanet hosts on screen, and the brightest named stars on screen.
-        let mut named = Vec::new();
-        for k in world.cached.len()..world.objects.len() {
-            let info = &world.objects[k];
-            let Some(index) = info.catalog_index else {
-                continue;
-            };
-            let rel = world.star_position(index).delta_from(cam);
-            match info.kind {
-                ObjectKind::ExoHost => pick(&mut snap, k as ObjectId, rel, info.kind),
-                ObjectKind::Star => {
-                    if proj.screen(rel).is_some_and(|p| proj.on_screen(p, 0.0)) {
-                        let d_pc = rel.length() / PC;
-                        let abs_mag = f64::from(world.star_data()[index as usize].abs_mag_v);
-                        named.push((abs_mag + 5.0 * (d_pc / 10.0).log10(), k as ObjectId, rel));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if named.len() > MAX_STAR_PICKS {
-            named.select_nth_unstable_by(MAX_STAR_PICKS, |a, b| a.0.total_cmp(&b.0));
-            named.truncate(MAX_STAR_PICKS);
-        }
-        named.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        for (_, id, rel) in named {
-            pick(&mut snap, id, rel, ObjectKind::Star);
-        }
-        snap
-    }
-
-    /// B9g: the faster `build` returns exactly what the previous code did (every f64 to the
-    /// bit: `Debug` prints the shortest string that round-trips), over the baked data, from
-    /// views that exercise each branch: bodies resolved and as points, the Sun as a surface and
-    /// as a point, near stars as surfaces, the named-star cull with wide, narrow and
-    /// panoramic fields (`sky-orion-3d` among them), and a camera far beyond the Galaxy.
+    /// B9g's named-star cull (carry-over 1 of Task C0 kept this assertion when it removed the
+    /// one-off `build_reference` comparison, as its doc asked after the Wave B gate): from the
+    /// `sky-orion-3d` view it skips most of the named stars (2 624 of the 3 321 at B9g: 79 %; the
+    /// frame's corner cone, 49.7° from the axis, holds 18 % of the sky, but the named stars crowd
+    /// toward Orion and the Milky Way), and it never skips a star that is on screen.
     #[test]
-    fn build_matches_the_reference() {
+    fn star_cull_skips_most_named_stars_and_none_on_screen() {
         use crate::world::load_world_data;
         let data = load_world_data(&uni_data::data_dir().join("baked"));
         let epoch = uni_core::Epoch::parse_iso_utc("2026-11-20T00:00:00Z").expect("date");
         let world = World::new(data, epoch);
-        let at = |name: &str| world.position(world.find(name).expect(name));
-        let look = |pos: UniversePos, dir: DVec3, fov_deg: f64, roll: f64| CameraView {
-            pos,
-            orient: DQuat::from_rotation_arc(DVec3::NEG_Z, dir.normalize())
-                * DQuat::from_rotation_z(roll),
-            fov_y_rad: fov_deg.to_radians(),
+        let sun = world.position(world.find("Sun").expect("Sun"));
+        let (ra, dec) = (83.8_f64.to_radians(), (-1.2_f64).to_radians());
+        let orion = DVec3::new(dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin());
+        let view = CameraView {
+            pos: sun.offset(orion * 100.0 * AU),
+            orient: DQuat::from_rotation_arc(DVec3::NEG_Z, orion),
+            fov_y_rad: 60f64.to_radians(),
             velocity_mps: DVec3::ZERO,
         };
-        let (earth, sun, saturn) = (at("Earth"), at("Sun"), at("Saturn"));
-        let radec = |ra: f64, dec: f64| {
-            let (ra, dec) = (ra.to_radians(), dec.to_radians());
-            DVec3::new(dec.cos() * ra.cos(), dec.cos() * ra.sin(), dec.sin())
-        };
-        let orion = radec(83.8, -1.2);
-        let gc = radec(266.405, -28.936);
-        let alpha_cen = at("Rigil Kentaurus");
-        let views = [
-            // sky-orion-3d and sky-galactic-center (bookmarks/m1.ron #15, #16).
-            look(sun.offset(orion * 100.0 * AU), orion, 60.0, 0.0),
-            look(sun.offset(gc * 100.0 * AU), gc, 60.0, 0.3),
-            // Earth and the Moon from 60 000 km; Saturn and its moons; the Sun close up.
-            look(
-                earth.offset(DVec3::new(6.0e7, 0.0, 0.0)),
-                DVec3::NEG_X,
-                60.0,
-                0.0,
-            ),
-            look(saturn.offset(DVec3::new(0.0, 1.5e9, 3.0e8)), -DVec3::Y, 20.0, 1.0),
-            look(sun.offset(DVec3::new(3.0e9, 0.0, 0.0)), DVec3::NEG_X, 30.0, 0.0),
-            // Near α Cen (stars within 0.1 pc), a narrow and a panoramic field.
-            look(alpha_cen.offset(DVec3::new(1.0e12, 0.0, 0.0)), DVec3::NEG_X, 20.0, 0.0),
-            look(earth, orion, 1.0, 0.0),
-            look(earth, gc, 170.0, 2.0),
-            // From 1 Mpc: every star far from the camera's f64 shortcut's comfort.
-            look(
-                UniversePos::from_meters(DVec3::new(3.0857e22, 1.0e21, -2.0e21)),
-                -DVec3::X,
-                60.0,
-                0.0,
-            ),
-        ];
-        for (i, view) in views.iter().enumerate() {
-            for viewport in [UVec2::new(1920, 1080), UVec2::new(640, 1280)] {
-                let fast = build(&world, view, viewport);
-                let reference = build_reference(&world, view, viewport);
-                assert_eq!(
-                    format!("{fast:?}"),
-                    format!("{reference:?}"),
-                    "view {i} at {viewport}"
-                );
-            }
-        }
-        // The cull is exercised: from the Orion view it skips 2 624 of the 3 321 named stars
-        // (79 %; the frame's corner cone, 49.7° from the axis, holds 18 % of the sky, but the
-        // named stars crowd toward Orion and the Milky Way).
-        let orion_view = &views[0];
-        let cull = StarCull::new(orion_view, UVec2::new(1920, 1080));
+        let viewport = UVec2::new(1920, 1080);
+        let cull = StarCull::new(&view, viewport);
+        let proj = Projector::new(&view, viewport);
         let years = world.star_years();
         let (mut named, mut skipped) = (0, 0);
         for k in world.cached.len()..world.objects().len() {
@@ -865,12 +963,22 @@ mod tests {
             if info.kind != ObjectKind::Star {
                 continue;
             }
-            let Some(s) = info.catalog_index.and_then(|i| world.star_data().get(i as usize))
-            else {
+            let Some(index) = info.catalog_index else {
+                continue;
+            };
+            let Some(s) = world.star_data().get(index as usize) else {
                 continue;
             };
             named += 1;
-            skipped += usize::from(cull.off_screen(star_pos_pc(s, years) * PC));
+            if cull.off_screen(star_pos_pc(s, years) * PC) {
+                skipped += 1;
+                let rel = world.star_position(index).delta_from(view.pos);
+                assert!(
+                    !proj.screen(rel).is_some_and(|p| proj.on_screen(p, 0.0)),
+                    "{} is on screen but culled",
+                    info.name
+                );
+            }
         }
         assert!(skipped * 10 > named * 7, "{skipped} of {named} skipped");
     }
@@ -888,6 +996,9 @@ mod tests {
         assert_eq!(proj_radius_px(1.0, 0.0, fov, 1080.0), f64::INFINITY);
         // Far away it tends to (h/2)·(R/d)/tan(fov/2).
         let far = proj_radius_px(1.0, 1.0e6, fov, 1080.0);
-        assert!((far / (540.0e-6 / (fov / 2.0).tan()) - 1.0).abs() < 1e-11, "{far}");
+        assert!(
+            (far / (540.0e-6 / (fov / 2.0).tan()) - 1.0).abs() < 1e-11,
+            "{far}"
+        );
     }
 }

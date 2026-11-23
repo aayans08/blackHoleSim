@@ -47,9 +47,48 @@ pub fn label(f: HonestyFlag) -> &'static str {
     }
 }
 
+/// Whether `f` labels something non-physical or extrapolated (amber) rather than an
+/// approximate-but-physical model (neutral grey), per the colour column of the M1 plan's table
+/// "Honesty labels in M1" (Task C0, A4r minor "no severity map"): amber for the three
+/// extrapolation flags and [`HonestyFlag::CometsCatchingUp`] (lead ruling A4 open 1), grey for
+/// the band model, the band's procedural detail and the procedural belt.
+pub fn is_non_physical(f: HonestyFlag) -> bool {
+    match f {
+        HonestyFlag::PlanetsExtrapolated
+        | HonestyFlag::PlutoExtrapolated
+        | HonestyFlag::StarsExtrapolated
+        | HonestyFlag::CometsCatchingUp => true,
+        HonestyFlag::BandModel
+        | HonestyFlag::MilkyWayDetailProcedural
+        | HonestyFlag::ProceduralBelt => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task C0 carry-over 3: the tone of every flag is the plan table's colour (amber = true).
+    #[test]
+    fn honesty_tones_follow_the_plan_table() {
+        let amber = [
+            HonestyFlag::PlanetsExtrapolated,
+            HonestyFlag::PlutoExtrapolated,
+            HonestyFlag::StarsExtrapolated,
+            HonestyFlag::CometsCatchingUp,
+        ];
+        let grey = [
+            HonestyFlag::BandModel,
+            HonestyFlag::MilkyWayDetailProcedural,
+            HonestyFlag::ProceduralBelt,
+        ];
+        for f in amber {
+            assert!(is_non_physical(f), "{f:?} is amber");
+        }
+        for f in grey {
+            assert!(!is_non_physical(f), "{f:?} is grey");
+        }
+    }
 
     /// The M1 plan's table "Honesty labels in M1", character for character (en dashes U+2013,
     /// the plus-minus sign U+00B1, an ASCII space in "100 000"), plus Task B4L's

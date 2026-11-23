@@ -76,7 +76,7 @@ use uni_core::{
 };
 use uni_data::{
     AsteroidRecord, BodyFacts, Comet, DataError, ExoSystem, FLAG_EXO_HOST, FLAG_FROM_ARCHIVE,
-    FLAG_NO_VELOCITY, RingProfile, STAR3_EPOCH_JD_TDB, SatRecord, Star3, StarNames,
+    FLAG_NO_VELOCITY, RingProfile, STAR3_EPOCH_JD_TDB, SatRecord, Star3, StarName, StarNames,
 };
 use uni_physics::bodies::{by_naif, system_gm_m3s2};
 use uni_physics::calc::hill_radius;
@@ -93,9 +93,10 @@ use uni_physics::{pluto, rotation};
 
 use crate::honesty::HonestyFlag;
 use crate::registry::{
-    NameTable, ObjectId, ObjectInfo, ObjectKind, Physical, Source, brdf_for, has_atmosphere,
+    NameTable, ObjectId, ObjectInfo, ObjectKind, Physical, Source, atmosphere_top_m, brdf_for,
+    has_atmosphere,
 };
-use crate::snapshot::{self, Snapshot};
+use crate::snapshot::{self, Projector, Snapshot, proj_radius_px};
 use crate::starindex::{StarIndex, catalogue_pos_pc, star_pos_pc, velocity_pc_per_yr};
 use crate::time::TimeController;
 
@@ -116,10 +117,6 @@ pub(crate) const MAX_NEAR_STARS: usize = 8;
 /// Star positions are linear motion; beyond this many years from the catalogue epoch the HUD
 /// says so (plan "Honesty labels in M1").
 const STAR_LINEAR_LIMIT_YR: f64 = 1.0e5;
-/// The honesty frustum test does not know the viewport, so it takes the widest frame the app
-/// renders (21:9 ≈ 2.33, rounded up): a Pluto just off a narrower screen may still raise the
-/// label, never the reverse.
-const HONESTY_MAX_ASPECT: f64 = 2.4;
 
 /// Name of the M0 test black hole (as `uni_app::world::TEST_BH_NAME`).
 pub const TEST_BH_NAME: &str = "TestBH-1";
@@ -294,6 +291,56 @@ pub struct WorldData {
     /// Saturn's ring profile (`saturn_rings.ron`); `None` keeps the A8-span default radii.
     pub rings: Option<RingProfile>,
     pub warnings: Vec<String>,
+}
+
+/// What an info card shows of one object (review I9, Task C0): the records behind it, chosen by
+/// where its state comes from, not by its [`ObjectKind`]: Pluto (ephemeris) is a `Body`, while
+/// Ceres, Eris, Haumea and Makemake (SBDB asteroid records) are `Asteroid`s, although all five
+/// are dwarf planets. [`World::details`] builds it.
+#[derive(Clone, Debug)]
+pub enum ObjectDetails {
+    /// The Sun, a planet, Pluto or a moon: its NSSDCA fact sheet and its JPL mean elements, where
+    /// the data has them.
+    Body {
+        facts: Option<BodyFacts>,
+        sat: Option<SatRecord>,
+    },
+    /// A named or registered catalogue star (AT-HYG). `teff_k` and `radius_m` are the values the
+    /// renderer draws it with ([`World::star_teff_k`], [`World::star_radius_m`]: Ballesteros
+    /// 2012 from B−V, Torres 2010 bolometric corrections), so the card and the picture agree.
+    Star {
+        star: Star3,
+        name: Option<StarName>,
+        teff_k: f64,
+        radius_m: f64,
+    },
+    /// A comet: its SBDB record, and the osculating conic it is drawn on now (heliocentric,
+    /// J2000 ecliptic, osculating at `conic_epoch`; A3/A4 rulings), from which the card takes q,
+    /// e, the period and the next perihelion.
+    Comet {
+        record: Comet,
+        conic: Conic,
+        conic_epoch: Epoch,
+    },
+    /// A registry asteroid (dwarf planets from SBDB included) and its SBDB full name.
+    Asteroid {
+        record: AsteroidRecord,
+        name: Option<String>,
+    },
+    /// An exoplanet host: its archive system. `star` is always `Some` for a registered host (a
+    /// host without a star is not registered); `archive_host` is true when that star was built
+    /// from the archive's own values because AT-HYG lacks it (`FLAG_FROM_ARCHIVE`, review I11),
+    /// and then `name` is `None`. `teff_k` and `radius_m` as for [`ObjectDetails::Star`].
+    ExoHost {
+        system: ExoSystem,
+        star: Option<Star3>,
+        name: Option<StarName>,
+        archive_host: bool,
+        teff_k: f64,
+        radius_m: f64,
+    },
+    /// TestBH-1: its mass [kg] and dimensionless spin a/M.
+    BlackHole { mass_kg: f64, spin: f64 },
 }
 
 /// Loads every baked file from `dir` (normally `uni_data::data_dir()/baked`). Never panics;
@@ -862,7 +909,28 @@ pub struct World {
     /// Saturn's ring radii (inner, outer) [m].
     pub(crate) ring_m: (f64, f64),
     band_enabled: bool,
-    selected: Option<ObjectId>,
+    pub(crate) selected: Option<ObjectId>,
+    /// The object a goto flies to (C3), a destination wherever it is (lead ruling B.3).
+    pub(crate) goto_target: Option<ObjectId>,
+    // The records behind the info cards (Task C0, review I9; `World::details`).
+    /// NSSDCA fact sheets (`body_facts.ron`).
+    facts: Vec<BodyFacts>,
+    /// JPL mean elements of the moons (`sat_elements.ron`).
+    sats: Vec<SatRecord>,
+    /// SBDB comet records, parallel to `comets` (`Source::Comet(k)` ↔ `comet_records[k]`).
+    comet_records: Vec<Comet>,
+    /// Every catalogue asteroid record (H ≤ 14, A9) and the SBDB full names they index.
+    asteroid_records: Vec<AsteroidRecord>,
+    asteroid_names: Vec<String>,
+    /// The record index of each asteroid orbit, parallel to `asteroids`.
+    asteroid_record_index: Vec<u32>,
+    /// Asteroid record indices drawn by uni-sim (the registry asteroids) or by the ephemeris
+    /// (SBDB's Pluto row), sorted ([`World::suppressed_asteroid_records`]).
+    suppressed_asteroids: Vec<u32>,
+    /// AT-HYG star names (`athyg_names.ron`).
+    star_names: Option<StarNames>,
+    /// The exoplanet system (index into `exo`) of each exoplanet-host object.
+    exo_of: HashMap<ObjectId, u32>,
 }
 
 impl World {
@@ -878,6 +946,18 @@ impl World {
     /// The world over any body source (tests use a fake one), comets settled as in
     /// [`World::new`].
     pub(crate) fn with_source(source: Arc<dyn BodySource>, data: WorldData, epoch: Epoch) -> Self {
+        let WorldData {
+            stars,
+            star_names,
+            sats,
+            comets,
+            asteroids,
+            asteroid_names,
+            exo,
+            facts,
+            rings,
+            warnings: _,
+        } = data;
         let mut world = World {
             time: TimeController::new(epoch),
             source,
@@ -905,25 +985,40 @@ impl World {
             ring_m: SATURN_RINGS_DEFAULT_M,
             band_enabled: true,
             selected: None,
+            goto_target: None,
+            facts: Vec::new(),
+            sats: Vec::new(),
+            comet_records: Vec::new(),
+            asteroid_records: Vec::new(),
+            asteroid_names: Vec::new(),
+            asteroid_record_index: Vec::new(),
+            suppressed_asteroids: Vec::new(),
+            star_names: None,
+            exo_of: HashMap::new(),
         };
-        let albedos: HashMap<i32, f64> = data
-            .facts
+        let albedos: HashMap<i32, f64> = facts
             .iter()
             .filter_map(|f| Some((f.naif, f.geometric_albedo?)))
             .collect();
-        let sheets: HashSet<i32> = data.facts.iter().map(|f| f.naif).collect();
-        world.add_ephemeris_bodies(&data.sats, &albedos);
-        world.add_comets(&data.comets);
-        world.add_asteroids(&data.asteroids, &data.asteroid_names, &sheets);
+        let sheets: HashSet<i32> = facts.iter().map(|f| f.naif).collect();
+        world.add_ephemeris_bodies(&sats, &albedos);
+        world.add_comets(&comets);
+        world.add_asteroids(&asteroids, &asteroid_names, &sheets);
         world.add_test_black_hole();
         world.cached = vec![UniversePos::default(); world.objects.len()];
         world.refresh_states();
-        if let Some(profile) = &data.rings {
+        if let Some(profile) = &rings {
             world.set_ring_profile(profile);
         }
         world.settle_comets_beyond(NEW_SETTLE_GAP_S);
         world.set_hill_radii();
-        world.add_stars(data.stars, data.star_names, data.exo);
+        world.add_stars(stars, star_names, exo);
+        // Kept for `World::details` and the asteroid pass (Task C0).
+        world.facts = facts;
+        world.sats = sats;
+        world.comet_records = comets;
+        world.asteroid_records = asteroids;
+        world.asteroid_names = asteroid_names;
         world
     }
 
@@ -1043,6 +1138,7 @@ impl World {
             gm_m3s2,
             frame: Some(frame),
             hill_radius_m: 0.0,
+            atmosphere_top_m: atmosphere_top_m(naif),
         };
         let physical = Physical {
             source: Source::Ephem,
@@ -1083,6 +1179,7 @@ impl World {
                 gm_m3s2: 0.0,
                 frame: None,
                 hill_radius_m: 0.0,
+                atmosphere_top_m: None,
             };
             let physical = Physical {
                 source: Source::Comet(self.comets.len()),
@@ -1099,19 +1196,27 @@ impl World {
     }
 
     /// The asteroids that are objects (plan A4): H ≤ 10, or a sheet in `body_facts.ron`
-    /// (`sheets`, NAIF ids, joined through `asteroid_naif_id`); never SBDB's Pluto row.
+    /// (`sheets`, NAIF ids, joined through `asteroid_naif_id`); never SBDB's Pluto row. Records
+    /// which record each orbit came from, and the suppressed list: every registry asteroid's
+    /// record plus SBDB's Pluto row (the ephemeris draws Pluto), sorted (Task C0, ruling A.4a).
     fn add_asteroids(
         &mut self,
         records: &[AsteroidRecord],
         names: &[String],
         sheets: &HashSet<i32>,
     ) {
-        for r in records {
+        for (index, r) in records.iter().enumerate() {
             let naif = uni_data::smallbody::asteroid_naif_id(r.spkid);
             let has_sheet = naif.is_some_and(|n| sheets.contains(&n));
-            if !(r.h <= REGISTRY_MAX_H || has_sheet) || r.spkid == SPKID_PLUTO {
+            if r.spkid == SPKID_PLUTO {
+                self.suppressed_asteroids.push(index as u32);
                 continue;
             }
+            if !(r.h <= REGISTRY_MAX_H || has_sheet) {
+                continue;
+            }
+            self.suppressed_asteroids.push(index as u32);
+            self.asteroid_record_index.push(index as u32);
             let full = names
                 .get(r.name_index as usize)
                 .cloned()
@@ -1134,6 +1239,7 @@ impl World {
                 gm_m3s2: 0.0,
                 frame: None,
                 hill_radius_m: 0.0,
+                atmosphere_top_m: None,
             };
             let physical = Physical {
                 source: Source::Asteroid(self.asteroids.len()),
@@ -1146,6 +1252,9 @@ impl World {
             self.asteroids.push(AsteroidOrbit::new(r));
             self.push(info, physical, &[asteroid_display_name(&full), &full], &[]);
         }
+        // Already in record order; sorted and deduplicated for the contract.
+        self.suppressed_asteroids.sort_unstable();
+        self.suppressed_asteroids.dedup();
     }
 
     /// TestBH-1: a 10 M☉ Schwarzschild hole in a fixed frame at SSB + (1000 AU, 0, 0) (M0).
@@ -1172,6 +1281,7 @@ impl World {
             gm_m3s2: TEST_BH_MASS_SUN * GM_SUN,
             frame: Some(frame),
             hill_radius_m: 0.0,
+            atmosphere_top_m: None,
         };
         let physical = Physical {
             source: Source::BlackHole(self.lenses.len()),
@@ -1275,7 +1385,7 @@ impl World {
                 .filter(|_| (index as usize) < catalogue_len)
                 .and_then(|n| n.get(index))
         };
-        for (sys, index) in exo.iter().zip(hosts) {
+        for (k, (sys, index)) in exo.iter().zip(hosts).enumerate() {
             let Some(index) = index else { continue };
             let entry = name_of(index);
             let proper = entry.and_then(|e| e.proper.as_deref());
@@ -1286,6 +1396,7 @@ impl World {
                 .collect();
             let id = self.push_star(index, ObjectKind::ExoHost, &candidates);
             self.star_objects.entry(index).or_insert(id);
+            self.exo_of.insert(id, k as u32);
         }
         if let Some(names) = &names {
             for entry in &names.entries {
@@ -1306,6 +1417,7 @@ impl World {
             }
         }
         self.exo = exo;
+        self.star_names = names;
         self.star_index = StarIndex::new(&self.stars);
     }
 
@@ -1322,6 +1434,7 @@ impl World {
             gm_m3s2: 0.0,
             frame: None,
             hill_radius_m: 0.0,
+            atmosphere_top_m: None,
         };
         let physical = Physical {
             source: Source::Star,
@@ -1345,9 +1458,9 @@ impl World {
         id
     }
 
-    /// T_eff [K] of star `index`: the archive's for an archive-only host that has one, else
-    /// from B−V (Ballesteros 2012).
-    pub(crate) fn star_teff_k(&self, index: u32) -> f64 {
+    /// T_eff [K] of star `index` (into [`World::star_data`]): the archive's for an archive-only
+    /// host that has one, else from B−V (Ballesteros 2012). The value the renderer draws with.
+    pub fn star_teff_k(&self, index: u32) -> f64 {
         match self.archive_teff.get(&index) {
             Some(&teff) => teff,
             None => self
@@ -1357,9 +1470,10 @@ impl World {
         }
     }
 
-    /// Photosphere radius [m] of star `index` from M_V and T_eff (Torres 2010 bolometric
-    /// corrections, Stefan–Boltzmann; `photometry::star_radius_m`); R☉ if that is not finite.
-    pub(crate) fn star_radius_m(&self, index: u32) -> f64 {
+    /// Photosphere radius [m] of star `index` (into [`World::star_data`]) from M_V and T_eff
+    /// (Torres 2010 bolometric corrections, Stefan–Boltzmann; `photometry::star_radius_m`); R☉
+    /// if that is not finite. The value the renderer draws with.
+    pub fn star_radius_m(&self, index: u32) -> f64 {
         let Some(star) = self.stars.get(index as usize) else {
             return R_SUN_M;
         };
@@ -1981,15 +2095,17 @@ impl World {
     }
 
     /// The world-state labels in effect: planets outside 3000 BC – AD 3000; Pluto outside
-    /// 1885–2099 while Pluto or Charon is in the view or selected; stars beyond ±100 000 yr;
-    /// the band while it is enabled. `ProceduralBelt` is the app's (C6).
-    pub fn honesty(&self, view: &CameraView) -> Vec<HonestyFlag> {
+    /// 1885–2099 while Pluto or Charon is in the view (`view` at internal size `viewport`
+    /// [px]) or selected; stars beyond ±100 000 yr; the band model and its procedural detail
+    /// while the band is enabled (B4L carry, Task C0 carry-over 6), in that order; comets
+    /// catching up. `ProceduralBelt` is the app's (C6).
+    pub fn honesty(&self, view: &CameraView, viewport: UVec2) -> Vec<HonestyFlag> {
         let t = self.epoch;
         let mut flags = Vec::new();
         if standish::validity(t) == Validity::Extrapolated {
             flags.push(HonestyFlag::PlanetsExtrapolated);
         }
-        if !pluto::in_window(t) && self.pluto_shown(view) {
+        if !pluto::in_window(t) && self.pluto_shown(view, viewport) {
             flags.push(HonestyFlag::PlutoExtrapolated);
         }
         if self.star_years().abs() > STAR_LINEAR_LIMIT_YR {
@@ -1997,6 +2113,7 @@ impl World {
         }
         if self.band_enabled {
             flags.push(HonestyFlag::BandModel);
+            flags.push(HonestyFlag::MilkyWayDetailProcedural);
         }
         if self.comets_catching_up() {
             flags.push(HonestyFlag::CometsCatchingUp);
@@ -2024,13 +2141,13 @@ impl World {
             .any(|k| self.comets.get(k).is_some_and(|c| c.needs_work(t)))
     }
 
-    /// Whether Pluto or Charon is selected or inside the view's frustum, taken as the cone
-    /// through the corners of the widest frame ([`HONESTY_MAX_ASPECT`]) widened by the body's
-    /// angular radius.
-    fn pluto_shown(&self, view: &CameraView) -> bool {
-        let tan_half = (0.5 * view.fov_y_rad).tan();
-        let cone = (tan_half * (1.0 + HONESTY_MAX_ASPECT * HONESTY_MAX_ASPECT).sqrt()).atan();
-        let forward = view.orient.normalize() * DVec3::NEG_Z;
+    /// Whether Pluto or Charon is selected or in the frame: its centre projects inside the
+    /// viewport widened by its projected radius (Task C0 carry-over 4: the real frame, not a
+    /// cone), or the camera is inside it. A body whose centre is behind the camera counts as off
+    /// screen even if its limb reaches into view (only from within a few radii of it).
+    fn pluto_shown(&self, view: &CameraView, viewport: UVec2) -> bool {
+        let proj = Projector::new(view, viewport);
+        let height = f64::from(viewport.y.max(1));
         self.ephem_order.iter().any(|&id| {
             let info = &self.objects[id as usize];
             if !matches!(info.naif, Some(PLUTO | CHARON)) {
@@ -2045,8 +2162,9 @@ impl World {
             if d <= radius {
                 return true;
             }
-            let off_axis = forward.cross(rel).length().atan2(forward.dot(rel));
-            off_axis <= cone + (radius / d).asin()
+            let margin_px = proj_radius_px(radius, d, view.fov_y_rad, height);
+            proj.screen(rel)
+                .is_some_and(|p| proj.on_screen(p, margin_px))
         })
     }
 
@@ -2069,9 +2187,110 @@ impl World {
     }
 
     /// The object the user has selected: [`HonestyFlag::PlutoExtrapolated`] also applies while
-    /// Pluto or Charon is selected off screen.
+    /// Pluto or Charon is selected off screen, a selected comet catches up first, and the
+    /// selected object is a destination wherever it is (lead ruling B.3).
     pub fn set_selected(&mut self, id: Option<ObjectId>) {
         self.selected = id;
+    }
+
+    /// The object a goto is flying to (C3; the app sets it from `NavStatus` each frame): a
+    /// destination wherever it is (lead ruling B.3).
+    pub fn set_goto_target(&mut self, id: Option<ObjectId>) {
+        self.goto_target = id;
+    }
+
+    /// What an info card shows of object `id` (Task C0, review I9; see [`ObjectDetails`]);
+    /// `None` for an id that is not in the registry.
+    pub fn details(&self, id: ObjectId) -> Option<ObjectDetails> {
+        let info = self.objects.get(id as usize)?;
+        let physical = self.physical.get(id as usize)?;
+        let details = match physical.source {
+            Source::Ephem => {
+                let naif = info.naif;
+                ObjectDetails::Body {
+                    facts: naif.and_then(|n| self.facts.iter().find(|f| f.naif == n).cloned()),
+                    sat: naif.and_then(|n| self.sats.iter().find(|s| s.naif == n).cloned()),
+                }
+            }
+            Source::Comet(c) => {
+                let (record, conic, conic_epoch) = self.comet_parts(c);
+                ObjectDetails::Comet {
+                    record: record.clone(),
+                    conic,
+                    conic_epoch,
+                }
+            }
+            Source::Asteroid(a) => {
+                let index = *self.asteroid_record_index.get(a)?;
+                let record = *self.asteroid_records.get(index as usize)?;
+                ObjectDetails::Asteroid {
+                    record,
+                    name: self.asteroid_names.get(record.name_index as usize).cloned(),
+                }
+            }
+            Source::Star => {
+                let index = info.catalog_index?;
+                let star = self.stars.get(index as usize).copied();
+                let archive_host = star.is_some_and(|s| s.flags() & FLAG_FROM_ARCHIVE != 0);
+                // Names index AT-HYG only, never an archive-only host appended after it.
+                let name = self
+                    .star_names
+                    .as_ref()
+                    .filter(|_| star.is_some() && !archive_host)
+                    .and_then(|n| n.get(index))
+                    .cloned();
+                let (teff_k, radius_m) = (self.star_teff_k(index), self.star_radius_m(index));
+                match info.kind {
+                    ObjectKind::ExoHost => ObjectDetails::ExoHost {
+                        system: self.exo.get(*self.exo_of.get(&id)? as usize)?.clone(),
+                        star,
+                        name,
+                        archive_host,
+                        teff_k,
+                        radius_m,
+                    },
+                    _ => ObjectDetails::Star {
+                        star: star?,
+                        name,
+                        teff_k,
+                        radius_m,
+                    },
+                }
+            }
+            Source::BlackHole(l) => {
+                let lens = self.lenses.get(l)?;
+                ObjectDetails::BlackHole {
+                    mass_kg: lens.mass_kg,
+                    spin: lens.spin,
+                }
+            }
+        };
+        Some(details)
+    }
+
+    /// Every catalogue asteroid record (H ≤ 14, A9's `asteroids.bin`), in file order: the
+    /// asteroid pass (C2) draws them, skipping [`World::suppressed_asteroid_records`].
+    pub fn asteroid_records(&self) -> &[AsteroidRecord] {
+        &self.asteroid_records
+    }
+
+    /// The record indices into [`World::asteroid_records`] that the asteroid pass must not draw,
+    /// sorted: every registry asteroid's (uni-sim draws them from f64 states as bodies or
+    /// points; Ceres, Eris, Haumea and Makemake included) and SBDB's Pluto row (the ephemeris
+    /// draws Pluto). Fixed once the world is built (ruling A.4a); `Snapshot::suppressed_asteroids`
+    /// is a copy.
+    pub fn suppressed_asteroid_records(&self) -> &[u32] {
+        &self.suppressed_asteroids
+    }
+
+    /// The asteroid record (index into [`World::asteroid_records`]) a registry object was made
+    /// from, whatever its [`ObjectKind`] (Ceres is a dwarf planet); `None` for any other object
+    /// (ruling A.4c: C6 boosts these objects' points when the belt is highlighted).
+    pub fn asteroid_record_of(&self, id: ObjectId) -> Option<u32> {
+        match self.physical.get(id as usize)?.source {
+            Source::Asteroid(a) => self.asteroid_record_index.get(a).copied(),
+            _ => None,
+        }
     }
 
     /// Saturn's ring radii from a ring profile. The default is already the span of A8's baked
@@ -2139,6 +2358,13 @@ impl World {
             _ => None,
         }
         .unwrap_or(DQuat::IDENTITY)
+    }
+
+    /// Comet orbit `c`'s SBDB record, its current osculating conic (J2000 ecliptic) and that
+    /// conic's epoch.
+    pub(crate) fn comet_parts(&self, c: usize) -> (&Comet, Conic, Epoch) {
+        let orbit = &self.comets[c];
+        (&self.comet_records[c], orbit.osc, orbit.osc_epoch)
     }
 
     /// SBDB total-magnitude parameters (M1, K1) of a comet object.
@@ -2321,7 +2547,7 @@ mod tests {
         let view = looking_along(world.position(sun).offset(DVec3::X * AU), DVec3::X);
         assert!(
             world
-                .honesty(&view)
+                .honesty(&view, VIEWPORT)
                 .contains(&HonestyFlag::PlanetsExtrapolated)
         );
     }
@@ -2635,13 +2861,16 @@ mod tests {
         };
         let away = looking_along(UniversePos::default().offset(DVec3::Z * AU), DVec3::Z);
         assert_eq!(
-            world.honesty(&away),
-            vec![HonestyFlag::BandModel],
-            "J2000: only the band"
+            world.honesty(&away, VIEWPORT),
+            vec![
+                HonestyFlag::BandModel,
+                HonestyFlag::MilkyWayDetailProcedural
+            ],
+            "J2000: only the band and its procedural detail (Task C0 carry-over 6)"
         );
 
         set(&mut world, Epoch::J2000.add_seconds(5000.0 * YEAR_S));
-        let flags = world.honesty(&away);
+        let flags = world.honesty(&away, VIEWPORT);
         assert!(
             flags.contains(&HonestyFlag::PlanetsExtrapolated),
             "{flags:?}"
@@ -2652,7 +2881,7 @@ mod tests {
         );
 
         set(&mut world, Epoch::J2000.add_seconds(2.0e5 * YEAR_S));
-        let flags = world.honesty(&away);
+        let flags = world.honesty(&away, VIEWPORT);
         assert!(flags.contains(&HonestyFlag::StarsExtrapolated), "{flags:?}");
         assert!(
             flags.contains(&HonestyFlag::PlanetsExtrapolated),
@@ -2662,7 +2891,7 @@ mod tests {
         set(&mut world, date("2200-01-01T00:00:00Z"));
         let above = UniversePos::default().offset(DVec3::Z * AU);
         let at_pluto = looking_at(above, world.position(pluto), 60.0);
-        let flags = world.honesty(&at_pluto);
+        let flags = world.honesty(&at_pluto, VIEWPORT);
         assert!(flags.contains(&HonestyFlag::PlutoExtrapolated), "{flags:?}");
         assert!(
             !flags.contains(&HonestyFlag::PlanetsExtrapolated),
@@ -2670,24 +2899,24 @@ mod tests {
         );
         assert!(
             !world
-                .honesty(&away)
+                .honesty(&away, VIEWPORT)
                 .contains(&HonestyFlag::PlutoExtrapolated)
         );
         world.set_selected(Some(pluto));
         assert!(
             world
-                .honesty(&away)
+                .honesty(&away, VIEWPORT)
                 .contains(&HonestyFlag::PlutoExtrapolated)
         );
         world.set_selected(None);
         set(&mut world, date("2026-11-20T00:00:00Z"));
         assert!(
             !world
-                .honesty(&at_pluto)
+                .honesty(&at_pluto, VIEWPORT)
                 .contains(&HonestyFlag::PlutoExtrapolated)
         );
         world.set_band_enabled(false);
-        assert!(world.honesty(&at_pluto).is_empty());
+        assert!(world.honesty(&at_pluto, VIEWPORT).is_empty());
         for flag in [
             HonestyFlag::PlanetsExtrapolated,
             HonestyFlag::PlutoExtrapolated,
@@ -2986,18 +3215,21 @@ mod tests {
         let mut world = make();
         let h = comet_index(&world, "1P/Halley");
         world.note_shown_comets(vec![(h, 1.0)]);
-        assert!(!world.honesty(&away).contains(&flag), "not before the jump");
+        assert!(
+            !world.honesty(&away, VIEWPORT).contains(&flag),
+            "not before the jump"
+        );
         jump(&mut world);
         assert!(
             world.comets[h].needs_work(world.epoch()),
             "a jump leaves work"
         );
         assert!(
-            world.honesty(&away).contains(&flag),
+            world.honesty(&away, VIEWPORT).contains(&flag),
             "raised after the jump"
         );
         let mut ticks = 0;
-        while world.honesty(&away).contains(&flag) {
+        while world.honesty(&away, VIEWPORT).contains(&flag) {
             ticks += 1;
             assert!(ticks <= 5000, "the flag never cleared");
             world.tick(0.0);
@@ -3012,10 +3244,13 @@ mod tests {
         let mut world = make();
         world.set_selected(Some(world.comet_objects[h]));
         jump(&mut world);
-        assert!(world.honesty(&away).contains(&flag), "selected comet");
+        assert!(
+            world.honesty(&away, VIEWPORT).contains(&flag),
+            "selected comet"
+        );
         world.set_selected(None);
         assert!(
-            !world.honesty(&away).contains(&flag),
+            !world.honesty(&away, VIEWPORT).contains(&flag),
             "neither selected nor drawn"
         );
     }
@@ -3400,23 +3635,38 @@ mod tests {
             noted.iter().any(|&(k, lux)| k == far && lux > 0.0),
             "{noted:?}"
         );
+        // Every active comet the snapshot listed counts as drawn too (Task C0 carry-over 8).
+        let noted_comets: HashSet<usize> = noted.iter().map(|&(k, _)| k).collect();
+        for c in &snap.comets {
+            assert!(noted_comets.iter().any(|&k| drawn.comet_objects[k] == c.id));
+        }
         drawn.time.set_epoch(later);
         drawn.tick(1.0 / 60.0);
         let conic_of = |world: &World| (world.comets[far].osc_epoch, world.comets[far].osc);
         assert_eq!(conic_of(&drawn), (three.osc_epoch, three.osc));
-        // The other 21 steps go to the 21 nearest the Sun, one each.
-        let others = moved(&drawn).iter().filter(|&&m| m).count() - 1;
-        assert_eq!(others, REOSC_STEPS_PER_TICK - REOSC_STEPS_PER_COMET);
+        // The drawn comets take three steps each while the budget lasts (`far`, the brightest
+        // from 0.01 AU, first); the steps left go to the other stale comets nearest the Sun.
+        let d = noted_comets.len();
+        let drawn_steps = (d * REOSC_STEPS_PER_COMET).min(REOSC_STEPS_PER_TICK);
+        let drawn_moving = d.min(REOSC_STEPS_PER_TICK / REOSC_STEPS_PER_COMET);
+        let rest = (REOSC_STEPS_PER_TICK - drawn_steps).min(n - d);
+        assert_eq!(
+            moved(&drawn).iter().filter(|&&m| m).count(),
+            drawn_moving + rest,
+            "{d} drawn"
+        );
 
-        // A resolved nucleus is noted as infinitely bright.
+        // A resolved nucleus is noted as infinitely bright; it is a listed comet, never a body
+        // (Task C0, ruling A.2a).
         let close = looking_at(pos.offset(DVec3::new(0.0, 0.0, 1.0e5)), pos, 60.0);
         let near = make();
+        let snap = near.snapshot(&close, VIEWPORT);
         assert!(
-            near.snapshot(&close, VIEWPORT)
-                .bodies
+            snap.comets
                 .iter()
-                .any(|b| b.id == id)
+                .any(|c| c.id == id && c.proj_radius_px >= POINT_LOD_PX)
         );
+        assert!(snap.bodies.iter().all(|b| b.id != id));
         let noted = near.shown_comets.lock().expect("lock").clone();
         assert!(noted.contains(&(far, f64::INFINITY)), "{noted:?}");
 
@@ -4069,6 +4319,640 @@ mod tests {
             }
         }
         assert!(checked > 20_000, "{checked}");
+    }
+
+    // ---- Task C0: comets, details, suppressed asteroids, destinations, the Pluto frame ----
+
+    /// A synthetic comet at perihelion at J2000 (its catalogue epoch, so nothing settles): q
+    /// [au], e, perihelion `argp_deg` from the node in the ecliptic (i = 0).
+    fn test_comet(
+        name: &str,
+        spkid: i32,
+        q_au: f64,
+        e: f64,
+        argp_deg: f64,
+        m1_k1: Option<(f64, f64)>,
+        diameter_km: Option<f64>,
+    ) -> Comet {
+        Comet {
+            name: name.to_owned(),
+            spkid,
+            q_au,
+            e,
+            i_deg: 0.0,
+            node_deg: 0.0,
+            argp_deg,
+            tp_jd_tdb: JD_J2000,
+            epoch_jd_tdb: JD_J2000,
+            m1: m1_k1.map(|m| m.0),
+            k1: m1_k1.map(|m| m.1),
+            diameter_km,
+        }
+    }
+
+    /// A synthetic circular asteroid on the ecliptic at `a_au`, at mean anomaly `m0_deg` at
+    /// J2000 (so at that longitude from the ecliptic's x axis).
+    fn test_asteroid(
+        spkid: u32,
+        a_au: f64,
+        m0_deg: f64,
+        h: f32,
+        name_index: u32,
+    ) -> AsteroidRecord {
+        AsteroidRecord {
+            a_au,
+            e: 0.0,
+            i_deg: 0.0,
+            node_deg: 0.0,
+            argp_deg: 0.0,
+            m0_deg,
+            epoch_jd_tdb: JD_J2000,
+            h,
+            g: 0.15,
+            diameter_km: f32::NAN,
+            albedo: f32::NAN,
+            spkid,
+            name_index,
+        }
+    }
+
+    fn test_system(host: &str, star_index: Option<u32>, dist_pc: f64) -> ExoSystem {
+        ExoSystem {
+            host: host.to_owned(),
+            star_index,
+            ra_deg: 10.0,
+            dec_deg: 5.0,
+            dist_pc,
+            v_mag: Some(9.0),
+            teff_k: Some(3500.0),
+            radius_rsun: Some(0.4),
+            planets: Vec::new(),
+        }
+    }
+
+    /// Task C0 (lead rulings A.2): `Snapshot::comets` holds the active comets (r_h < 5 AU) and
+    /// any comet whose nucleus is resolved, brightest first; a comet is never in `bodies`; every
+    /// listed comet counts as drawn for the catch-up order.
+    #[test]
+    fn comets_in_snapshot_only_when_active() {
+        use uni_physics::photometry::comet_total_v;
+        let mut data = empty_data();
+        data.comets = vec![
+            test_comet(
+                "Active-1",
+                9_000_001,
+                1.0,
+                0.5,
+                0.0,
+                Some((10.0, 10.0)),
+                Some(4.0),
+            ),
+            test_comet("Far-1", 9_000_002, 6.0, 0.5, 90.0, None, None),
+            test_comet(
+                "Active-2",
+                9_000_003,
+                2.0,
+                0.6,
+                180.0,
+                Some((5.0, 8.0)),
+                None,
+            ),
+        ];
+        let world = fake_world(vec![(10, None, DVec3::ZERO)], data);
+        let (a1, far, a2) = (
+            id_of(&world, "Active-1"),
+            id_of(&world, "Far-1"),
+            id_of(&world, "Active-2"),
+        );
+        let sun = world.position(id_of(&world, "Sun"));
+        let cam = sun.offset(DVec3::new(0.0, 0.0, 3.0 * AU));
+        let snap = world.snapshot(&looking_at(cam, sun, 60.0), VIEWPORT);
+        let ids: Vec<ObjectId> = snap.comets.iter().map(|c| c.id).collect();
+        // Active-2 (M1 5) outshines Active-1 (M1 10); Far-1 (6 AU, unresolved) is not listed.
+        assert_eq!(ids, vec![a2, a1], "{ids:?}");
+        for c in &snap.comets {
+            let v = c.total_v.expect("both have M1, K1");
+            let want = comet_total_v(c.m1.unwrap(), c.k1.unwrap(), c.r_au, c.delta_au);
+            assert!((v - want).abs() < 1e-12);
+        }
+        assert!(snap.comets[0].total_v < snap.comets[1].total_v);
+        let v1 = &snap.comets[1];
+        assert_eq!((v1.name.as_str(), v1.spkid), ("Active-1", 9_000_001));
+        // At perihelion on the ecliptic's x axis (ICRS +x), 1 AU from the Sun.
+        let helio = world.position(a1).delta_from(sun);
+        assert!((helio - DVec3::new(AU, 0.0, 0.0)).length() < 1.0, "{helio}");
+        assert!((v1.r_au - 1.0).abs() < 1e-12, "{}", v1.r_au);
+        assert!((v1.sun_rel_m + helio).length() < 1e-3, "Sun − nucleus");
+        assert!((v1.nucleus_rel_m - world.position(a1).delta_from(cam)).length() < 1e-3);
+        assert!((v1.delta_au - v1.nucleus_rel_m.length() / AU).abs() < 1e-12);
+        // Vis-viva at perihelion, perpendicular to the radius.
+        let mu = v1.conic.mu_m3s2;
+        let speed = (mu * (1.0 + 0.5) / AU).sqrt();
+        assert!((v1.helio_vel_mps.length() / speed - 1.0).abs() < 1e-9);
+        assert!(v1.helio_vel_mps.dot(helio).abs() < 1e-6 * speed * AU);
+        assert_eq!(v1.conic_epoch, Epoch::J2000);
+        assert!((v1.conic.q_m - AU).abs() < 1.0 && (v1.conic.e - 0.5).abs() < 1e-12);
+        assert!(!v1.radius_assumed && (v1.nucleus_radius_m - 2.0e3).abs() < 1e-9);
+        assert!(snap.bodies.iter().all(|b| !ids.contains(&b.id)));
+        // Every listed comet counts as drawn (carry-over 8).
+        let shown: Vec<usize> = world
+            .shown_comets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        assert!(
+            shown.contains(&comet_index(&world, "Active-1")),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&comet_index(&world, "Active-2")),
+            "{shown:?}"
+        );
+
+        // 500 km from Far-1 (6 AU: inactive) its 2 km nucleus resolves: listed, never a body or
+        // a point.
+        let far_pos = world.position(far);
+        let near_cam = far_pos.offset(DVec3::new(0.0, 0.0, 5.0e5));
+        let view = looking_at(near_cam, far_pos, 60.0);
+        let snap = world.snapshot(&view, VIEWPORT);
+        let c = snap
+            .comets
+            .iter()
+            .find(|c| c.id == far)
+            .expect("resolved nucleus listed");
+        let px = proj_radius_px(ASSUMED_RADIUS_M, 5.0e5, view.fov_y_rad, VIEWPORT.y as f64);
+        assert!(
+            px >= POINT_LOD_PX && (c.proj_radius_px - px).abs() < 1e-9,
+            "{px}"
+        );
+        assert!(c.radius_assumed && c.total_v.is_none() && c.r_au > 5.0);
+        assert!(snap.bodies.iter().all(|b| b.id != far));
+        assert!(snap.points.iter().all(|p| p.id != Some(far)));
+        // From far away, Far-1 on screen is a point, and still not listed.
+        let view = looking_at(sun.offset(DVec3::new(0.0, 0.0, 30.0 * AU)), far_pos, 60.0);
+        let snap = world.snapshot(&view, VIEWPORT);
+        assert!(snap.points.iter().any(|p| p.id == Some(far)));
+        assert!(snap.comets.iter().all(|c| c.id != far));
+    }
+
+    /// Task C0 (review I9, ruling A.3): `World::details` returns, for one object of every kind,
+    /// the variant of its source with its own records; Pluto (ephemeris) and Ceres (an asteroid
+    /// record) are both dwarf planets but different variants.
+    #[test]
+    fn details_cover_every_kind() {
+        let mut data = empty_data();
+        data.facts = real_facts();
+        data.sats = vec![sat_record(401, 499, 11.0)];
+        data.comets = vec![test_comet(
+            "Test-C",
+            9_000_009,
+            1.5,
+            0.3,
+            0.0,
+            Some((8.0, 9.0)),
+            None,
+        )];
+        data.asteroids = vec![
+            test_asteroid(20_000_004, 2.36, 10.0, 3.2, 0),
+            test_asteroid(20_000_001, 2.77, 20.0, 3.3, 1),
+            test_asteroid(20_134_340, 39.5, 30.0, -0.5, 2),
+            test_asteroid(20_009_999, 2.5, 40.0, 13.0, 3),
+        ];
+        data.asteroid_names = vec![
+            "4 Vesta (A807 FA)".to_owned(),
+            "1 Ceres (A801 AA)".to_owned(),
+            "134340 Pluto (1930 BM)".to_owned(),
+            "9999 Faintling".to_owned(),
+        ];
+        data.stars = vec![
+            Star3::new(
+                [2.0, 0.0, 0.0],
+                1.0,
+                [0.0; 3],
+                0.6,
+                11,
+                uni_data::FLAG_NAMED,
+            ),
+            Star3::new(
+                [0.0, 3.0, 0.0],
+                4.5,
+                [0.0; 3],
+                1.2,
+                12,
+                uni_data::FLAG_EXO_HOST,
+            ),
+        ];
+        data.star_names = Some(StarNames {
+            entries: vec![star_name(0, "Testar"), star_name(1, "Hostar")],
+        });
+        data.exo = vec![
+            test_system("Host-A", Some(1), 3.0),
+            test_system("Faint-1", None, 12.47),
+        ];
+        let world = fake_world(
+            vec![
+                (10, None, DVec3::ZERO),
+                (499, Some(10), DVec3::new(1.5 * AU, 0.0, 0.0)),
+                (401, Some(499), DVec3::new(9.4e6, 0.0, 0.0)),
+                (999, Some(10), DVec3::new(40.0 * AU, 0.0, 0.0)),
+                (901, Some(999), DVec3::new(0.0, 1.96e7, 0.0)),
+            ],
+            data,
+        );
+        let details = |name: &str| world.details(id_of(&world, name)).expect(name);
+        let facts_naif = |d: &ObjectDetails| match d {
+            ObjectDetails::Body { facts, .. } => facts.as_ref().map(|f| f.naif),
+            other => panic!("not a body: {other:?}"),
+        };
+        assert_eq!(facts_naif(&details("Sun")), Some(10));
+        assert_eq!(facts_naif(&details("Mars")), Some(499));
+        assert_eq!(facts_naif(&details("Pluto")), Some(999));
+        assert_eq!(facts_naif(&details("Charon")), Some(901));
+        match details("Phobos") {
+            ObjectDetails::Body { facts, sat } => {
+                assert_eq!(facts.map(|f| f.naif), Some(401));
+                assert_eq!(sat.map(|s| s.naif), Some(401));
+            }
+            other => panic!("Phobos: {other:?}"),
+        }
+        match details("Mars") {
+            ObjectDetails::Body { sat, .. } => assert!(sat.is_none()),
+            other => panic!("Mars: {other:?}"),
+        }
+        match details("Test-C") {
+            ObjectDetails::Comet {
+                record,
+                conic,
+                conic_epoch,
+            } => {
+                assert_eq!(record.spkid, 9_000_009);
+                let k = comet_index(&world, "Test-C");
+                assert_eq!(
+                    (conic, conic_epoch),
+                    (world.comets[k].osc, world.comets[k].osc_epoch)
+                );
+            }
+            other => panic!("comet: {other:?}"),
+        }
+        for (name, spkid, full) in [
+            ("Vesta", 20_000_004, "4 Vesta (A807 FA)"),
+            ("Ceres", 20_000_001, "1 Ceres (A801 AA)"),
+        ] {
+            match details(name) {
+                ObjectDetails::Asteroid { record, name: n } => {
+                    assert_eq!(record.spkid, spkid);
+                    assert_eq!(n.as_deref(), Some(full));
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        let ceres = id_of(&world, "Ceres");
+        assert_eq!(
+            world.objects()[ceres as usize].kind,
+            ObjectKind::DwarfPlanet
+        );
+        assert_eq!(world.asteroid_record_of(ceres), Some(1));
+        assert_eq!(world.asteroid_record_of(id_of(&world, "Pluto")), None);
+        match details("Testar") {
+            ObjectDetails::Star {
+                star,
+                name,
+                teff_k,
+                radius_m,
+            } => {
+                assert_eq!(star, world.star_data()[0]);
+                assert_eq!(name.and_then(|n| n.proper).as_deref(), Some("Testar"));
+                assert_eq!(
+                    (teff_k, radius_m),
+                    (world.star_teff_k(0), world.star_radius_m(0))
+                );
+            }
+            other => panic!("Testar: {other:?}"),
+        }
+        match details("Hostar") {
+            ObjectDetails::ExoHost {
+                system,
+                star,
+                name,
+                archive_host,
+                teff_k,
+                ..
+            } => {
+                assert_eq!(system.host, "Host-A");
+                assert_eq!(star, Some(world.star_data()[1]));
+                assert_eq!(name.and_then(|n| n.proper).as_deref(), Some("Hostar"));
+                assert!(!archive_host);
+                assert_eq!(teff_k, world.star_teff_k(1));
+            }
+            other => panic!("Hostar: {other:?}"),
+        }
+        match details("Faint-1") {
+            ObjectDetails::ExoHost {
+                system,
+                star,
+                name,
+                archive_host,
+                teff_k,
+                ..
+            } => {
+                assert_eq!(system.host, "Faint-1");
+                assert!(archive_host && name.is_none() && star.is_some());
+                assert_eq!(teff_k, 3500.0, "the archive's T_eff");
+            }
+            other => panic!("Faint-1: {other:?}"),
+        }
+        match details(TEST_BH_NAME) {
+            ObjectDetails::BlackHole { mass_kg, spin } => {
+                assert_eq!((mass_kg, spin), (TEST_BH_MASS_SUN * M_SUN, 0.0));
+            }
+            other => panic!("TestBH-1: {other:?}"),
+        }
+        // Every kind is covered, and an id outside the registry has no details.
+        let kinds: HashSet<String> = world
+            .objects()
+            .iter()
+            .map(|o| format!("{:?}", o.kind))
+            .collect();
+        assert_eq!(kinds.len(), 9, "{kinds:?}");
+        assert!(
+            world
+                .objects()
+                .iter()
+                .all(|o| world.details(o.id).is_some())
+        );
+        assert!(world.details(world.objects().len() as ObjectId).is_none());
+    }
+
+    /// Task C0 (review I12, ruling A.4a): the suppressed list is every registry asteroid's
+    /// record plus SBDB's Pluto row, sorted, and the same in every snapshot, over the real
+    /// catalogue.
+    #[test]
+    fn suppressed_asteroids_match_registry() {
+        let (records, names) =
+            uni_data::load_asteroids(&baked("asteroids.bin"), &baked("asteroid_names.txt"))
+                .expect("asteroids.bin");
+        let mut data = empty_data();
+        data.asteroids = records.clone();
+        data.asteroid_names = names;
+        let world = fake_world(vec![(10, None, DVec3::ZERO)], data);
+        // (Field by field: unknown diameters and albedos are NaN, which `==` rejects.)
+        assert_eq!(world.asteroid_records().len(), records.len());
+        assert!(
+            world
+                .asteroid_records()
+                .iter()
+                .zip(&records)
+                .all(|(a, b)| a.spkid == b.spkid && a.a_au.to_bits() == b.a_au.to_bits())
+        );
+        let registry: Vec<u32> = world
+            .objects()
+            .iter()
+            .filter_map(|o| world.asteroid_record_of(o.id))
+            .collect();
+        let pluto_row = records
+            .iter()
+            .position(|r| r.spkid == SPKID_PLUTO)
+            .expect("SBDB's Pluto row") as u32;
+        let mut expected = registry.clone();
+        expected.push(pluto_row);
+        expected.sort_unstable();
+        let list = world.suppressed_asteroid_records();
+        assert_eq!(list, expected.as_slice());
+        assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted, no repeats");
+        for (k, r) in records.iter().enumerate() {
+            if r.h <= REGISTRY_MAX_H {
+                assert!(
+                    list.binary_search(&(k as u32)).is_ok(),
+                    "record {k} (H {})",
+                    r.h
+                );
+            }
+        }
+        // Each registry asteroid's record is its own (same SPK-ID).
+        for o in world.objects() {
+            if let Some(k) = world.asteroid_record_of(o.id) {
+                let spkid = records[k as usize].spkid;
+                assert_eq!(
+                    o.naif,
+                    uni_data::smallbody::asteroid_naif_id(spkid),
+                    "{}",
+                    o.name
+                );
+            }
+        }
+        let sun = world.position(id_of(&world, "Sun"));
+        for view in [
+            looking_along(sun.offset(DVec3::X * AU), DVec3::X),
+            looking_along(sun.offset(DVec3::Z * 40.0 * AU), -DVec3::Z),
+        ] {
+            assert_eq!(
+                world.snapshot(&view, VIEWPORT).suppressed_asteroids,
+                expected
+            );
+        }
+        println!(
+            "{} records, {} registry asteroids, {} suppressed",
+            records.len(),
+            registry.len(),
+            list.len()
+        );
+    }
+
+    /// Task C0 (ruling A.4a): with a synthetic catalogue, the Pluto row is suppressed without
+    /// being an object, a faint record is neither, and the list does not change after ticks.
+    #[test]
+    fn suppressed_asteroids_include_sbdb_pluto_row() {
+        let mut data = empty_data();
+        data.asteroids = vec![
+            test_asteroid(20_000_004, 2.36, 10.0, 3.2, 0),
+            test_asteroid(SPKID_PLUTO, 39.5, 30.0, -0.5, 1),
+            test_asteroid(20_009_999, 2.5, 40.0, 13.0, 2),
+            test_asteroid(20_000_010, 3.1, 50.0, 5.4, 3),
+        ];
+        data.asteroid_names = (0..4).map(|k| format!("{k} Rock")).collect();
+        let mut world = fake_world(vec![(10, None, DVec3::ZERO)], data);
+        assert_eq!(world.suppressed_asteroid_records(), &[0, 1, 3]);
+        assert!(
+            world
+                .objects()
+                .iter()
+                .all(|o| world.asteroid_record_of(o.id) != Some(1))
+        );
+        world.time.set_rate(1.0e9);
+        world.tick(1.0);
+        let view = looking_along(UniversePos::default().offset(DVec3::Y * AU), DVec3::X);
+        assert_eq!(
+            world.snapshot(&view, VIEWPORT).suppressed_asteroids,
+            vec![0, 1, 3]
+        );
+    }
+
+    /// Task C0 (lead ruling B.3): the destinations are the Sun, the planets, TestBH-1 and the
+    /// dominant planet's major moons always (on screen or not), the selected object and the goto
+    /// target wherever they are, and otherwise only the six brightest comets, asteroids and
+    /// exoplanet hosts on screen.
+    #[test]
+    fn destinations_follow_the_marker_rule() {
+        let mut data = empty_data();
+        // Eight active comets 2.5 AU out, within ±10.5° of the ecliptic's x axis, M1 5 … 12.
+        data.comets = (0..8)
+            .map(|k| {
+                let argp = (f64::from(k) - 3.5) * 3.0;
+                let m1 = 5.0 + f64::from(k);
+                test_comet(
+                    &format!("Comet-{k}"),
+                    9_100_000 + k,
+                    2.5,
+                    0.2,
+                    argp,
+                    Some((m1, 10.0)),
+                    None,
+                )
+            })
+            .collect();
+        // Eight registry asteroids at 2.6 AU in the same directions, H 3 … 10; one more behind.
+        data.asteroids = (0..8)
+            .map(|k| {
+                let m0 = (f64::from(k) - 3.5) * 3.0 + 1.5;
+                test_asteroid(20_100_000 + k, 2.6, m0, 3.0 + k as f32, k)
+            })
+            .chain([test_asteroid(20_200_000, 2.6, 180.0, 9.0, 8)])
+            .collect();
+        data.asteroid_names = (0..9)
+            .map(|k| format!("{} Rock-{k}", 100_000 + k))
+            .collect();
+        // Eight exoplanet hosts 10 pc out toward +x, M_V 1 … 8; one more behind.
+        data.stars = (0..8)
+            .map(|k| {
+                let y = 0.2 * (k as f32 - 3.5);
+                Star3::new(
+                    [10.0, y, 0.0],
+                    1.0 + k as f32,
+                    [0.0; 3],
+                    0.6,
+                    100 + k,
+                    uni_data::FLAG_EXO_HOST,
+                )
+            })
+            .chain([Star3::new(
+                [-10.0, 0.0, 0.0],
+                0.5,
+                [0.0; 3],
+                0.6,
+                200,
+                uni_data::FLAG_EXO_HOST,
+            )])
+            .collect();
+        data.exo = (0..9)
+            .map(|k| test_system(&format!("Host-{k}"), Some(k), 10.0))
+            .collect();
+        let world_bodies = vec![
+            (10, None, DVec3::ZERO),
+            (399, Some(10), DVec3::new(AU, 0.0, 0.0)),
+            (301, Some(399), DVec3::new(0.0, -3.84e8, 0.0)),
+            (9399, Some(399), DVec3::new(0.0, -2.0e8, 0.0)),
+            (599, Some(10), DVec3::new(-5.2 * AU, 0.0, 0.0)),
+            (501, Some(599), DVec3::new(4.2e8, 0.0, 0.0)),
+        ];
+        let mut world = fake_world(world_bodies, data);
+        let earth = world.position(id_of(&world, "Earth"));
+        // 2 × 10⁴ km from Earth (its Hill sphere), looking along +x: Earth itself is 90° off axis.
+        let cam = earth.offset(DVec3::new(0.0, 2.0e7, 0.0));
+        let view = looking_along(cam, DVec3::X);
+        assert_eq!(
+            Some(world.dominant_frame(&cam)),
+            world.objects()[id_of(&world, "Earth") as usize].frame
+        );
+        let names = |world: &World, snap: &Snapshot| -> Vec<String> {
+            snap.destinations
+                .iter()
+                .map(|d| world.objects()[d.id as usize].name.clone())
+                .collect()
+        };
+        let snap = world.snapshot(&view, VIEWPORT);
+        let got = names(&world, &snap);
+        let has = |n: &str| got.iter().any(|g| g == n);
+        for always in ["Sun", "Earth", "Jupiter", "Moon", TEST_BH_NAME] {
+            assert!(has(always), "{always} missing from {got:?}");
+        }
+        assert!(!has("Io"), "Jupiter is not the dominant planet: {got:?}");
+        assert!(!has("NAIF 9399"), "not a major moon: {got:?}");
+        for k in 0..8 {
+            assert_eq!(has(&format!("Comet-{k}")), k < 6, "Comet-{k}: {got:?}");
+            assert_eq!(has(&format!("Rock-{k}")), k < 6, "Rock-{k}: {got:?}");
+            assert_eq!(has(&format!("Host-{k}")), k < 6, "Host-{k}: {got:?}");
+        }
+        assert!(
+            !has("Rock-8") && !has("Host-8"),
+            "behind the camera: {got:?}"
+        );
+        assert!(snap.destinations.windows(2).all(|w| w[0].id < w[1].id));
+        let dest = |world: &World, snap: &Snapshot, n: &str| {
+            let id = id_of(world, n);
+            *snap.destinations.iter().find(|d| d.id == id).expect(n)
+        };
+        let sun = dest(&world, &snap, "Sun");
+        assert!(sun.screen_px.is_none(), "the Sun is behind the camera");
+        assert!((sun.dist_m - sun.rel_pos_m.length()).abs() < 1e-3);
+        let bh = dest(&world, &snap, TEST_BH_NAME);
+        assert!(bh.screen_px.is_some() && bh.kind == ObjectKind::BlackHole);
+
+        // Selected and goto targets are destinations wherever they are.
+        world.set_selected(Some(id_of(&world, "Comet-7")));
+        world.set_goto_target(Some(id_of(&world, "Rock-8")));
+        let snap = world.snapshot(&view, VIEWPORT);
+        let got = names(&world, &snap);
+        assert!(got.contains(&"Comet-7".to_owned()) && got.contains(&"Rock-8".to_owned()));
+        assert!(dest(&world, &snap, "Rock-8").screen_px.is_none());
+        world.set_selected(Some(id_of(&world, "Host-8")));
+        world.set_goto_target(Some(id_of(&world, "Io")));
+        let snap = world.snapshot(&view, VIEWPORT);
+        let got = names(&world, &snap);
+        assert!(got.contains(&"Host-8".to_owned()) && got.contains(&"Io".to_owned()));
+        assert!(!got.contains(&"Comet-7".to_owned()) && !got.contains(&"Rock-8".to_owned()));
+        assert_eq!(got.iter().filter(|g| *g == "Host-8").count(), 1);
+    }
+
+    /// Task C0 carry-over 4: Pluto's flag follows the real frame. Pluto 50° to the side of the
+    /// view axis (fov 60°) is inside the old 2.4:1 cone but outside a 16:9 frame: no flag at
+    /// 1920 × 1080, the flag in a 2.4:1 frame.
+    #[test]
+    fn pluto_flag_follows_the_real_frame() {
+        let mut world = fake_world(
+            vec![
+                (10, None, DVec3::ZERO),
+                (999, Some(10), DVec3::new(40.0 * AU, 0.0, 0.0)),
+                (901, Some(999), DVec3::new(0.0, 1.96e7, 0.0)),
+            ],
+            empty_data(),
+        );
+        world.time.set_epoch(date("2200-01-01T00:00:00Z"));
+        world.tick(0.0);
+        let pluto = world.position(id_of(&world, "Pluto"));
+        // Camera axes: right +x, up +z, back −y (looking along +y).
+        let orient = DQuat::from_mat3(&glam::DMat3::from_cols(DVec3::X, DVec3::Z, -DVec3::Y));
+        let side = 50f64.to_radians();
+        let dir = DVec3::new(side.sin(), side.cos(), 0.0);
+        let view = CameraView {
+            pos: pluto.offset(-dir * 10.0 * AU),
+            orient,
+            fov_y_rad: 60f64.to_radians(),
+            velocity_mps: DVec3::ZERO,
+        };
+        let flag = HonestyFlag::PlutoExtrapolated;
+        assert!(
+            !world.honesty(&view, VIEWPORT).contains(&flag),
+            "off a 16:9 frame"
+        );
+        assert!(
+            world.honesty(&view, UVec2::new(2592, 1080)).contains(&flag),
+            "in 2.4:1"
+        );
+        // Straight ahead it is flagged at any aspect.
+        let ahead = looking_at(view.pos, pluto, 60.0);
+        assert!(world.honesty(&ahead, VIEWPORT).contains(&flag));
     }
 
     /// Prints the steady tick's split (release: `--release -- --nocapture tick_split --ignored`).

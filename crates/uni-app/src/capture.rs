@@ -464,14 +464,17 @@ fn render_one(
                 label: Some("capture hud"),
             });
         let mut c = *controls;
-        cmds.extend(hud.draw_headless(
+        // No overlay until C6 wires it (Task C0: call site only).
+        let (hud_cmds, _hud_out) = hud.draw_headless(
             gpu,
             &mut enc,
             &job.target.view,
             job.target.size.to_array(),
             &data,
+            &uni_ui::Overlay::default(),
             &mut c,
-        ));
+        );
+        cmds.extend(hud_cmds);
         cmds.push(enc.finish());
     }
     let cpu_ms = start.elapsed().as_secs_f32() * 1e3;

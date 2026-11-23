@@ -74,17 +74,12 @@ pub const ATHYG_V_LIM: f32 = 10.0;
 pub const BSC5_V_LIM: f32 = 6.5;
 /// A Julian year [s] (IAU: 365.25 d), the unit of `StarInput::years_since_epoch`.
 pub const JULIAN_YEAR_S: f64 = 365.25 * DAY;
-/// While a lens is traced: the stars over it are drawn unlensed until M3 (the plan's M1
-/// wording; C4 moves the string into `uni_ui::theme`).
-pub const UNLENSED_STARS_LABEL: &str = "Stars near the hole are not yet lensed (M3)";
-/// While the debug grid shows through a traced lens (ruling 14; m0.1's string).
-pub const DEBUG_GRID_LABEL: &str = "Lens background: M0 debug grid";
-/// While the camera is inside an atmosphere and the stars twinkle (B4 report, label request for
-/// C4: Young's law extrapolated below its aperture range, every star at the zenith).
-pub const TWINKLE_LABEL: &str = "Twinkling: approximate model";
-/// While one of Saturn's major moons is on screen (A2 ruling I3, ruling 10: Meeus ch. 46 puts
-/// Mimas up to 2.45 px and Dione 1.16 px off at the Saturn bookmarks).
-pub const SATURN_MOONS_LABEL: &str = "Saturn's major moons: approximate position (Meeus 46)";
+/// The UI-state labels this module raises (the lens labels while a lens is traced, the twinkle
+/// label inside an atmosphere, Saturn's moons' label), defined once in `uni_ui::theme` (Task C0
+/// carry-over 2) and re-exported here under their B9 paths.
+pub use uni_ui::theme::{
+    DEBUG_GRID_LABEL, SATURN_MOONS_LABEL, TWINKLE_LABEL, UNLENSED_STARS_LABEL,
+};
 /// NAIF ids of Saturn's eight major moons (Mimas … Iapetus), Meeus ch. 46's.
 pub const SATURN_MAJOR_MOONS: [i32; 8] = [601, 602, 603, 604, 605, 606, 607, 608];
 
@@ -679,6 +674,7 @@ impl Scene {
         let labels = honesty_labels(
             world,
             view,
+            viewport,
             &snapshot,
             &settings,
             lens_env,
@@ -789,13 +785,15 @@ impl Scene {
     }
 }
 
-/// The honesty labels in effect for a frame, in a fixed order: uni-sim's world-state labels
-/// (the band's two while it is drawn: ruling, B4L), the eye-adapted and vivid-colour labels,
-/// the lens labels, the twinkle label and Saturn's moons' label.
+/// The honesty labels in effect for a frame (`view` at internal size `viewport`), in a fixed
+/// order: uni-sim's world-state labels (the band's two, which uni-sim raises together, only
+/// while the band is drawn: ruling, B4L), the eye-adapted and vivid-colour labels, the lens
+/// labels, the twinkle label and Saturn's moons' label.
 #[allow(clippy::too_many_arguments)]
 pub fn honesty_labels(
     world: &World,
     view: &CameraView,
+    viewport: UVec2,
     snapshot: &Snapshot,
     settings: &ExposureSettings,
     lens_env: LensEnv,
@@ -805,14 +803,15 @@ pub fn honesty_labels(
     vivid: bool,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for f in world.sim.honesty(view) {
-        if f == HonestyFlag::BandModel && !band_on {
+    for f in world.sim.honesty(view, viewport) {
+        let band_label = matches!(
+            f,
+            HonestyFlag::BandModel | HonestyFlag::MilkyWayDetailProcedural
+        );
+        if band_label && !band_on {
             continue;
         }
         out.push(uni_sim::honesty::label(f).to_owned());
-        if f == HonestyFlag::BandModel {
-            out.push(uni_sim::honesty::label(HonestyFlag::MilkyWayDetailProcedural).to_owned());
-        }
     }
     if settings.eye_adapted_in_effect() {
         out.push(uni_ui::EYE_ADAPTED_STARS_LABEL.to_owned());
@@ -908,6 +907,10 @@ pub fn default_controls(lens_scale: f32) -> HudControls {
         lens_scale,
         visible: true,
         show_help: false,
+        card_expanded: false,
+        notes_expanded: false,
+        show_warp: false,
+        highlight_belt: false,
     }
 }
 
@@ -1084,9 +1087,11 @@ impl Perf {
 
 /// What the HUD shows for this frame: `notices` (data and GPU warnings) first, then the lens
 /// coverage warning, then the frame's honesty labels. The amber eye-adapted label follows the
-/// resolve's own condition (frame contract, review m13); uni-ui's M0 lens lines stay off
-/// (`lens_on_screen` false), since the lens labels are in the frame's labels with the M1
-/// wording.
+/// resolve's own condition (frame contract, review m13); uni-ui's own lens lines stay off
+/// (`lens_on_screen` false), since the lens labels are in the frame's labels. The v2 fields
+/// (Task C0) hold plain defaults until C6 wires the navigator, the card and the notes: the
+/// place line and the Location panel name the nearest body, the Time panel the clock, the Speed
+/// panel free flight; no Gravity panel, card or notes (the labels stay in `warnings`).
 pub fn hud_data(
     world: &World,
     frame: &Frame,
@@ -1106,7 +1111,37 @@ pub fn hud_data(
             .filter(|l| l.as_str() != uni_ui::EYE_ADAPTED_STARS_LABEL)
             .cloned(),
     );
+    let dist_from_sun_m = world
+        .position_of("Sun")
+        .map_or(f64::NAN, |s| ctx.camera.pos.delta_from(s).length());
+    let frame_name = world
+        .frame_body_name(frame.snapshot.dominant_frame)
+        .unwrap_or_else(|| "SSB".to_owned());
     HudData {
+        location: uni_ui::LocationPanel {
+            region: nearest_name.clone(),
+            from_sun_m: dist_from_sun_m,
+            light_time_s: dist_from_sun_m / uni_core::C,
+            frame: frame_name,
+        },
+        time: uni_ui::TimePanel {
+            epoch: world.epoch(),
+            rate: world.sim.time.rate(),
+            paused: world.sim.time.is_paused(),
+        },
+        gravity: None,
+        speed: uni_ui::SpeedPanel {
+            header: uni_ui::FREE_FLIGHT_LABEL.to_owned(),
+            tone: uni_ui::LabelTone::NonPhysical,
+            speed_mps,
+            note: None,
+        },
+        target: None,
+        notes: Vec::new(),
+        nav_line: uni_ui::NavLine::Here {
+            name: nearest_name.clone(),
+            dist_m: nearest_dist_m,
+        },
         fps: perf.fps,
         cpu_ms: perf.cpu_ms,
         gpu_ms: perf.gpu_ms,
@@ -1114,9 +1149,7 @@ pub fn hud_data(
         gpu_timing_available: perf.gpu_timing_available,
         render_size: ctx.viewport.to_array(),
         output_size: ctx.output_size.to_array(),
-        dist_from_sun_m: world
-            .position_of("Sun")
-            .map_or(f64::NAN, |s| ctx.camera.pos.delta_from(s).length()),
+        dist_from_sun_m,
         nearest_name,
         nearest_dist_m,
         speed_mps,
@@ -1567,6 +1600,7 @@ mod tests {
             let labels = honesty_labels(
                 &world,
                 &c.camera,
+                c.viewport,
                 &snap,
                 &s,
                 env,

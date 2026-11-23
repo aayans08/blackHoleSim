@@ -169,6 +169,8 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
         result("galaxy_detail", check_galaxy_detail(gpu, lib)),
     ];
     results.extend(crate::band::band_probes(gpu, lib));
+    // C2's asteroid probe (Task C0 hook; none until C2 lands).
+    results.extend(crate::asteroids::asteroid_probes(gpu, lib));
     results
 }
 

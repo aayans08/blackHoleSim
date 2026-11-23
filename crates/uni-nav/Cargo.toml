@@ -13,3 +13,7 @@ glam.workspace = true
 serde.workspace = true
 ron.workspace = true
 anyhow.workspace = true
+# Wave C (Task C0, review I8): every dependency C3 needs, so no wave agent edits this manifest.
+uni-sim.workspace = true
+uni-physics.workspace = true
+uni-data.workspace = true

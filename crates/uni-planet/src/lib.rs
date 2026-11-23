@@ -9,9 +9,13 @@
 //!
 //! B1 owns [`body`], [`material`] and [`probes`]; B2 owns [`star_surface`] and [`rings`]. Only B0
 //! and the lead edit this file (module list, re-exports, shader registration).
+//!
+//! M1 Wave C: Task C0 added [`comet`] (C1's comets, pass "comets": nucleus, coma, dust and ion
+//! tails) and its shader `planet/comet.wgsl`, and the `comet_probes` call in [`probes`].
 
 pub mod body;
 pub mod capmesh;
+pub mod comet;
 pub mod eclipse;
 pub mod lod;
 pub mod material;
@@ -24,6 +28,10 @@ pub use body::{
     venus_cloud_longitude_offset_deg,
 };
 pub use capmesh::{CAP_RINGS, CAP_SEGMENTS, cap_indices, cap_mesh};
+pub use comet::coma::coma_surface_brightness;
+pub use comet::nucleus::nucleus_mesh;
+pub use comet::tails::{ion_tail_dir, tail_schedule};
+pub use comet::{CometRenderer, CometScene, MAX_TAILED_COMETS, TAIL_REFRESH_WALL_S};
 pub use eclipse::sun_visible_fraction;
 pub use lod::lod_exposure_mix;
 pub use probes::gpu_probes;
@@ -44,6 +52,8 @@ pub const STAR_SURFACE_WGSL: &str = "planet/star_surface.wgsl";
 pub const RINGS_WGSL: &str = "planet/rings.wgsl";
 /// `ShaderLib` path of `sun_visible_fraction`, the WGSL twin of [`sun_visible_fraction`] (B0).
 pub const ECLIPSE_WGSL: &str = "planet/eclipse.wgsl";
+/// `ShaderLib` path of the comet pass (C1).
+pub const COMET_WGSL: &str = "planet/comet.wgsl";
 
 /// Registers every uni-planet WGSL file in `lib` (which should come from
 /// [`uni_gfx::ShaderLib::with_common`]), and uni-atmo's, because `planet/body.wgsl` imports
@@ -57,6 +67,7 @@ pub fn register_shaders(lib: &mut uni_gfx::ShaderLib) {
         include_str!("../shaders/star_surface.wgsl"),
     );
     lib.add(RINGS_WGSL, include_str!("../shaders/rings.wgsl"));
+    lib.add(COMET_WGSL, include_str!("../shaders/comet.wgsl"));
 }
 
 #[cfg(test)]
@@ -70,7 +81,13 @@ mod tests {
     fn wave_b_planet_shaders_validate() {
         let mut lib = ShaderLib::with_common();
         register_shaders(&mut lib);
-        for path in [ECLIPSE_WGSL, BODY_WGSL, STAR_SURFACE_WGSL, RINGS_WGSL] {
+        for path in [
+            ECLIPSE_WGSL,
+            BODY_WGSL,
+            STAR_SURFACE_WGSL,
+            RINGS_WGSL,
+            COMET_WGSL,
+        ] {
             let src = lib.compose(path).unwrap();
             if let Err(e) = validate_wgsl(&src) {
                 panic!("{path}: {e}\n{src}");

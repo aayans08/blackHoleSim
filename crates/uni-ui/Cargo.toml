@@ -14,3 +14,9 @@ winit.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
+# Wave C (Task C0, review I8): every dependency C4 and C5 need, so no wave agent edits this
+# manifest. glam: the overlay's points (`Marker`, `Bracket`, `OrbitLine`, `exo_orbit_points`).
+uni-sim.workspace = true
+uni-physics.workspace = true
+uni-data.workspace = true
+glam.workspace = true

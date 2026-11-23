@@ -6,8 +6,14 @@
 //! [`psf`] holds the CPU twins of the shaders' PSF maths. Task B0 wrote the Wave B module
 //! stubs; B4 owns [`stars3d`], [`sectors`], [`points`] and [`probes`], B5 owns [`band`]. Only B0
 //! and the lead edit this file (module list, re-exports, shader registration).
+//!
+//! M1 Wave C: Task C0 added [`asteroids`] and [`belt`] (C2's real asteroids and procedural belt,
+//! pass "asteroids") with the shader `sky/asteroids.wgsl`, and the `asteroid_probes` call in
+//! [`probes`].
 
+pub mod asteroids;
 pub mod band;
+pub mod belt;
 pub mod points;
 pub mod probes;
 pub mod psf;
@@ -15,7 +21,11 @@ pub mod sectors;
 pub mod stars;
 pub mod stars3d;
 
+pub use asteroids::{
+    AsteroidField, AsteroidInput, BELT_HIGHLIGHT_GAIN, belt_highlight_v, kepler_f32, split_f64,
+};
 pub use band::{BandCubemap, BandDraw, BandInput, band_texel};
+pub use belt::{BELT_KUIPER_COUNT, BELT_MAIN_COUNT, BeltModel};
 pub use points::{PointSprite, PointSprites};
 pub use probes::gpu_probes;
 pub use psf::psf_weights;
@@ -39,6 +49,8 @@ pub const POINTS_WGSL: &str = "sky/points.wgsl";
 pub const BAND_UPDATE_WGSL: &str = "sky/band_update.wgsl";
 /// `ShaderLib` path of the band draw pass (B5).
 pub const BAND_DRAW_WGSL: &str = "sky/band_draw.wgsl";
+/// `ShaderLib` path of the asteroid pass (C2).
+pub const ASTEROIDS_WGSL: &str = "sky/asteroids.wgsl";
 
 /// Registers every uni-sky WGSL file in `lib` (which should come from
 /// [`uni_gfx::ShaderLib::with_common`]): M0's `stars.wgsl`, the Wave B passes, and uni-procgen's
@@ -56,6 +68,7 @@ pub fn register_shaders(lib: &mut uni_gfx::ShaderLib) {
         include_str!("../shaders/band_update.wgsl"),
     );
     lib.add(BAND_DRAW_WGSL, include_str!("../shaders/band_draw.wgsl"));
+    lib.add(ASTEROIDS_WGSL, include_str!("../shaders/asteroids.wgsl"));
 }
 
 #[cfg(test)]
@@ -76,6 +89,7 @@ mod tests {
             POINTS_WGSL,
             BAND_UPDATE_WGSL,
             BAND_DRAW_WGSL,
+            ASTEROIDS_WGSL,
         ] {
             let src = lib.compose(path).unwrap();
             if let Err(e) = validate_wgsl(&src) {

@@ -6,6 +6,11 @@
 //! A windowed HUD ([`Hud::new`]) reads its input and screen size from winit. A headless HUD
 //! ([`Hud::new_headless`], for `--capture ... --hud`) has no window: it is laid out for the
 //! capture size instead.
+//!
+//! M1 Wave C (Task C4): Task C0 added the v2 interface (the panel, card and notes fields of
+//! [`HudData`], the UI state in [`HudControls`], [`HudOutput`], and the overlay argument of
+//! [`Hud::draw`] and [`Hud::draw_headless`]). Until C4 lands the HUD still draws v0 and ignores
+//! the new fields; the labels it shows live in [`crate::theme`].
 
 use std::ops::RangeInclusive;
 
@@ -16,12 +21,16 @@ use winit::{
     window::Window,
 };
 
+use crate::cards::{CardAction, TargetCard};
 use crate::format::{format_distance, format_epoch, format_speed, format_time_rate};
+use crate::overlay::Overlay;
+use crate::panels::{GravityPanel, LocationPanel, NavLine, SpeedPanel, TimePanel};
+use crate::theme::{DEBUG_GRID_LABEL, EYE_ADAPTED_STARS_LABEL, LabelTone, UNLENSED_STARS_LABEL};
 
 /// Warnings and non-physical labels (owner-approved HUD palette).
-const AMBER: Color32 = Color32::from_rgb(0xF5, 0xB0, 0x4C);
+const AMBER: Color32 = crate::theme::NON_PHYSICAL;
 /// Danger (owner-approved HUD palette).
-const RED: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
+const RED: Color32 = crate::theme::DANGER;
 
 /// Slider range for both exposures, EV at ISO 100. A UI choice, not physics: it spans the
 /// photographic EV of a moonless night sky (about −6) to direct sunlight (about 15, the
@@ -42,23 +51,11 @@ const CONTROLS: [(&str, &str); 8] = [
     ("F1", "Show / hide this list"),
 ];
 
-/// What is approximate wherever the lens pass draws in M0 (Global Constraints, Honesty): it
-/// bends a debug grid, not the real sky, and the catalogue stars are drawn unlensed over it.
-/// Shown only while it draws ([`honesty_labels`]).
-const HONESTY_LABELS: [&str; 2] = [
-    "Lens background: M0 debug grid",
-    "Stars near the hole are not yet lensed (M0)",
-];
-
-/// Shown in amber while stars are exposed differently from the scene (design §7 item 4; §2
-/// anti-goal 2): the "Eye-adapted stars" dual exposure is not what a camera would record.
-pub const EYE_ADAPTED_STARS_LABEL: &str = "Eye-adapted stars (dual exposure, non-physical)";
-
-/// Shown in amber while the "Vivid star colours" option is on (owner feedback, 2026-11-22; on by
-/// default): star colours are saturated beyond their Planck chromaticity, keeping their
-/// luminance (`uni_sky::vivid_color`), which a camera would not record. C0 moves this and
-/// [`EYE_ADAPTED_STARS_LABEL`] into `uni_ui::theme`.
-pub const VIVID_STAR_COLOURS_LABEL: &str = "Vivid star colours · non-physical";
+/// What is approximate wherever the lens pass draws (Global Constraints, Honesty): it bends a
+/// debug grid or the band, and the catalogue stars are drawn unlensed over it. Shown only while
+/// it draws ([`honesty_labels`]), with the M1 wording of [`crate::theme`] (Task C0 carry-over
+/// 2 replaced m0.1's private "(M0)" lines).
+const LENS_LABELS: [&str; 2] = [DEBUG_GRID_LABEL, UNLENSED_STARS_LABEL];
 
 /// The app's own hotkeys in uni-nav's key map (Task 6): Tab hides the HUD, F1 shows the
 /// controls list, F12 saves the view as a bookmark. Matched by physical key, as uni-nav does.
@@ -105,6 +102,22 @@ pub struct HudData {
     /// True when this frame's stars are exposed at a different EV from the scene. The HUD then
     /// shows [`EYE_ADAPTED_STARS_LABEL`] in amber.
     pub eye_adapted_stars: bool,
+    // ---- v2 (Task C0 interface, drawn by C4) ----
+    /// The Location panel.
+    pub location: LocationPanel,
+    /// The Time panel (one mono line at top centre while the card is open).
+    pub time: TimePanel,
+    /// The Gravity panel of the dominant body; `None` far from every body.
+    pub gravity: Option<GravityPanel>,
+    /// The Speed panel.
+    pub speed: SpeedPanel,
+    /// The target card of the selected object (or the goto target); `None` without one.
+    pub target: Option<TargetCard>,
+    /// The notes line: honesty labels and warnings with their tones (world labels from
+    /// `uni_sim::honesty`, UI labels from `theme::ui_labels`, renderer warnings).
+    pub notes: Vec<(String, LabelTone)>,
+    /// The collapsed HUD's place line.
+    pub nav_line: NavLine,
 }
 
 /// Settings the HUD edits. The app reads them back after [`Hud::draw`].
@@ -118,6 +131,29 @@ pub struct HudControls {
     pub visible: bool,
     /// Shows the controls list (F1). Its close button clears this.
     pub show_help: bool,
+    // ---- v2 UI state (Task C0, ruling C.4; all false at start) ----
+    /// The target card is open (the "i" button or I).
+    pub card_expanded: bool,
+    /// The notes line is expanded to the full sentences ("What is approximate here").
+    pub notes_expanded: bool,
+    /// The time-warp buttons show (T).
+    pub show_warp: bool,
+    /// "Highlight asteroid belt" is on (the amber `theme::BELT_HIGHLIGHT_LABEL` follows it).
+    pub highlight_belt: bool,
+}
+
+/// One-shot actions the HUD's buttons asked for this frame (Task C0; persistent UI state is in
+/// [`HudControls`]). The app acts on them after [`Hud::draw`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HudOutput {
+    /// Card buttons pressed.
+    pub actions: Vec<CardAction>,
+    /// A moon picked from the card's Moons list, by name.
+    pub selected_moon: Option<String>,
+    /// A warp button pressed: an index into `uni_sim::time::WARP_PRESETS`.
+    pub warp_preset: Option<usize>,
+    /// The Pause button pressed.
+    pub toggle_pause: bool,
 }
 
 /// The egui context, its winit input state and its wgpu renderer.
@@ -222,12 +258,15 @@ impl Hud {
     }
 
     /// Runs the HUD and records its draw into `enc` over `target` (`LoadOp::Load`, so it
-    /// composites over the frame). `target` is the plain (non-sRGB) swapchain view.
+    /// composites over the frame). `target` is the plain (non-sRGB) swapchain view. `overlay`
+    /// (markers, brackets, orbits) is drawn under the panels.
     ///
     /// A HUD made by [`Self::new_headless`] draws as [`Self::draw_headless`] does.
     ///
-    /// Returns command buffers that must be submitted before `enc.finish()`.
-    #[allow(clippy::too_many_arguments)] // The signature is the frozen M0 interface.
+    /// Returns command buffers that must be submitted before `enc.finish()`, and the one-shot
+    /// actions of the HUD's buttons. (Task C0 stub of the v2 interface: v0 is drawn, `overlay`
+    /// is not, and the output is empty.)
+    #[allow(clippy::too_many_arguments)] // The frozen M1 interface (Task C0).
     pub fn draw(
         &mut self,
         window: &Window,
@@ -236,15 +275,19 @@ impl Hud {
         target: &wgpu::TextureView,
         size_px: [u32; 2],
         data: &HudData,
+        overlay: &Overlay,
         controls: &mut HudControls,
-    ) -> Vec<wgpu::CommandBuffer> {
+    ) -> (Vec<wgpu::CommandBuffer>, HudOutput) {
         let Some(state) = self.state.as_mut() else {
-            return self.draw_headless(gpu, enc, target, size_px, data, controls);
+            return self.draw_headless(gpu, enc, target, size_px, data, overlay, controls);
         };
         let raw = state.take_egui_input(window);
         let mut out = run_hud(&self.ctx, raw, data, controls);
         state.handle_platform_output(window, std::mem::take(&mut out.platform_output));
-        self.render(gpu, enc, target, size_px, out)
+        (
+            self.render(gpu, enc, target, size_px, out),
+            HudOutput::default(),
+        )
     }
 
     /// Runs the HUD and records its draw as [`Self::draw`] does, but with no window: it is laid
@@ -254,7 +297,9 @@ impl Hud {
     /// for an immediate repaint (three runs on the first call, then one). One call draws the
     /// whole HUD.
     ///
-    /// Returns command buffers that must be submitted before `enc.finish()`.
+    /// Returns command buffers that must be submitted before `enc.finish()`, and the HUD's
+    /// output (as [`Self::draw`]).
+    #[allow(clippy::too_many_arguments)] // The frozen M1 interface (Task C0).
     pub fn draw_headless(
         &mut self,
         gpu: &uni_gfx::GpuContext,
@@ -262,8 +307,10 @@ impl Hud {
         target: &wgpu::TextureView,
         size_px: [u32; 2],
         data: &HudData,
+        overlay: &Overlay,
         controls: &mut HudControls,
-    ) -> Vec<wgpu::CommandBuffer> {
+    ) -> (Vec<wgpu::CommandBuffer>, HudOutput) {
+        let _ = overlay;
         let (out, _runs) = run_hud_settled(
             &self.ctx,
             size_px,
@@ -272,7 +319,10 @@ impl Hud {
             data,
             controls,
         );
-        self.render(gpu, enc, target, size_px, out)
+        (
+            self.render(gpu, enc, target, size_px, out),
+            HudOutput::default(),
+        )
     }
 
     /// Tessellates one egui output and records it into `enc` over `target`.
@@ -585,12 +635,12 @@ fn show_controls_list(ctx: &egui::Context, open: &mut bool) {
 }
 
 /// The amber honesty lines for a frame, each only while it is true (design anti-goal 2):
-/// [`HONESTY_LABELS`] when the lens pass draws, and [`EYE_ADAPTED_STARS_LABEL`] while the stars'
+/// [`LENS_LABELS`] when the lens pass draws, and [`EYE_ADAPTED_STARS_LABEL`] while the stars'
 /// exposure differs from the scene's.
 fn honesty_labels(lens_on_screen: bool, eye_adapted_stars: bool) -> Vec<&'static str> {
     let mut out = Vec::new();
     if lens_on_screen {
-        out.extend(HONESTY_LABELS);
+        out.extend(LENS_LABELS);
     }
     if eye_adapted_stars {
         out.push(EYE_ADAPTED_STARS_LABEL);
@@ -658,13 +708,38 @@ mod tests {
             inside_horizon: false,
             lens_on_screen: false,
             eye_adapted_stars: false,
+            location: LocationPanel {
+                region: "Near the Sun".into(),
+                from_sun_m: 0.0,
+                light_time_s: 0.0,
+                frame: "Sun".into(),
+            },
+            time: TimePanel {
+                epoch: uni_core::Epoch::J2000,
+                rate: 1.0,
+                paused: false,
+            },
+            gravity: None,
+            speed: SpeedPanel {
+                header: crate::theme::FREE_FLIGHT_LABEL.into(),
+                tone: LabelTone::NonPhysical,
+                speed_mps: 0.0,
+                note: None,
+            },
+            target: None,
+            notes: Vec::new(),
+            nav_line: NavLine::Here {
+                name: "Sun".into(),
+                dist_m: 0.0,
+            },
         }
     }
 
-    /// The M0 honesty lines, verbatim (Task 10b brief).
+    /// The lens lines, verbatim: m0.1's debug-grid line and the plan's M1 wording of the
+    /// unlensed-stars line (Task C0 carry-over 2).
     const HONESTY_LINES: [&str; 2] = [
         "Lens background: M0 debug grid",
-        "Stars near the hole are not yet lensed (M0)",
+        "Stars near the hole are not yet lensed (M3)",
     ];
 
     fn controls(show_help: bool) -> HudControls {
@@ -674,6 +749,10 @@ mod tests {
             lens_scale: 1.0,
             visible: true,
             show_help,
+            card_expanded: false,
+            notes_expanded: false,
+            show_warp: false,
+            highlight_belt: false,
         }
     }
 

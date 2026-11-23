@@ -370,15 +370,18 @@ impl App {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("hud") });
         let size_px = [frame.texture.width(), frame.texture.height()];
-        cmds.extend(g.hud.draw(
+        // No overlay and no HUD actions until C6 wires them (Task C0: call site only).
+        let (hud_cmds, _hud_out) = g.hud.draw(
             &g.window,
             &g.gpu,
             &mut enc,
             &plain_view,
             size_px,
             &data,
+            &uni_ui::Overlay::default(),
             &mut self.controls,
-        ));
+        );
+        cmds.extend(hud_cmds);
         cmds.push(enc.finish());
         self.cpu_ms = start.elapsed().as_secs_f32() * 1e3;
 

@@ -404,6 +404,29 @@ pub(crate) mod tests {
         assert!(world.find_object("Vulcan").is_none());
     }
 
+    /// Task C0 (ruling C.2): uni-sim's `ObjectInfo::atmosphere_top_m` (a copy, since uni-sim
+    /// cannot depend on uni-atmo) equals uni-atmo's top radius for every body with a preset, and
+    /// no other object has one.
+    #[test]
+    fn atmosphere_top_matches_atmo_presets() {
+        let world = World::bare(Epoch::J2000);
+        let mut found = Vec::new();
+        for o in world.sim.objects() {
+            let preset = o.naif.and_then(uni_atmo::preset_for);
+            match (preset, o.atmosphere_top_m) {
+                (Some(p), Some(top)) => {
+                    assert_eq!(top, p.top_radius_m, "{}", o.name);
+                    assert!(top > o.radii_m.z, "{}: top above the surface", o.name);
+                    found.push(o.naif);
+                }
+                (None, None) => {}
+                (p, top) => panic!("{}: preset {:?}, top {top:?}", o.name, p.is_some()),
+            }
+        }
+        found.sort();
+        assert_eq!(found, [Some(299), Some(399), Some(499), Some(606)]);
+    }
+
     #[test]
     fn iso_utc_round_trips_through_bookmark_parsing() {
         for s in [

@@ -2738,6 +2738,9 @@ dependencies = [
  "ron",
  "serde",
  "uni-core",
+ "uni-data",
+ "uni-physics",
+ "uni-sim",
  "winit",
 ]
 
@@ -2840,8 +2843,12 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "glam",
  "uni-core",
+ "uni-data",
  "uni-gfx",
+ "uni-physics",
+ "uni-sim",
  "wgpu",
  "winit",
 ]
