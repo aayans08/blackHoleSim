@@ -9,6 +9,14 @@
 //!   `vivid_color`, `twinkle_factor` and the f16 decoding `f16_bits_to_f32` (exact) against
 //!   their CPU twins.
 //!
+//! - `stars3d_halo` (Task B9, for B4L): the eye's glare halo, `stars3d_moffat`,
+//!   `stars3d_halo_energy` and the windowed, renormalised `stars3d_halo_weight`, against their
+//!   CPU twins over footprints of 2–64 px.
+//! - `galaxy_detail` (Task B9, for B4L): `gal_band_radiance` toward the named dark clouds, the
+//!   Cygnus and Aquila rifts and Baade's window with footprints from 0 (every octave of the
+//!   clumpy dust and star clouds) to 0.2 rad (the octaves faded out), against
+//!   `GalaxyModel::band_radiance`.
+//!
 //! B5's band probes are `band::band_probes`, called below.
 
 use anyhow::Context as _;
@@ -152,9 +160,13 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     crate::register_shaders(lib);
     lib.add(MAG_DIR_PROBE, MAG_DIR_PROBE_WGSL);
     lib.add(PSF_PROBE, PSF_PROBE_WGSL);
+    lib.add(HALO_PROBE, HALO_PROBE_WGSL);
+    lib.add(DETAIL_PROBE, DETAIL_PROBE_WGSL);
     let mut results = vec![
         result("stars3d_mag_dir", check_mag_dir(gpu, lib)),
         result("stars3d_psf", check_psf(gpu, lib)),
+        result("stars3d_halo", check_halo(gpu, lib)),
+        result("galaxy_detail", check_galaxy_detail(gpu, lib)),
     ];
     results.extend(crate::band::band_probes(gpu, lib));
     results
@@ -341,7 +353,9 @@ fn check_psf(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)
         &src,
         "cs_main",
         bytemuck::cast_slice(&inputs),
-        std::mem::size_of_val(inputs.as_slice()) as u64,
+        // One 48-byte `PsfProbeOut` per input (B9: the 64-byte input size here read back 85
+        // outputs for 64 inputs, so `psf_worst` saw a length mismatch and reported NaN).
+        (inputs.len() * std::mem::size_of::<PsfProbeOut>()) as u64,
         [n.div_ceil(64), 1, 1],
     )?;
     let out: Vec<PsfProbeOut> = bytemuck::pod_collect_to_vec(&bytes);
@@ -409,6 +423,206 @@ fn nan_max<T: PartialOrd + Copy>(a: T, b: T) -> T {
     } else {
         a
     }
+}
+
+/// Shader path of the halo probe (B9, for B4L).
+const HALO_PROBE: &str = "sky/probe_stars3d_halo.wgsl";
+const HALO_PROBE_WGSL: &str = r#"// sky/probe_stars3d_halo.wgsl: `universe --selftest` probe of the 3-D stars' glare halo
+// (crates/uni-sky/src/probes.rs). Group 2: stars3d.wgsl declares groups 0 and 1.
+#import "sky/stars3d.wgsl"
+
+// x: r [px]; y: footprint radius R [px]; zw: 0.
+@group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
+// x: stars3d_moffat(r); y: stars3d_halo_energy(R); z: stars3d_halo_weight(r, R, 1/E(R)); w: 0.
+@group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_in)) {
+        return;
+    }
+    let c = probe_in[gid.x];
+    let e = stars3d_halo_energy(c.y);
+    probe_out[gid.x] = vec4<f32>(stars3d_moffat(c.x), e, stars3d_halo_weight(c.x, c.y, 1.0 / e),
+        0.0);
+}
+"#;
+
+/// The halo probe's tolerance: relative to each value's scale (pow and division on the GPU;
+/// the weight relative to the footprint's central weight).
+const HALO_TOLERANCE: f32 = 1e-4;
+
+/// 64 (r, R) pairs: footprints from the 2-px minimum to the 64-px cap (Sirius's 42.5 px at EV
+/// −4 among them), r from the centre to just past the edge.
+fn halo_inputs() -> Vec<[f32; 4]> {
+    let radii = [2.0, 3.0, 5.0, 8.0, 13.5, 21.0, 42.5, 64.0];
+    let mut out = Vec::with_capacity(64);
+    for (i, &radius) in radii.iter().enumerate() {
+        for k in 0..8 {
+            let r = radius * (k as f32 / 7.0) * 1.05 + 0.01 * i as f32;
+            out.push([r, radius, 0.0, 0.0]);
+        }
+    }
+    out
+}
+
+fn check_halo(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    use crate::stars3d::{stars3d_halo_energy, stars3d_halo_weight, stars3d_moffat};
+    let inputs = halo_inputs();
+    let src = lib.compose(HALO_PROBE)?;
+    let n = u32::try_from(inputs.len()).context("too many probe inputs")?;
+    let bytes = run_compute(
+        gpu,
+        &src,
+        "cs_main",
+        bytemuck::cast_slice(&inputs),
+        (inputs.len() * 16) as u64,
+        [n.div_ceil(64), 1, 1],
+    )?;
+    let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+    anyhow::ensure!(out.len() == inputs.len(), "stars3d_halo: short read-back");
+    let mut worst = [0.0_f32; 3];
+    for (c, g) in inputs.iter().zip(&out) {
+        let (r, radius) = (c[0], c[1]);
+        let e = stars3d_halo_energy(radius);
+        let cpu = [
+            stars3d_moffat(r),
+            e,
+            stars3d_halo_weight(r, radius, 1.0 / e),
+        ];
+        let scale = [
+            stars3d_moffat(0.0),
+            1.0,
+            stars3d_halo_weight(0.0, radius, 1.0 / e),
+        ];
+        for k in 0..3 {
+            worst[k] = nan_max(worst[k], (g[k] - cpu[k]).abs() / scale[k]);
+        }
+    }
+    let pass = worst.iter().all(|w| *w <= HALO_TOLERANCE);
+    Ok((
+        pass,
+        format!(
+            "{n} (r, R) pairs, R 2–64 px: moffat {:.1e}, halo energy {:.1e}, windowed weight \
+             {:.1e} (relative to scale; tolerance {HALO_TOLERANCE:.0e})",
+            worst[0], worst[1], worst[2]
+        ),
+    ))
+}
+
+/// Shader path of the galaxy-detail probe (B9, for B4L).
+const DETAIL_PROBE: &str = "sky/probe_galaxy_detail.wgsl";
+const DETAIL_PROBE_WGSL: &str = r#"// sky/probe_galaxy_detail.wgsl: `universe --selftest` probe of
+// gal_band_radiance's detail (B4L) against `GalaxyModel::band_radiance`.
+#import "procgen/galaxy.wgsl"
+
+struct DetailRay {
+    // xyz: camera, galactocentric [pc]; w: v_lim [V mag].
+    cam_v_lim: vec4<f32>,
+    // xyz: unit direction, galactic axes; w: footprint [rad].
+    dir: vec4<f32>,
+}
+
+struct DetailIn {
+    galaxy: GalaxyGpu,
+    rays: array<DetailRay>,
+}
+
+@group(0) @binding(0) var<storage, read> probe_in: DetailIn;
+// procgen/galaxy.wgsl reads the importer's `galaxy`; the probe fills it from its input.
+var<private> galaxy: GalaxyGpu;
+// rgb: band radiance [cd/m²]; w: 0.
+@group(0) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_in.rays)) {
+        return;
+    }
+    galaxy = probe_in.galaxy;
+    let ray = probe_in.rays[gid.x];
+    let rgb = gal_band_radiance(ray.cam_v_lim.xyz, ray.dir.xyz, ray.cam_v_lim.w, ray.dir.w);
+    probe_out[gid.x] = vec4<f32>(rgb, 0.0);
+}
+"#;
+
+/// Relative |GPU − CPU| of the band radiance (B5 brief: ±1 %).
+const DETAIL_TOLERANCE: f64 = 1e-2;
+
+/// 60 rays from the Sun at V = 10: toward the named dark clouds and the dusty band (Galactic l,
+/// b [deg]: Taurus 172/−15, Ophiuchus ρ Oph 353/17, the Pipe 0/5, the Coalsack 301/−1, the
+/// Cygnus Rift 80/0, the Aquila Rift 30/3, Orion 209/−19, Baade's window 1/−3.9, Chamaeleon
+/// 300/−16, Lupus 339/16, Perseus 160/−20, Corona Australis 0/−18), each with footprints 0,
+/// one 512² texel, 0.01, 0.05 and 0.2 rad.
+fn detail_rays(model: &uni_procgen::galaxy::GalaxyModel) -> Vec<[[f32; 4]; 2]> {
+    let sun = model.sun_galactocentric_pc();
+    let targets = [
+        (172.0, -15.0),
+        (353.0, 17.0),
+        (0.0, 5.0),
+        (301.0, -1.0),
+        (80.0, 0.0),
+        (30.0, 3.0),
+        (209.0, -19.0),
+        (1.0, -3.9),
+        (300.0, -16.0),
+        (339.0, 16.0),
+        (160.0, -20.0),
+        (0.0, -18.0),
+    ];
+    let footprints = [0.0, 2.0 / crate::band::ENV_SIZE as f32, 0.01, 0.05, 0.2];
+    let mut out = Vec::with_capacity(60);
+    for (l, b) in targets {
+        let (l, b): (f64, f64) = (f64::to_radians(l), f64::to_radians(b));
+        let d = DVec3::new(b.cos() * l.cos(), b.cos() * l.sin(), b.sin());
+        for fp in footprints {
+            out.push([
+                [sun.x as f32, sun.y as f32, sun.z as f32, 10.0],
+                [d.x as f32, d.y as f32, d.z as f32, fp],
+            ]);
+        }
+    }
+    out
+}
+
+fn check_galaxy_detail(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    let model = uni_procgen::galaxy::GalaxyModel::milky_way();
+    let rays = detail_rays(&model);
+    let n = u32::try_from(rays.len()).context("too many probe rays")?;
+    let mut input = bytemuck::bytes_of(&model.gpu()).to_vec();
+    input.extend_from_slice(bytemuck::cast_slice(&rays));
+    let src = lib.compose(DETAIL_PROBE)?;
+    let bytes = run_compute(
+        gpu,
+        &src,
+        "cs_main",
+        &input,
+        u64::from(n) * 16,
+        [n.div_ceil(64), 1, 1],
+    )?;
+    let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+    anyhow::ensure!(out.len() == rays.len(), "galaxy_detail: short read-back");
+    let mut worst = 0.0_f64;
+    let mut spread = (f64::INFINITY, 0.0_f64);
+    for (r, g) in rays.iter().zip(&out) {
+        let cpu = model.band_radiance(
+            Vec3::from_slice(&r[0][..3]).as_dvec3(),
+            Vec3::from_slice(&r[1][..3]).as_dvec3(),
+            f64::from(r[0][3]),
+            f64::from(r[1][3]),
+        );
+        let gpu_v = Vec3::from_slice(&g[..3]).as_dvec3();
+        worst = nan_max(worst, (gpu_v - cpu).abs().max_element() / cpu.max_element());
+        spread = (spread.0.min(cpu.y), spread.1.max(cpu.y));
+    }
+    Ok((
+        worst <= DETAIL_TOLERANCE,
+        format!(
+            "{n} rays (12 dusty directions × 5 footprints 0–0.2 rad), band G {:.2e}–{:.2e} \
+             cd/m², max relative |GPU − CPU| {worst:.1e} (tolerance {DETAIL_TOLERANCE:.0e})",
+            spread.0, spread.1
+        ),
+    ))
 }
 
 #[cfg(test)]
