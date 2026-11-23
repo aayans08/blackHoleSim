@@ -3,11 +3,11 @@
 //! An annulus mesh in the ring plane (256 segments, exact plane depth), depth-tested without
 //! depth write, premultiplied, `lens_mask.g` = the opacity along the view ray and `lens_mask.a`
 //! = the star share 1 − w ([`crate::body::star_share`], lead ruling B6 I1), both with `Max`. The
-//! exposure weight w is the planet's ([`crate::body::exposure_weight`]). The radii come from the
-//! profile (A8's span; uni-sim's `RingView` uses the same, lead ruling after A4). The app pushes
-//! this pass only when `WorldData::rings` loaded (ruling A.3); without it the load warning is
-//! shown. Card note (review m11): `Rings: Solar System Scope texture; phase function
-//! approximate`.
+//! exposure weight w is the planet's ([`crate::body::exposure_weight`]), drawn at the log-space
+//! `pre_mix(star_pre, scene_pre, w)` (uni-gfx, task B11). The radii come from the profile (A8's
+//! span; uni-sim's `RingView` uses the same, lead ruling after A4). The app pushes this pass only
+//! when `WorldData::rings` loaded (ruling A.3); without it the load warning is shown. Card note
+//! (review m11): `Rings: Solar System Scope texture; phase function approximate`.
 //!
 //! **Photometry.** Radiance L = (E/π)·ρ(r)·P(θ)·A(τ, μ₀, μ) [cd/m²], i.e. I/F = ρ·P·A, with
 //! - E the sunlight at the planet [lx] × [`planet_shadow_on_ring`] (the ray to the Sun against

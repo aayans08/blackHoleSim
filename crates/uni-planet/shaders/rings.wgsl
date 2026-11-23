@@ -151,8 +151,8 @@ struct RingFsOut {
 // The star share this fragment stores in lens_mask.a, blended with Max (M1 frame contract, lead
 // ruling B6 I1): 1 - w where it covers anything (here: opacity > 0), else 0. The meter
 // (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
-// mix(scene_pre(), star_pre(), share) = this pass's mix(star_pre(), scene_pre(), w). w is the
-// planet's, snapped to 1 on the CPU when 1 - w < 2^-14 (uni_planet::body::exposure_weight).
+// pre_mix(scene_pre(), star_pre(), share) = this pass's pre_mix(star_pre(), scene_pre(), w). w is
+// the planet's, snapped to 1 on the CPU when 1 - w < 2^-14 (uni_planet::body::exposure_weight).
 // CPU twin: uni_planet::body::star_share.
 fn star_share(w: f32, coverage: f32) -> f32 {
     return select(0.0, 1.0 - w, coverage > 0.0);
@@ -199,7 +199,8 @@ fn fs_main(in: RingVsOut) -> RingFsOut {
     let radiance = ring.sun.w * shadow / PI * ring.sun_color.rgb * rho * phase * layer;
     // Opacity along the view ray (slant path τ/μ).
     let alpha_view = 1.0 - exp(-tau / mu);
-    let pre = mix(star_pre(), scene_pre(), ring.centre.w);
+    // The planet's exposure, blended in log space (common/exposure.wgsl, task B11).
+    let pre = pre_mix(star_pre(), scene_pre(), ring.centre.w);
     var out: RingFsOut;
     out.color = vec4<f32>(min(radiance * pre, vec3<f32>(HDR_MAX)), alpha_view);
     out.mask = vec4<f32>(0.0, alpha_view, 0.0, star_share(ring.centre.w, alpha_view));

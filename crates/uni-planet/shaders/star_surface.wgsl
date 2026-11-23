@@ -250,7 +250,7 @@ struct StarGpu {
     to_body_y: vec4<f32>,
     to_body_z: vec4<f32>,
     // rgb: disk-centre luminance per channel [cd/m²], I/(πR²) × colour / <LD>; w: the exposure
-    // blend weight (lod_exposure_mix; 1 = scene exposure).
+    // blend weight (lod_exposure_mix; 1 = scene exposure), used in log space: pre_mix.
     l0: vec4<f32>,
     // x: radius [m], y: granule cell size [m], z, w: the granulation contrast of the r and b
     // channels relative to g (Planck's sensitivity to temperature at their wavelengths).
@@ -285,8 +285,8 @@ struct StarFsOut {
 // The star share this fragment stores in lens_mask.a, blended with Max (M1 frame contract, lead
 // ruling B6 I1): 1 - w where it covers anything, else 0, with the instance's own w (no draw
 // split). The meter (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
-// mix(scene_pre(), star_pre(), share) = this pass's mix(star_pre(), scene_pre(), w). The CPU
-// snaps w to 1 when 1 - w < 2^-14 (uni_planet::body::exposure_weight). CPU twin:
+// pre_mix(scene_pre(), star_pre(), share) = this pass's pre_mix(star_pre(), scene_pre(), w). The
+// CPU snaps w to 1 when 1 - w < 2^-14 (uni_planet::body::exposure_weight). CPU twin:
 // uni_planet::body::star_share.
 fn star_share(w: f32, coverage: f32) -> f32 {
     return select(0.0, 1.0 - w, coverage > 0.0);
@@ -342,7 +342,8 @@ fn fs_main(in: StarVsOut) -> StarFsOut {
     }
 
     let lum = s.l0.rgb * limb_darkening(mu) * g;
-    let pre = mix(star_pre(), scene_pre(), s.l0.w);
+    // The star's exposure, blended in log space (common/exposure.wgsl, task B11).
+    let pre = pre_mix(star_pre(), scene_pre(), s.l0.w);
     var out: StarFsOut;
     out.color = vec4<f32>(min(lum * pre, vec3<f32>(HDR_MAX)) * cov, cov);
     out.mask = vec4<f32>(0.0, cov, 0.0, star_share(s.l0.w, cov));

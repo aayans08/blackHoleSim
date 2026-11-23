@@ -8,8 +8,9 @@
 // Radiance convention (uni_physics::photometry): a surface of normal reflectance rho lit by an
 // illuminance E at normal incidence has radiance L = rho * R(mu0, mu) * E / pi [cd/m^2], with R
 // the lunar-Lambert reflectance factor (Lambert when L = 0). World light: written as
-// L * pre, pre = mix(star_pre(), scene_pre(), w), clamped to HDR_MAX (M1 frame contract), and
-// the star share 1 - w into lens_mask.a (star_share).
+// L * pre, pre = pre_mix(star_pre(), scene_pre(), w) (the log-space blend of common/exposure.wgsl,
+// task B11), clamped to HDR_MAX (M1 frame contract), and the star share 1 - w into lens_mask.a
+// (star_share).
 //
 // Bindings: group 0 the renderer's (common/camera.wgsl); group 1 the body (`BodyUniform` at a
 // dynamic offset, its maps, Saturn's ring profile); group 2 uni-atmo's ground lighting
@@ -143,9 +144,11 @@ fn ring_transmittance(p: vec3<f32>, s: vec3<f32>, inner: f32, outer: f32) -> f32
 // k = (1 - w) A + w + B (w - sigma), clamped to [0, k_max], sigma = pre_atmo / pre. This pass
 // at k = 1 sends a disk flux D, the point sends A D, and the atmosphere pass adds B D at
 // pre_atmo, so the total k D pre + B D pre_atmo is pre [(1 - w) A D + w (D + B D)]: the
-// point's flux at 1.5 px, the real rendering from 4 px (k = 1), a linear cross-fade between.
-// fs_main passes sigma = 1: the atmosphere draws at its body's exposure weight (lead ruling
-// B6 I1, task B10; uni_atmo::AtmoDraw::exposure_mix = uni_planet::body::exposure_weight).
+// point's flux at 1.5 px, the real rendering from 4 px (k = 1), a linear cross-fade of the flux
+// between, written at the log-space exposure pre = pre_mix(star_pre(), scene_pre(), w) (task
+// B11). fs_main passes sigma = 1: the atmosphere draws at its body's exposure weight and the same
+// pre_mix (lead ruling B6 I1, task B10; uni_atmo::AtmoDraw::exposure_mix =
+// uni_planet::body::exposure_weight), so k does not depend on how pre blends.
 fn flux_match(h: vec4<f32>, sigma: f32) -> f32 {
     return clamp((1.0 - h.x) * h.y + h.x + h.z * (h.x - sigma), 0.0, h.w);
 }
@@ -153,9 +156,9 @@ fn flux_match(h: vec4<f32>, sigma: f32) -> f32 {
 // The star share this fragment stores in lens_mask.a, blended with Max (M1 frame contract, lead
 // ruling B6 I1): 1 - w where it covers anything, else 0 (0 = scene exposure, the clear value).
 // The meter (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
-// mix(scene_pre(), star_pre(), share) = this pass's mix(star_pre(), scene_pre(), w). The CPU
-// snaps w to 1 when 1 - w < 2^-14 (uni_planet::body::exposure_weight), so the share is 0 or an
-// f16 normal, never a subnormal Metal could flush. CPU twin: uni_planet::body::star_share.
+// pre_mix(scene_pre(), star_pre(), share) = this pass's pre_mix(star_pre(), scene_pre(), w). The
+// CPU snaps w to 1 when 1 - w < 2^-14 (uni_planet::body::exposure_weight), so the share is 0 or
+// an f16 normal, never a subnormal Metal could flush. CPU twin: uni_planet::body::star_share.
 fn star_share(w: f32, coverage: f32) -> f32 {
     return select(0.0, 1.0 - w, coverage > 0.0);
 }
@@ -326,7 +329,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> BodyOut {
     }
 
     // Skylight is dimmed by an eclipse too (the sky above is lit by the same Sun).
-    let pre = mix(star_pre(), scene_pre(), body_u.light.w);
+    let pre = pre_mix(star_pre(), scene_pre(), body_u.light.w);
     // sigma = 1: the atmosphere over this body draws at the same exposure weight (flux_match).
     let k = flux_match(body_u.handover, 1.0);
     let radiance = rho * body_u.light.rgb * k * (refl * sun_t + sky) * vis / PI;

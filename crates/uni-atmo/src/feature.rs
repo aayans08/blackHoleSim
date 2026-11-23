@@ -9,15 +9,18 @@
 //! `atmosphere_grey.wgsl`).
 //!
 //! **Exposure and star share (lead ruling B6 I1, task B10).** A body in the 1.5–4 px LOD band is
-//! drawn at pre = mix(star_pre, scene_pre, w) with w = `uni_planet::lod_exposure_mix` while
-//! eye-adapted stars are in effect. Its atmosphere uses the same w ([`AtmoDraw::exposure_mix`],
-//! which the app sets to `uni_planet::body::exposure_weight` of the same body), so the in-scatter
-//! sits at the body's exposure (closing Titan's star/scene gap at the 1.5 px handover; uni-planet
-//! `flux_match` then takes σ = 1), and every fragment the march does not discard stores
-//! s = 1 − w in `lens_mask.a` with `Max`. The meter (uni-post `histogram.wgsl`, pass 9) divides
-//! the pixel by mix(scene_pre, star_pre, s), the writer's pre. w is snapped to 1 when
-//! 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴ ([`atmo_exposure_mix`]), so a share is never an f16
-//! subnormal that Metal could flush to 0.
+//! drawn at pre = pre_mix(star_pre, scene_pre, w), the log-space blend star_pre^(1 − w)·
+//! scene_pre^w of uni-gfx (`common/exposure.wgsl`, CPU twin `uni_gfx::frame::pre_mix`; task
+//! B11), with w = `uni_planet::lod_exposure_mix` while eye-adapted stars are in effect. Its
+//! atmosphere uses the same w ([`AtmoDraw::exposure_mix`], which the app sets to
+//! `uni_planet::body::exposure_weight` of the same body) and the same `pre_mix`, so the
+//! in-scatter sits at the body's exposure (closing Titan's star/scene gap at the 1.5 px handover;
+//! uni-planet `flux_match` then takes σ = 1), and every fragment the march does not discard
+//! stores s = 1 − w in `lens_mask.a` with `Max`. The meter (uni-post `histogram.wgsl`, pass 9)
+//! divides the pixel by pre_mix(scene_pre, star_pre, s), the writer's pre. w is snapped to 1
+//! when 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴ ([`atmo_exposure_mix`]), so a share is never an f16
+//! subnormal that Metal could flush to 0; with the log blend the snap moves pre by less than
+//! 2⁻¹⁴·(EV_scene − EV_star) stops (0.0012 stop at a 19-stop gap).
 //!
 //! **Recorded deviation (frame contract):** a per-pixel march (32 steps, up to 48 on long limb
 //! paths) through Hillaire's transmittance and multiple-scattering LUTs, not his sky-view and
@@ -67,7 +70,7 @@ pub struct AtmoDraw {
     /// app sets it to `uni_planet::body::exposure_weight(proj_radius_px, eye_adapted)` of the
     /// same body, so the atmosphere and its body share one exposure in the 1.5–4 px LOD band
     /// (1 from 4 px on, and whenever eye-adapted stars are not in effect). The pass writes its
-    /// in-scatter at mix(star_pre, scene_pre, w) and stores the star share 1 − w in
+    /// in-scatter at pre_mix(star_pre, scene_pre, w) and stores the star share 1 − w in
     /// `lens_mask.a`; [`atmo_exposure_mix`] sanitises and snaps it first.
     pub exposure_mix: f32,
 }
@@ -1442,7 +1445,8 @@ mod tests {
 
     /// Both lens-mask writers (the dual variant's mask pipeline and the grey variant) store
     /// `atmo_star_share()` in alpha, which is 1 − the same `misc.x` that `atmo_light` exposes the
-    /// in-scatter with (lead ruling B6 I1).
+    /// in-scatter with (lead ruling B6 I1), through the log-space `pre_mix` of uni-gfx (task B11),
+    /// as the body pass does, and no linear mix of the two pre-exposures is left.
     #[test]
     fn atmosphere_shaders_store_the_star_share() {
         use uni_gfx::{ShaderLib, validate_wgsl};
@@ -1459,10 +1463,18 @@ mod tests {
         assert_eq!(common.matches("return 1.0 - atmo_draw.misc.x;").count(), 1);
         assert_eq!(
             common
-                .matches("let pre = mix(star_pre(), scene_pre(), atmo_draw.misc.x);")
+                .matches("let pre = pre_mix(star_pre(), scene_pre(), atmo_draw.misc.x);")
                 .count(),
             1
         );
+        for arg in ["mix(star_pre()", "mix(scene_pre()"] {
+            let log = format!("pre_{arg}");
+            assert_eq!(
+                common.matches(arg).count(),
+                common.matches(log.as_str()).count(),
+                "a linear {arg}"
+            );
+        }
         for (path, line) in [
             (
                 crate::ATMOSPHERE_MASK_WGSL,

@@ -389,22 +389,22 @@ fn atmo_view_transmittance(pix: vec2<f32>) -> vec3<f32> {
 
 // Inscattered light per lux -> pre-exposed hdr: x sun illuminance x the Sun's colour (light 0,
 // the brightest, is the Sun; white if there is none) x the draw's exposure, the body's own
-// mix(star_pre(), scene_pre(), w) (scene_pre from 4 px on; lead ruling B6 I1), clamped to
-// HDR_MAX.
+// pre_mix(star_pre(), scene_pre(), w) (the log-space blend of common/exposure.wgsl, task B11;
+// scene_pre from 4 px on; lead ruling B6 I1), clamped to HDR_MAX.
 fn atmo_light(inscatter_per_lux: vec3<f32>) -> vec3<f32> {
     var sun_rgb = vec3<f32>(1.0);
     if (lights.info.x >= 1u) {
         sun_rgb = lights.lights[0].color_intensity.rgb;
     }
-    let pre = mix(star_pre(), scene_pre(), atmo_draw.misc.x);
+    let pre = pre_mix(star_pre(), scene_pre(), atmo_draw.misc.x);
     return min(inscatter_per_lux * atmo_draw.sun.w * sun_rgb * pre, vec3<f32>(HDR_MAX));
 }
 
 // The star share every fragment of this draw stores in lens_mask.a, blended with Max (M1 frame
 // contract, lead ruling B6 I1): 1 - w. Each fragment the march does not discard adds in-scatter
-// at mix(star_pre(), scene_pre(), w), so it covers its pixel for this purpose. The meter
+// at pre_mix(star_pre(), scene_pre(), w), so it covers its pixel for this purpose. The meter
 // (post/histogram.wgsl, meter_pre) reads the pixel's pre back as
-// mix(scene_pre(), star_pre(), share). 0 from 4 px on (w = 1). CPU twin:
+// pre_mix(scene_pre(), star_pre(), share). 0 from 4 px on (w = 1). CPU twin:
 // uni_atmo::feature::atmo_star_share.
 fn atmo_star_share() -> f32 {
     return 1.0 - atmo_draw.misc.x;

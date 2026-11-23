@@ -16,15 +16,17 @@
 // one atomic per bin holds both: count << 16 | step sum (a workgroup has at most 256 pixels per
 // bin: count ≤ 256, step sum ≤ 3840 < 2^16).
 //
-// Star share (B6 fix rounds 1-2, review r0 Important 1; the lead's ruling is pending):
-// lens_mask.a at this pass is the pixel's star share s = 1 - w, where w = lod_exposure_mix is the
-// weight its writer used in pre = mix(star_pre(), scene_pre(), w), composited with the Max blend
-// the writers' lens_mask target already has. The meter divides hdr's Y by
-// mix(scene_pre(), star_pre(), s). s = 0, the clear value and what every writer leaves while it
-// masks lens_mask alpha out, is the plan's rule (÷ scene_pre) exactly. hdr's own alpha is not
-// read. A body in the 1.5-4 px band read ÷ scene_pre grows 2^(EV_scene - EV_star) with the scene
-// EV, which runs the loop away; with a Max-composited share no reading grows with the scene EV
-// (crates/uni-post/src/histogram.rs module docs).
+// Star share (B6 fix rounds 1-2, review r0 Important 1; lead ruling B6 I1, writers task B10,
+// log-space blend task B11): lens_mask.a at this pass is the pixel's star share s = 1 - w, where
+// w = lod_exposure_mix is the weight its writer used in pre = pre_mix(star_pre(), scene_pre(), w)
+// (common/exposure.wgsl), composited with the Max blend of the writers' lens_mask target. The
+// meter divides hdr's Y by pre_mix(scene_pre(), star_pre(), s), the writer's pre read back.
+// s = 0, the clear value and what plain world light stores, is the plan's rule (÷ scene_pre)
+// exactly: pre_mix returns scene_pre() unchanged there. hdr's own alpha is not read. A body in
+// the 1.5-4 px band read ÷ scene_pre would be 2^(s (EV_scene - EV_star)) too bright (with B10's
+// linear blend the error grew as 2^(EV_scene - EV_star) and ran the loop away); with a
+// Max-composited share no reading grows with the scene EV (crates/uni-post/src/histogram.rs
+// module docs).
 //
 // CPU twins (crates/uni-post/src/histogram.rs): meter_pre, meter_luminance, meter_pixel (the
 // per-pixel step of cs_histogram), meter_bin, Histogram::meter (meter_reduce here, same order
@@ -109,9 +111,11 @@ fn meter_luminance(rgb: vec3<f32>, pre: f32) -> f32 {
 }
 
 // The pre-exposure a pixel was written with, from its star share s (lens_mask alpha, not NaN):
-// mix(scene_pre, star_pre, s), s clamped to [0, 1]; s = 0 gives scene_pre() exactly.
+// the log-space pre_mix(scene_pre(), star_pre(), s) = scene_pre^(1 - s) star_pre^s, s clamped to
+// [0, 1], i.e. the writers' pre_mix(star_pre(), scene_pre(), w) with w = 1 - s; s = 0 gives
+// scene_pre() exactly.
 fn meter_pre(s: f32) -> f32 {
-    return mix(scene_pre(), star_pre(), clamp(s, 0.0, 1.0));
+    return pre_mix(scene_pre(), star_pre(), clamp(s, 0.0, 1.0));
 }
 
 // Bin (x) and sub-bin step (y) of lit luminance l ≥ METER_MIN_CD_M2; values beyond the range go

@@ -20,25 +20,29 @@
 //! atomic). [`Histogram`] is the exact CPU twin; [`meter_histogram`] (counts only, bin centres)
 //! differs from it by at most half a bin.
 //!
-//! ## Star share in `lens_mask` alpha (fix rounds 1–2, review r0 Important 1; needs the lead's
-//! ruling)
+//! ## Star share in `lens_mask` alpha (fix rounds 1–2, review r0 Important 1; lead ruling B6 I1,
+//! writers task B10, log-space blend task B11)
 //!
 //! The plan's rule divides every pixel by `scene_pre`. A body whose projected radius is in the
-//! 1.5–4 px LOD band is written at pre = mix(star_pre, scene_pre, w) (`uni_planet::
-//! lod_exposure_mix`; body.wgsl, rings.wgsl, star_surface.wgsl), so ÷ `scene_pre` reads it
-//! (1 − w)·2^(EV_scene − EV_star) + w times too bright. That reading grows with the scene EV, a
-//! positive feedback: an Earth at 12 px with the Moon at 3.2 px ran the exposure to EV 40
-//! (`earth_moon_band_pair_settles`). The meter therefore reads the pixel's **star share**
-//! s = 1 − w from `lens_mask` alpha and divides `hdr`'s Y by [`meter_pre`] = mix(scene_pre,
-//! star_pre, s):
-//! - s = 0 is the clear value (`Renderer` clears `lens_mask` to 0) and what every pass leaves
-//!   while its `lens_mask` target masks alpha out (all of them at fix round 2). Such pixels read
-//!   exactly as the plan's rule, so nothing changes until a writer stores s.
-//! - The encoding is 1 − w, not w, for two reasons. Zero (the clear value) then means scene
-//!   exposure. And f16's relative precision lands where the feedback is sensitive (w → 1):
-//!   a stored s is off by ≤ 2⁻¹¹ relative, and so is the pre the meter recovers. A share below
-//!   f16's smallest normal (2⁻¹⁴) may be flushed to 0 on store, which would feed back again, so
-//!   writers snap w to 1 there (`band_share_below_f16_normal_needs_the_snap`).
+//! 1.5–4 px LOD band is written at the log-space pre = pre_mix(star_pre, scene_pre, w) =
+//! star_pre^(1 − w)·scene_pre^w (`uni_gfx::frame::pre_mix`, w = `uni_planet::
+//! lod_exposure_mix`; body.wgsl, rings.wgsl, star_surface.wgsl, atmosphere_common.wgsl), so
+//! ÷ `scene_pre` reads it 2^((1 − w)·(EV_scene − EV_star)) times too bright. (With B10's linear
+//! blend that was (1 − w)·2^(EV_scene − EV_star) + w, which grew with the scene EV, a positive
+//! feedback: an Earth at 12 px with the Moon at 3.2 px ran the exposure to EV 40,
+//! `earth_moon_band_pair_settles`.) The meter therefore reads the pixel's **star share**
+//! s = 1 − w from `lens_mask` alpha and divides `hdr`'s Y by [`meter_pre`] =
+//! pre_mix(scene_pre, star_pre, s), the writer's own pre:
+//! - s = 0 is the clear value (`Renderer` clears `lens_mask` to 0) and what plain world light
+//!   (w = 1, or eye-adapted stars not in effect) stores. Such pixels read exactly as the plan's
+//!   rule (`pre_mix` returns `scene_pre` unchanged at s = 0).
+//! - The encoding is 1 − w, not w, so that zero (the clear value) means scene exposure. A stored
+//!   s is off by ≤ 2⁻¹¹ relative (f16 rounding), so the pre the meter recovers is off by
+//!   ≤ 2⁻¹¹·s·|EV_scene − EV_star| stops (0.009 stop at a 19-stop gap). A share below f16's
+//!   smallest normal (2⁻¹⁴) may be flushed to 0 on store; with the log blend that misreads the
+//!   pixel by < 2⁻¹⁴·|EV_scene − EV_star| stops (≤ 0.004 over the EV100 range −30…40) and cannot
+//!   run away. Writers still snap w to 1 there, so the share is 0 or an f16 normal and reads back
+//!   exactly (`band_share_flushed_below_f16_normal_stays_bounded`).
 //! - Why `lens_mask` alpha and not `hdr` alpha (fix round 2): every pre-meter writer already
 //!   has a `lens_mask` target with a Max blend on colour and alpha (it writes `g` = coverage),
 //!   so storing s is a write-mask bit and one expression per writer, and it works for instanced
@@ -46,15 +50,14 @@
 //!   lens pass (pass 10), whereas `hdr` alpha is set to 1 by uni-rel's debug background and
 //!   would take a coverage value from any writer that unmasked it.
 //! - Mixed pixels: with the share composited by Max, contributor i of a pixel (luminance L_i,
-//!   written at pre(s_i)) is read as L_i·pre(s_i)/pre(s_max), and that ratio never grows with
-//!   the scene EV, so no pixel's reading can feed back. With eye-adapted stars and a scene EV at
-//!   or above the star EV (the sunlit case) pre(s_max) ≥ pre(s_i), so a pixel also never reads
-//!   above its brightest contributor; a band body over black reads exactly
-//!   (`mixed_band_pixel_never_feeds_back`).
-//! - Not built here: the writers (B1 body, B2 rings and star surfaces) must store s, and the
-//!   frame contract (uni-gfx `targets.rs`, whose `lens_mask` alpha is "reserved for M3") must
-//!   state it. Until they do, a band body next to a metered one still runs the loop away. The
-//!   fix round 2 report gives the exact change.
+//!   written at pre(s_i)) is read as L_i·pre(s_i)/pre(s_max) = (scene_pre/star_pre)^(s_max −
+//!   s_i), and that ratio never grows with the scene EV, so no pixel's reading can feed back.
+//!   With eye-adapted stars and a scene EV at or above the star EV (the sunlit case)
+//!   pre(s_max) ≥ pre(s_i), so a pixel also never reads above its brightest contributor; a band
+//!   body over black reads exactly (`mixed_band_pixel_never_feeds_back`).
+//! - The writers store s since task B10 (uni-planet bodies, rings and star surfaces; uni-atmo
+//!   atmospheres, with their body's w), and the frame contract (uni-gfx `targets.rs`, `lens_mask`
+//!   channel `a`) states it.
 
 use anyhow::Context as _;
 use uni_gfx::{
@@ -147,14 +150,15 @@ pub fn meter_luminance(pre_rgb: [f32; 3], pre: f32) -> f32 {
 }
 
 /// The pre-exposure the light in an `hdr` pixel was written with, from the pixel's star share
-/// `star_share` (its `lens_mask` alpha at the meter, see the module docs): mix(`scene_pre`,
-/// `star_pre`, s) = `scene_pre`·(1 − s) + `star_pre`·s (WGSL `mix`, same order), with s
-/// clamped to [0, 1]. s = 0 gives `scene_pre` exactly. A NaN share gives NaN (the pixel is not
-/// metered). Twin of `meter_pre` in `histogram.wgsl`.
+/// `star_share` (its `lens_mask` alpha at the meter, see the module docs): the log-space
+/// `pre_mix(scene_pre, star_pre, s)` = `scene_pre`^(1 − s)·`star_pre`^s (uni-gfx
+/// `uni_gfx::frame::pre_mix`, task B11), s clamped to [0, 1]: the writers'
+/// `pre_mix(star_pre, scene_pre, w)` read back with s = 1 − w. s = 0 gives `scene_pre` exactly
+/// and s = 1 `star_pre`. A NaN share gives NaN (the pixel is not metered). Twin of `meter_pre`
+/// in `histogram.wgsl`.
 pub fn meter_pre(scene_pre: f32, star_pre: f32, star_share: f32) -> f32 {
-    // f32::clamp keeps NaN, so a NaN share stays NaN here.
-    let s = star_share.clamp(0.0, 1.0);
-    scene_pre * (1.0 - s) + star_pre * s
+    // f32::clamp keeps NaN, and pre_mix of a NaN fraction is NaN, so a NaN share stays NaN.
+    uni_gfx::frame::pre_mix(scene_pre, star_pre, star_share.clamp(0.0, 1.0))
 }
 
 /// What `cs_histogram` reads from one pixel: its world luminance [cd/m²], [`meter_luminance`]
@@ -533,9 +537,10 @@ impl RenderFeature for ExposureMeter {
 mod tests {
     use super::*;
     use crate::exposure::next_adapted_ev;
-    use crate::{EV100_MAX, ExposureMode, ExposureSettings, NIGHT_EV100};
+    use crate::{EV100_MAX, EV100_MIN, ExposureMode, ExposureSettings, NIGHT_EV100};
     use glam::Vec3;
     use std::f32::consts::PI;
+    use uni_gfx::frame::pre_mix;
     use uni_gfx::{Exposure, HDR_MAX, exposure_scale};
 
     /// AgX white in pre-exposed units: 2^4.026069 = 16.29 (`AGX_MAX_EV` in uni-post `agx`).
@@ -631,11 +636,11 @@ mod tests {
     /// f16's smallest normal, 2^−14.
     const F16_MIN_NORMAL: f32 = crate::probes::F16_MIN_NORMAL;
 
-    /// The pre-exposure a writer uses for light with scene-exposure weight `w`: mix(star_pre,
-    /// scene_pre, w) (body.wgsl, rings.wgsl, star_surface.wgsl; w = `lod_exposure_mix`, 1 for a
-    /// body of 4 px or more).
+    /// The pre-exposure a writer uses for light with scene-exposure weight `w`: the log-space
+    /// pre_mix(star_pre, scene_pre, w) (task B11; body.wgsl, rings.wgsl, star_surface.wgsl,
+    /// atmosphere_common.wgsl; w = `lod_exposure_mix`, 1 for a body of 4 px or more).
     fn writer_pre(w: f32, scene_pre: f32, star_pre: f32) -> f32 {
-        star_pre * (1.0 - w) + scene_pre * w
+        pre_mix(star_pre, scene_pre, w)
     }
 
     /// One grey world-light pixel of luminance `l` [cd/m²] fully covered by one writer, as the
@@ -873,7 +878,8 @@ mod tests {
     #[test]
     fn meter_pixel_divides_by_its_own_pre() {
         // Fix rounds 1 and 2 (review r0 Important 1): lens_mask.a is the pixel's star share s,
-        // and the meter divides hdr's Y by mix(scene_pre, star_pre, s).
+        // and the meter divides hdr's Y by pre_mix(scene_pre, star_pre, s), the log-space blend
+        // the writers use (task B11).
         let (scene, star) = (exposure_scale(15.0), exposure_scale(NIGHT_EV100));
         let rgbs = [
             [0.3, 0.5, 0.9],
@@ -892,20 +898,35 @@ mod tests {
             assert_eq!(meter_pixel(rgb, 1.0, scene, star), one);
             assert_eq!(meter_pixel(rgb, 2.0, scene, star), one);
             assert_eq!(meter_pixel(rgb, f32::INFINITY, scene, star), one);
-            // Between: the writer's mix(star_pre, scene_pre, w) with w = 1 − s.
-            let quarter = meter_luminance(rgb, scene * 0.75 + star * 0.25);
+            // Between: the writer's pre_mix(star_pre, scene_pre, w) with w = 1 − s.
+            let quarter = meter_luminance(rgb, pre_mix(scene, star, 0.25));
             assert_eq!(meter_pixel(rgb, 0.25, scene, star), quarter);
             // A NaN share: the pixel's pre is unknown, so it is not metered.
             assert_eq!(meter_bin(meter_pixel(rgb, f32::NAN, scene, star)), None);
         }
         // The HDR_MAX bound is taken at the pixel's own pre.
-        let half = scene * 0.5 + star * 0.5;
+        let half = pre_mix(scene, star, 0.5);
         assert_eq!(
             meter_pixel([0.0, 0.0, HDR_MAX], 0.5, scene, star),
             HDR_MAX / half
         );
-        assert_eq!(meter_pre(scene, star, 0.0), scene);
-        assert_eq!(meter_pre(scene, star, 1.0), star);
+        assert_eq!(meter_pre(scene, star, 0.0).to_bits(), scene.to_bits());
+        assert_eq!(meter_pre(scene, star, 1.0).to_bits(), star.to_bits());
+        // The decode is the writers' encoding read backwards, in equal stops: a share s is
+        // s·(EV_scene − EV_star) stops above scene_pre (19 stops here; a quarter share 4.75),
+        // where B10's linear decode put a quarter share 2.0 stops below star_pre (17 above
+        // scene_pre).
+        for i in 0..=64 {
+            let s = i as f32 / 64.0;
+            let pre = meter_pre(scene, star, s);
+            let writer = writer_pre(1.0 - s, scene, star);
+            assert!(
+                (pre / writer - 1.0).abs() < 2e-5,
+                "s {s}: {pre} vs {writer}"
+            );
+            let stops = (pre / scene).log2();
+            assert!((stops - 19.0 * s).abs() < 1e-4, "s {s}: {stops} stops");
+        }
     }
 
     #[test]
@@ -954,17 +975,34 @@ mod tests {
         // The pass reads the share from lens_mask's alpha, and hdr only for its colour.
         assert!(src.contains("textureLoad(meter_lens_mask, p, 0).a"), "{src}");
         assert!(src.contains("textureLoad(meter_hdr, p, 0).rgb"), "{src}");
+        // It decodes the share with the writers' log-space blend (task B11), the twin of
+        // `meter_pre`, and no linear mix of the two pre-exposures is left.
+        assert_eq!(
+            src.matches("return pre_mix(scene_pre(), star_pre(), clamp(s, 0.0, 1.0));")
+                .count(),
+            1,
+            "{src}"
+        );
+        for arg in ["mix(star_pre()", "mix(scene_pre()"] {
+            let log = format!("pre_{arg}");
+            assert_eq!(
+                src.matches(arg).count(),
+                src.matches(log.as_str()).count(),
+                "a linear {arg}"
+            );
+        }
     }
 
     #[test]
     fn earth_moon_band_pair_settles() {
         // Review r0 Important 1, its worked case: a full-phase Earth at r = 12 px (metered) with
         // the Moon at r = 3.2 px (w = 0.87) or 3.8 px (w = 0.99), inside the 1.5–4 px LOD band,
-        // so drawn at mix(star_pre, scene_pre, w); eye-adapted stars at EV −4; settle (τ = 0).
-        // Read ÷ scene_pre, the Moon's pixels grow by 2^(EV − EV_star) with the scene EV and the
-        // loop runs to EV100_MAX (review: −4 → 15.1 → 26.1 → 37.2 → 40, a black frame). Read ÷
-        // their own pre (star share in lens_mask.a), they read their true luminance and it
-        // settles.
+        // so drawn at pre_mix(star_pre, scene_pre, w) (task B11); eye-adapted stars at EV −4;
+        // settle (τ = 0). With B10's linear blend, read ÷ scene_pre, the Moon's pixels grew by
+        // (1 − w)·2^(EV − EV_star) + w with the scene EV and the loop ran to EV100_MAX (review:
+        // −4 → 15.1 → 26.1 → 37.2 → 40, a black frame); with the log blend that reading would be
+        // 2^((1 − w)·(EV − EV_star)) too bright, a bias rather than a runaway. Read ÷ their own
+        // pre (star share in lens_mask.a), they read their true luminance and it settles.
         //
         // Lambert stand-ins at 1 AU (E = 1.259e5 lux, star_illuminance_lux(−26.74)), for the
         // loop's stability rather than an absolute EV: Earth's disk composite ρ = 0.302 (ruling
@@ -1025,14 +1063,15 @@ mod tests {
         // Fix round 2: lens_mask.a is composited with Max (the blend the writers' lens_mask
         // target already has), so a pixel's share s_max is ≥ each contributor's share s_i, and
         // contributor i (luminance L_i, written at pre(s_i)) is read as L_i·pre(s_i)/pre(s_max).
-        // With x = scene_pre/star_pre that ratio is (x(1 − s_i) + s_i)/(x(1 − s_max) + s_max),
-        // whose derivative in x has the sign of s_max − s_i ≥ 0. It is therefore non-increasing
-        // in the scene EV: a fixed scene never reads brighter because the exposure rose, which is
-        // the loop's positive feedback (review r0 Important 1). With eye-adapted stars and a
-        // scene EV ≥ the star EV (star_pre ≥ scene_pre, the sunlit case where the runaway
-        // happened) pre(s_max) ≥ every pre(s_i), so a pixel also never reads above its
-        // brightest contributor. A band body over black reads c·L exactly. Swept over scene EV
-        // −30…40 with f16 storage.
+        // With the log-space pre(s) = scene_pre^(1 − s)·star_pre^s (task B11) and
+        // x = scene_pre/star_pre that ratio is x^(s_max − s_i), non-decreasing in x because
+        // s_max − s_i ≥ 0 (as was B10's linear (x(1 − s_i) + s_i)/(x(1 − s_max) + s_max)). It is
+        // therefore non-increasing in the scene EV: a fixed scene never reads brighter because the
+        // exposure rose, which is the loop's positive feedback (review r0 Important 1). With
+        // eye-adapted stars and a scene EV ≥ the star EV (x ≤ 1, the sunlit case where the
+        // runaway happened) the ratio is ≤ 1, so a pixel also never reads above its brightest
+        // contributor. A band body over black reads c·L exactly. Swept over scene EV −30…40 with
+        // f16 storage.
         let star_ev = NIGHT_EV100;
         let star = exposure_scale(star_ev);
         // (back, front): luminance [cd/m²] and w; w = 1 is a body at 4 px or more.
@@ -1081,22 +1120,36 @@ mod tests {
     }
 
     #[test]
-    fn band_share_below_f16_normal_needs_the_snap() {
-        // Fix round 2, evidence for the writer-side rule. A share 1 − w below f16's smallest
-        // normal (2^−14) may be flushed to 0 when lens_mask is stored (Metal does not promise
-        // f16 subnormals in a render target; `f16` here flushes them as well). The meter then
-        // divides by scene_pre light that was written at pre(w) = scene_pre + (1 − w)·(star_pre −
-        // scene_pre), over-reading it by 1 + (1 − w)·(2^(EV − EV_star) − 1), which still grows
-        // with the scene EV. The Moon at w = 1 − 6·10⁻⁵ (radius ≈ 3.982 px) next to the 12-px
-        // Earth therefore still runs away. With the snap the writers need (w = 1 when 1 − w <
-        // 2^−14, applied before both the pre and the share, so they agree) it settles on the
-        // true-luminance reading.
+    fn band_share_flushed_below_f16_normal_stays_bounded() {
+        // A share 1 − w below f16's smallest normal (2^−14) may be flushed to 0 when lens_mask is
+        // stored (Metal does not promise f16 subnormals in a render target; `f16` here flushes
+        // them as well). The meter then divides by scene_pre light that was written at the
+        // log-space pre_mix(star_pre, scene_pre, w) (task B11), over-reading it by
+        // 2^((1 − w)·(EV − EV_star)): under 70·2^−14 ≈ 0.004 stop over the whole EV100 range
+        // −30…40, and with a feedback gain of 1 − w < 2^−14 it cannot run away. (With B10's
+        // linear blend the over-read was 1 + (1 − w)·(2^(EV − EV_star) − 1), which grew with the
+        // scene EV, and this Moon ran the loop away: fix round 2's evidence for the snap.) The
+        // writers still snap (w = 1 when 1 − w < 2^−14, before both the pre and the share), so
+        // a stored share is 0 or an f16 normal and the meter reads the writer's pre back exactly;
+        // the snap moves pre by as little. The Moon at w = 1 − 6·10⁻⁵ (radius ≈ 3.982 px) next to
+        // the 12-px Earth settles on the true-luminance reading either way.
         let e = 1.259e5f32;
         let earth = lambert_sphere(12.0, 0.0, 0.302 * e / PI);
         let moon = lambert_sphere(3.982, 0.0, 0.18 * e / PI);
         let w = 1.0 - 6.0e-5f32;
         assert!(1.0 - w < F16_MIN_NORMAL && f16(1.0 - w) == 0.0);
         let snap = |w: f32| if 1.0 - w < F16_MIN_NORMAL { 1.0 } else { w };
+        // The worst over-read of a flushed share over the meter's EV range: below 0.004 stop.
+        for ev in [EV100_MIN, NIGHT_EV100, 0.0, 15.0, EV100_MAX] {
+            let (scene, star) = (exposure_scale(ev), exposure_scale(NIGHT_EV100));
+            // A luminance written near 1 in hdr, neither clamped nor flushed.
+            let l = 1.0 / scene;
+            let (rgb, share) = band_pixel(l, w, scene, star);
+            assert_eq!(share, 0.0);
+            let over = (meter_pixel(rgb, share, scene, star) / l).log2();
+            let bound = (1.0 - w) * (ev - NIGHT_EV100).abs() + 2f32.powi(-10);
+            assert!(over.abs() <= bound, "EV {ev}: {over} stops (bound {bound})");
+        }
         let run = |w: f32| {
             let px: Vec<(f32, f32)> = earth
                 .iter()
@@ -1120,8 +1173,12 @@ mod tests {
         );
         let flushed = run(w);
         assert!(
-            flushed[16] > truth + 3.0 && flushed[16] > flushed[15],
-            "flushed share: {flushed:?} vs true {truth}"
+            flushed[3..]
+                .iter()
+                .zip(&snapped[3..])
+                .all(|(f, s)| (f - s).abs() < 0.01),
+            "flushed share: {flushed:?} vs snapped {snapped:?}"
         );
+        assert!((flushed[16] - flushed[15]).abs() < 1e-3, "{flushed:?}");
     }
 }

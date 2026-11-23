@@ -4,8 +4,10 @@ use uni_sim::snapshot::{BLEND_LOD_PX, POINT_LOD_PX};
 
 /// Weight of the scene exposure for a resolved body or star of projected radius
 /// `proj_radius_px` [px] while "Eye-adapted stars" is in effect: the pass writes its light with
-/// `mix(star_pre, scene_pre, lod_exposure_mix(radius))` (M1 frame contract, "Exposure split";
-/// ruling 5).
+/// `pre_mix(star_pre, scene_pre, lod_exposure_mix(radius))` (M1 frame contract, "Exposure split";
+/// ruling 5), the log-space blend star_pre^(1 − w)·scene_pre^w of uni-gfx
+/// (`common/exposure.wgsl`, CPU twin `uni_gfx::frame::pre_mix`; task B11), so the exposure in
+/// stops follows this weight: (EV_scene − EV_star)·w stops below the star exposure.
 ///
 /// - 0 at and below [`POINT_LOD_PX`] (1.5 px), where uni-sim still hands the body over as a point
 ///   drawn at star exposure, so the resolved disk starts at exactly the point's exposure;

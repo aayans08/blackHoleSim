@@ -39,18 +39,22 @@
 //! whole rendered disk, this pass's ground as uni-atmo's pass dims it plus that pass's
 //! in-scatter (ruling W-B1, review I3: [`body_light`], [`flux_match`]; B3's disk share from its
 //! CPU twins, [`atmo_handover`]). The exposure factor blends from `star_pre` to `scene_pre` with
-//! [`crate::lod_exposure_mix`] while eye-adapted stars are in effect ([`exposure_weight`]).
+//! the weight w = [`crate::lod_exposure_mix`] while eye-adapted stars are in effect
+//! ([`exposure_weight`]), in log space: pre = `pre_mix(star_pre, scene_pre, w)` =
+//! star_pre^(1 − w)·scene_pre^w (uni-gfx `common/exposure.wgsl`, CPU twin
+//! `uni_gfx::frame::pre_mix`; task B11), so the exposure moves by equal stops per step of w and
+//! the 1.5–4 px band spreads the star/scene gap evenly instead of dropping it just below 4 px.
 //!
 //! **Star share (lead ruling B6 I1, task B10).** Every uni-planet pass that draws at
-//! pre = mix(star_pre, scene_pre, w) with w < 1 (bodies, rings, star surfaces in the 1.5–4 px
+//! pre = pre_mix(star_pre, scene_pre, w) with w < 1 (bodies, rings, star surfaces in the 1.5–4 px
 //! band) stores s = 1 − w in `lens_mask.a` on each fragment that covers anything, blended with
 //! `Max` ([`lens_mask_target`], [`star_share`]); the clear value 0 means scene exposure. The meter
-//! (uni-post `histogram.wgsl`, pass 9) divides each pixel by mix(scene_pre, star_pre, s), which is
-//! the writer's pre, so a body in the band is metered at its true luminance and the exposure loop
-//! cannot run away. w is snapped to 1 when 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴, f16's smallest
-//! normal, which Metal may otherwise flush to 0 on store ([`exposure_weight`]). The app gives a
-//! body's atmosphere the same w (`uni_atmo::AtmoDraw::exposure_mix`), so its in-scatter shares the
-//! body's exposure and its share.
+//! (uni-post `histogram.wgsl`, pass 9) divides each pixel by pre_mix(scene_pre, star_pre, s),
+//! which is the writer's pre, so a body in the band is metered at its true luminance and the
+//! exposure loop cannot run away. w is snapped to 1 when 1 − w < [`STAR_SHARE_MIN`] = 2⁻¹⁴, f16's
+//! smallest normal, which Metal may otherwise flush to 0 on store ([`exposure_weight`]). The app
+//! gives a body's atmosphere the same w (`uni_atmo::AtmoDraw::exposure_mix`), so its in-scatter
+//! shares the body's exposure and its share.
 //!
 //! No Earth- or Venus-specific calibration constant lives here (constraints §4a, W-B1..W-B3);
 //! `World::objects()` grows at run time, so nothing is sized per `ObjectId`: materials are keyed
@@ -120,15 +124,18 @@ pub(crate) const BODY_BINDINGS: u32 = 6;
 /// Smallest non-zero star share a uni-planet pass stores in `lens_mask.a`: 2⁻¹⁴, the smallest
 /// normal binary16 (IEEE 754-2019 §3.6; `lens_mask` is Rgba16Float). Metal does not promise to
 /// keep f16 subnormals when it stores a render target, and a share flushed to 0 reads as scene
-/// exposure while the light was written nearer `star_pre`: the meter then reads it too bright by
-/// 1 + s·(2^(EV_scene − EV_star) − 1), which still grows with the scene EV (uni-post
-/// `band_share_below_f16_normal_needs_the_snap`). [`exposure_weight`] snaps w to 1 instead (lead
-/// ruling B6 I1).
+/// exposure while the light was written at pre_mix(star_pre, scene_pre, w): the meter then reads
+/// it 2^(s·(EV_scene − EV_star)) too bright, under 70·2⁻¹⁴ ≈ 0.004 stop for any s < 2⁻¹⁴ over
+/// the whole EV100 range −30…40 (uni-post `band_share_flushed_below_f16_normal_stays_bounded`;
+/// with B10's linear blend it was 1 + s·(2^(EV_scene − EV_star) − 1), which ran the loop away
+/// for a scene EV well above the star EV). [`exposure_weight`] snaps w to 1 anyway (lead ruling
+/// B6 I1), so a stored share is 0 or an f16 normal and the meter reads back exactly the writer's
+/// pre.
 pub const STAR_SHARE_MIN: f32 = 1.0 / 16384.0;
 
 /// The exposure weight w with which the uni-planet passes draw a resolved body, its rings or a
-/// star surface of projected radius `proj_radius_px` [px]: pre = mix(star_pre, scene_pre, w) (M1
-/// frame contract, "Exposure split").
+/// star surface of projected radius `proj_radius_px` [px]: pre = pre_mix(star_pre, scene_pre, w),
+/// the log-space blend (M1 frame contract, "Exposure split"; task B11).
 ///
 /// While eye-adapted stars are in effect it is [`crate::lod_exposure_mix`] snapped by
 /// [`snap_exposure_weight`] (0 at ≤ 1.5 px, 1 from about 3.98 px on), otherwise 1 (scene
@@ -146,8 +153,14 @@ pub fn exposure_weight(proj_radius_px: f64, eye_adapted: bool) -> f32 {
 
 /// `w`, or 1 when 1 − w < [`STAR_SHARE_MIN`], so the share 1 − w is either 0 or an f16 normal.
 /// 1 − smoothstep(t) ≈ 3(1 − t)², so the snap acts only for radii in about (3.982, 4) px, keeps w
-/// non-decreasing in the radius, and moves it by less than 2⁻¹⁴. The CPU applies it before the
-/// upload, so the pass's pre and its share use the same w (in f32, 1 − w is exact for w ≥ ½).
+/// non-decreasing in the radius, and moves it by less than 2⁻¹⁴. With the log-space blend
+/// (task B11) that moves pre by less than 2⁻¹⁴·(EV_scene − EV_star) stops, 0.0012 stop at a
+/// 19-stop gap: no visible step (with B10's linear blend the same snap stepped the brightness by
+/// 1 + 2⁻¹⁴·(2^ΔEV − 1), 33× at 19 stops). The CPU applies it before the upload, so the pass's pre
+/// and its share use the same w (in f32, 1 − w is exact for w ≥ ½). Kept in uni-planet rather
+/// than in [`crate::lod_exposure_mix`]: uni-atmo snaps the w it is given with its own twin
+/// (`uni_atmo::feature::atmo_exposure_mix`, which cannot depend on uni-planet), so moving the snap
+/// would not remove that duplicate.
 pub(crate) fn snap_exposure_weight(w: f32) -> f32 {
     if 1.0 - w < STAR_SHARE_MIN { 1.0 } else { w }
 }
@@ -156,8 +169,8 @@ pub(crate) fn snap_exposure_weight(w: f32) -> f32 {
 /// fragment drawn with exposure weight `w` and coverage (the rings: opacity) `coverage` stores in
 /// `lens_mask.a`, blended with `Max` (lead ruling B6 I1): 1 − w where it covers anything, else 0.
 /// The meter (uni-post `histogram.wgsl`, `meter_pre`) reads it back as the pixel's pre,
-/// mix(scene_pre, star_pre, s) = mix(star_pre, scene_pre, w), the writer's own (0 = scene
-/// exposure, the clear value).
+/// pre_mix(scene_pre, star_pre, s) = pre_mix(star_pre, scene_pre, w), the writer's own (0 =
+/// scene exposure, the clear value).
 pub fn star_share(w: f32, coverage: f32) -> f32 {
     if coverage > 0.0 { 1.0 - w } else { 0.0 }
 }
@@ -365,8 +378,9 @@ pub(crate) struct BodyLight {
     /// B: the atmosphere pass's in-scatter flux over this pass's disk flux at k = 1 (0 without
     /// an atmosphere).
     pub inscatter_share: f64,
-    /// Exposure weight: 0 `star_pre` … 1 `scene_pre` ([`exposure_weight`]); the pass stores the
-    /// star share 1 − this in `lens_mask.a`.
+    /// Exposure weight: 0 `star_pre` … 1 `scene_pre` ([`exposure_weight`]; the shader draws at
+    /// `pre_mix(star_pre, scene_pre, w)`, task B11); the pass stores the star share 1 − this in
+    /// `lens_mask.a`.
     pub exposure_mix: f32,
 }
 
@@ -407,9 +421,10 @@ impl BodyLight {
 ///   4 px on k = 1. σ = 1 because B3 draws its in-scatter at every size, unfaded, at this body's
 ///   own exposure weight (lead ruling B6 I1: the app sets `uni_atmo::AtmoDraw::exposure_mix` to
 ///   [`exposure_weight`] of the same body; before task B10 it drew at scene_pre and σ was
-///   scene_pre/pre). In units of
-///   E·R_mean²/d², with ρ_p = ρ(p_V), R_d the drawn mean radius, R_b the preset's bottom radius
-///   and lum = BT.709 ⊙ the Sun's colour:
+///   scene_pre/pre). k, A and B are physical ratios: none depends on how the exposure blends
+///   (task B11 changed it to the log-space `pre_mix`; body and atmosphere share it, so σ stays
+///   1). In units of E·R_mean²/d², with ρ_p = ρ(p_V), R_d the drawn mean radius, R_b the preset's
+///   bottom radius and lum = BT.709 ⊙ the Sun's colour:
 ///   - the point (uni-sim `reflected_lux`, Lambert): P = ρ_p·⅔Φ(α)·C;
 ///   - this pass at k = 1: D = C·ρ̄·⅔Φ(α)·(R_d/R_mean)²·lum·(colour ⊙ ground factor);
 ///   - B3's in-scatter: I = lum·in-scatter·(R_b/R_mean)²;
@@ -1547,12 +1562,17 @@ fn warm_atmo_handover(naifs: Vec<i32>) {
 /// k = 1), the point's P = A·D and the atmosphere pass's in-scatter I = B·D (written at
 /// pre_atmo), the total k·D·pre + I·pre_atmo equals pre·[(1 − w)·P + w·(D + I)]: the point's
 /// flux at 1.5 px (w = 0, pre = star_pre while eye-adapted stars are in effect), the real
-/// rendering from 4 px (w = 1, k = 1), and a linear cross-fade between.
+/// rendering from 4 px (w = 1, k = 1, pre = scene_pre), and a linear cross-fade of the flux
+/// between.
 ///
 /// Since task B10 the atmosphere draws at its body's exposure weight (lead ruling B6 I1,
 /// [`exposure_weight`]), so pre_atmo = pre and the shader passes σ = 1: k = (1 − w)·A + w +
 /// B·(w − 1), linear in w in both exposure modes. (Before, B3 drew at scene_pre and σ was
-/// scene_pre/pre.)
+/// scene_pre/pre.) Task B11 made pre itself the log-space blend pre_mix(star_pre, scene_pre, w)
+/// (uni-gfx); since the body and its atmosphere use the same pre, σ = 1 and k are unchanged,
+/// and the exposed total is pre_mix(star_pre, scene_pre, w)·[(1 − w)·P + w·(D + I)]: its
+/// exposure falls by equal stops per step of w while the flux cross-fades
+/// (`point_disk_handover_flux_continuous`).
 pub(crate) fn flux_match(handover: [f32; 4], sigma: f32) -> f32 {
     let [w, a, b, k_max] = handover;
     ((1.0 - w) * a + w + b * (w - sigma)).clamp(0.0, k_max)
@@ -1576,6 +1596,7 @@ mod tests {
     use core::mem::offset_of;
     use glam::{DQuat, DVec3};
     use uni_core::{AU, Epoch};
+    use uni_gfx::frame::pre_mix;
     use uni_gfx::{ShaderLib, exposure_scale, validate_wgsl};
     use uni_physics::photometry::{
         Brdf, disk_illuminance_lux, disk_phase_function, planet_phase_correction,
@@ -1818,10 +1839,43 @@ mod tests {
     /// ρ̄ = ρ(p_V) and k = 1. Titan's ground is hidden under its haze, so k stays 1 there and the
     /// handover is B3's in-scatter alone: its gap is printed and bounded below, now in both
     /// exposure modes (before B10 the in-scatter stayed at scene exposure and Titan's disk fell
-    /// the full star/scene gap short with eye-adapted stars). Also: k reaches 1 by 4 px, and the
-    /// cross-fade is exact and smooth through the band.
+    /// the full star/scene gap short with eye-adapted stars). Also: k reaches 1 by 4 px, where
+    /// the exposed disk is the real rendering at scene exposure, and the cross-fade is exact and
+    /// smooth through the band.
+    ///
+    /// Task B11: the exposure is the log-space blend pre = `pre_mix(star_pre, scene_pre, w)`
+    /// (uni-gfx), as body.wgsl and the atmosphere write it. Between neighbouring sizes (0.025 px
+    /// apart) the exposure moves by exactly ΔEV·Δw stops and the exposed total by at most
+    /// `MAX_STEP_STOPS` (measured: 0.22 stop with eye-adapted stars). B10's linear blend kept
+    /// the total within 0.5 stop of the point's to 2 px and 3.1 stops to 3 px, then dropped the
+    /// other ~11 of the 14 stops between 3 and 4 px, in steps of up to 1.57 stops per 0.025 px
+    /// (printed as "linear" for the report, with the exposed total against the point at 1.5, 2,
+    /// 3 and 4 px for both blends). k itself does not depend on the blend: the atmosphere uses
+    /// the body's own pre, so σ = 1 for any blend ([`flux_match`]).
     #[test]
     fn point_disk_handover_flux_continuous() {
+        /// Largest change of the exposed (disk + atmosphere) total between neighbouring sizes
+        /// [stops]: ΔEV·Δw ≤ 14 × 0.017 from the exposure, ≤ 0.05 from the growing disk.
+        const MAX_STEP_STOPS: f64 = 0.35;
+        /// One size's numbers; energies are exposed [lx × pre].
+        struct At {
+            /// Disk + atmosphere at the log blend (what the passes write).
+            disk: f64,
+            /// The point at star exposure.
+            point: f64,
+            /// The cross-fade's target, pre·[(1 − w)·point + w·(disk + atmosphere at k = 1)].
+            target: f64,
+            light: BodyLight,
+            k: f64,
+            /// Disk + atmosphere with fix round 1's k₀ (no atmosphere table).
+            old: f64,
+            /// Disk + atmosphere at B10's linear blend (report only).
+            linear: f64,
+            /// The real rendering (k = 1) at scene exposure.
+            real: f64,
+            /// log₂ of the exposure.
+            log2_pre: f64,
+        }
         let fov = 60f64.to_radians();
         let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
         // Mars's map is red: a luminance-1 colour, so the ground's channels weigh as drawn.
@@ -1925,10 +1979,11 @@ mod tests {
             let disk_rho = map_rho.unwrap_or(rho_point);
             let truth = atmo.then(|| fine_atmo(naif.unwrap(), phase));
             for eye_adapted in [true, false] {
-                let star_pre = f64::from(exposure_scale(if eye_adapted { -4.0 } else { 10.0 }));
-                let scene_pre = f64::from(exposure_scale(10.0));
-                // (exposed disk + atmosphere, exposed point, exposed target of the cross-fade,
-                // light) at a projected radius of `px`.
+                let (star_ev, scene_ev) = (if eye_adapted { -4.0 } else { 10.0 }, 10.0);
+                let star_pre = f64::from(exposure_scale(star_ev));
+                let scene_pre = f64::from(exposure_scale(scene_ev));
+                let gap_stops = f64::from(scene_ev - star_ev);
+                // The numbers at a projected radius of `px`.
                 let energy_at = |px: f64| {
                     let dist = radius / (px * 2.0 * (0.5 * fov).tan() / 1080.0).atan().sin();
                     let v = view(naif, brdf, p_v, radius, atmo, dist, phase, px);
@@ -1954,7 +2009,15 @@ mod tests {
                         ),
                         None => (bare, 0.0),
                     };
-                    let pre = star_pre + (scene_pre - star_pre) * f64::from(light.exposure_mix);
+                    // body.wgsl and the atmosphere: pre_mix(star_pre(), scene_pre(), w).
+                    let pre = f64::from(pre_mix(
+                        star_pre as f32,
+                        scene_pre as f32,
+                        light.exposure_mix,
+                    ));
+                    // B10's linear blend, for the report's before/after numbers only.
+                    let pre_linear =
+                        star_pre + (scene_pre - star_pre) * f64::from(light.exposure_mix);
                     // σ = 1: B3's in-scatter is written at this same pre (body.wgsl fs_main).
                     let k = light.flux_match(1.0);
                     // The point path (uni-sim `reflected_lux`): C clamped to ≤ 10 (A3 ruling).
@@ -1988,18 +2051,50 @@ mod tests {
                         |_| None,
                     )
                     .flux_match(1.0);
-                    (
-                        (k * own + inscatter) * pre,
-                        point * star_pre,
+                    At {
+                        disk: (k * own + inscatter) * pre,
+                        point: point * star_pre,
                         target,
                         light,
                         k,
-                        (old * own + inscatter) * pre,
-                    )
+                        old: (old * own + inscatter) * pre,
+                        linear: (k * own + inscatter) * pre_linear,
+                        real: (own + inscatter) * scene_pre,
+                        log2_pre: pre.log2(),
+                    }
                 };
-                let (disk, point, _, light, k0, old) = energy_at(1.5);
+                let at15 = energy_at(1.5);
+                let At {
+                    disk,
+                    point,
+                    light,
+                    k: k0,
+                    old,
+                    ..
+                } = at15;
                 let gap = disk / point - 1.0;
                 let mag = |x: f64| -2.5 * x.log10();
+                // The report's table: the exposed total against the point at 1.5, 2, 3 and 4 px
+                // (the point at the same distance), log blend and B10's linear blend.
+                let row = [1.5, 2.0, 3.0, 4.0].map(|px| {
+                    let a = energy_at(px);
+                    (
+                        px,
+                        a.light.exposure_mix,
+                        a.disk / a.point,
+                        a.linear / a.point,
+                    )
+                });
+                eprintln!(
+                    "{name} {phase_deg}° eye-adapted {eye_adapted}: exposed (disk + atmosphere) \
+                     / point, log blend [linear blend]: {}",
+                    row.map(|(px, w, log, lin)| format!(
+                        "{px} px (w {w:.4}) {log:.4e} = {:+.2} stops [{lin:.4e} = {:+.2} stops]",
+                        log.log2(),
+                        lin.log2()
+                    ))
+                    .join("; ")
+                );
                 eprintln!(
                     "{name} {phase_deg}° eye-adapted {eye_adapted}: (disk + atmosphere)/point at \
                      1.5 px = {:.4} ({:+.3} mag; fix round 1's k₀ gave {:.4}, {:+.3} mag); \
@@ -2030,23 +2125,50 @@ mod tests {
                     if eye_adapted { 0.0 } else { 1.0 },
                     "{name}"
                 );
-                // By 4 px: scene exposure and the real rendering (no cross-fade left).
-                let (_, _, _, light4, k4, _) = energy_at(4.0);
+                // By 4 px: scene exposure and the real rendering (no cross-fade left), exactly.
+                let at4 = energy_at(4.0);
+                let (light4, k4) = (at4.light, at4.k);
                 assert_eq!(light4.exposure_mix, 1.0, "{name}");
                 assert_eq!(light4.flux_weight, 1.0, "{name}");
                 assert_eq!(k4, 1.0, "{name}: {light4:?}");
+                assert!(
+                    (at4.disk / at4.real - 1.0).abs() < 1e-12,
+                    "{name}: {} vs {}",
+                    at4.disk,
+                    at4.real
+                );
                 // Through the band the total stays within 3 % of the cross-fade of the point
                 // into the real rendering (k from the table, the rendering from fine_atmo), k
                 // stays in [0, k_max], and the exposure weight steps by at most 3 % between
                 // neighbouring sizes (smoothstep in ln r: at most 1.5 × the mean slope, 1.5 %
                 // here). k is linear in w in both exposure modes (σ = 1: B3's in-scatter shares
                 // this pass's exposure since B10), so it steps by at most 3 % of |k₀ − 1|. With
-                // eye-adapted stars the exposed energy itself changes by orders of magnitude
-                // across the band, which is the eye-adapted blend's purpose.
+                // eye-adapted stars the exposed energy itself falls by the star/scene gap across
+                // the band, which is the eye-adapted blend's purpose; the log blend spreads it
+                // evenly, ΔEV·Δw stops per step (B11), so no step exceeds MAX_STEP_STOPS.
                 let (mut prev, mut prev_k) = (light, k0);
+                let (mut prev_e, mut prev_lin, mut prev_log2_pre) =
+                    (at15.disk, at15.linear, at15.log2_pre);
+                let (mut max_step, mut max_step_linear) = (0.0_f64, 0.0_f64);
                 for step in 1..=100 {
-                    let (e, _, target, l, k, _) = energy_at(1.5 + 2.5 * f64::from(step) / 100.0);
+                    let a = energy_at(1.5 + 2.5 * f64::from(step) / 100.0);
+                    let (e, target, l, k) = (a.disk, a.target, a.light, a.k);
                     assert!(e.is_finite() && e > 0.0, "{name} step {step}");
+                    // The exposure in stops is linear in w: it moves by ΔEV·Δw exactly.
+                    let step_w = f64::from(l.exposure_mix - prev.exposure_mix);
+                    let d_pre = a.log2_pre - prev_log2_pre;
+                    assert!(
+                        (d_pre + gap_stops * step_w).abs() < 1e-4,
+                        "{name} step {step}: exposure moved {d_pre} stops, Δw {step_w}"
+                    );
+                    let jump = (e / prev_e).log2().abs();
+                    assert!(
+                        jump <= MAX_STEP_STOPS,
+                        "{name} step {step} eye-adapted {eye_adapted}: {jump} stops"
+                    );
+                    max_step = max_step.max(jump);
+                    max_step_linear = max_step_linear.max((a.linear / prev_lin).log2().abs());
+                    (prev_e, prev_lin, prev_log2_pre) = (e, a.linear, a.log2_pre);
                     assert!(
                         (0.0..=f64::from(FLUX_MATCH_MAX)).contains(&k),
                         "{name} {step}"
@@ -2066,6 +2188,11 @@ mod tests {
                     assert!((0.0..=0.03).contains(&dw), "{name} step {step}: Δw {dw}");
                     (prev, prev_k) = (l, k);
                 }
+                eprintln!(
+                    "{name} {phase_deg}° eye-adapted {eye_adapted}: largest step of the exposed \
+                     total between sizes 0.025 px apart: {max_step:.3} stops (B10's linear \
+                     blend: {max_step_linear:.3} stops)"
+                );
             }
         }
     }
@@ -2577,10 +2704,11 @@ mod tests {
     /// - The snap: every non-zero share is ≥ 2⁻¹⁴, f16's smallest normal, so the Rgba16Float store
     ///   cannot flush it even where Metal flushes subnormals. The snap acts only just below 4 px
     ///   (3.995 px snapped, 3.95 px not), moves w by < 2⁻¹⁴ and keeps it non-decreasing.
-    /// - The meter's encoding (uni-post `histogram.wgsl` `meter_pre`: mix(scene_pre, star_pre, s),
-    ///   0 = scene exposure) recovers the writer's pre mix(star_pre, scene_pre, w) from the
-    ///   f16-stored share to within its rounding, 2⁻¹¹·s·|star_pre − scene_pre|, at star EV −4
-    ///   against scene EV 15, 0 and −10.
+    /// - The meter's encoding (uni-post `histogram.wgsl` `meter_pre`: pre_mix(scene_pre,
+    ///   star_pre, s), 0 = scene exposure) recovers the writer's pre pre_mix(star_pre,
+    ///   scene_pre, w) (task B11, both the uni-gfx helper) from the f16-stored share to within
+    ///   its rounding, 2⁻¹¹·s·|ΔEV| stops, at star EV −4 against scene EV 15, 0 and −10.
+    /// - The snap's effect on brightness (B11): pre moves by less than |ΔEV|·2⁻¹⁴ stops.
     #[test]
     fn star_share_snapped_and_read_back_by_the_meter() {
         use uni_data::{f16_to_f32, f32_to_f16};
@@ -2623,12 +2751,8 @@ mod tests {
             .chain((0..=10_000).map(|i| 3.97 + 0.03 * f64::from(i) / 1.0e4))
             .collect();
         radii.sort_by(f64::total_cmp);
-        let pres = [(15.0, -4.0), (0.0, -4.0), (-10.0, -4.0)].map(|(scene, star)| {
-            (
-                f64::from(exposure_scale(scene)),
-                f64::from(exposure_scale(star)),
-            )
-        });
+        let pres = [(15.0, -4.0), (0.0, -4.0), (-10.0, -4.0)]
+            .map(|(scene, star)| (exposure_scale(scene), exposure_scale(star)));
         let (mut prev, mut snapped, mut lowest_snapped) = (0.0_f32, 0, f64::INFINITY);
         for r in radii {
             let lod = lod_exposure_mix(r);
@@ -2651,17 +2775,26 @@ mod tests {
                 "r {r}: {s} → {stored}"
             );
             for (scene_pre, star_pre) in pres {
-                // The writer: mix(star_pre, scene_pre, w). The meter: mix(scene_pre, star_pre, s).
-                let writer = star_pre + (scene_pre - star_pre) * f64::from(w);
-                let meter = scene_pre + (star_pre - scene_pre) * f64::from(stored.clamp(0.0, 1.0));
-                let bound = 2f64.powi(-11) * f64::from(s) * (star_pre - scene_pre).abs();
+                // The writer: pre_mix(star_pre, scene_pre, w). The meter: pre_mix(scene_pre,
+                // star_pre, s), s clamped to [0, 1].
+                let writer = pre_mix(star_pre, scene_pre, w);
+                let meter = pre_mix(scene_pre, star_pre, stored.clamp(0.0, 1.0));
+                let gap = f64::from(star_pre / scene_pre).log2().abs();
+                // f16 rounding of s, plus f32 rounding of the logs (|log₂ pre| < 16 here).
+                let bound = 2f64.powi(-11) * f64::from(s) * gap + 1e-5;
+                let off = f64::from(meter / writer).log2().abs();
                 assert!(
-                    (meter - writer).abs() <= bound * (1.0 + 1e-9) + 1e-12 * writer,
+                    off <= bound,
                     "r {r}, pres {scene_pre} {star_pre}: meter {meter} vs writer {writer}"
                 );
                 if s == 0.0 {
-                    assert_eq!(meter, scene_pre, "r {r}");
+                    assert_eq!(meter.to_bits(), scene_pre.to_bits(), "r {r}");
+                    assert_eq!(writer.to_bits(), scene_pre.to_bits(), "r {r}");
                 }
+                // The snap moves pre by less than ΔEV·2⁻¹⁴ stops: no visible step.
+                let unsnapped = pre_mix(star_pre, scene_pre, lod_exposure_mix(r));
+                let moved = f64::from(writer / unsnapped).log2().abs();
+                assert!(moved <= gap * 2f64.powi(-14) + 1e-5, "r {r}: {moved} stops");
             }
         }
         assert!(snapped > 0, "the snap never acted");
@@ -2713,8 +2846,10 @@ mod tests {
 
     /// The three world writers' shaders store the star share (lead ruling B6 I1): each defines
     /// `star_share(w, coverage)` (twin of [`star_share`]) and writes it into the mask's alpha with
-    /// the same w its pre uses, per instance for the star surfaces. body.wgsl passes σ = 1 to
-    /// `flux_match`, because the atmosphere now draws at the body's exposure weight.
+    /// the same w its pre uses, per instance for the star surfaces. Each draws at the log-space
+    /// blend `pre_mix(star_pre(), scene_pre(), w)` (task B11, uni-gfx `common/exposure.wgsl`) and
+    /// no linear mix of the two pre-exposures is left. body.wgsl passes σ = 1 to `flux_match`,
+    /// because the atmosphere now draws at the body's exposure weight.
     #[test]
     fn world_writer_shaders_store_the_star_share() {
         let mut lib = ShaderLib::with_common();
@@ -2722,17 +2857,17 @@ mod tests {
         for (path, pre, mask) in [
             (
                 crate::BODY_WGSL,
-                "let pre = mix(star_pre(), scene_pre(), body_u.light.w);",
+                "let pre = pre_mix(star_pre(), scene_pre(), body_u.light.w);",
                 "out.mask = vec4<f32>(0.0, coverage, 0.0, star_share(body_u.light.w, coverage));",
             ),
             (
                 crate::RINGS_WGSL,
-                "let pre = mix(star_pre(), scene_pre(), ring.centre.w);",
+                "let pre = pre_mix(star_pre(), scene_pre(), ring.centre.w);",
                 "out.mask = vec4<f32>(0.0, alpha_view, 0.0, star_share(ring.centre.w, alpha_view));",
             ),
             (
                 crate::STAR_SURFACE_WGSL,
-                "let pre = mix(star_pre(), scene_pre(), s.l0.w);",
+                "let pre = pre_mix(star_pre(), scene_pre(), s.l0.w);",
                 "out.mask = vec4<f32>(0.0, cov, 0.0, star_share(s.l0.w, cov));",
             ),
         ] {
@@ -2751,6 +2886,15 @@ mod tests {
                 "{path}"
             );
             assert_eq!(src.matches(pre).count(), 1, "{path}: pre");
+            // Every mix of the two pre-exposures is the log-space pre_mix.
+            for arg in ["mix(star_pre()", "mix(scene_pre()"] {
+                let log = format!("pre_{arg}");
+                assert_eq!(
+                    src.matches(arg).count(),
+                    src.matches(log.as_str()).count(),
+                    "{path}: a linear {arg}"
+                );
+            }
             assert_eq!(src.matches(mask).count(), 1, "{path}: mask");
         }
         let body = lib.compose(crate::BODY_WGSL).unwrap();

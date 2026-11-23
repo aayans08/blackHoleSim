@@ -16,7 +16,8 @@
 //! distance to the silhouette. Surface luminance per channel c:
 //! L_c(μ) = I/(πR²) · colour_c · LD_c(μ)/⟨LD_c⟩ · G_c, written × the exposure (world light, scene
 //! exposure; blended from star exposure below 4 px with [`crate::lod_exposure_mix`] while
-//! eye-adapted stars are in effect, [`crate::body::exposure_weight`]) and clamped to `HDR_MAX`.
+//! eye-adapted stars are in effect, [`crate::body::exposure_weight`], in log space:
+//! `pre_mix(star_pre, scene_pre, w)`, uni-gfx, task B11) and clamped to `HDR_MAX`.
 //! `lens_mask.g` gets the coverage and `lens_mask.a` the star share 1 − w, per instance
 //! ([`crate::body::star_share`], lead ruling B6 I1), both with `Max`.
 //!

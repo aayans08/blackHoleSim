@@ -3,8 +3,10 @@
 //! B1's probes: `ray_ellipsoid` (256 rays, including a camera 1 m above Earth), `equirect_uv`
 //! (256), `sun_visible_fraction` (256, B0's twin in `planet/eclipse.wgsl`), `reflectance` (64,
 //! the lunar-Lambert twin), `ring_transmittance` (64), `flux_match` (64, ruling W-B1's handover
-//! factor, review I3), `bodies_disk_flux` (the whole bodies pass renders an unmapped Lambert
-//! sphere into a 256² target; Σ L·Ω_pixel against `disk_illuminance_lux` within 2 %) and
+//! factor, review I3), `pre_mix` (64, uni-gfx's log-space exposure blend that body.wgsl, the
+//! rings, the star surfaces, the atmosphere and the meter use; task B11), `bodies_disk_flux`
+//! (the whole bodies pass renders an unmapped Lambert sphere into a 256² target; Σ L·Ω_pixel
+//! against `disk_illuminance_lux` within 2 %) and
 //! `bc_matches_fallback` (Earth's BC7 mip of width 2048 decoded on the GPU against the 2k
 //! uncompressed copy over a 256 × 256 window: PSNR ≥ 38 dB; "skipped: no BC" without
 //! `TEXTURE_COMPRESSION_BC`). B2's probes are its own modules'
@@ -17,6 +19,7 @@ use anyhow::{Context as _, anyhow};
 use glam::{DQuat, DVec3, Mat4, UVec2, Vec2, Vec3};
 use uni_core::{CameraView, Epoch, UniversePos};
 use uni_data::{MapKind, TexFormat, load_map_index, load_tex};
+use uni_gfx::frame::pre_mix;
 use uni_gfx::probe::{ProbeResult, run_compute};
 use uni_gfx::{
     Exposure, FrameCtx, GpuContext, Renderer, ShaderLib, SharedInput, exposure_scale, read_hdr,
@@ -39,6 +42,7 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
         probe("reflectance", check_reflectance(gpu, lib)),
         probe("ring_transmittance", check_ring_transmittance(gpu, lib)),
         probe("flux_match", check_flux_match(gpu, lib)),
+        probe("pre_mix", check_pre_mix(gpu, lib)),
         probe("bodies_disk_flux", check_disk_flux(gpu, lib)),
         probe("bc_matches_fallback", check_bc_matches_fallback(gpu)),
     ];
@@ -139,6 +143,16 @@ fn cs_flux_match(@builtin(global_invocation_id) gid: vec3<u32>) {
     let h = probe_in[2u * gid.x];
     let s = probe_in[2u * gid.x + 1u];
     probe_out[gid.x] = vec4<f32>(flux_match(h, s.x), 0.0, 0.0, 0.0);
+}
+
+// In: (a, b, t, 0). Out: (pre_mix(a, b, t), 0, 0, 0) (common/exposure.wgsl, task B11).
+@compute @workgroup_size(64)
+fn cs_pre_mix(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_out)) {
+        return;
+    }
+    let a = probe_in[gid.x];
+    probe_out[gid.x] = vec4<f32>(pre_mix(a.x, a.y, a.z), 0.0, 0.0, 0.0);
 }
 "#;
 
@@ -467,8 +481,10 @@ fn check_ring_transmittance(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result
 
 /// 64 handover cases ((w, A, B, k_max), (σ, 0, 0, 0)): w across the band, A and B from the
 /// bodies' measured shares (Earth 2.864/0.405, Mars 2.463/1.622) and extremes that clamp k to 0
-/// and to k_max, and σ = 1 (one exposure), 1/2, 1/16 and 1/256 (eye-adapted stars 1, 4 and 8
-/// stops brighter than the scene).
+/// and to k_max, and σ = 1, 1/2, 1/16 and 1/256. body.wgsl passes σ = 1 since task B10 (the
+/// atmosphere draws at its body's own `pre_mix` exposure, in either exposure mode); the other
+/// values keep the general formula's σ term checked (σ = pre_atmo/pre for an atmosphere drawn 1,
+/// 4 or 8 stops below the body's exposure, B1's pre-B10 case).
 fn flux_match_inputs() -> Vec<[f32; 4]> {
     let mut input = Vec::with_capacity(128);
     for w in [0.0, 0.3, 0.97, 1.0] {
@@ -501,6 +517,68 @@ fn check_flux_match(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, 
         ),
     ))
 }
+
+/// 64 `pre_mix` cases (a, b, t, 0) (task B11): 8 pairs of pre-exposures (`exposure_scale` of
+/// star EV −4 against scene EV −4, 0, 10 and 15, both directions, and EV −10 → 40, the meter's
+/// widest span) × t at both ends (returned unchanged, so compared bit for bit), next to them
+/// (2⁻¹⁴ and 1 − 2⁻¹⁴, the star-share snap) and inside the band (w 0.05, 0.2076 at 2 px, ½,
+/// 0.875).
+fn pre_mix_inputs() -> Vec<[f32; 4]> {
+    let mut input = Vec::with_capacity(64);
+    for (ea, eb) in [
+        (-4.0, 10.0),
+        (-4.0, 15.0),
+        (-4.0, 0.0),
+        (-4.0, -4.0),
+        (10.0, -4.0),
+        (15.0, -4.0),
+        (0.0, -4.0),
+        (-10.0, 40.0),
+    ] {
+        let (a, b) = (exposure_scale(ea), exposure_scale(eb));
+        for t in [
+            0.0,
+            2f32.powi(-14),
+            0.05,
+            0.2076,
+            0.5,
+            0.875,
+            1.0 - 2f32.powi(-14),
+            1.0,
+        ] {
+            input.push([a, b, t, 0.0]);
+        }
+    }
+    input
+}
+
+/// GPU `pre_mix` (uni-gfx `common/exposure.wgsl`, imported through `body.wgsl`) against its CPU
+/// twin `uni_gfx::frame::pre_mix`: the ends bit for bit, the rest within
+/// [`PRE_MIX_TOLERANCE_STOPS`] (the GPU's exp2 and log2 may be less exact than the CPU's).
+fn check_pre_mix(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    let input = pre_mix_inputs();
+    let out = run_twin(gpu, lib, "cs_pre_mix", &input, 1)?;
+    let mut ends_exact = true;
+    let worst = worst(input.iter().zip(&out).map(|(c, g)| {
+        let cpu = pre_mix(c[0], c[1], c[2]);
+        if c[2] == 0.0 || c[2] == 1.0 {
+            ends_exact &= cpu.to_bits() == g[0].to_bits();
+        }
+        (f64::from(g[0]) / f64::from(cpu)).log2().abs()
+    }));
+    Ok((
+        ends_exact && worst <= PRE_MIX_TOLERANCE_STOPS,
+        format!(
+            "{} cases, ends exact: {ends_exact}, max |log₂(GPU/CPU)| {worst:.1e} stops \
+             (tolerance {PRE_MIX_TOLERANCE_STOPS:.0e})",
+            out.len()
+        ),
+    ))
+}
+
+/// Tolerance of the `pre_mix` probe [stops]: a 50-stop log₂ to a few f32 ulps (4·2⁻¹⁸ ≈
+/// 1.5·10⁻⁵) with room for a fast-math exp2; a linear mix instead misses by stops.
+const PRE_MIX_TOLERANCE_STOPS: f64 = 2.0e-4;
 
 /// The `bodies_disk_flux` scene: an unmapped Lambert sphere (p_V 0.3) of 1000 km at 500 000 km,
 /// 98 px in radius in a 256² frame of fov 0.3°, phase 60°, lit by 10⁵ lx, at scene EV 12. At
@@ -996,6 +1074,7 @@ mod tests {
             "cs_reflectance",
             "cs_ring_transmittance",
             "cs_flux_match",
+            "cs_pre_mix",
         ] {
             assert!(
                 m.entry_points.iter().any(|e| e.name == entry),
@@ -1042,6 +1121,36 @@ mod tests {
             ks.iter().any(|&k| k > 1.0 && k < FLUX_MATCH_MAX),
             "interior"
         );
+    }
+
+    /// The `pre_mix` probe's 64 cases: both ends (where the twin returns its input bit for bit),
+    /// the interior in both directions and with equal pre-exposures, all finite and positive.
+    /// Inside the band the log blend differs from a linear one by far more than the probe's
+    /// tolerance, so the probe tells them apart.
+    #[test]
+    fn pre_mix_probe_inputs_cover_the_cases() {
+        let input = pre_mix_inputs();
+        assert_eq!(input.len(), 64);
+        assert!(input.iter().flatten().all(|v| v.is_finite() && *v >= 0.0));
+        let ends = input.iter().filter(|c| c[2] == 0.0 || c[2] == 1.0).count();
+        assert_eq!(ends, 16);
+        for c in &input {
+            let p = pre_mix(c[0], c[1], c[2]);
+            assert!(p.is_finite() && p > 0.0, "{c:?}");
+            if c[2] == 0.0 {
+                assert_eq!(p.to_bits(), c[0].to_bits());
+            }
+            if c[2] == 1.0 {
+                assert_eq!(p.to_bits(), c[1].to_bits());
+            }
+        }
+        assert!(input.iter().any(|c| c[0] < c[1]) && input.iter().any(|c| c[0] > c[1]));
+        assert!(input.iter().any(|c| c[0] == c[1]));
+        // Star EV −4 against scene EV 15, half way: the linear mix is 8.5 stops off.
+        let (a, b) = (exposure_scale(-4.0), exposure_scale(15.0));
+        let linear = a + (b - a) * 0.5;
+        let off = f64::from(linear / pre_mix(a, b, 0.5)).log2();
+        assert!(off > 8.4 && off > 1e3 * PRE_MIX_TOLERANCE_STOPS, "{off}");
     }
 
     /// The bodies_disk_flux probe's arithmetic on the CPU: the CPU twins rasterised over the
