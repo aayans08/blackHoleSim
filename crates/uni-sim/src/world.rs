@@ -26,10 +26,14 @@
 //! its catalogue conic, the conics it reached before and its current conic is nearest in time.
 //! No comet is shown from its catalogue conic for the start date (review I3), and no frame
 //! waits for a whole integration (review r1 N1):
-//! - [`World::new`] settles every comet at the start date ([`World::settle_comets`]): one
-//!   integration each, in 120-day segments that are all kept as checkpoints, spread over the
-//!   CPU cores with `std::thread::scope` (ruling 3), longest first. That is a one-off start-up
-//!   cost, listed there.
+//! - [`World::new`] settles only the comets whose conic epoch is more than
+//!   `NEW_SETTLE_GAP_S` (90 days) from the start date ([`World::settle_comets`]'s work, so one
+//!   integration each, in 120-day segments kept as checkpoints, on scoped threads). The world's
+//!   data holds `comets_2026.ron`, every comet already re-osculated to 2026-11-20 TDB by
+//!   `uni-bake comets-epoch` (lead ruling A4 P1), so at the default start date none settle and
+//!   start-up does not wait on integrations (design: no loading screens). Without that file
+//!   ([`load_world_data`] warns and reads `comets.ron`) the catalogue epochs are years away and
+//!   `new` settles them all: 7.5 s optimised, 30 s debug. A tick finishes the comets 30–90 days out.
 //! - A tick never settles. It runs a fixed number of short steps (`REOSC_STEPS_PER_TICK`, at
 //!   most `REOSC_STEPS_PER_COMET` per comet) on scoped threads: first for the selected comet
 //!   and the comets the last snapshot drew (brightest first), then for the other stale comets
@@ -45,9 +49,10 @@
 //!   epoch), and under a warp faster than the steps keep up with, a comet lags the date and is
 //!   drawn two-body from the nearest conic it has until it catches up: a drawn comet at 24 RK4
 //!   steps per tick (Halley, ten years past the start date, in 77 ticks, 1.3 s at 60 fps), the
-//!   whole catalogue in minutes after a decades-long jump. No honesty label covers that lag yet
-//!   (it needs a new `HonestyFlag`, a stub change; A4 report, fix round 3). Captures call
-//!   [`World::settle_comets`] after setting a bookmark's epoch.
+//!   whole catalogue in minutes after a decades-long jump. [`HonestyFlag::CometsCatchingUp`]
+//!   labels it while the selected comet or a comet the last snapshot drew has work left; the
+//!   other comets may lag unlabelled (lead ruling A4: not visible, and selecting one moves it
+//!   to the front). Captures call [`World::settle_comets`] after setting a bookmark's epoch.
 //!
 //! Chunked steps cost metres at most against one integration. Perturbed motion is followed only
 //! within `PERTURBED_SPAN_S` of the catalogue epoch; beyond it the comet is two-body from the
@@ -59,9 +64,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use glam::{DQuat, DVec3, UVec2};
 use uni_core::{
-    AU, CameraView, DAY, Epoch, FrameId, FrameMotion, FrameTree, GM_SUN, Lens, M_SUN, PC,
-    R_SUN_M, ROOT_FRAME, UniversePos, bv_to_teff, radec_to_icrs, schwarzschild_radius,
-    star_illuminance_lux,
+    AU, CameraView, DAY, Epoch, FrameId, FrameMotion, FrameTree, GM_SUN, Lens, M_SUN, PC, R_SUN_M,
+    ROOT_FRAME, UniversePos, bv_to_teff, radec_to_icrs, schwarzschild_radius, star_illuminance_lux,
 };
 use uni_data::{
     AsteroidRecord, BodyFacts, Comet, DataError, ExoSystem, FLAG_EXO_HOST, FLAG_FROM_ARCHIVE,
@@ -157,9 +161,10 @@ const DWARF_PLANET_SPKIDS: [u32; 4] = [20_000_001, 20_136_108, 20_136_199, 20_13
 /// I2). A8's bake (`tools/bake/src/rings.rs`) fitted that span to Solar System Scope's ring
 /// texture by placing the texture's Cassini-division drop at the Huygens gap, 117 680 km, and
 /// its A ring's outer edge at 136 775 km, both the M1 plan's values (NSSDCA's Saturnian Rings
-/// Fact Sheet gives 117 507 km and 136 780 km): 69 934–140 972 km. `WorldData` has no ring
-/// field (A0b stub), so the test `saturn_carries_its_rings` pins these to the baked file, and a
-/// re-bake that moves them fails there.
+/// Fact Sheet gives 117 507 km and 136 780 km): 69 934–140 972 km. [`WorldData::rings`] gives
+/// the profile itself ([`World::new`] applies it); these are the fallback when it is missing, and
+/// the test `saturn_carries_its_rings` pins them to the baked file, so a re-bake that moves them
+/// fails there.
 const SATURN_RINGS_DEFAULT_M: (f64, f64) = (69_933_828.337_874_65, 140_972_084.468_664_85);
 /// NAIF id of Saturn, whose rings the snapshot reports.
 pub(crate) const SATURN: i32 = 699;
@@ -170,6 +175,9 @@ const CHARON: i32 = 901;
 /// A comet is re-osculated once the shown date is this far from its conic's epoch (lead ruling
 /// after A3: "e.g. when the shown date moves > 30 days from the last osculation epoch").
 const REOSC_INTERVAL_S: f64 = 30.0 * DAY;
+/// [`World::new`] settles only comets whose conic epoch is more than this far from the start
+/// date (lead ruling A4 P1); a tick finishes the ones between [`REOSC_INTERVAL_S`] and this.
+const NEW_SETTLE_GAP_S: f64 = 90.0 * DAY;
 /// `uni_physics::smallbody`'s RK4 step rule, repeated here (its private `STEP_ETA` and
 /// `MAX_STEP_S`) to size the tick steps: η = 10⁻³ of the shortest local dynamical time
 /// √(d³/GM) about the Sun and the eight planetary systems, at most 2 days
@@ -276,6 +284,8 @@ pub struct WorldData {
     pub asteroid_names: Vec<String>,
     pub exo: Vec<ExoSystem>,
     pub facts: Vec<BodyFacts>,
+    /// Saturn's ring profile (`saturn_rings.ron`); `None` keeps the A8-span default radii.
+    pub rings: Option<RingProfile>,
     pub warnings: Vec<String>,
 }
 
@@ -306,13 +316,27 @@ pub fn load_world_data(dir: &Path) -> WorldData {
         "only the Moon, the Galilean moons and Saturn's eight major moons (Meeus theories)",
         &mut warnings,
     );
-    let comets = warn_on(
-        uni_data::load_comets(&read("comets.ron")),
-        "comets.ron",
-        dir,
-        "no comets",
-        &mut warnings,
-    );
+    // comets_2026.ron (every comet re-osculated to the default start date by `uni-bake
+    // comets-epoch`, lead ruling A4 P1) is preferred; comets.ron keeps SBDB's own epochs.
+    let comets = match uni_data::load_comets(&read("comets_2026.ron")) {
+        Ok(comets) => Some(comets),
+        Err(first) => {
+            let comets = warn_on(
+                uni_data::load_comets(&read("comets.ron")),
+                "comets.ron",
+                dir,
+                "no comets",
+                &mut warnings,
+            );
+            if comets.is_some() {
+                warnings.push(match first {
+                    DataError::NotFound(_) => "comets_2026.ron missing: comets settle from catalogue epochs at start-up".to_owned(),
+                    err => format!("comets_2026.ron unreadable ({err}): comets settle from catalogue epochs at start-up"),
+                });
+            }
+            comets
+        }
+    };
     // Two files make one catalogue: each missing one is reported, and the pair loads only
     // when both are there.
     let pair = [read("asteroids.bin"), read("asteroid_names.txt")];
@@ -355,6 +379,13 @@ pub fn load_world_data(dir: &Path) -> WorldData {
         "no fact sheets (assumed albedos)",
         &mut warnings,
     );
+    let rings = warn_on(
+        uni_data::load_ring_profile(&read("saturn_rings.ron")),
+        "saturn_rings.ron",
+        dir,
+        "Saturn's rings use the default radii",
+        &mut warnings,
+    );
     WorldData {
         stars: stars.unwrap_or_default(),
         star_names,
@@ -364,6 +395,7 @@ pub fn load_world_data(dir: &Path) -> WorldData {
         asteroid_names,
         exo: exo.unwrap_or_default(),
         facts: facts.unwrap_or_default(),
+        rings,
         warnings,
     }
 }
@@ -500,7 +532,9 @@ fn bv_from_teff(teff_k: f64) -> f64 {
 /// SBDB "1 Ceres (A801 AA)" → "Ceres"; an unnamed "123456 (2001 AB12)" keeps its full name.
 fn asteroid_display_name(full: &str) -> &str {
     let full = full.trim();
-    let rest = full.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start();
+    let rest = full
+        .trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start();
     let core = match rest.find(" (") {
         Some(at) => &rest[..at],
         None if rest.starts_with('(') => "",
@@ -562,7 +596,9 @@ impl CometOrbit {
     /// checkpoints and the current conic (the current one on a tie).
     fn start_for(&self, target: Epoch) -> (Epoch, Conic) {
         let gap = |e: Epoch| target.seconds_since(e).abs();
-        let at = self.checkpoints.partition_point(|(e, _)| e.seconds_since(target) < 0.0);
+        let at = self
+            .checkpoints
+            .partition_point(|(e, _)| e.seconds_since(target) < 0.0);
         let mut best = (self.osc_epoch, self.osc);
         for &(e, c) in self.checkpoints[at.saturating_sub(1)..].iter().take(2) {
             if gap(e) < gap(best.0) {
@@ -600,7 +636,9 @@ impl CometOrbit {
     /// unless one has its epoch.
     fn remember(&mut self, always: bool) {
         let e = self.osc_epoch;
-        let at = self.checkpoints.partition_point(|(c, _)| c.seconds_since(e) < 0.0);
+        let at = self
+            .checkpoints
+            .partition_point(|(c, _)| c.seconds_since(e) < 0.0);
         if self.checkpoints.get(at).is_some_and(|(c, _)| *c == e) {
             return;
         }
@@ -638,7 +676,8 @@ impl CometOrbit {
                     let to = if left.abs() <= CHECKPOINT_SPACING_S {
                         target
                     } else {
-                        self.osc_epoch.add_seconds(CHECKPOINT_SPACING_S.copysign(left))
+                        self.osc_epoch
+                            .add_seconds(CHECKPOINT_SPACING_S.copysign(left))
                     };
                     if !self.advance(to, to == target) {
                         break;
@@ -778,8 +817,10 @@ pub struct World {
 }
 
 impl World {
-    /// The world at `epoch`, every comet already re-osculated there ([`World::settle_comets`]:
-    /// one integration per comet on every core, the cost listed there).
+    /// The world at `epoch`. Comets whose conic epoch is more than 90 days away are settled
+    /// there ([`World::settle_comets`]'s integration, on every core); none are with
+    /// `comets_2026.ron` at the default start date (module doc). `data.rings` sets Saturn's ring
+    /// radii.
     pub fn new(data: WorldData, epoch: Epoch) -> Self {
         let sats = data.sats.iter().map(sat_elements).collect();
         World::with_source(Arc::new(Ephemeris::new(sats)), data, epoch)
@@ -826,7 +867,10 @@ impl World {
         world.add_test_black_hole();
         world.cached = vec![UniversePos::default(); world.objects.len()];
         world.refresh_states();
-        world.settle_comets();
+        if let Some(profile) = &data.rings {
+            world.set_ring_profile(profile);
+        }
+        world.settle_comets_beyond(NEW_SETTLE_GAP_S);
         world.set_hill_radii();
         world.add_stars(data.stars, data.star_names, data.exo);
         world
@@ -953,7 +997,11 @@ impl World {
             source: Source::Ephem,
             depth,
             brdf: brdf_for(Some(naif)),
-            geometric_albedo: albedo.unwrap_or(if naif == SUN { 0.0 } else { DEFAULT_MOON_ALBEDO }),
+            geometric_albedo: albedo.unwrap_or(if naif == SUN {
+                0.0
+            } else {
+                DEFAULT_MOON_ALBEDO
+            }),
             mean_radius_m: mean_radius(radii_m),
             has_atmosphere: has_atmosphere(naif),
         };
@@ -1121,7 +1169,9 @@ impl World {
                 }
                 (Source::BlackHole(_), _) => match self.sun {
                     Some(sun) => {
-                        let d = self.cached[k].delta_from(self.cached[sun as usize]).length();
+                        let d = self.cached[k]
+                            .delta_from(self.cached[sun as usize])
+                            .length();
                         let sqrt_q = (info.gm_m3s2 / self.objects[sun as usize].gm_m3s2).sqrt();
                         d * sqrt_q / (1.0 + sqrt_q)
                     }
@@ -1255,9 +1305,7 @@ impl World {
 
     /// Years since the star catalogue's epoch (J2000.0 for AT-HYG v4.0).
     pub(crate) fn star_years(&self) -> f64 {
-        self.epoch
-            .seconds_since(epoch_from_jd(STAR3_EPOCH_JD_TDB))
-            / YEAR_S
+        self.epoch.seconds_since(epoch_from_jd(STAR3_EPOCH_JD_TDB)) / YEAR_S
     }
 
     /// Root position of star `index` at the current epoch.
@@ -1275,12 +1323,21 @@ impl World {
         let p_pc = pos.delta_from(UniversePos::default()) / PC;
         let near: Vec<(u32, Option<ObjectId>)> = self
             .star_index
-            .within(&self.stars, p_pc, self.star_years(), NEAR_STAR_PC, MAX_NEAR_STARS)
+            .within(
+                &self.stars,
+                p_pc,
+                self.star_years(),
+                NEAR_STAR_PC,
+                MAX_NEAR_STARS,
+            )
             .into_iter()
             .map(|(index, _)| (index, self.star_objects.get(&index).copied()))
             .collect();
         if near.iter().any(|(_, id)| id.is_none()) {
-            let mut pending = self.unnamed_near.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut pending = self
+                .unnamed_near
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             for &(index, _) in near.iter().filter(|(_, id)| id.is_none()) {
                 if !pending.contains(&index) {
                     pending.push(index);
@@ -1318,7 +1375,9 @@ impl World {
         let t = self.epoch;
         for &id in &self.ephem_order {
             let info = &self.objects[id as usize];
-            let parent = info.parent.map_or(UniversePos::default(), |p| self.cached[p as usize]);
+            let parent = info
+                .parent
+                .map_or(UniversePos::default(), |p| self.cached[p as usize]);
             let naif = info.naif.unwrap_or_default();
             self.cached[id as usize] = add_rel(parent, rel_or_zero(&*self.source, naif, t));
         }
@@ -1328,7 +1387,9 @@ impl World {
     /// Comets, asteroids and TestBH-1 at `self.epoch`, relative to the cached Sun.
     fn refresh_small_bodies(&mut self) {
         let t = self.epoch;
-        let sun = self.sun.map_or(UniversePos::default(), |s| self.cached[s as usize]);
+        let sun = self
+            .sun
+            .map_or(UniversePos::default(), |s| self.cached[s as usize]);
         for k in 0..self.cached.len() {
             let helio = match self.physical[k].source {
                 Source::Comet(c) => self.comets[c].state(t).0,
@@ -1372,7 +1433,9 @@ impl World {
     /// made on it, never on the machine or the wall time (review r1 N2).
     fn reosculate_comets(&mut self) {
         let t = self.epoch;
-        let sun = self.sun.map_or(UniversePos::default(), |s| self.cached[s as usize]);
+        let sun = self
+            .sun
+            .map_or(UniversePos::default(), |s| self.cached[s as usize]);
         for k in 0..self.comets.len() {
             if self.comets[k].adopt(t) {
                 self.place_comet(k, sun);
@@ -1386,16 +1449,21 @@ impl World {
                 (2, self.cached[id].delta_from(sun).length_squared())
             })
             .collect();
-        let shown = self.shown_comets.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let shown = self
+            .shown_comets
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
         for &(k, lux) in shown.iter() {
             if let Some(r) = rank.get_mut(k) {
                 *r = (1, if r.0 == 1 { r.1.min(-lux) } else { -lux });
             }
         }
-        let selected = self.selected.and_then(|id| match self.physical.get(id as usize)?.source {
-            Source::Comet(k) => Some(k),
-            _ => None,
-        });
+        let selected = self
+            .selected
+            .and_then(|id| match self.physical.get(id as usize)?.source {
+                Source::Comet(k) => Some(k),
+                _ => None,
+            });
         if let Some(r) = selected.and_then(|k| rank.get_mut(k)) {
             *r = (0, 0.0);
         }
@@ -1436,7 +1504,10 @@ impl World {
     /// Records the comets a snapshot drew (comet index, illuminance [lx]), replacing the last
     /// snapshot's: the next ticks re-osculate the stale ones first (review r2 P1).
     pub(crate) fn note_shown_comets(&self, shown: Vec<(usize, f64)>) {
-        *self.shown_comets.lock().unwrap_or_else(PoisonError::into_inner) = shown;
+        *self
+            .shown_comets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = shown;
     }
 
     /// Comet `k`'s cached position from its conic at the cached epoch (kept if not finite).
@@ -1483,12 +1554,15 @@ fn run_comet_jobs(comets: &mut [CometOrbit], jobs: &[(usize, usize)], t: Epoch, 
                 });
                 next.map(|at| queue.swap_remove(at))
             };
-            let Some((order, comet, steps)) = job else { break };
+            let Some((order, comet, steps)) = job else {
+                break;
+            };
             if comet.step(t, chunk) && steps > 1 {
-                queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push((order, comet, steps - 1));
+                queue.lock().unwrap_or_else(PoisonError::into_inner).push((
+                    order,
+                    comet,
+                    steps - 1,
+                ));
             }
         }
     };
@@ -1545,7 +1619,10 @@ fn asteroid_size(r: &AsteroidRecord) -> (f64, f64) {
         (Some(d), Some(p)) => (d, p),
         (Some(d), None) => (d, (scale / d).powi(2)),
         (None, Some(p)) => (scale / p.sqrt(), p),
-        (None, None) => (scale / ASSUMED_ASTEROID_ALBEDO.sqrt(), ASSUMED_ASTEROID_ALBEDO),
+        (None, None) => (
+            scale / ASSUMED_ASTEROID_ALBEDO.sqrt(),
+            ASSUMED_ASTEROID_ALBEDO,
+        ),
     }
 }
 
@@ -1739,7 +1816,30 @@ impl World {
         if self.band_enabled {
             flags.push(HonestyFlag::BandModel);
         }
+        if self.comets_catching_up() {
+            flags.push(HonestyFlag::CometsCatchingUp);
+        }
         flags
+    }
+
+    /// Whether the selected comet or a comet the last snapshot drew still has catch-up work
+    /// ([`CometOrbit::needs_work`] at the cached epoch); the other comets may lag unlabelled.
+    fn comets_catching_up(&self) -> bool {
+        let t = self.epoch;
+        let selected = self
+            .selected
+            .and_then(|id| match self.physical[id as usize].source {
+                Source::Comet(k) => Some(k),
+                _ => None,
+            });
+        let shown = self
+            .shown_comets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        selected
+            .into_iter()
+            .chain(shown.iter().map(|&(k, _)| k))
+            .any(|k| self.comets.get(k).is_some_and(|c| c.needs_work(t)))
     }
 
     /// Whether Pluto or Charon is selected or inside the view's frustum, taken as the cone
@@ -1819,18 +1919,28 @@ impl World {
     /// 120-day segments (fix round 3) left it at 29–31 s in debug and 7.5 s with every
     /// workspace crate at opt-level 3. The release build is the gate's to measure.
     pub fn settle_comets(&mut self) {
+        self.settle_comets_beyond(0.0);
+    }
+
+    /// [`World::settle_comets`] for the comets whose conic epoch is more than `gap_s` from the
+    /// date they are settled toward (`0` = every comet that needs work).
+    fn settle_comets_beyond(&mut self, gap_s: f64) {
         let t = self.epoch;
         let mut work: Vec<(f64, usize)> = self
             .comets
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.needs_work(t))
+            .filter(|(_, c)| {
+                c.needs_work(t) && c.target(t).seconds_since(c.osc_epoch).abs() > gap_s
+            })
             .map(|(k, c)| (c.work_span_s(t), k))
             .collect();
         work.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         let jobs: Vec<(usize, usize)> = work.iter().map(|&(_, k)| (k, usize::MAX)).collect();
         run_comet_jobs(&mut self.comets, &jobs, t, Chunk::Whole);
-        let sun = self.sun.map_or(UniversePos::default(), |s| self.cached[s as usize]);
+        let sun = self
+            .sun
+            .map_or(UniversePos::default(), |s| self.cached[s as usize]);
         for (k, _) in jobs {
             self.place_comet(k, sun);
         }
@@ -1839,7 +1949,10 @@ impl World {
     /// The source's orientation of an ephemeris body at the cached epoch (identity without
     /// a model, and for every other object).
     pub(crate) fn orientation(&self, id: ObjectId) -> DQuat {
-        match (self.physical[id as usize].source, self.objects[id as usize].naif) {
+        match (
+            self.physical[id as usize].source,
+            self.objects[id as usize].naif,
+        ) {
             (Source::Ephem, Some(naif)) => self.source.orient(naif, self.epoch),
             _ => None,
         }
@@ -1901,6 +2014,7 @@ mod tests {
             asteroid_names: Vec::new(),
             exo: Vec::new(),
             facts: Vec::new(),
+            rings: None,
             warnings: Vec::new(),
         }
     }
@@ -1938,7 +2052,9 @@ mod tests {
     }
 
     fn id_of(world: &World, name: &str) -> ObjectId {
-        world.find(name).unwrap_or_else(|| panic!("{name} not in the registry"))
+        world
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} not in the registry"))
     }
 
     fn sat_record(naif: i32, planet: i32, radius_km: f64) -> SatRecord {
@@ -2016,9 +2132,16 @@ mod tests {
             clock.elapsed().as_secs_f64()
         );
         let elapsed = world.epoch().seconds_since(start);
-        assert!((elapsed / (1.0e12 * 10_000.0 / 60.0) - 1.0).abs() < 1e-9, "{elapsed}");
+        assert!(
+            (elapsed / (1.0e12 * 10_000.0 / 60.0) - 1.0).abs() < 1e-9,
+            "{elapsed}"
+        );
         let view = looking_along(world.position(sun).offset(DVec3::X * AU), DVec3::X);
-        assert!(world.honesty(&view).contains(&HonestyFlag::PlanetsExtrapolated));
+        assert!(
+            world
+                .honesty(&view)
+                .contains(&HonestyFlag::PlanetsExtrapolated)
+        );
     }
 
     #[test]
@@ -2039,7 +2162,9 @@ mod tests {
             "asteroid_names.txt",
             "exoplanets.ron",
             "body_facts.ron",
+            "saturn_rings.ron",
         ];
+        assert!(data.rings.is_none());
         assert_eq!(data.warnings.len(), files.len(), "{:#?}", data.warnings);
         for file in files {
             assert_eq!(
@@ -2164,7 +2289,10 @@ mod tests {
             resolved += in_bodies;
             point += in_points;
         }
-        assert!(resolved > 10 && point > 10, "{resolved} resolved, {point} points");
+        assert!(
+            resolved > 10 && point > 10,
+            "{resolved} resolved, {point} points"
+        );
     }
 
     /// One named star 1 pc out, with Sirius's M_V; the camera 1 AU from it.
@@ -2172,7 +2300,14 @@ mod tests {
     fn near_star_goes_to_star_surfaces_and_is_suppressed() {
         let mut data = empty_data();
         data.stars = vec![
-            Star3::new([1.0, 0.0, 0.0], 1.42, [0.0; 3], 0.0, 1, uni_data::FLAG_NAMED),
+            Star3::new(
+                [1.0, 0.0, 0.0],
+                1.42,
+                [0.0; 3],
+                0.0,
+                1,
+                uni_data::FLAG_NAMED,
+            ),
             Star3::new([-3.0, 1.0, 0.0], 4.0, [0.0; 3], 0.6, 2, 0),
         ];
         data.star_names = Some(StarNames {
@@ -2190,7 +2325,11 @@ mod tests {
             .find(|s| s.id == star)
             .expect("the star is resolved");
         assert_eq!(surface.catalog_index, Some(0));
-        assert!(surface.proj_radius_px >= POINT_LOD_PX, "{}", surface.proj_radius_px);
+        assert!(
+            surface.proj_radius_px >= POINT_LOD_PX,
+            "{}",
+            surface.proj_radius_px
+        );
         assert!((surface.rel_pos_m - DVec3::new(0.0, -AU, 0.0)).length() < 1.0e3);
         assert_eq!(snap.suppressed_stars, vec![0]);
         assert!(snap.points.iter().all(|p| p.id != Some(star)), "never both");
@@ -2275,12 +2414,22 @@ mod tests {
     fn snapshot_rel_positions_are_f64_camera_relative() {
         let world = World::new(empty_data(), date("2026-11-20T00:00:00Z"));
         let neptune = id_of(&world, "Neptune");
-        let cam = world.position(neptune).offset(DVec3::new(2.0e8, 3.0e7, -1.0e7));
+        let cam = world
+            .position(neptune)
+            .offset(DVec3::new(2.0e8, 3.0e7, -1.0e7));
         let view = looking_at(cam, world.position(neptune), 60.0);
         let snap = world.snapshot(&view, VIEWPORT);
-        let body = snap.bodies.iter().find(|b| b.id == neptune).expect("Neptune resolved");
+        let body = snap
+            .bodies
+            .iter()
+            .find(|b| b.id == neptune)
+            .expect("Neptune resolved");
         let want = world.position(neptune).delta_from(cam);
-        assert!((body.rel_pos_m - want).length() < 1e-3, "{} vs {want}", body.rel_pos_m);
+        assert!(
+            (body.rel_pos_m - want).length() < 1e-3,
+            "{} vs {want}",
+            body.rel_pos_m
+        );
         let sun = snap.sun.as_ref().expect("sun light");
         let sun_want = world.position(id_of(&world, "Sun")).delta_from(cam);
         assert!((sun.rel_pos_m - sun_want).length() < 1e-3);
@@ -2303,30 +2452,58 @@ mod tests {
             w.tick(0.0);
         };
         let away = looking_along(UniversePos::default().offset(DVec3::Z * AU), DVec3::Z);
-        assert_eq!(world.honesty(&away), vec![HonestyFlag::BandModel], "J2000: only the band");
+        assert_eq!(
+            world.honesty(&away),
+            vec![HonestyFlag::BandModel],
+            "J2000: only the band"
+        );
 
         set(&mut world, Epoch::J2000.add_seconds(5000.0 * YEAR_S));
         let flags = world.honesty(&away);
-        assert!(flags.contains(&HonestyFlag::PlanetsExtrapolated), "{flags:?}");
-        assert!(!flags.contains(&HonestyFlag::StarsExtrapolated), "{flags:?}");
+        assert!(
+            flags.contains(&HonestyFlag::PlanetsExtrapolated),
+            "{flags:?}"
+        );
+        assert!(
+            !flags.contains(&HonestyFlag::StarsExtrapolated),
+            "{flags:?}"
+        );
 
         set(&mut world, Epoch::J2000.add_seconds(2.0e5 * YEAR_S));
         let flags = world.honesty(&away);
         assert!(flags.contains(&HonestyFlag::StarsExtrapolated), "{flags:?}");
-        assert!(flags.contains(&HonestyFlag::PlanetsExtrapolated), "{flags:?}");
+        assert!(
+            flags.contains(&HonestyFlag::PlanetsExtrapolated),
+            "{flags:?}"
+        );
 
         set(&mut world, date("2200-01-01T00:00:00Z"));
         let above = UniversePos::default().offset(DVec3::Z * AU);
         let at_pluto = looking_at(above, world.position(pluto), 60.0);
         let flags = world.honesty(&at_pluto);
         assert!(flags.contains(&HonestyFlag::PlutoExtrapolated), "{flags:?}");
-        assert!(!flags.contains(&HonestyFlag::PlanetsExtrapolated), "{flags:?}");
-        assert!(!world.honesty(&away).contains(&HonestyFlag::PlutoExtrapolated));
+        assert!(
+            !flags.contains(&HonestyFlag::PlanetsExtrapolated),
+            "{flags:?}"
+        );
+        assert!(
+            !world
+                .honesty(&away)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
         world.set_selected(Some(pluto));
-        assert!(world.honesty(&away).contains(&HonestyFlag::PlutoExtrapolated));
+        assert!(
+            world
+                .honesty(&away)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
         world.set_selected(None);
         set(&mut world, date("2026-11-20T00:00:00Z"));
-        assert!(!world.honesty(&at_pluto).contains(&HonestyFlag::PlutoExtrapolated));
+        assert!(
+            !world
+                .honesty(&at_pluto)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
         world.set_band_enabled(false);
         assert!(world.honesty(&at_pluto).is_empty());
         for flag in [
@@ -2371,13 +2548,20 @@ mod tests {
             world.time.set_rate(86_400.0);
             world.tick(1.0);
         }
-        let earth = world.objects()[id_of(&world, "Earth") as usize].frame.unwrap();
+        let earth = world.objects()[id_of(&world, "Earth") as usize]
+            .frame
+            .unwrap();
         assert_eq!(world.frames().find("Earth"), Some(earth));
-        let bh = world.objects()[id_of(&world, TEST_BH_NAME) as usize].frame.unwrap();
+        let bh = world.objects()[id_of(&world, TEST_BH_NAME) as usize]
+            .frame
+            .unwrap();
         assert_eq!(world.frames().find(TEST_BH_NAME), Some(bh));
         let lens = &world.lenses()[0];
         assert_eq!(lens.name, TEST_BH_NAME);
-        assert_eq!(lens.pos.delta_from(UniversePos::default()), DVec3::new(1000.0 * AU, 0.0, 0.0));
+        assert_eq!(
+            lens.pos.delta_from(UniversePos::default()),
+            DVec3::new(1000.0 * AU, 0.0, 0.0)
+        );
     }
 
     /// Velocities and Hill radii from the real ephemeris.
@@ -2394,9 +2578,17 @@ mod tests {
         // Hill radii a(1 − e)∛(m/3M): Earth 1.47e9 m (about the Earth alone), the Moon
         // ≈ 5.8e7 m.
         let hill = |name: &str| world.objects()[id(name) as usize].hill_radius_m;
-        assert!((1.40e9..1.52e9).contains(&hill("Earth")), "{}", hill("Earth"));
+        assert!(
+            (1.40e9..1.52e9).contains(&hill("Earth")),
+            "{}",
+            hill("Earth")
+        );
         assert!((5.0e7..6.5e7).contains(&hill("Moon")), "{}", hill("Moon"));
-        assert!((4.6e10..5.4e10).contains(&hill("Jupiter")), "{}", hill("Jupiter"));
+        assert!(
+            (4.6e10..5.4e10).contains(&hill("Jupiter")),
+            "{}",
+            hill("Jupiter")
+        );
         assert_eq!(hill("Sun"), 2.3e5 * AU);
         // The camera rides with the Moon near it, with the Earth farther out, and with TestBH-1
         // within 760 AU of it.
@@ -2404,7 +2596,10 @@ mod tests {
         let frame = |name: &str| world.objects()[id(name) as usize].frame.unwrap();
         assert_eq!(world.dominant_frame(&near("Moon", 1.0e7)), frame("Moon"));
         assert_eq!(world.dominant_frame(&near("Earth", 5.0e8)), frame("Earth"));
-        assert_eq!(world.dominant_frame(&near(TEST_BH_NAME, 100.0 * AU)), frame(TEST_BH_NAME));
+        assert_eq!(
+            world.dominant_frame(&near(TEST_BH_NAME, 100.0 * AU)),
+            frame(TEST_BH_NAME)
+        );
         let bh_sphere = hill(TEST_BH_NAME) / AU;
         assert!((755.0..765.0).contains(&bh_sphere), "{bh_sphere}");
     }
@@ -2422,7 +2617,10 @@ mod tests {
         let mut world = World::new(data, date("2026-11-20T00:00:00Z"));
         let ceres = id_of(&world, "Ceres");
         assert_eq!(world.find("1 Ceres (A801 AA)"), Some(ceres));
-        assert_eq!(world.objects()[ceres as usize].kind, ObjectKind::DwarfPlanet);
+        assert_eq!(
+            world.objects()[ceres as usize].kind,
+            ObjectKind::DwarfPlanet
+        );
         assert_eq!(world.objects()[ceres as usize].naif, Some(2_000_001));
         let pallas = id_of(&world, "Pallas");
         assert_eq!(world.objects()[pallas as usize].kind, ObjectKind::Asteroid);
@@ -2439,15 +2637,31 @@ mod tests {
             assert!(objects.len() >= 30, "{}", objects.len());
             for (info, r) in objects.iter().zip(picked.iter().filter(|r| r.h <= 10.0)) {
                 let conic = uni_physics::smallbody::conic_from_mean_anomaly(
-                    r.a_au, r.e, r.i_deg, r.node_deg, r.argp_deg, r.m0_deg, r.epoch_jd_tdb,
+                    r.a_au,
+                    r.e,
+                    r.i_deg,
+                    r.node_deg,
+                    r.argp_deg,
+                    r.m0_deg,
+                    r.epoch_jd_tdb,
                 );
                 let (pos, vel) = heliocentric_state_icrs(&conic, world.epoch());
                 let ours = world.position(info.id).delta_from(sun);
                 // Two roundings of the same ellipse (M from the epoch vs from periapsis): ≈ 1 cm
                 // at 2100.
-                assert!((ours - pos).length() < 0.1, "{}: {} m", info.name, (ours - pos).length());
+                assert!(
+                    (ours - pos).length() < 0.1,
+                    "{}: {} m",
+                    info.name,
+                    (ours - pos).length()
+                );
                 let v = world.velocity(info.id) - world.velocity(id_of(&world, "Sun"));
-                assert!((v - vel).length() < 1e-6, "{}: {} m/s", info.name, (v - vel).length());
+                assert!(
+                    (v - vel).length() < 1e-6,
+                    "{}: {} m/s",
+                    info.name,
+                    (v - vel).length()
+                );
             }
         }
     }
@@ -2473,7 +2687,9 @@ mod tests {
 
     /// Heliocentric position [m] of object `name`.
     fn helio(world: &World, name: &str) -> DVec3 {
-        world.position(id_of(world, name)).delta_from(world.position(id_of(world, "Sun")))
+        world
+            .position(id_of(world, name))
+            .delta_from(world.position(id_of(world, "Sun")))
     }
 
     /// Lead ruling after A3 (review I3): no comet is shown two-body from its catalogue conic,
@@ -2482,7 +2698,10 @@ mod tests {
     fn comets_are_settled_at_construction() {
         let (halley, neowise) = halley_and_neowise();
         let t = date("1986-03-13T00:00:00Z");
-        let data = WorldData { comets: vec![halley.clone(), neowise], ..empty_data() };
+        let data = WorldData {
+            comets: vec![halley.clone(), neowise],
+            ..empty_data()
+        };
         let world = World::new(data, t);
         assert!(world.comets.iter().all(|c| !c.needs_work(t)), "settled");
         // The perturbed state at t (A3: 4990 km from Horizons there, 5.06 % of r for two-body).
@@ -2494,6 +2713,169 @@ mod tests {
         let two_body = heliocentric_state_icrs(&catalogue, t).0;
         let shift = (want - two_body).length() / want.length();
         assert!(shift > 0.01, "perturbations move Halley by {shift} of r");
+    }
+
+    /// Lead ruling A4 P1: `World::new` does no comet integration when the comets come from
+    /// `comets_2026.ron` and the date is the default start date, so start-up does not block.
+    /// Checked on the comets' own state (checkpoints and conic epochs), and not vacuously: the
+    /// same comets from `comets.ron` do integrate.
+    #[test]
+    fn new_does_no_comet_integration_from_the_derived_file() {
+        let t = date("2026-11-20T00:00:00Z");
+        let derived = uni_data::load_comets(&baked("comets_2026.ron")).expect("comets_2026.ron");
+        assert!(derived.len() >= 500, "{} comets", derived.len());
+        let started = std::time::Instant::now();
+        let world = World::new(
+            WorldData {
+                comets: derived.clone(),
+                ..empty_data()
+            },
+            t,
+        );
+        eprintln!(
+            "World::new, {} comets from comets_2026.ron: {:?}",
+            derived.len(),
+            started.elapsed()
+        );
+        let untouched = |w: &World| {
+            w.comets.iter().all(|c| {
+                c.checkpoints.len() == 1 && c.osc_epoch == c.catalogue_epoch && !c.needs_work(t)
+            })
+        };
+        assert!(untouched(&world), "no comet integrated");
+        // The same comets, 12 of them (so the test stays quick in a debug build), from the
+        // catalogue epochs: every one of them integrates.
+        let raw: Vec<Comet> = uni_data::load_comets(&baked("comets.ron"))
+            .expect("comets.ron")
+            .into_iter()
+            .take(12)
+            .collect();
+        let from_raw = World::new(
+            WorldData {
+                comets: raw,
+                ..empty_data()
+            },
+            t,
+        );
+        let integrated = from_raw
+            .comets
+            .iter()
+            .filter(|c| c.checkpoints.len() > 1)
+            .count();
+        assert!(
+            integrated >= 10,
+            "{integrated} of 12 integrated from comets.ron"
+        );
+        assert!(
+            from_raw.comets.iter().all(|c| !c.needs_work(t)),
+            "and settled"
+        );
+    }
+
+    /// Lead ruling A4: `CometsCatchingUp` is raised after a 30-year date jump while the
+    /// selected comet or a drawn comet has work left, and clears when it is done; a comet that
+    /// is neither lags unlabelled.
+    #[test]
+    fn comets_catching_up_flag_rises_after_a_jump_and_clears() {
+        let t0 = date("2026-11-20T00:00:00Z");
+        let derived = uni_data::load_comets(&baked("comets_2026.ron")).expect("comets_2026.ron");
+        let halley: Comet = derived
+            .iter()
+            .find(|c| c.name == "1P/Halley")
+            .cloned()
+            .expect("Halley");
+        let make = || {
+            World::new(
+                WorldData {
+                    comets: vec![halley.clone()],
+                    ..empty_data()
+                },
+                t0,
+            )
+        };
+        let flag = HonestyFlag::CometsCatchingUp;
+        let away = looking_along(UniversePos::default().offset(DVec3::Z * AU), DVec3::Z);
+        let jump = |w: &mut World| {
+            w.time.set_epoch(t0.add_seconds(30.0 * YEAR_S));
+            w.tick(0.0);
+        };
+
+        // Drawn: raised right after the jump, cleared by ticking.
+        let mut world = make();
+        let h = comet_index(&world, "1P/Halley");
+        world.note_shown_comets(vec![(h, 1.0)]);
+        assert!(!world.honesty(&away).contains(&flag), "not before the jump");
+        jump(&mut world);
+        assert!(
+            world.comets[h].needs_work(world.epoch()),
+            "a jump leaves work"
+        );
+        assert!(
+            world.honesty(&away).contains(&flag),
+            "raised after the jump"
+        );
+        let mut ticks = 0;
+        while world.honesty(&away).contains(&flag) {
+            ticks += 1;
+            assert!(ticks <= 5000, "the flag never cleared");
+            world.tick(0.0);
+        }
+        assert!(
+            !world.comets[h].needs_work(world.epoch()),
+            "cleared because the work is done"
+        );
+        assert!(ticks > 1, "it took {ticks} ticks");
+
+        // Selected, not drawn: the same.
+        let mut world = make();
+        world.set_selected(Some(world.comet_objects[h]));
+        jump(&mut world);
+        assert!(world.honesty(&away).contains(&flag), "selected comet");
+        world.set_selected(None);
+        assert!(
+            !world.honesty(&away).contains(&flag),
+            "neither selected nor drawn"
+        );
+    }
+
+    /// `WorldData::rings` sets Saturn's ring radii in `World::new`: the profile's first and
+    /// last radius, the baked file's and a different one.
+    #[test]
+    fn world_uses_the_loaded_ring_profile() {
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let profile = data.rings.clone().expect("saturn_rings.ron loaded");
+        let bodies = || {
+            vec![
+                (10, None, DVec3::ZERO),
+                (699, Some(10), DVec3::new(9.5 * AU, 0.0, 0.0)),
+            ]
+        };
+        let world = fake_world(
+            bodies(),
+            WorldData {
+                rings: Some(profile.clone()),
+                ..empty_data()
+            },
+        );
+        assert_eq!(world.ring_m, (profile.inner_m, profile.outer_m));
+        let other = RingProfile {
+            inner_m: 7.4658e7,
+            outer_m: 1.36775e8,
+            ..profile
+        };
+        let world = fake_world(
+            bodies(),
+            WorldData {
+                rings: Some(other),
+                ..empty_data()
+            },
+        );
+        assert_eq!(world.ring_m, (7.4658e7, 1.36775e8));
+        let world = fake_world(bodies(), empty_data());
+        assert_eq!(
+            world.ring_m, SATURN_RINGS_DEFAULT_M,
+            "no profile: the fallback"
+        );
     }
 
     /// Ticks until Halley (comet `h`) needs no work; returns how many it took.
@@ -2516,11 +2898,20 @@ mod tests {
     fn comets_catch_up_after_date_jumps_without_stalling() {
         let (halley, neowise) = halley_and_neowise();
         let t0 = date("1986-03-13T00:00:00Z");
-        let data = || WorldData { comets: vec![halley.clone(), neowise.clone()], ..empty_data() };
+        let data = || WorldData {
+            comets: vec![halley.clone(), neowise.clone()],
+            ..empty_data()
+        };
         let mut world = World::new(data(), t0);
-        let (h, n) = (comet_index(&world, "1P/Halley"), comet_index(&world, "C/2020 F3 (NEOWISE)"));
+        let (h, n) = (
+            comet_index(&world, "1P/Halley"),
+            comet_index(&world, "C/2020 F3 (NEOWISE)"),
+        );
         let (osc_1986, epoch_1986) = (world.comets[h].osc, world.comets[h].osc_epoch);
-        assert!(epoch_1986.seconds_since(t0).abs() < 1e-3, "settled at construction");
+        assert!(
+            epoch_1986.seconds_since(t0).abs() < 1e-3,
+            "settled at construction"
+        );
         let most = REOSC_STEPS_PER_COMET as f64 * REOSC_CHUNK_S * (1.0 + 1e-12);
         // Every history below, replayed on a second world, gives bit-identical conics.
         let history = |world: &mut World| {
@@ -2530,7 +2921,10 @@ mod tests {
             world.tick(1.0 / 60.0);
             let moved = world.comets[h].osc_epoch.seconds_since(before);
             assert!(moved > 0.0 && moved <= most, "{} days", moved / DAY);
-            assert!(world.comets[h].needs_work(world.epoch()), "a tick never settles");
+            assert!(
+                world.comets[h].needs_work(world.epoch()),
+                "a tick never settles"
+            );
             // NEOWISE is nine days from its catalogue epoch: its catalogue conic, at once.
             assert_eq!(world.comets[n].osc_epoch, world.comets[n].catalogue_epoch);
             let ticks = 1 + tick_until_settled(world, h);
@@ -2539,7 +2933,11 @@ mod tests {
             let before = world.comets[h].osc_epoch;
             world.tick(1.0 / 60.0);
             let moved = world.comets[h].osc_epoch.seconds_since(before);
-            assert!(moved > 0.0 && moved <= most, "{} days under the warp", moved / DAY);
+            assert!(
+                moved > 0.0 && moved <= most,
+                "{} days under the warp",
+                moved / DAY
+            );
             assert!(world.comets[h].needs_work(world.epoch()));
             // Back to the start date, paused: the checkpoint, no integration.
             world.time.set_rate(1.0);
@@ -2547,7 +2945,10 @@ mod tests {
             world.time.set_epoch(t0);
             world.tick(1.0 / 60.0);
             assert!(!world.comets[h].needs_work(world.epoch()));
-            assert_eq!((world.comets[h].osc_epoch, world.comets[h].osc), (epoch_1986, osc_1986));
+            assert_eq!(
+                (world.comets[h].osc_epoch, world.comets[h].osc),
+                (epoch_1986, osc_1986)
+            );
             // To 1996, inside the span caught up above: one tick from the nearest checkpoint
             // (120 days apart, review r2 P1).
             world.time.set_epoch(date("1996-01-01T00:00:00Z"));
@@ -2563,8 +2964,8 @@ mod tests {
         tick_until_settled(&mut world, h);
         let (osc, at) = (world.comets[h].osc, world.comets[h].osc_epoch);
         let one = osculate_at(&osc_1986, epoch_1986, at);
-        let err = (heliocentric_state_icrs(&osc, at).0 - heliocentric_state_icrs(&one, at).0)
-            .length();
+        let err =
+            (heliocentric_state_icrs(&osc, at).0 - heliocentric_state_icrs(&one, at).0).length();
         assert!(err < 10.0, "{err} m after {ticks} ticks");
         println!("Halley 1986 → 2020 caught up in {ticks} ticks, {err:.2} m from one run");
         let mut again = World::new(data(), t0);
@@ -2572,7 +2973,11 @@ mod tests {
         again.time.set_epoch(date("2020-07-15T03:00:00Z"));
         again.tick(1.0 / 60.0);
         tick_until_settled(&mut again, h);
-        assert_eq!((again.comets[h].osc_epoch, again.comets[h].osc), (at, osc), "deterministic");
+        assert_eq!(
+            (again.comets[h].osc_epoch, again.comets[h].osc),
+            (at, osc),
+            "deterministic"
+        );
     }
 
     /// Review I3, r1 N1: a tick step integrates `REOSC_CHUNK_STEPS` of the integrator's steps
@@ -2608,7 +3013,11 @@ mod tests {
         }
         assert!(t.seconds_since(comet.osc_epoch).abs() <= REOSC_INTERVAL_S);
         assert_eq!(longest, REOSC_CHUNK_S, "16-day steps far from the Sun");
-        assert!(shortest < 0.5 * DAY, "{} days near perihelion", shortest / DAY);
+        assert!(
+            shortest < 0.5 * DAY,
+            "{} days near perihelion",
+            shortest / DAY
+        );
         // 0.05 AU from Jupiter's barycentre its pull sets the step, as in the integrator:
         // √(d³/GM_J) = 63 days there, against 4.3 years for the Sun at 5.2 AU.
         let jupiter = standish::heliocentric_state_icrs(Planet::Jupiter, t).0;
@@ -2617,7 +3026,11 @@ mod tests {
         let want = SMALLBODY_STEP_ETA * ((0.05 * AU).powi(3) / gm).sqrt();
         assert!((smallbody_rk4_step_s(close, t) / want - 1.0).abs() < 1e-9);
         assert!(short_span_s(close, t) < 0.1 * short_span_s(jupiter * 1.1, t));
-        let one = osculate_at(&catalogue, epoch_from_jd(halley.epoch_jd_tdb), comet.osc_epoch);
+        let one = osculate_at(
+            &catalogue,
+            epoch_from_jd(halley.epoch_jd_tdb),
+            comet.osc_epoch,
+        );
         let err = (heliocentric_state_icrs(&comet.osc, t).0 - heliocentric_state_icrs(&one, t).0)
             .length();
         // Each restart's conic round trip costs ≈ 2 cm; the steps' own rounding of the RK4
@@ -2640,7 +3053,10 @@ mod tests {
     fn settle_keeps_checkpoints_across_its_span() {
         let (halley, _) = halley_and_neowise();
         let t0 = date("1986-03-13T00:00:00Z");
-        let data = WorldData { comets: vec![halley.clone()], ..empty_data() };
+        let data = WorldData {
+            comets: vec![halley.clone()],
+            ..empty_data()
+        };
         let mut world = World::new(data, t0);
         let h = comet_index(&world, "1P/Halley");
         let comet = world.comets[h].clone();
@@ -2648,10 +3064,17 @@ mod tests {
         let span = t0.seconds_since(comet.catalogue_epoch);
         assert_eq!(marks.first(), Some(&comet.catalogue_epoch));
         assert_eq!(marks.last(), Some(&t0));
-        assert_eq!(marks.len(), (span / CHECKPOINT_SPACING_S).ceil() as usize + 1);
+        assert_eq!(
+            marks.len(),
+            (span / CHECKPOINT_SPACING_S).ceil() as usize + 1
+        );
         for pair in marks.windows(2) {
             let gap = pair[1].seconds_since(pair[0]);
-            assert!(gap > 0.0 && gap <= CHECKPOINT_SPACING_S, "{} days", gap / DAY);
+            assert!(
+                gap > 0.0 && gap <= CHECKPOINT_SPACING_S,
+                "{} days",
+                gap / DAY
+            );
         }
         let mut at = comet.catalogue_epoch;
         while at.seconds_since(t0) < 0.0 {
@@ -2685,28 +3108,56 @@ mod tests {
             .expect("comets.ron")
             .into_iter()
             .take(30)
-            .map(|c| Comet { epoch_jd_tdb: jd0, ..c })
+            .map(|c| Comet {
+                epoch_jd_tdb: jd0,
+                ..c
+            })
             .collect();
         let n = comets.len();
         // Paused, so each tick lands exactly on the date set.
         let make = || {
-            let mut world = World::new(WorldData { comets: comets.clone(), ..empty_data() }, t0);
+            let mut world = World::new(
+                WorldData {
+                    comets: comets.clone(),
+                    ..empty_data()
+                },
+                t0,
+            );
             world.time.toggle_pause();
             world
         };
         let moved = |world: &World| -> Vec<bool> {
-            world.comets.iter().map(|c| c.osc_epoch != c.catalogue_epoch).collect()
+            world
+                .comets
+                .iter()
+                .map(|c| c.osc_epoch != c.catalogue_epoch)
+                .collect()
         };
 
         // Nothing drawn: the 24 stale comets nearest the Sun take one step each.
         let mut plain = make();
-        assert!(plain.comets.iter().all(|c| !c.needs_work(t0) && c.osc_epoch == c.catalogue_epoch));
+        assert!(
+            plain
+                .comets
+                .iter()
+                .all(|c| !c.needs_work(t0) && c.osc_epoch == c.catalogue_epoch)
+        );
         plain.time.set_epoch(later);
         plain.tick(1.0 / 60.0);
         let sun = plain.position(id_of(&plain, "Sun"));
-        let dist = |k: usize| plain.position(plain.comet_objects[k]).delta_from(sun).length();
-        let far = (0..n).max_by(|&a, &b| dist(a).total_cmp(&dist(b))).expect("comets");
-        assert_eq!(moved(&plain).iter().filter(|&&m| m).count(), REOSC_STEPS_PER_TICK);
+        let dist = |k: usize| {
+            plain
+                .position(plain.comet_objects[k])
+                .delta_from(sun)
+                .length()
+        };
+        let far = (0..n)
+            .max_by(|&a, &b| dist(a).total_cmp(&dist(b)))
+            .expect("comets");
+        assert_eq!(
+            moved(&plain).iter().filter(|&&m| m).count(),
+            REOSC_STEPS_PER_TICK
+        );
         assert!(!moved(&plain)[far], "the farthest comet waits");
 
         // `far`'s orbit after exactly `REOSC_STEPS_PER_COMET` short steps.
@@ -2721,9 +3172,15 @@ mod tests {
         let pos = drawn.position(id);
         let view = looking_at(pos.offset(DVec3::new(0.0, 0.0, 0.01 * AU)), pos, 1.0);
         let snap = drawn.snapshot(&view, VIEWPORT);
-        assert!(snap.points.iter().any(|p| p.id == Some(id)), "drawn as a point");
+        assert!(
+            snap.points.iter().any(|p| p.id == Some(id)),
+            "drawn as a point"
+        );
         let noted = drawn.shown_comets.lock().expect("lock").clone();
-        assert!(noted.iter().any(|&(k, lux)| k == far && lux > 0.0), "{noted:?}");
+        assert!(
+            noted.iter().any(|&(k, lux)| k == far && lux > 0.0),
+            "{noted:?}"
+        );
         drawn.time.set_epoch(later);
         drawn.tick(1.0 / 60.0);
         let conic_of = |world: &World| (world.comets[far].osc_epoch, world.comets[far].osc);
@@ -2735,7 +3192,12 @@ mod tests {
         // A resolved nucleus is noted as infinitely bright.
         let close = looking_at(pos.offset(DVec3::new(0.0, 0.0, 1.0e5)), pos, 60.0);
         let near = make();
-        assert!(near.snapshot(&close, VIEWPORT).bodies.iter().any(|b| b.id == id));
+        assert!(
+            near.snapshot(&close, VIEWPORT)
+                .bodies
+                .iter()
+                .any(|b| b.id == id)
+        );
         let noted = near.shown_comets.lock().expect("lock").clone();
         assert!(noted.contains(&(far, f64::INFINITY)), "{noted:?}");
 
@@ -2790,7 +3252,9 @@ mod tests {
             let snap = world.snapshot(&view, VIEWPORT);
             let point = snap.points.iter().find(|p| p.id == Some(id)).expect(name);
             let rel = world.position(id).delta_from(cam);
-            let sun_rel = world.position(id_of(&world, "Sun")).delta_from(world.position(id));
+            let sun_rel = world
+                .position(id_of(&world, "Sun"))
+                .delta_from(world.position(id));
             let phase = sun_rel.angle_between(-rel);
             let info = &world.objects()[id as usize];
             let fact = facts.iter().find(|f| Some(f.naif) == info.naif).unwrap();
@@ -2802,7 +3266,10 @@ mod tests {
             let c = planet_phase_correction(info.naif.unwrap(), brdf, phase).min(10.0);
             let ratio = point.illuminance_lux / (disk * c);
             let phase_deg = phase.to_degrees();
-            assert!((ratio - 1.0).abs() < 1e-3, "{name}: {ratio} at phase {phase_deg} deg");
+            assert!(
+                (ratio - 1.0).abs() < 1e-3,
+                "{name}: {ratio} at phase {phase_deg} deg"
+            );
         }
     }
 
@@ -2827,7 +3294,9 @@ mod tests {
             let body = |id| snap.bodies.iter().find(|b| b.id == id).expect("resolved");
             let near = |b: &BodyView, other: ObjectId| {
                 let want = world.position(other).delta_from(cam);
-                b.occluders.iter().any(|o| (o.rel_pos_m - want).length() < 1.0)
+                b.occluders
+                    .iter()
+                    .any(|o| (o.rel_pos_m - want).length() < 1.0)
             };
             assert_eq!(near(body(earth), moon), earth_has_moon, "Moon at {moon_x}");
             assert_eq!(near(body(moon), earth), moon_has_earth, "Moon at {moon_x}");
@@ -2840,19 +3309,31 @@ mod tests {
     #[test]
     fn saturn_carries_its_rings() {
         let mut world = fake_world(
-            vec![(10, None, DVec3::ZERO), (699, Some(10), DVec3::new(9.5 * AU, 0.0, 0.0))],
+            vec![
+                (10, None, DVec3::ZERO),
+                (699, Some(10), DVec3::new(9.5 * AU, 0.0, 0.0)),
+            ],
             empty_data(),
         );
         let saturn = id_of(&world, "Saturn");
         let centre = world.position(saturn);
         let view = looking_at(centre.offset(DVec3::new(0.0, 0.0, 1.0e9)), centre, 60.0);
-        let ring = world.snapshot(&view, VIEWPORT).bodies[0].ring.expect("rings");
+        let ring = world.snapshot(&view, VIEWPORT).bodies[0]
+            .ring
+            .expect("rings");
         // Review I2: by default the radii of A8's baked profile, the span B2's ring texture
         // covers. A re-bake that moves them fails here.
         let profile =
             uni_data::load_ring_profile(&baked("saturn_rings.ron")).expect("saturn_rings.ron");
-        assert_eq!((ring.inner_m, ring.outer_m), (profile.inner_m, profile.outer_m));
-        assert_eq!(ring.normal, DVec3::Z, "the fake has no rotation model: body z is ICRS z");
+        assert_eq!(
+            (ring.inner_m, ring.outer_m),
+            (profile.inner_m, profile.outer_m)
+        );
+        assert_eq!(
+            ring.normal,
+            DVec3::Z,
+            "the fake has no rotation model: body z is ICRS z"
+        );
         let other = RingProfile {
             inner_m: 7.4658e7,
             outer_m: 1.36775e8,
@@ -2862,7 +3343,10 @@ mod tests {
         let ring = world.snapshot(&view, VIEWPORT).bodies[0].ring.unwrap();
         assert_eq!((ring.inner_m, ring.outer_m), (other.inner_m, other.outer_m));
         // Impossible radii are ignored.
-        world.set_ring_profile(&RingProfile { inner_m: 2.0e8, ..other.clone() });
+        world.set_ring_profile(&RingProfile {
+            inner_m: 2.0e8,
+            ..other.clone()
+        });
         let ring = world.snapshot(&view, VIEWPORT).bodies[0].ring.unwrap();
         assert_eq!((ring.inner_m, ring.outer_m), (other.inner_m, other.outer_m));
     }
@@ -2908,10 +3392,16 @@ mod tests {
         data.facts = vec![sheet];
         let world = fake_world(vec![(10, None, DVec3::ZERO)], data);
         assert!(world.find("Vesta").is_some(), "H ≤ 10");
-        let bennu = world.find("Bennu").expect("its fact sheet makes Bennu an object");
+        let bennu = world
+            .find("Bennu")
+            .expect("its fact sheet makes Bennu an object");
         assert_eq!(world.objects()[bennu as usize].naif, Some(bennu_naif));
         assert_eq!(world.objects()[bennu as usize].kind, ObjectKind::Asteroid);
-        assert_eq!(world.find("Itokawa"), None, "H 19.2 without a sheet is a uni-sky point");
+        assert_eq!(
+            world.find("Itokawa"),
+            None,
+            "H 19.2 without a sheet is a uni-sky point"
+        );
         assert_eq!(world.find("Hygiea"), None, "no H: not H ≤ 10");
     }
 
@@ -2929,7 +3419,10 @@ mod tests {
         ];
         let mut world = fake_world(vec![(10, None, DVec3::ZERO)], data);
         let objects = world.objects().len();
-        assert!(world.objects().iter().all(|o| o.catalog_index.is_none()), "not an object");
+        assert!(
+            world.objects().iter().all(|o| o.catalog_index.is_none()),
+            "not an object"
+        );
         let centre = world.star_position(0);
         let radius = world.star_radius_m(0);
         assert!((radius / R_SUN_M - 1.0).abs() < 0.2, "{radius} m");
@@ -2970,7 +3463,10 @@ mod tests {
         assert_eq!((surface.id, surface.catalog_index), (id, Some(0)));
         assert_eq!((surface.radius_m, surface.proj_radius_px), (radius, px));
         assert!((surface.luminous_intensity_cd / intensity - 1.0).abs() < 1e-12);
-        assert!(snap.points.iter().all(|p| p.id.is_some()), "never also a point");
+        assert!(
+            snap.points.iter().all(|p| p.id.is_some()),
+            "never also a point"
+        );
         let (near_id, altitude) = snap.nearest_surface.expect("a surface");
         assert_eq!(near_id, id);
         assert!((altitude - (d - radius)).abs() < 1.0, "{altitude}");
@@ -2981,7 +3477,11 @@ mod tests {
         // `nearest_surface` notes a star too; a second notice registers it only once.
         let other = world.star_position(1).offset(DVec3::new(AU, 0.0, 0.0));
         let sun = id_of(&world, "Sun");
-        assert_eq!(world.nearest_surface(&other).map(|(s, _)| s), Some(sun), "not yet");
+        assert_eq!(
+            world.nearest_surface(&other).map(|(s, _)| s),
+            Some(sun),
+            "not yet"
+        );
         world.snapshot(&looking_along(other, DVec3::X), VIEWPORT);
         world.tick(1.0 / 60.0);
         assert_eq!(world.objects().len(), objects + 2);
@@ -2996,13 +3496,19 @@ mod tests {
     #[test]
     fn nearest_surface_follows_the_ellipsoid() {
         let world = fake_world(
-            vec![(10, None, DVec3::ZERO), (399, Some(10), DVec3::new(AU, 0.0, 0.0))],
+            vec![
+                (10, None, DVec3::ZERO),
+                (399, Some(10), DVec3::new(AU, 0.0, 0.0)),
+            ],
             empty_data(),
         );
         let earth = id_of(&world, "Earth");
         let centre = world.position(earth);
         let r = world.objects()[earth as usize].radii_m;
-        for offset in [DVec3::new(0.0, 0.0, r.z + 1.0e5), DVec3::new(r.x + 1.0e5, 0.0, 0.0)] {
+        for offset in [
+            DVec3::new(0.0, 0.0, r.z + 1.0e5),
+            DVec3::new(r.x + 1.0e5, 0.0, 0.0),
+        ] {
             let (id, alt) = world.nearest_surface(&centre.offset(offset)).unwrap();
             assert_eq!(id, earth);
             assert!((alt - 1.0e5).abs() < 1.0, "{alt} at {offset}");
@@ -3017,13 +3523,23 @@ mod tests {
         let mut data = empty_data();
         data.stars = vec![
             Star3::new([0.0, 0.0, 5.0], 1.0, [0.0; 3], 0.0, 1, uni_data::FLAG_NAMED),
-            Star3::new([0.0, 0.0, -5.0], 1.0, [0.0; 3], 0.0, 2, uni_data::FLAG_NAMED),
+            Star3::new(
+                [0.0, 0.0, -5.0],
+                1.0,
+                [0.0; 3],
+                0.0,
+                2,
+                uni_data::FLAG_NAMED,
+            ),
         ];
         data.star_names = Some(StarNames {
             entries: vec![star_name(0, "Northstar"), star_name(1, "Southstar")],
         });
         let world = fake_world(
-            vec![(10, None, DVec3::ZERO), (499, Some(10), DVec3::new(0.0, 0.0, 1.5 * AU))],
+            vec![
+                (10, None, DVec3::ZERO),
+                (499, Some(10), DVec3::new(0.0, 0.0, 1.5 * AU)),
+            ],
             data,
         );
         let eye = UniversePos::default().offset(DVec3::new(0.0, 0.0, -AU));
@@ -3032,7 +3548,10 @@ mod tests {
         let ids: Vec<ObjectId> = snap.pick.iter().map(|p| p.id).collect();
         let (sun, mars) = (id_of(&world, "Sun"), id_of(&world, "Mars"));
         let (north, south) = (id_of(&world, "Northstar"), id_of(&world, "Southstar"));
-        assert!(ids.contains(&sun) && ids.contains(&mars) && ids.contains(&north), "{ids:?}");
+        assert!(
+            ids.contains(&sun) && ids.contains(&mars) && ids.contains(&north),
+            "{ids:?}"
+        );
         assert!(!ids.contains(&south), "behind the camera");
         let item = |id| snap.pick.iter().find(|p| p.id == id).unwrap();
         assert_eq!(item(mars).priority, 3);
@@ -3082,10 +3601,17 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 world.tick(0.0);
                 slowest = slowest.max(t0.elapsed().as_secs_f64());
-                let moved = world.comets.iter().zip(&before).filter(|(c, e)| c.osc_epoch != **e);
+                let moved = world
+                    .comets
+                    .iter()
+                    .zip(&before)
+                    .filter(|(c, e)| c.osc_epoch != **e);
                 assert!(moved.count() <= REOSC_STEPS_PER_TICK);
             }
-            assert!(world.comets.iter().any(|c| c.needs_work(world.epoch())), "never settled");
+            assert!(
+                world.comets.iter().any(|c| c.needs_work(world.epoch())),
+                "never settled"
+            );
             slowest
         };
         world.time.set_epoch(date("1996-11-20T00:00:00Z"));
@@ -3099,13 +3625,20 @@ mod tests {
         let t0 = std::time::Instant::now();
         world.tick(1.0 / 60.0);
         let back = t0.elapsed().as_secs_f64();
-        assert!(world.comets.iter().all(|c| !c.needs_work(world.epoch())), "checkpoints");
+        assert!(
+            world.comets.iter().all(|c| !c.needs_work(world.epoch())),
+            "checkpoints"
+        );
 
         // Review r2 P1, measured. Ticks until all 512 comets catch up after a jump to 2020,
         // inside most comets' settled spans (120-day checkpoints): those with a later
         // catalogue epoch integrate back from it.
         let stale = |world: &World| {
-            world.comets.iter().filter(|c| c.needs_work(world.epoch())).count()
+            world
+                .comets
+                .iter()
+                .filter(|c| c.needs_work(world.epoch()))
+                .count()
         };
         world.time.set_epoch(date("2020-07-15T00:00:00Z"));
         world.tick(1.0 / 60.0);
@@ -3132,7 +3665,10 @@ mod tests {
             let pos = world.position(halley);
             let view = looking_at(pos.offset(DVec3::new(0.0, 0.0, 0.01 * AU)), pos, 2.0);
             let snap = world.snapshot(&view, VIEWPORT);
-            assert!(snap.points.iter().any(|p| p.id == Some(halley)), "Halley drawn");
+            assert!(
+                snap.points.iter().any(|p| p.id == Some(halley)),
+                "Halley drawn"
+            );
             if !world.comets[h].needs_work(world.epoch()) {
                 break;
             }
@@ -3171,7 +3707,11 @@ mod tests {
             total_drawn / f64::from(ticks_drawn - 1) * 1e3,
             slowest_drawn * 1e3,
             world.comets.len(),
-            world.comets.iter().map(|c| c.checkpoints.len()).sum::<usize>()
+            world
+                .comets
+                .iter()
+                .map(|c| c.checkpoints.len())
+                .sum::<usize>()
         );
         assert!(back < 0.1, "{back} s");
         assert!(worst < 0.25, "{worst} s");

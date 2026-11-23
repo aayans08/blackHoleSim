@@ -15,6 +15,9 @@ pub enum HonestyFlag {
     BandModel,
     /// The procedural asteroid belt is drawn and visible; the app raises it (C6) (grey).
     ProceduralBelt,
+    /// The selected comet, or a comet the last snapshot drew, is still being re-osculated
+    /// toward the shown date after a date change (amber).
+    CometsCatchingUp,
 }
 
 /// The exact on-screen text of `f`.
@@ -31,6 +34,9 @@ pub fn label(f: HonestyFlag) -> &'static str {
         }
         HonestyFlag::BandModel => "Milky Way band: galaxy model v0 (real dust map in M4)",
         HonestyFlag::ProceduralBelt => "Faint asteroids: procedural, from catalogue statistics",
+        HonestyFlag::CometsCatchingUp => {
+            "Comet positions catching up after a date change (approximate)"
+        }
     }
 }
 
@@ -62,6 +68,10 @@ mod tests {
             (
                 HonestyFlag::ProceduralBelt,
                 "Faint asteroids: procedural, from catalogue statistics",
+            ),
+            (
+                HonestyFlag::CometsCatchingUp,
+                "Comet positions catching up after a date change (approximate)",
             ),
         ];
         for (flag, text) in expected {
