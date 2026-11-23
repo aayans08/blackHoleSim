@@ -1,0 +1,76 @@
+#![enable(implicit_some)]
+// Sky v1 capture set (early slice of Task B9): the engine sky of Wave B, i.e. the Milky Way band
+// (B5), the AT-HYG 3-D star field (B4), auto-exposure with the eye-adapted star exposure, and
+// bloom (B6). Render it with
+//   universe --capture bookmarks/sky-v1.ron --out captures/sky-v1 --sky v1
+// and open the window on the first view with `universe --sky v1`.
+//
+// Axes: ICRS/J2000, origin at the Solar System barycentre (SSB), metres; +x toward RA 0h
+// Dec 0°, +z toward the north celestial pole. The camera looks along its local −Z with +Y up;
+// `orient` (x, y, z, w) turns camera axes into ICRS axes.
+//
+// Every view is from the SSB. The sky v1 stack draws no Sun or planets; once B9 draws them,
+// the Sun's photosphere is about 66 000 km from the SSB at this epoch (review C2), so these
+// views will need a camera off the SSB then.
+//
+// Fields left out keep their defaults: Auto exposure, eye-adapted stars on (star EV100 −4,
+// uni-sky's default), lens scale 1.0 in captures. The three sky views of bookmarks/m0.ron are
+// copied unchanged (a uni-app test checks that they are identical).
+[
+    // 90° field toward the Galactic Centre (Sgr A*, RA 266.405°, Dec −28.936°), north up:
+    // Sagittarius, Scorpius and the bulge with its dust lanes. The window opens here with
+    // `--sky v1`.
+    (
+        name: "sky-wide-galactic-center",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.015935122771616423, 0.5077695271067934, 0.8609217208370549, 0.02701795319710947),
+            fov_y_rad: 1.5707963267948966, // 90°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // 90° field toward the Galactic anticentre (l 180°, b 0°: RA 86.405°, Dec +28.936°, from the
+    // ICRS → Galactic rotation of ESA 1997, Vol. 1 §1.5.3), north up: Taurus with the Pleiades
+    // and the Hyades, Auriga, Gemini, and Orion's belt about 30° below the centre.
+    (
+        name: "sky-wide-anticenter",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.8609224904493991, -0.02701801644757056, -0.01593510479310702, 0.5077682194277976),
+            fov_y_rad: 1.5707963267948966, // 90°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // Copied from bookmarks/m0.ron: at the SSB looking at Orion (RA 83.8°, Dec −1.2°), north up.
+    (
+        name: "sky-orion",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.6986395023855304, -0.03783696294392544, -0.03863783442459364, 0.7134271705595857),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // Copied from bookmarks/m0.ron: at the SSB looking at the Galactic Centre (RA 266.405°,
+    // Dec −28.936°), north up.
+    (
+        name: "sky-galactic-center",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.015935122771616423, 0.5077695271067934, 0.8609217208370549, 0.02701795319710947),
+            fov_y_rad: 1.0471975511965976, // 60°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+    // Copied from bookmarks/m0.ron: at the SSB looking at Sirius (HR 2491, RA 101.2872°,
+    // Dec −16.7161°) with a 2° field, north up.
+    (
+        name: "sky-zoom-sirius",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, 0.0, 0.0)),
+            orient: (0.5939196735697798, 0.058690663558033075, 0.0789062835194903, 0.7984914688204413),
+            fov_y_rad: 0.03490658503988659, // 2°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+    ),
+]

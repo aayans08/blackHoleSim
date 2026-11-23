@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use glam::{DQuat, DVec3};
 use uni_core::{AU, Epoch, FrameMotion, FrameTree, Lens, M_SUN, ROOT_FRAME, UniversePos};
-use uni_data::{CatalogStar, DataError};
+use uni_data::{CatalogStar, DataError, Star3};
 use uni_gfx::LensView;
 
 /// Name of the M0 test black hole.
@@ -134,12 +134,67 @@ pub fn iso_utc(epoch: Epoch) -> String {
 
 /// The baked Yale Bright Star Catalogue, `<data dir>/baked/bsc5.bin` (uni-data, Task 7).
 pub fn sky_path() -> PathBuf {
-    uni_data::data_dir().join("baked").join("bsc5.bin")
+    baked_dir().join("bsc5.bin")
+}
+
+/// `<data dir>/baked`: every baked data file the app reads.
+pub fn baked_dir() -> PathBuf {
+    uni_data::data_dir().join("baked")
 }
 
 /// `bookmarks/m0.ron` in the workspace: the M0 capture sheet and the windowed start view.
 pub fn m0_bookmarks_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bookmarks/m0.ron")
+}
+
+/// `bookmarks/sky-v1.ron` in the workspace: the `--sky v1` capture set and its windowed start
+/// view.
+pub fn sky_v1_bookmarks_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bookmarks/sky-v1.ron")
+}
+
+/// The epoch the `--sky v1` star catalogue's uni-sim world is built at: the baked data's start
+/// date, at which `comets_2026.ron` needs no comet settling (uni-sim `World::new`), so building
+/// the world costs no comet integration. The stars it yields do not depend on it.
+const SIM_WORLD_EPOCH_UTC: &str = "2026-11-20T00:00:00Z";
+
+/// The 3-D star catalogue of `--sky v1`, built as B9 will: `uni_sim::World::star_data()` of a
+/// uni-sim world over the baked data in `dir` (`load_world_data`), i.e. AT-HYG followed by the
+/// archive-only exoplanet hosts. The world is dropped afterwards; only its stars are kept.
+///
+/// Never panics. Without AT-HYG (missing or unreadable `athyg_m10.bin`) it returns no stars and
+/// uni-sim's warning for that file; the caller falls back to BSC5 or stops. The warnings about
+/// the other baked files are logged only (the sky v1 stack draws none of them).
+pub fn load_sky_v1_stars(dir: &Path) -> (Vec<Star3>, Vec<String>) {
+    let data = uni_sim::world::load_world_data(dir);
+    if data.stars.is_empty() {
+        let mut warnings: Vec<String> = data
+            .warnings
+            .iter()
+            .filter(|w| w.contains("athyg_m10.bin"))
+            .cloned()
+            .collect();
+        if warnings.is_empty() {
+            warnings.push(format!(
+                "athyg_m10.bin in {} holds no stars: no AT-HYG sky",
+                dir.display()
+            ));
+        }
+        return (Vec::new(), warnings);
+    }
+    for w in &data.warnings {
+        log::info!("sky v1 world data: {w}");
+    }
+    let Some(epoch) = Epoch::parse_iso_utc(SIM_WORLD_EPOCH_UTC) else {
+        return (
+            Vec::new(),
+            vec![format!(
+                "internal error: bad epoch {SIM_WORLD_EPOCH_UTC:?}: no AT-HYG sky"
+            )],
+        );
+    };
+    let world = uni_sim::world::World::new(data, epoch);
+    (world.star_data().to_vec(), Vec::new())
 }
 
 #[cfg(test)]
@@ -365,6 +420,106 @@ mod tests {
         assert_north_up(&b);
         assert!((b.view.fov_y_rad - 60_f64.to_radians()).abs() < 1e-15);
         assert_eq!(b.lens_scale, Some(1.0));
+    }
+
+    // ---- bookmarks/sky-v1.ron says what its comments say -----------------------------
+
+    fn sky_v1_marks() -> Vec<Bookmark> {
+        uni_nav::load_bookmarks(&sky_v1_bookmarks_path()).expect("bookmarks/sky-v1.ron loads")
+    }
+
+    #[test]
+    fn sky_v1_bookmarks_parse_and_copy_the_m0_sky_views() {
+        let marks = sky_v1_marks();
+        let names: Vec<&str> = marks.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "sky-wide-galactic-center",
+                "sky-wide-anticenter",
+                "sky-orion",
+                "sky-galactic-center",
+                "sky-zoom-sirius",
+            ]
+        );
+        // The three M0 sky views are copied unchanged.
+        for name in ["sky-orion", "sky-galactic-center", "sky-zoom-sirius"] {
+            let copy = marks.iter().find(|b| b.name == name).unwrap();
+            assert_eq!(copy, &bookmark(name), "{name}");
+        }
+        for b in &marks {
+            assert_eq!(
+                b.epoch_utc.as_deref(),
+                Some("2026-11-20T00:00:00Z"),
+                "{}",
+                b.name
+            );
+            assert_eq!(b.view.pos.delta_from(UniversePos::default()), DVec3::ZERO);
+            assert_eq!(b.lens_scale, None, "{}", b.name);
+            // Auto exposure with eye-adapted stars (the defaults), unless a field says otherwise.
+            assert_eq!((b.exposure, b.eye_adapted), (None, None), "{}", b.name);
+        }
+    }
+
+    #[test]
+    fn sky_v1_wide_views_look_at_the_centre_and_anticentre() {
+        let marks = sky_v1_marks();
+        let find = |name: &str| marks.iter().find(|b| b.name == name).unwrap().clone();
+        // The Galactic anticentre (l 180°, b 0°) is minus the galactic x axis, the first row of
+        // the ICRS → Galactic rotation (ESA 1997).
+        let anticentre = -DVec3::from_array(uni_core::ICRS_TO_GALACTIC[0]);
+        for (name, target) in [
+            (
+                "sky-wide-galactic-center",
+                radec_to_icrs(266.405_f64.to_radians(), (-28.936_f64).to_radians()),
+            ),
+            ("sky-wide-anticenter", anticentre),
+        ] {
+            let b = find(name);
+            assert!(
+                (b.view.fov_y_rad - 90_f64.to_radians()).abs() < 1e-15,
+                "{name}"
+            );
+            let (fwd, _, _) = axes(&b);
+            let a = angle(fwd, target);
+            assert!(a < 1e-12, "{name}: {a} rad off target");
+            assert_north_up(&b);
+        }
+        // The anticentre field holds Orion's belt (RA 83.8°, Dec −1.2°) inside its 45° half
+        // height, and the wide centre view shares sky-galactic-center's orientation.
+        let (fwd, _, _) = axes(&find("sky-wide-anticenter"));
+        let belt = radec_to_icrs(83.8_f64.to_radians(), (-1.2_f64).to_radians());
+        assert!(angle(fwd, belt) < 45_f64.to_radians());
+        assert_eq!(
+            find("sky-wide-galactic-center").view.orient,
+            bookmark("sky-galactic-center").view.orient
+        );
+    }
+
+    /// The committed AT-HYG bake loads through a uni-sim world: its 329 768 stars (A7) plus the
+    /// archive-only exoplanet hosts, with no warning.
+    #[test]
+    fn committed_athyg_loads_through_the_sim_world() {
+        let athyg = uni_data::load_athyg(&baked_dir().join("athyg_m10.bin")).unwrap();
+        let (stars, warnings) = load_sky_v1_stars(&baked_dir());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(athyg.len(), 329_768);
+        assert!(stars.len() >= athyg.len(), "{}", stars.len());
+        assert_eq!(&stars[..athyg.len()], &athyg[..]);
+    }
+
+    #[test]
+    fn sim_world_epoch_parses() {
+        assert!(Epoch::parse_iso_utc(SIM_WORLD_EPOCH_UTC).is_some());
+    }
+
+    /// Review Focus 3: no AT-HYG gives no stars and one warning naming the file, never a panic.
+    #[test]
+    fn missing_athyg_gives_no_stars_and_a_warning() {
+        let (stars, warnings) = load_sky_v1_stars(Path::new("/nonexistent"));
+        assert!(stars.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("athyg_m10.bin"), "{warnings:?}");
     }
 
     #[test]

@@ -7,6 +7,12 @@
 //! resolution equals `--size`, so the tonemap reads the HDR target 1:1. A GPU time the device
 //! did not measure validly is `null` in the JSON and "n/a" on the terminal, never 0 (review
 //! I5). Any uncaptured GPU error fails the run, so a broken frame is never published (m6).
+//!
+//! With `--sky v1` the scene is the sky v1 stack (`Scene::new_v1`): auto-exposure runs with
+//! `settle` (each frame jumps to the metered target, which the resolve reads one frame after the
+//! meter, so the default 4 frames are settled from the second on), and the JSON adds `sky` and
+//! the `ev100` [scene, star] the GPU resolved for the captured frame. Without the flag the run and
+//! its files are as before.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,10 +26,10 @@ use uni_gfx::{CAPTURE_FORMAT, CaptureTarget, GpuContext};
 use uni_ui::Hud;
 
 use crate::scene::{
-    CAPTURE_LENS_SCALE, Perf, Scene, apply_bookmark, default_controls, exposure, frame_ctx,
-    hud_data,
+    CAPTURE_LENS_SCALE, Perf, Scene, SkyCatalog, SkyExposure, SkyMode, apply_bookmark,
+    default_controls, frame_ctx, hud_data,
 };
-use crate::world::{World, iso_utc, sky_path};
+use crate::world::{World, baked_dir, iso_utc, load_sky_v1_stars, sky_path};
 
 /// Default capture size (brief).
 pub const DEFAULT_SIZE: UVec2 = UVec2::new(1920, 1080);
@@ -46,6 +52,8 @@ pub struct CaptureArgs {
     pub size: UVec2,
     pub frames: u32,
     pub hud: bool,
+    /// `--sky`: the M0 stack (default) or sky v1.
+    pub sky: SkyMode,
 }
 
 /// Why a capture run failed. The binary exits with 2 for [`CaptureError::MissingData`] and
@@ -82,6 +90,13 @@ pub struct CaptureMetrics {
     pub lens_scale: f32,
     /// The bookmark's epoch, `YYYY-MM-DDThh:mm:ssZ` (UTC, whole seconds).
     pub epoch_utc: String,
+    /// `"v1"` with `--sky v1`; left out of the JSON for the M0 sky.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sky: Option<&'static str>,
+    /// Sky v1: the [scene, star] EV100 the GPU resolved for the captured frame (read back after
+    /// its wait); left out for the M0 sky, whose exposure is the bookmark's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ev100: Option<[f32; 2]>,
 }
 
 /// The baked star catalogue, or [`CaptureError::MissingData`] (headless runs never render an
@@ -95,6 +110,26 @@ pub fn load_stars() -> Result<Vec<CatalogStar>, CaptureError> {
         )));
     }
     Ok(stars)
+}
+
+/// The star catalogue `sky` draws headless, or [`CaptureError::MissingData`]: BSC5 for the M0
+/// sky ([`load_stars`]); AT-HYG as `uni_sim::World::star_data()` for sky v1. A headless sky v1
+/// run without AT-HYG stops rather than fall back to BSC5 (as the window does), so a capture
+/// named sky v1 never shows another catalogue.
+pub fn load_catalog(sky: SkyMode) -> Result<SkyCatalog, CaptureError> {
+    match sky {
+        SkyMode::M0 => load_stars().map(SkyCatalog::Bsc5),
+        SkyMode::V1 => {
+            let (stars, warnings) = load_sky_v1_stars(&baked_dir());
+            if stars.is_empty() {
+                return Err(CaptureError::MissingData(format!(
+                    "{} (bake it with `cargo run -p uni-bake -- athyg ...`, see data/manifest.toml)",
+                    warnings.join("; ")
+                )));
+            }
+            Ok(SkyCatalog::AtHyg(stars))
+        }
+    }
 }
 
 /// A headless GPU that can render `size` (`flag` names the option in the error).
@@ -126,7 +161,7 @@ pub fn submit_and_wait(
 
 /// Renders every bookmark in `args.bookmarks` into `args.out`.
 pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
-    let stars = load_stars()?;
+    let catalog = load_catalog(args.sky)?;
     let bookmarks = uni_nav::load_bookmarks(&args.bookmarks)?;
     check_names(&bookmarks)?;
     std::fs::create_dir_all(&args.out)
@@ -134,8 +169,15 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
 
     let gpu = headless_gpu(args.size, "--size")?;
     // Internal resolution = output size: the tonemap reads the HDR target 1:1.
-    let mut scene = Scene::new(&gpu, args.size, CAPTURE_FORMAT, &stars, CAPTURE_LENS_SCALE)?;
-    drop(stars);
+    let mut scene = Scene::for_sky(
+        &gpu,
+        args.size,
+        CAPTURE_FORMAT,
+        args.sky,
+        &catalog,
+        CAPTURE_LENS_SCALE,
+    )?;
+    drop(catalog);
     let target = CaptureTarget::new(&gpu.device, args.size);
     let mut hud = args
         .hud
@@ -148,18 +190,21 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         world.epoch = DEFAULT_EPOCH;
         let mut controls = default_controls(CAPTURE_LENS_SCALE);
         let view = apply_bookmark(b, &mut world, &mut controls)?;
+        let sky_exposure = SkyExposure::from_bookmark(b);
         scene.set_lens_scale(controls.lens_scale);
         let size = scene.renderer.targets().size;
 
         let mut cpu_ms = 0.0;
         for f in 0..args.frames {
             let start = Instant::now();
+            // Sky v1 settles: each frame jumps to the metered target (a capture is a still).
+            let fe = scene.set_exposure(&controls, sky_exposure, true);
             let ctx = frame_ctx(
                 &world,
                 &view,
                 size,
                 size,
-                exposure(&controls),
+                fe.exposure,
                 frame_index,
                 CAPTURE_DT_S,
             );
@@ -167,7 +212,15 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             if let Some(hud) = hud.as_mut().filter(|_| f + 1 == args.frames) {
                 // The previous frame's GPU timings (the captured frame's are not measured yet).
                 let perf = Perf::from_renderer(&scene.renderer, &gpu, 0.0, cpu_ms);
-                let data = hud_data(&world, &ctx, perf, 0.0, scene.star_count, &[]);
+                let data = hud_data(
+                    &world,
+                    &ctx,
+                    perf,
+                    0.0,
+                    scene.star_count,
+                    &[],
+                    fe.settings.as_ref(),
+                );
                 let mut enc = gpu
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -209,6 +262,8 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             star_count: scene.star_count,
             lens_scale: controls.lens_scale,
             epoch_utc: iso_utc(world.epoch),
+            sky: (scene.sky() == SkyMode::V1).then_some("v1"),
+            ev100: scene.resolved_ev100(),
         };
         let json_path = args.out.join(format!("{}.json", b.name));
         write_metrics(&json_path, &metrics)?;
@@ -273,8 +328,11 @@ fn summary(png: &Path, m: &CaptureMetrics) -> String {
                 .join(", ")
         )
     };
+    let ev = m.ev100.map_or_else(String::new, |[scene, star]| {
+        format!("; EV100 scene {scene:.2}, stars {star:.2}")
+    });
     format!(
-        "captured {} ({}×{}): {gpu}; CPU {:.2} ms; {} stars; lens scale {}",
+        "captured {} ({}×{}): {gpu}; CPU {:.2} ms; {} stars; lens scale {}{ev}",
         png.display(),
         m.width,
         m.height,
@@ -304,6 +362,8 @@ mod tests {
             star_count: 9096,
             lens_scale: 1.0,
             epoch_utc: "2026-11-20T00:00:00Z".to_owned(),
+            sky: None,
+            ev100: None,
         };
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
@@ -331,6 +391,33 @@ mod tests {
         assert_eq!(v["epoch_utc"], "2026-11-20T00:00:00Z");
     }
 
+    /// Sky v1 adds `sky` and the resolved `ev100`; the M0 JSON keeps exactly the keys above.
+    #[test]
+    fn sky_v1_metrics_add_sky_and_ev100() {
+        let m = CaptureMetrics {
+            name: "sky-orion".to_owned(),
+            width: 4,
+            height: 3,
+            gpu_ms: BTreeMap::new(),
+            gpu_frame_ms: None,
+            cpu_ms: 0.5,
+            star_count: 329_768,
+            lens_scale: 1.0,
+            epoch_utc: String::new(),
+            sky: Some("v1"),
+            ev100: Some([-4.0, -4.0]),
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["sky"], "v1");
+        assert_eq!(v["ev100"], serde_json::json!([-4.0, -4.0]));
+        assert_eq!(v.as_object().unwrap().len(), 11);
+        let line = summary(Path::new("out/sky-orion.png"), &m);
+        assert!(
+            line.ends_with("329768 stars; lens scale 1; EV100 scene -4.00, stars -4.00"),
+            "{line}"
+        );
+    }
+
     #[test]
     fn metrics_are_written_as_json() {
         let path = std::env::temp_dir().join(format!(
@@ -347,6 +434,8 @@ mod tests {
             star_count: 0,
             lens_scale: 0.5,
             epoch_utc: "2000-01-01T11:58:55Z".to_owned(),
+            sky: None,
+            ev100: None,
         };
         write_metrics(&path, &m).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -385,6 +474,8 @@ mod tests {
             star_count: 7,
             lens_scale: 1.0,
             epoch_utc: String::new(),
+            sky: None,
+            ev100: None,
         };
         let line = summary(Path::new("out/x.png"), &m);
         assert!(line.contains("GPU ms n/a"), "{line}");
@@ -403,6 +494,8 @@ mod tests {
             star_count: 7,
             lens_scale: 1.0,
             epoch_utc: String::new(),
+            sky: None,
+            ev100: None,
         };
         let line = summary(Path::new("out/x.png"), &m);
         assert!(

@@ -9,6 +9,11 @@
 //! orientation, field of view, epoch and exposures) as a bookmark that `--capture` renders,
 //! with the lens traced at the capture scale of 1.0 rather than the window's slider value,
 //! and Esc quits. GPU errors are logged and shown on the HUD instead of aborting the app.
+//!
+//! With `--sky v1` the window runs the sky v1 stack (`Scene::new_v1`) and opens at
+//! `sky-wide-galactic-center` of `bookmarks/sky-v1.ron`. Its auto-exposure adapts over time (no
+//! settle); the HUD's scene slider is the manual EV that Auto starts from, the star slider the
+//! eye-adapted star EV. Without AT-HYG it falls back to the BSC5 stars with a HUD warning.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +22,6 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use glam::{DQuat, DVec3, UVec2};
 use uni_core::{CameraView, Epoch, UniversePos};
-use uni_data::CatalogStar;
 use uni_gfx::GpuContext;
 use uni_nav::{Action, Bookmark, FlyCamera, InputState};
 use uni_ui::{Hud, HudControls};
@@ -31,13 +35,18 @@ use winit::{
 };
 
 use crate::scene::{
-    INTERACTIVE_LENS_SCALE, Perf, Scene, apply_bookmark, default_controls, exposure, frame_ctx,
-    hud_data, internal_size,
+    INTERACTIVE_LENS_SCALE, Perf, Scene, SkyCatalog, SkyExposure, SkyMode, apply_bookmark,
+    default_controls, frame_ctx, hud_data, internal_size,
 };
-use crate::world::{World, iso_utc, m0_bookmarks_path, sky_path};
+use crate::world::{
+    World, baked_dir, iso_utc, load_sky_v1_stars, m0_bookmarks_path, sky_path,
+    sky_v1_bookmarks_path,
+};
 
 /// Bookmark the window opens at (brief).
 const START_BOOKMARK: &str = "start";
+/// Bookmark the window opens at with `--sky v1`, in `bookmarks/sky-v1.ron`.
+const SKY_V1_START_BOOKMARK: &str = "sky-wide-galactic-center";
 const WINDOW_TITLE: &str = "Universe";
 /// Initial window size in logical pixels.
 const WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 800.0);
@@ -53,20 +62,19 @@ const MAX_CAMERA_DT_S: f64 = 0.1;
 /// GPU error lines kept on the HUD (the most recent ones; review m6).
 const MAX_GPU_ERROR_NOTICES: usize = 3;
 
-/// Opens the window and runs until it is closed.
-pub fn run() -> anyhow::Result<()> {
-    let (stars, mut notices) = World::load_sky(&sky_path());
+/// Opens the window with the `sky` stack and runs until it is closed.
+pub fn run(sky: SkyMode) -> anyhow::Result<()> {
+    let (catalog, mut notices) = window_catalog(sky);
     for n in &notices {
         log::warn!("{n}");
     }
     let mut world = World::new(Epoch::J2000);
     let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
-    let view = start_view(
-        &m0_bookmarks_path(),
-        &mut world,
-        &mut controls,
-        &mut notices,
-    );
+    let (path, name) = match sky {
+        SkyMode::M0 => (m0_bookmarks_path(), START_BOOKMARK),
+        SkyMode::V1 => (sky_v1_bookmarks_path(), SKY_V1_START_BOOKMARK),
+    };
+    let (view, sky_exposure) = start_view(&path, name, &mut world, &mut controls, &mut notices);
 
     let event_loop = EventLoop::new().context("creating the event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -76,7 +84,9 @@ pub fn run() -> anyhow::Result<()> {
     desc.backends = wgpu::Backends::METAL;
     let mut app = App {
         instance: Some(wgpu::Instance::new(desc)),
-        stars,
+        sky,
+        catalog: Some(catalog),
+        sky_exposure,
         notices,
         flash: None,
         world,
@@ -98,32 +108,57 @@ pub fn run() -> anyhow::Result<()> {
     app.error.map_or(Ok(()), Err)
 }
 
-/// The start bookmark's view (applying its epoch and exposure), or a view from the SSB plus a
-/// HUD notice if it cannot be loaded.
+/// The window's star catalogue for `sky`, with its HUD notices: BSC5 for M0 (a missing file
+/// gives an empty sky and a notice, as before); for sky v1 AT-HYG as `uni_sim::World::star_data()`,
+/// or, when AT-HYG is missing, the BSC5 stars plus a notice saying so (B9 Step 1's fallback).
+fn window_catalog(sky: SkyMode) -> (SkyCatalog, Vec<String>) {
+    if sky == SkyMode::V1 {
+        let (stars, warnings) = load_sky_v1_stars(&baked_dir());
+        if !stars.is_empty() {
+            return (SkyCatalog::AtHyg(stars), warnings);
+        }
+        let (bsc5, mut notices) = World::load_sky(&sky_path());
+        notices.extend(warnings);
+        notices.push("No AT-HYG stars: sky v1 shows the BSC5 stars instead".to_owned());
+        return (SkyCatalog::Bsc5(bsc5), notices);
+    }
+    let (stars, notices) = World::load_sky(&sky_path());
+    (SkyCatalog::Bsc5(stars), notices)
+}
+
+/// Bookmark `name`'s view in `path` (applying its epoch and exposure) and its sky v1 exposure
+/// choices, or a view from the SSB with the default choices plus a HUD notice if it cannot be
+/// loaded.
 fn start_view(
     path: &Path,
+    name: &str,
     world: &mut World,
     controls: &mut HudControls,
     notices: &mut Vec<String>,
-) -> CameraView {
+) -> (CameraView, SkyExposure) {
     let start = uni_nav::load_bookmarks(path).and_then(|marks| {
         marks
             .into_iter()
-            .find(|b| b.name == START_BOOKMARK)
-            .with_context(|| format!("no bookmark {START_BOOKMARK:?} in {}", path.display()))
+            .find(|b| b.name == name)
+            .with_context(|| format!("no bookmark {name:?} in {}", path.display()))
     });
-    match start.and_then(|b| apply_bookmark(&b, world, controls)) {
-        Ok(view) => view,
+    let applied = start.and_then(|b| {
+        let view = apply_bookmark(&b, world, controls)?;
+        Ok((view, SkyExposure::from_bookmark(&b)))
+    });
+    match applied {
+        Ok(start) => start,
         Err(e) => {
             let msg = format!("Start view unavailable, starting at the SSB: {e:#}");
             log::warn!("{msg}");
             notices.push(msg);
-            CameraView {
+            let view = CameraView {
                 pos: UniversePos::default(),
                 orient: DQuat::IDENTITY,
                 fov_y_rad: FALLBACK_FOV_Y_RAD,
                 velocity_mps: DVec3::ZERO,
-            }
+            };
+            (view, SkyExposure::default())
         }
     }
 }
@@ -154,8 +189,12 @@ impl Gfx {
 struct App {
     /// Moved into the GPU context when the window is created.
     instance: Option<wgpu::Instance>,
+    /// The sky stack (`--sky`).
+    sky: SkyMode,
     /// Handed to the star pass when the window is created.
-    stars: Vec<CatalogStar>,
+    catalog: Option<SkyCatalog>,
+    /// Sky v1's exposure choices from the start bookmark (unused by the M0 stack).
+    sky_exposure: SkyExposure,
     /// HUD warnings that stay up (catalogue, start view).
     notices: Vec<String>,
     /// A HUD notice shown until the given time.
@@ -201,12 +240,16 @@ impl App {
             "the surface has no {srgb_format:?} view"
         );
         let internal = internal_size(UVec2::new(config.width, config.height));
-        let stars = std::mem::take(&mut self.stars);
-        let scene = Scene::new(
+        let catalog = self
+            .catalog
+            .take()
+            .context("the star catalogue was already handed to a scene")?;
+        let scene = Scene::for_sky(
             &gpu,
             internal,
             srgb_format,
-            &stars,
+            self.sky,
+            &catalog,
             self.controls.lens_scale,
         )?;
         let hud = Hud::new(&window, &gpu, plain_format);
@@ -271,13 +314,17 @@ impl App {
         }
 
         g.scene.set_lens_scale(self.controls.lens_scale);
+        // Sky v1 adapts over time in the window (no settle).
+        let fe = g
+            .scene
+            .set_exposure(&self.controls, self.sky_exposure, false);
         let output = UVec2::new(frame.texture.width(), frame.texture.height());
         let ctx = frame_ctx(
             &self.world,
             &self.camera.view,
             internal_size(output),
             output,
-            exposure(&self.controls),
+            fe.exposure,
             self.frame_index,
             dt,
         );
@@ -309,6 +356,7 @@ impl App {
             self.camera.speed_mps(),
             g.scene.star_count,
             &notices,
+            fe.settings.as_ref(),
         );
         let mut enc = g
             .gpu
@@ -484,13 +532,15 @@ mod tests {
         let mut world = World::new(Epoch::J2000);
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
         let mut notices = Vec::new();
-        let view = start_view(
+        let (view, sky_exposure) = start_view(
             &m0_bookmarks_path(),
+            START_BOOKMARK,
             &mut world,
             &mut controls,
             &mut notices,
         );
         assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(sky_exposure, SkyExposure::default());
         let (name, _) = world.nearest(&view.pos);
         assert_eq!(name, "TestBH-1");
         assert_eq!(
@@ -502,12 +552,35 @@ mod tests {
     }
 
     #[test]
+    fn sky_v1_start_view_is_the_wide_galactic_centre() {
+        let mut world = World::new(Epoch::J2000);
+        let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
+        let mut notices = Vec::new();
+        let (view, sky_exposure) = start_view(
+            &sky_v1_bookmarks_path(),
+            SKY_V1_START_BOOKMARK,
+            &mut world,
+            &mut controls,
+            &mut notices,
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(view.pos, UniversePos::default());
+        assert!((view.fov_y_rad - std::f64::consts::FRAC_PI_2).abs() < 1e-15);
+        assert_eq!(sky_exposure, SkyExposure::default());
+        assert_eq!(
+            world.epoch,
+            Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
     fn missing_bookmarks_start_at_the_ssb_with_a_notice() {
         let mut world = World::new(Epoch::J2000);
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
         let mut notices = Vec::new();
-        let view = start_view(
+        let (view, _) = start_view(
             Path::new("/nonexistent/m0.ron"),
+            START_BOOKMARK,
             &mut world,
             &mut controls,
             &mut notices,
@@ -525,8 +598,9 @@ mod tests {
         ));
         let mut world = World::new(Epoch::J2000);
         let mut controls = default_controls(0.75);
-        let view = start_view(
+        let (view, _) = start_view(
             &m0_bookmarks_path(),
+            START_BOOKMARK,
             &mut world,
             &mut controls,
             &mut Vec::new(),

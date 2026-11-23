@@ -20,6 +20,9 @@
 //! - **GPU passes**: the mean of each pass's valid measurements, "n/a" when it has none, and
 //!   the count of valid ones when some were invalid (review I5: never shown as 0).
 //!
+//! With `--sky v1` the scene is the sky v1 stack (`Scene::new_v1`), with auto-exposure settling
+//! each frame as in captures; a header line says so. Without the flag the run is as before.
+//!
 //! Not measured: present and vsync (there is no window), the HUD (the window draws egui on
 //! top) and thermal throttling over minutes (the M3 Air is fanless; a short bench runs cool).
 
@@ -31,9 +34,10 @@ use glam::UVec2;
 use uni_core::Epoch;
 use uni_gfx::{CAPTURE_FORMAT, CaptureTarget};
 
-use crate::capture::{CaptureError, headless_gpu, load_stars, ms_or_na, submit_and_wait};
+use crate::capture::{CaptureError, headless_gpu, load_catalog, ms_or_na, submit_and_wait};
 use crate::scene::{
-    INTERACTIVE_LENS_SCALE, Scene, apply_bookmark, default_controls, exposure, frame_ctx,
+    INTERACTIVE_LENS_SCALE, Scene, SkyExposure, SkyMode, apply_bookmark, default_controls,
+    frame_ctx,
 };
 use crate::world::World;
 
@@ -54,6 +58,8 @@ pub struct BenchArgs {
     pub bookmarks: PathBuf,
     pub size: UVec2,
     pub frames: u32,
+    /// `--sky`: the M0 stack (default) or sky v1.
+    pub sky: SkyMode,
 }
 
 /// Mean and 95th percentile (nearest rank) of a set of samples.
@@ -176,20 +182,27 @@ impl BookmarkBench {
 
 /// Benchmarks every bookmark in `args.bookmarks`, printing two lines per bookmark.
 pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
-    let stars = load_stars()?;
+    let catalog = load_catalog(args.sky)?;
     let bookmarks = uni_nav::load_bookmarks(&args.bookmarks)?;
     if bookmarks.is_empty() {
         return Err(anyhow::anyhow!("the bookmark file lists no bookmarks").into());
     }
     let gpu = headless_gpu(args.size, "--size")?;
-    let mut scene = Scene::new(
+    let mut scene = Scene::for_sky(
         &gpu,
         args.size,
         CAPTURE_FORMAT,
-        &stars,
+        args.sky,
+        &catalog,
         INTERACTIVE_LENS_SCALE,
     )?;
-    drop(stars);
+    drop(catalog);
+    if args.sky == SkyMode::V1 {
+        println!(
+            "bench: sky v1 (band, {} AT-HYG stars in 3-D, auto-exposure, bloom)",
+            scene.star_count
+        );
+    }
     let target = CaptureTarget::new(&gpu.device, args.size);
     let mut world = World::new(DEFAULT_EPOCH);
     world.time_rate = 0.0;
@@ -202,6 +215,7 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
         world.epoch = DEFAULT_EPOCH;
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
         let view = apply_bookmark(b, &mut world, &mut controls)?;
+        let sky_exposure = SkyExposure::from_bookmark(b);
         scene.set_lens_scale(controls.lens_scale);
         let mut result = BookmarkBench {
             name: b.name.clone(),
@@ -213,12 +227,13 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
         };
         for f in 0..WARMUP_FRAMES + args.frames {
             let start = Instant::now();
+            let fe = scene.set_exposure(&controls, sky_exposure, true);
             let ctx = frame_ctx(
                 &world,
                 &view,
                 args.size,
                 args.size,
-                exposure(&controls),
+                fe.exposure,
                 frame_index,
                 BENCH_DT_S,
             );
