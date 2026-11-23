@@ -2,11 +2,12 @@
 //!
 //! B1's probes: `ray_ellipsoid` (256 rays, including a camera 1 m above Earth), `equirect_uv`
 //! (256), `sun_visible_fraction` (256, B0's twin in `planet/eclipse.wgsl`), `reflectance` (64,
-//! the lunar-Lambert twin), `ring_transmittance` (64), `bodies_disk_flux` (the whole bodies pass
-//! renders an unmapped Lambert sphere into a 256² target; Σ L·Ω_pixel against
-//! `disk_illuminance_lux` within 2 %) and `bc_matches_fallback` (Earth's BC7 mip of width 2048
-//! decoded on the GPU against the 2k uncompressed copy over a 256 × 256 window: PSNR ≥ 38 dB;
-//! "skipped: no BC" without `TEXTURE_COMPRESSION_BC`). B2's probes are its own modules'
+//! the lunar-Lambert twin), `ring_transmittance` (64), `flux_match` (64, ruling W-B1's handover
+//! factor, review I3), `bodies_disk_flux` (the whole bodies pass renders an unmapped Lambert
+//! sphere into a 256² target; Σ L·Ω_pixel against `disk_illuminance_lux` within 2 %) and
+//! `bc_matches_fallback` (Earth's BC7 mip of width 2048 decoded on the GPU against the 2k
+//! uncompressed copy over a 256 × 256 window: PSNR ≥ 38 dB; "skipped: no BC" without
+//! `TEXTURE_COMPRESSION_BC`). B2's probes are its own modules'
 //! `star_probes` and `ring_probes`, called below.
 
 use std::f64::consts::PI;
@@ -24,7 +25,7 @@ use uni_gfx::{
 use uni_physics::photometry::{Brdf, disk_illuminance_lux, reflectance, rho_from_geometric_albedo};
 use uni_sim::snapshot::{BodyView, proj_radius_px};
 
-use crate::body::{BodyRenderer, BodyScene, ring_crossing_radius};
+use crate::body::{BodyRenderer, BodyScene, FLUX_MATCH_MAX, flux_match, ring_crossing_radius};
 use crate::{equirect_uv, ray_ellipsoid, ring_transmittance, sun_visible_fraction};
 
 /// Every uni-planet probe, registering its shaders in `lib`.
@@ -37,6 +38,7 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
         probe("sun_visible_fraction", check_sun_visible_fraction(gpu, lib)),
         probe("reflectance", check_reflectance(gpu, lib)),
         probe("ring_transmittance", check_ring_transmittance(gpu, lib)),
+        probe("flux_match", check_flux_match(gpu, lib)),
         probe("bodies_disk_flux", check_disk_flux(gpu, lib)),
         probe("bc_matches_fallback", check_bc_matches_fallback(gpu)),
     ];
@@ -126,6 +128,17 @@ fn cs_ring_transmittance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let r = ring_crossing_radius(a.xyz, b.xyz, a.w, b.w);
     let t = select(1.0, 1.0 - probe_opacity(r, a.w, b.w), r >= 0.0);
     probe_out[gid.x] = vec4<f32>(t, 0.0, 0.0, 0.0);
+}
+
+// In: (w, A, B, k_max), (sigma, 0, 0, 0). Out: (k, 0, 0, 0).
+@compute @workgroup_size(64)
+fn cs_flux_match(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_out)) {
+        return;
+    }
+    let h = probe_in[2u * gid.x];
+    let s = probe_in[2u * gid.x + 1u];
+    probe_out[gid.x] = vec4<f32>(flux_match(h, s.x), 0.0, 0.0, 0.0);
 }
 "#;
 
@@ -447,6 +460,43 @@ fn check_ring_transmittance(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result
         format!(
             "{} globe points ({shaded} under the annulus), max |GPU − CPU| {worst:.1e} \
              (tolerance {TOLERANCE:.0e})",
+            out.len()
+        ),
+    ))
+}
+
+/// 64 handover cases ((w, A, B, k_max), (σ, 0, 0, 0)): w across the band, A and B from the
+/// bodies' measured shares (Earth 2.864/0.405, Mars 2.463/1.622) and extremes that clamp k to 0
+/// and to k_max, and σ = 1 (one exposure), 1/2, 1/16 and 1/256 (eye-adapted stars 1, 4 and 8
+/// stops brighter than the scene).
+fn flux_match_inputs() -> Vec<[f32; 4]> {
+    let mut input = Vec::with_capacity(128);
+    for w in [0.0, 0.3, 0.97, 1.0] {
+        for (a, b) in [(1.0, 0.0), (2.864, 0.405), (2.463, 1.622), (40.0, 50.0)] {
+            for sigma in [1.0, 0.5, 1.0 / 16.0, 1.0 / 256.0] {
+                input.push([w, a, b, FLUX_MATCH_MAX]);
+                input.push([sigma, 0.0, 0.0, 0.0]);
+            }
+        }
+    }
+    input
+}
+
+/// GPU `flux_match` against its CPU twin.
+fn check_flux_match(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    let input = flux_match_inputs();
+    let out = run_twin(gpu, lib, "cs_flux_match", &input, 2)?;
+    let worst = worst(
+        input
+            .chunks_exact(2)
+            .zip(&out)
+            .map(|(c, g)| f64::from((flux_match(c[0], c[1][0]) - g[0]).abs())),
+    );
+    const TOLERANCE: f64 = 2e-5;
+    Ok((
+        worst <= TOLERANCE,
+        format!(
+            "{} cases, max |GPU − CPU| {worst:.1e} (tolerance {TOLERANCE:.0e})",
             out.len()
         ),
     ))
@@ -945,6 +995,7 @@ mod tests {
             "cs_sun_visible_fraction",
             "cs_reflectance",
             "cs_ring_transmittance",
+            "cs_flux_match",
         ] {
             assert!(
                 m.entry_points.iter().any(|e| e.name == entry),
@@ -974,6 +1025,23 @@ mod tests {
             })
             .count();
         assert!(hits > 64 && hits < 256 - 32, "{hits} hits");
+    }
+
+    /// The `flux_match` probe's 64 cases reach both clamps and the interior.
+    #[test]
+    fn flux_match_probe_inputs_cover_the_cases() {
+        let input = flux_match_inputs();
+        assert_eq!(input.len(), 2 * 64);
+        let ks: Vec<f32> = input
+            .chunks_exact(2)
+            .map(|c| flux_match(c[0], c[1][0]))
+            .collect();
+        assert!(ks.contains(&0.0), "clamped to 0");
+        assert!(ks.contains(&FLUX_MATCH_MAX), "clamped to k_max");
+        assert!(
+            ks.iter().any(|&k| k > 1.0 && k < FLUX_MATCH_MAX),
+            "interior"
+        );
     }
 
     /// The bodies_disk_flux probe's arithmetic on the CPU: the CPU twins rasterised over the

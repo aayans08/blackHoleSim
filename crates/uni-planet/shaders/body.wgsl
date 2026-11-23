@@ -19,7 +19,7 @@
 #import "planet/eclipse.wgsl"
 #import "atmo/ground_lighting.wgsl"
 
-// Twin of `uni_planet::body::BodyUniform` (14 vec4, 224 bytes, vec4 members only;
+// Twin of `uni_planet::body::BodyUniform` (15 vec4, 240 bytes, vec4 members only;
 // `body_uniforms_layout_match_wgsl`).
 struct BodyUniform {
     // Rows of the ICRS -> body-fixed rotation (xyz); w: 0. Body +z is the pole, +x the prime
@@ -34,8 +34,8 @@ struct BodyUniform {
     cam_unit: vec4<f32>,
     // xyz: Sun centre - body centre, body-fixed [m]; w: the Sun's radius [m].
     sun: vec4<f32>,
-    // rgb: E_sun [lx] x the Sun's colour (luminance 1) x the phase correction C x the W-B1
-    // flux cross-fade; w: exposure weight (0 star_pre ... 1 scene_pre).
+    // rgb: E_sun [lx] x the Sun's colour (luminance 1) x the phase correction C; w: exposure
+    // weight (0 star_pre ... 1 scene_pre).
     light: vec4<f32>,
     // rgb: reflectance multiplier (the map's albedo_scale, or the uniform rho without a map);
     // w: lunar-Lambert L (0 = Lambert).
@@ -46,6 +46,10 @@ struct BodyUniform {
     // x: map longitude offset [rad] (Venus's super-rotating cloud tops); y, z: ring shadow
     // inner and outer radius [m] (z <= y: none); w: number of occluders.
     extra: vec4<f32>,
+    // Ruling W-B1's point -> disk handover (see flux_match): x: w (0 at 1.5 px, 1 from 4 px);
+    // y: A, the point's flux over this pass's disk flux at k = 1; z: B, the atmosphere pass's
+    // in-scatter flux over the same; w: the bound of k.
+    handover: vec4<f32>,
     // xyz: occluder centre - body centre, body-fixed [m]; w: its radius [m].
     occluders: array<vec4<f32>, 4>,
 }
@@ -132,6 +136,15 @@ fn ring_transmittance(p: vec3<f32>, s: vec3<f32>, inner: f32, outer: f32) -> f32
     }
     let u = (r - inner) / (outer - inner);
     return 1.0 - textureSampleLevel(body_ring, body_ring_sampler, vec2<f32>(u, 0.5), 0.0).r;
+}
+
+// Ruling W-B1's factor k on this pass's light (CPU twin `uni_planet::body::flux_match`):
+// k = (1 - w) A + w + B (w - sigma), clamped to [0, k_max], sigma = scene_pre / pre. This pass
+// at k = 1 sends a disk flux D, the point sends A D, and the atmosphere pass adds B D at
+// scene_pre, so the total k D pre + B D scene_pre is pre [(1 - w) A D + w (D + B D)]: the
+// point's flux at 1.5 px, the real rendering from 4 px (k = 1), a linear cross-fade between.
+fn flux_match(h: vec4<f32>, sigma: f32) -> f32 {
+    return clamp((1.0 - h.x) * h.y + h.x + h.z * (h.x - sigma), 0.0, h.w);
 }
 
 // Reflectance factor R(mu0, mu), normalised by rho: lunar-Lambert 2 L mu0 / (mu0 + mu) +
@@ -276,9 +289,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> BodyOut {
     }
 
     // Atmosphere (uni-atmo group 2; neutral for airless bodies): the Sun's light left after the
-    // path down to this radius, and skylight per unit sun illuminance on horizontal ground.
-    let r_m = length(p_body);
-    let mu_s = dot(p_body / r_m, s);
+    // path down to the ground, and skylight per unit sun illuminance on horizontal ground. B3's
+    // contract (atmo/ground_lighting.wgsl): r is the atmosphere's bottom radius plus the height
+    // above the reference ellipsoid, 0 without terrain in M1 (|p| would put Earth's equator 7 km
+    // up and its poles 14 km down), and mu_s is taken about the surface normal. The W-B1
+    // handover tables evaluate the ground the same way (uni_planet::body::AtmoHandover).
+    let r_m = atmo_ground.radii.x;
+    let mu_s = mu0;
     let sun_t = atmo_sun_transmittance(r_m, mu_s);
     let sky = atmo_sky_irradiance(r_m, mu_s);
 
@@ -295,8 +312,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> BodyOut {
     }
 
     // Skylight is dimmed by an eclipse too (the sky above is lit by the same Sun).
-    let radiance = rho * body_u.light.rgb * (refl * sun_t + sky) * vis / PI;
     let pre = mix(star_pre(), scene_pre(), body_u.light.w);
+    let k = flux_match(body_u.handover, scene_pre() / max(pre, 1.0e-30));
+    let radiance = rho * body_u.light.rgb * k * (refl * sun_t + sky) * vis / PI;
     let lit = min(radiance * pre, vec3<f32>(HDR_MAX));
     var out: BodyOut;
     out.hdr = vec4<f32>(lit * coverage, coverage);

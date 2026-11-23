@@ -34,16 +34,18 @@
 //! [`BodyView::geometric_albedo`] and [`BodyView::mean_radius_m`]; every pixel's radiance is
 //! multiplied by Mallama & Hilton's phase correction C clamped to
 //! `uni_sim::snapshot::MAX_PHASE_CORRECTION`, the same clamp as the point path (A3 ruling). For
-//! the bodies drawn with an atmosphere the point flux cross-fades to the rendered disk over the
-//! 1.5–4 px band (ruling W-B1, [`body_light`]). The exposure factor blends from `star_pre` to
-//! `scene_pre` with [`crate::lod_exposure_mix`] while eye-adapted stars are in effect.
+//! the bodies drawn with an atmosphere the point flux cross-fades over the 1.5–4 px band to the
+//! whole rendered disk, this pass's ground as uni-atmo's pass dims it plus that pass's
+//! in-scatter (ruling W-B1, review I3: [`body_light`], [`flux_match`]; B3's disk share from its
+//! CPU twins, [`atmo_handover`]). The exposure factor blends from `star_pre` to `scene_pre` with
+//! [`crate::lod_exposure_mix`] while eye-adapted stars are in effect.
 //!
 //! No Earth- or Venus-specific calibration constant lives here (constraints §4a, W-B1..W-B3);
 //! `World::objects()` grows at run time, so nothing is sized per `ObjectId`: materials are keyed
 //! by NAIF id and the per-frame buffers grow with the number of bodies drawn.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::Context as _;
 use glam::{DMat3, DVec3, Vec2, Vec3};
@@ -54,13 +56,17 @@ use uni_gfx::{
     DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT,
     PassTimer, RenderFeature, ShaderLib, SharedInput,
 };
-use uni_physics::photometry::{Brdf, planet_phase_correction, rho_from_geometric_albedo};
+use uni_physics::photometry::{
+    Brdf, disk_phase_function, planet_phase_correction, rho_from_geometric_albedo,
+};
 use uni_sim::registry::ObjectId;
 use uni_sim::snapshot::{BodyView, MAX_PHASE_CORRECTION, StarSurfaceView};
 
 use crate::capmesh::{CAP_RINGS, CAP_SEGMENTS, cap_indices, cap_mesh};
 use crate::lod::lod_exposure_mix;
-use crate::material::{GpuMaps, Loaded, MaterialTable, SurfaceParams, load_pair, solid_texture};
+use crate::material::{
+    BT709, GpuMaps, Loaded, MaterialTable, SurfaceParams, load_pair, solid_texture,
+};
 
 /// What the bodies, star-surface and ring passes draw this frame (set by the app before
 /// `Renderer::render`; the three passes share one input).
@@ -114,7 +120,7 @@ pub(crate) struct BodyUniform {
     pub cam_unit: [f32; 4],
     /// Sun − body centre, body-fixed [m]; w: the Sun's radius [m].
     pub sun: [f32; 4],
-    /// E☉ × Sun colour × C × cross-fade; w: exposure weight.
+    /// E☉ × Sun colour × C; w: exposure weight.
     pub light: [f32; 4],
     /// Reflectance multiplier; w: lunar-Lambert L.
     pub albedo: [f32; 4],
@@ -122,6 +128,8 @@ pub(crate) struct BodyUniform {
     pub maps: [f32; 4],
     /// Longitude offset [rad], ring inner, ring outer [m], occluder count.
     pub extra: [f32; 4],
+    /// Ruling W-B1's handover: w, A, B, k_max ([`flux_match`]).
+    pub handover: [f32; 4],
     /// Occluder − body centre, body-fixed [m]; w radius [m].
     pub occluders: [[f32; 4]; 4],
 }
@@ -168,9 +176,11 @@ pub(crate) enum Placement {
 /// camera crossed its proxy):
 /// - outside the drawn ellipsoid ([`drawn_radii`]): that ellipsoid;
 /// - between the solid radii and the drawn ones (Venus, 0–70 km up, under its cloud deck): the
-///   solid radii, the surface under the deck, with no warning; the atmosphere pass draws the
-///   clouds and haze around the camera. Venus has no surface map, so the solid sphere carries
-///   the cloud-top map;
+///   solid radii, the surface under the deck, with no warning. Venus has no surface map, so the
+///   solid sphere carries the cloud-top map, and it is lit as at the deck (uni-atmo clamps the
+///   ground-lighting radius to its bottom radius, the deck). uni-atmo's pass draws nothing for
+///   Venus there yet (its `camera_origin` is `None` more than 1 m below the deck), so no clouds
+///   or haze surround the camera (review r1 N1, N2; a lead decision);
 /// - inside (or on) the solid body: nothing, "Inside <name>";
 /// - non-finite view data: nothing, and a warning that does not claim the camera is inside.
 pub(crate) fn placement(view: &BodyView, name: &str) -> Placement {
@@ -271,38 +281,74 @@ pub(crate) struct BodyLight {
     pub phase_rad: f64,
     /// Mallama & Hilton's C(α), clamped as in the point path.
     pub phase_correction: f64,
-    /// Ruling W-B1's point → disk flux factor: k₀ at 1.5 px, 1 from 4 px on.
-    pub flux_match: f64,
+    /// Ruling W-B1's flux weight w = [`lod_exposure_mix`]: 0 at 1.5 px, 1 from 4 px on.
+    pub flux_weight: f64,
+    /// A: the point's flux over this pass's own disk flux at k = 1 (1 when there is nothing to
+    /// match).
+    pub point_share: f64,
+    /// B: the atmosphere pass's in-scatter flux over this pass's disk flux at k = 1 (0 without
+    /// an atmosphere).
+    pub inscatter_share: f64,
     /// Exposure weight: 0 `star_pre` … 1 `scene_pre`.
     pub exposure_mix: f32,
 }
 
-/// The factors [`body_uniform`] uploads for `view` drawn with `radii` and disk-averaged
-/// reflectance `disk_rho` (the map's ρ̄, or the uniform ρ; `None` when unknown).
+impl BodyLight {
+    /// The uniform's `handover` vec4: (w, A, B, [`FLUX_MATCH_MAX`]).
+    pub fn handover(&self) -> [f32; 4] {
+        [
+            self.flux_weight as f32,
+            self.point_share as f32,
+            self.inscatter_share as f32,
+            FLUX_MATCH_MAX,
+        ]
+    }
+
+    /// Ruling W-B1's k at σ = scene_pre / pre ([`flux_match`], as the shader computes it).
+    #[cfg(test)]
+    pub fn flux_match(&self, sigma: f64) -> f64 {
+        f64::from(flux_match(self.handover(), sigma as f32))
+    }
+}
+
+/// The factors [`body_uniform`] uploads for `view` drawn with `radii`. `disk_rho` is the disk-
+/// averaged reflectance (the map's ρ̄, or the uniform ρ; `None` when unknown), `disk_colour` the
+/// map's mean colour normalised to luminance 1 (1 without a map), `sun_color` the Sun's colour
+/// (luminance 1). `atmo` gives B3's atmosphere over the body at a phase angle
+/// ([`atmo_handover`]); it is called only for a body with an atmosphere inside the 1.5–4 px band.
 ///
 /// - C = `planet_phase_correction(naif, brdf, α)` clamped to ≤ `MAX_PHASE_CORRECTION`, the
 ///   point path's clamp (A3 ruling), 1 without a NAIF id or for a NaN. C holds its value beyond
 ///   each law's fitted range; for Earth and Mars that hold starts at 170°, A3's choice, accepted
 ///   by the lead (A3 ruling).
 /// - Ruling W-B1: a body drawn with an atmosphere shows its real ground (Earth's ρ̄ 0.302 against
-///   ρ(p_V) 0.651; the atmosphere pass supplies the rest), so its disk is scaled by
-///   k = k₀ + (1 − k₀)·w, w = [`lod_exposure_mix`] (0 at 1.5 px, 1 at 4 px), with
-///   k₀ = (ρ(p_V)/ρ̄)·(R_mean/R_drawn)²: at 1.5 px the disk sends the point's flux (Venus is drawn
-///   at its cloud tops, 1.2 % larger), and from 4 px on its real rendering. Airless bodies keep
-///   k = 1 (their maps are solved for p_V). Without the map statistics (`disk_rho` `None`, a 2k
-///   copy missing; the HUD says so, review I1) k₀ = 1.
-///   **Precondition (review I3, open, awaiting a lead ruling):** k₀ makes this pass alone carry the
-///   point's whole flux at 1.5 px, so the total is continuous only if the atmosphere pass (B3)
-///   fades its own light by the same w. uni-atmo does not do that yet: once B3's in-scatter is
-///   calibrated to W-B1's target (ground + atmosphere = point), Earth at 1.5 px is
-///   (0.651 + 0.349)/0.651 ≈ 1.54× the point (+0.47 mag). Not fixable inside this pass: it does
-///   not know B3's disk share.
+///   ρ(p_V) 0.651) under B3's atmosphere, which adds its in-scatter and dims the ground. Its
+///   point flux cross-fades to that whole rendering over the 1.5–4 px band of
+///   [`lod_exposure_mix`]: this pass's light is scaled by k = [`flux_match`]`((w, A, B, k_max),
+///   σ)` (the shader computes σ = scene_pre/pre), so at 1.5 px this pass and the atmosphere pass
+///   together send the point's flux, and from 4 px on k = 1 (review I3: B3 draws its in-scatter
+///   at every size, unfaded, at scene_pre; uni-atmo `feature.rs` `misc[0] = 1`). In units of
+///   E·R_mean²/d², with ρ_p = ρ(p_V), R_d the drawn mean radius, R_b the preset's bottom radius
+///   and lum = BT.709 ⊙ the Sun's colour:
+///   - the point (uni-sim `reflected_lux`, Lambert): P = ρ_p·⅔Φ(α)·C;
+///   - this pass at k = 1: D = C·ρ̄·⅔Φ(α)·(R_d/R_mean)²·lum·(colour ⊙ ground factor);
+///   - B3's in-scatter: I = lum·in-scatter·(R_b/R_mean)²;
+///   - A = P/D, B = I/D (bounded by [`HANDOVER_SHARE_MAX`]).
+///
+///   Without B3's table (a body with no uni-atmo preset) A is the bare-ground ratio
+///   (ρ_p/ρ̄)·(R_mean/R_d)² and B = 0, fix round 0's k₀. A ground factor below
+///   [`HANDOVER_GROUND_MIN`] (Titan) leaves A = 1, B = 0. Airless bodies, w = 1, or no map
+///   statistics (`disk_rho` `None`, a 2k copy missing; the HUD says so, review I1) give A = 1,
+///   B = 0, so k = 1.
 /// - The exposure weight is w while eye-adapted stars are in effect, else 1 (scene exposure).
 pub(crate) fn body_light(
     view: &BodyView,
     radii: DVec3,
     disk_rho: Option<f64>,
+    disk_colour: Vec3,
+    sun_color: Vec3,
     eye_adapted: bool,
+    atmo: impl FnOnce(f64) -> Option<AtmoDisk>,
 ) -> BodyLight {
     let phase = angle(view.sun_rel_m, -view.rel_pos_m);
     let raw = view
@@ -315,18 +361,49 @@ pub(crate) fn body_light(
     };
     let w = f64::from(lod_exposure_mix(view.proj_radius_px));
     let drawn_mean = (radii.x * radii.y * radii.z).cbrt();
-    let k0 = match disk_rho {
-        Some(rho) if view.has_atmosphere && rho > 0.0 && drawn_mean > 0.0 => {
-            let area = (view.mean_radius_m / drawn_mean).powi(2);
-            rho_from_geometric_albedo(view.brdf, view.geometric_albedo) / rho * area
+    let (mut a, mut b) = (1.0, 0.0);
+    if let Some(rho) = disk_rho
+        && view.has_atmosphere
+        && rho > 0.0
+        && drawn_mean > 0.0
+        && w < 1.0
+    {
+        let r_mean = view.mean_radius_m;
+        let rho_p = rho_from_geometric_albedo(view.brdf, view.geometric_albedo);
+        // The bare-ground ratio: a Lambert sphere of ρ̄ drawn at R_d against the point.
+        a = rho_p / rho * (r_mean / drawn_mean).powi(2);
+        if view.brdf == Brdf::Lambert
+            && let Some(disk) = atmo(phase)
+        {
+            let lum = BT709 * sun_color.as_dvec3();
+            let ground = (lum * disk_colour.as_dvec3() * disk.ground_factor).element_sum();
+            if ground >= HANDOVER_GROUND_MIN {
+                a /= ground;
+                let d = phase_correction
+                    * rho
+                    * (2.0 / 3.0)
+                    * disk_phase_function(Brdf::Lambert, phase)
+                    * (drawn_mean / r_mean).powi(2)
+                    * ground;
+                let i = lum.dot(disk.inscatter) * (disk.bottom_m / r_mean).powi(2);
+                b = (i / d).min(HANDOVER_SHARE_MAX);
+            } else {
+                a = 1.0;
+            }
         }
-        _ => 1.0,
-    };
-    let k0 = if k0.is_finite() { k0 } else { 1.0 };
+    }
+    if !(a.is_finite() && a >= 0.0) {
+        a = 1.0;
+    }
+    if !(b.is_finite() && b >= 0.0) {
+        b = 0.0;
+    }
     BodyLight {
         phase_rad: phase,
         phase_correction,
-        flux_match: k0 + (1.0 - k0) * w,
+        flux_weight: w,
+        point_share: a,
+        inscatter_share: b,
         exposure_mix: if eye_adapted { w as f32 } else { 1.0 },
     }
 }
@@ -352,7 +429,7 @@ pub(crate) fn body_uniform(
         Brdf::Lambert => 0.0,
         Brdf::LunarLambert { l } => l as f32,
     };
-    let e = view.sun_illuminance_lux * light.phase_correction * light.flux_match;
+    let e = view.sun_illuminance_lux * light.phase_correction;
     let rgb = sun_color.as_dvec3() * e;
     let mut occluders = [[0.0; 4]; 4];
     let mut count = 0;
@@ -383,6 +460,7 @@ pub(crate) fn body_uniform(
             outer as f32,
             count as f32,
         ],
+        handover: light.handover(),
         occluders,
     }
 }
@@ -624,6 +702,15 @@ impl BodyRenderer {
             frame_vertices: Vec::new(),
         };
         renderer.rebuild_bind_groups(gpu);
+        // Ruling W-B1's handover tables of the bodies with an atmosphere (review I3), built in
+        // the background before any of them reaches the 1.5–4 px band.
+        warm_atmo_handover(
+            facts
+                .iter()
+                .map(|f| f.naif)
+                .filter(|&n| uni_atmo::preset_for(n).is_some())
+                .collect(),
+        );
         Ok(renderer)
     }
 
@@ -764,7 +851,19 @@ impl BodyRenderer {
                 self.table
                     .surface_for(view.naif, view.brdf, view.geometric_albedo, &name);
             self.warnings.extend(notes);
-            let light = body_light(view, radii, surface.disk_rho, scene.eye_adapted);
+            let colour = view
+                .naif
+                .and_then(|n| self.table.mean_albedo_rgb(n))
+                .unwrap_or(Vec3::ONE);
+            let light = body_light(
+                view,
+                radii,
+                surface.disk_rho,
+                colour,
+                self.sun_color,
+                scene.eye_adapted,
+                |phase| Some(atmo_handover(view.naif?)?.at(phase)),
+            );
             let ring = self
                 .ring
                 .as_ref()
@@ -1080,6 +1179,304 @@ pub fn ring_profile_opacity(profile: &RingProfile, r_m: f32) -> f32 {
     profile.samples[i][3] * (1.0 - f) + profile.samples[j][3] * f
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ruling W-B1's handover with B3's atmosphere drawn (review I3)
+
+/// Upper bound of ruling W-B1's flux factor k ([`flux_match`]). k grows as this pass's ground
+/// carries less of the disk's light; at phase 0 the point's share A is 1.6–2.9 for Venus, Mars
+/// and Earth and k at most A (`flux_match_cases`), and the bound keeps a thin crescent's ground
+/// from being scaled without limit.
+pub(crate) const FLUX_MATCH_MAX: f32 = 10.0;
+
+/// Below this ground factor (the ground's light left by the atmosphere, against a bare Lambert
+/// ground at the same phase) the ground cannot carry the point's flux: k stays 1 and the
+/// handover is the atmosphere pass's alone (Titan: its ground sits under τ ≈ 11 of haze, factor
+/// ~10⁻⁵).
+const HANDOVER_GROUND_MIN: f64 = 0.05;
+
+/// Bound of the in-scatter share B, so a Φ(α) → 0 near phase 180° gives a large finite share
+/// (k then clamps to 0), never ∞ or NaN.
+const HANDOVER_SHARE_MAX: f64 = 1.0e6;
+
+/// Phase-angle step of [`AtmoHandover`]'s tables [deg]: 0°, 10°, …, 180°.
+const HANDOVER_PHASE_STEP_DEG: f64 = 10.0;
+/// Entries of [`AtmoHandover`]'s tables.
+const HANDOVER_PHASES: usize = 19;
+/// Impact-parameter intervals of the disk quadrature over the ground (b < bottom radius), spaced
+/// b = R·sin(π/2·s) so they crowd toward the limb.
+const HANDOVER_GROUND_RINGS: usize = 24;
+/// Impact-parameter intervals over the shell beyond the limb, b = R + (top − R)·s², crowded
+/// toward the bottom where the air is densest.
+const HANDOVER_SHELL_RINGS: usize = 24;
+/// Azimuth intervals over the half disk (the integrands are mirror-symmetric about the plane of
+/// the camera and the Sun).
+const HANDOVER_AZIMUTHS: usize = 16;
+/// Nodes of the sun-transmittance table in √μ_s over [0, 1].
+const HANDOVER_SUN_T_NODES: usize = 64;
+/// Nodes of the sky-irradiance table in μ_s over [[`HANDOVER_SKY_MU_MIN`], 1] (steps of 0.05).
+const HANDOVER_SKY_NODES: usize = 29;
+/// Lowest Sun zenith cosine of the sky-irradiance table (the Sun 23.6° below the horizon; the
+/// sky is dark well before).
+const HANDOVER_SKY_MU_MIN: f64 = -0.4;
+
+/// One sample of the disk quadrature: the far camera on +x looks back along −x through the point
+/// (y, z) of the projected disk; `weight` is the sample's area [m²].
+#[derive(Clone, Copy, Debug)]
+struct DiskSample {
+    y: f64,
+    z: f64,
+    weight: f64,
+}
+
+/// A midpoint quadrature over the projected disk of a sphere of radius `bottom` and the shell up
+/// to `top`: `ground_rings` rings at b = bottom·sin(π/2·s) (crowded toward the limb, where the
+/// view path through the air lengthens), `shell_rings` at b = bottom + (top − bottom)·s²
+/// (crowded toward the dense bottom of the shell), each split into `azimuths` sectors of the half
+/// disk ψ ∈ [0, π] and weighted for both mirror halves.
+fn disk_quadrature(
+    bottom: f64,
+    top: f64,
+    ground_rings: usize,
+    shell_rings: usize,
+    azimuths: usize,
+) -> Vec<DiskSample> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let ground = (0..ground_rings).map(|k| {
+        let s = (k as f64 + 0.5) / ground_rings as f64;
+        let b = bottom * (FRAC_PI_2 * s).sin();
+        (
+            b,
+            b * bottom * FRAC_PI_2 * (FRAC_PI_2 * s).cos() / ground_rings as f64,
+        )
+    });
+    let shell = (0..shell_rings).map(|k| {
+        let s = (k as f64 + 0.5) / shell_rings as f64;
+        let b = bottom + (top - bottom) * s * s;
+        (b, b * 2.0 * (top - bottom) * s / shell_rings as f64)
+    });
+    let d_psi = 2.0 * PI / azimuths as f64;
+    ground
+        .chain(shell)
+        .flat_map(|(b, b_db)| {
+            (0..azimuths).map(move |m| {
+                let psi = PI * (m as f64 + 0.5) / azimuths as f64;
+                DiskSample {
+                    y: b * psi.cos(),
+                    z: b * psi.sin(),
+                    weight: b_db * d_psi,
+                }
+            })
+        })
+        .collect()
+}
+
+/// The ground lighting of one atmosphere at its bottom radius against the Sun's zenith cosine,
+/// tabulated from uni-atmo's CPU twins (`transmittance`, `sky_irradiance`: the functions behind
+/// `atmo_sun_transmittance` and `atmo_sky_irradiance`). The shader evaluates them at the same
+/// radius (B3's contract: no terrain in M1).
+struct GroundLightTable {
+    /// Sun transmittance at √μ_s = i/(n − 1).
+    sun_t: Vec<DVec3>,
+    /// Sky irradiance per unit sun illuminance at μ_s = min + i·step.
+    sky: Vec<DVec3>,
+    sky_step: f64,
+}
+
+impl GroundLightTable {
+    fn new(params: &uni_atmo::AtmosphereParams) -> Self {
+        let r = params.bottom_radius_m;
+        let sky_step = (1.0 - HANDOVER_SKY_MU_MIN) / (HANDOVER_SKY_NODES - 1) as f64;
+        Self {
+            sun_t: (0..HANDOVER_SUN_T_NODES)
+                .map(|i| {
+                    let s = i as f64 / (HANDOVER_SUN_T_NODES - 1) as f64;
+                    uni_atmo::transmittance(params, r, s * s).as_dvec3()
+                })
+                .collect(),
+            sky: (0..HANDOVER_SKY_NODES)
+                .map(|i| {
+                    let mu_s = HANDOVER_SKY_MU_MIN + i as f64 * sky_step;
+                    uni_atmo::sky_irradiance(params, r, mu_s).as_dvec3()
+                })
+                .collect(),
+            sky_step,
+        }
+    }
+
+    /// μ₀·T_sun(μ₀) + E_sky(μ₀): what a Lambert ground of unit ρ multiplies by E/π (the shader's
+    /// `refl * sun_t + sky`), linear between the nodes.
+    fn lit(&self, mu0: f64) -> DVec3 {
+        let direct = if mu0 > 0.0 {
+            let x = mu0.min(1.0).sqrt() * (HANDOVER_SUN_T_NODES - 1) as f64;
+            let i = (x.floor() as usize).min(HANDOVER_SUN_T_NODES - 2);
+            self.sun_t[i].lerp(self.sun_t[i + 1], x - i as f64) * mu0
+        } else {
+            DVec3::ZERO
+        };
+        let x = ((mu0 - HANDOVER_SKY_MU_MIN) / self.sky_step).max(0.0);
+        let i = (x.floor() as usize).min(HANDOVER_SKY_NODES - 2);
+        direct + self.sky[i].lerp(self.sky[i + 1], (x - i as f64).min(1.0))
+    }
+}
+
+/// B3's atmosphere over one body at one phase angle, per channel at (680, 550, 440) nm (B3's
+/// channels, drawn as linear R, G, B).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AtmoDisk {
+    /// The light this pass's Lambert ground sends after B3's pass, over a bare Lambert ground's
+    /// at the same phase: ∫ T_view·(μ₀·T_sun + E_sky)/π dA ÷ ∫ max(μ₀, 0)/π dA on the same
+    /// quadrature (T_view: the view ray's transmittance down to the ground, B3's dual-source
+    /// blend dst × T; T_sun and E_sky: `atmo_sun_transmittance`, `atmo_sky_irradiance`).
+    pub ground_factor: DVec3,
+    /// B3's in-scatter over the disk and the shell beyond the limb per lux of sunlight, ÷ the
+    /// bottom radius² (geometric-albedo units: Earth's is 0.063 at 550 nm and phase 0, B3's
+    /// report).
+    pub inscatter: DVec3,
+    /// The preset's bottom radius [m] (Venus: its cloud tops).
+    pub bottom_m: f64,
+}
+
+/// The two integrals of [`AtmoDisk`] for `params` at phase `phase_rad` on the quadrature
+/// `samples` (from [`disk_quadrature`] with the preset's radii): (in-scatter, ground factor), the
+/// factor `None` where the bare ground is unlit (phase 180°).
+fn atmo_disk(
+    params: &uni_atmo::AtmosphereParams,
+    light: &GroundLightTable,
+    samples: &[DiskSample],
+    phase_rad: f64,
+) -> (DVec3, Option<DVec3>) {
+    use std::f64::consts::PI;
+    let r = params.bottom_radius_m;
+    // The camera far along +x, the Sun at phase α from it.
+    let sun = DVec3::new(phase_rad.cos(), phase_rad.sin(), 0.0);
+    let far = 2.0 * params.top_radius_m;
+    let (mut ground, mut bare, mut inscatter) = (DVec3::ZERO, 0.0, DVec3::ZERO);
+    for s in samples {
+        let (scattered, t_view) = uni_atmo::segment_radiance(
+            params,
+            DVec3::new(far, s.y, s.z),
+            DVec3::NEG_X,
+            f64::INFINITY,
+            sun,
+        );
+        inscatter += scattered.as_dvec3() * s.weight;
+        let b2 = s.y * s.y + s.z * s.z;
+        if b2 < r * r {
+            let n = DVec3::new((r * r - b2).sqrt(), s.y, s.z) / r;
+            let mu0 = n.dot(sun);
+            ground += t_view.as_dvec3() * light.lit(mu0) * (s.weight / PI);
+            bare += mu0.max(0.0) * s.weight / PI;
+        }
+    }
+    let factor = (bare > 0.0).then(|| ground / bare);
+    (inscatter / (r * r), factor)
+}
+
+/// [`AtmoDisk`] tables of one atmosphere body, against phase angle in
+/// [`HANDOVER_PHASE_STEP_DEG`] steps. Built once per body (about 15 000 view marches, plus B3's
+/// CPU LUTs on their first use).
+#[derive(Clone, Debug)]
+pub(crate) struct AtmoHandover {
+    bottom_m: f64,
+    ground_factor: [DVec3; HANDOVER_PHASES],
+    inscatter: [DVec3; HANDOVER_PHASES],
+}
+
+impl AtmoHandover {
+    /// The tables for `params` on the default quadrature.
+    pub fn compute(params: &uni_atmo::AtmosphereParams) -> Self {
+        let samples = disk_quadrature(
+            params.bottom_radius_m,
+            params.top_radius_m,
+            HANDOVER_GROUND_RINGS,
+            HANDOVER_SHELL_RINGS,
+            HANDOVER_AZIMUTHS,
+        );
+        let light = GroundLightTable::new(params);
+        let mut ground_factor = [DVec3::ONE; HANDOVER_PHASES];
+        let mut inscatter = [DVec3::ZERO; HANDOVER_PHASES];
+        for j in 0..HANDOVER_PHASES {
+            let phase = (j as f64 * HANDOVER_PHASE_STEP_DEG).to_radians();
+            let (i, g) = atmo_disk(params, &light, &samples, phase);
+            inscatter[j] = i;
+            // At 180° the bare ground is unlit: hold the factor of the previous phase.
+            ground_factor[j] = g.unwrap_or(if j > 0 {
+                ground_factor[j - 1]
+            } else {
+                DVec3::ONE
+            });
+        }
+        Self {
+            bottom_m: params.bottom_radius_m,
+            ground_factor,
+            inscatter,
+        }
+    }
+
+    /// The atmosphere at phase `phase_rad`, linear between the tabulated phases.
+    pub fn at(&self, phase_rad: f64) -> AtmoDisk {
+        let x = (phase_rad.abs().to_degrees() / HANDOVER_PHASE_STEP_DEG)
+            .clamp(0.0, (HANDOVER_PHASES - 1) as f64);
+        let i = (x.floor() as usize).min(HANDOVER_PHASES - 2);
+        let f = x - i as f64;
+        AtmoDisk {
+            ground_factor: self.ground_factor[i].lerp(self.ground_factor[i + 1], f),
+            inscatter: self.inscatter[i].lerp(self.inscatter[i + 1], f),
+            bottom_m: self.bottom_m,
+        }
+    }
+}
+
+/// The [`AtmoHandover`] of body `naif`, built on first use and shared (every renderer, every
+/// thread); `None` for a body without a uni-atmo preset. A caller that finds it being built by
+/// another thread ([`warm_atmo_handover`]) waits for it, so the result never depends on timing.
+pub(crate) fn atmo_handover(naif: i32) -> Option<Arc<AtmoHandover>> {
+    type Cell = Arc<OnceLock<Option<Arc<AtmoHandover>>>>;
+    static CELLS: Mutex<Vec<(i32, Cell)>> = Mutex::new(Vec::new());
+    let cell = {
+        let mut cells = CELLS.lock().unwrap_or_else(PoisonError::into_inner);
+        match cells.iter().find(|(n, _)| *n == naif) {
+            Some((_, cell)) => Arc::clone(cell),
+            None => {
+                let cell = Cell::default();
+                cells.push((naif, Arc::clone(&cell)));
+                cell
+            }
+        }
+    };
+    cell.get_or_init(|| uni_atmo::preset_for(naif).map(|p| Arc::new(AtmoHandover::compute(&p))))
+        .clone()
+}
+
+/// Builds the [`AtmoHandover`] of each of `naifs` on a background thread, so a body entering the
+/// 1.5–4 px band seldom waits for its table (about 1.4 s per body in the unoptimised test build,
+/// most of it B3's CPU LUTs). If the thread cannot start, each table is built on first use.
+fn warm_atmo_handover(naifs: Vec<i32>) {
+    if naifs.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("uni-planet handover".into())
+        .spawn(move || {
+            for naif in naifs {
+                atmo_handover(naif);
+            }
+        });
+}
+
+/// Twin of `flux_match` in `body.wgsl`: ruling W-B1's factor k on this pass's light, from the
+/// uniform's `handover` = (w, A, B, k_max) and σ = scene_pre / pre (pre: this pass's exposure).
+///
+/// k = (1 − w)·A + w + B·(w − σ), clamped to [0, k_max]. With this pass's own disk flux D (at
+/// k = 1), the point's P = A·D and the atmosphere pass's in-scatter I = B·D (written at
+/// scene_pre), the total k·D·pre + I·scene_pre equals pre·[(1 − w)·P + w·(D + I)]: the point's
+/// flux at 1.5 px (w = 0, pre = star_pre while eye-adapted stars are in effect), the real
+/// rendering from 4 px (w = 1, k = 1), and a linear cross-fade between.
+pub(crate) fn flux_match(handover: [f32; 4], sigma: f32) -> f32 {
+    let [w, a, b, k_max] = handover;
+    ((1.0 - w) * a + w + b * (w - sigma)).clamp(0.0, k_max)
+}
+
 /// East-longitude offset [deg, in 0..360] of Venus's cloud-top map at epoch `t`: retrograde
 /// super-rotation with a [`VENUS_CLOUD_TOP_PERIOD_D`] (4.0-day) period relative to the surface
 /// (Sánchez-Lavega et al. 2017, Space Sci. Rev. 212, 1541), not the 243-day surface rate
@@ -1311,19 +1708,42 @@ mod tests {
         }
     }
 
-    /// Review Focus 4: at the 1.5 px handover the resolved disk carries the point's energy. The
-    /// point path's flux is the closed form ρ·[L + 2(1 − L)/3]·E·(R/d)²·Φ(α)·C (uni-sim
-    /// `reflected_lux`) at star exposure; the disk's is the integral over what the shader writes
-    /// (`disk_illuminance_lux` with the map's disk-averaged ρ̄ and the drawn radius) times the
-    /// per-body factors [`body_light`] uploads, at the blended exposure. Earth and Venus
-    /// exercise the W-B1 cross-fade (ρ̄ ≠ ρ(p_V), Venus drawn at its cloud tops); the others
-    /// have ρ̄ = ρ(p_V). Also: the factors reach the real rendering by 4 px and change smoothly.
+    /// The disk integrals of B3's atmosphere for `naif` at `phase` on a quadrature finer than
+    /// the table's in every direction (64 + 64 rings × 48 azimuths against 24 + 24 × 16), at
+    /// the exact phase: the reference the table and the handover are checked against.
+    fn fine_atmo(naif: i32, phase: f64) -> AtmoDisk {
+        let p = uni_atmo::preset_for(naif).unwrap();
+        let samples = disk_quadrature(p.bottom_radius_m, p.top_radius_m, 64, 64, 48);
+        let light = GroundLightTable::new(&p);
+        let (inscatter, factor) = atmo_disk(&p, &light, &samples, phase);
+        AtmoDisk {
+            ground_factor: factor.unwrap(),
+            inscatter,
+            bottom_m: p.bottom_radius_m,
+        }
+    }
+
+    /// Review Focus 4 and review I3: at the 1.5 px handover the body carries the point's energy.
+    /// The point path's flux is the closed form ρ·[L + 2(1 − L)/3]·E·(R/d)²·Φ(α)·C (uni-sim
+    /// `reflected_lux`) at star exposure. The disk's is what this pass writes
+    /// (`disk_illuminance_lux` with the map's disk-averaged ρ̄ and the drawn radius, times C and
+    /// k) at the blended exposure, plus, for the bodies with an atmosphere, what B3's pass does
+    /// to it: the ground dimmed by its ground factor and B3's in-scatter added at scene
+    /// exposure, both from [`fine_atmo`] at the exact phase (finer than the table [`body_light`]
+    /// reads, and between its 10° nodes). Checked with eye-adapted stars (star EV −4 against
+    /// scene EV 10) and without (one exposure). Earth, Mars and Venus exercise the cross-fade
+    /// (Venus drawn at its cloud tops); the airless bodies have ρ̄ = ρ(p_V) and k = 1. Titan's
+    /// ground is hidden under its haze, so k stays 1 there and the handover is B3's: its gap is
+    /// printed and bounded below. Also: k reaches 1 by 4 px, and the cross-fade is exact and
+    /// smooth through the band.
     #[test]
     fn point_disk_handover_flux_continuous() {
-        let (star_pre, scene_pre) = (exposure_scale(-4.0), exposure_scale(10.0));
         let fov = 60f64.to_radians();
+        let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
+        // Mars's map is red: a luminance-1 colour, so the ground's channels weigh as drawn.
+        let red = Vec3::new(1.8, 0.85, 0.55) / Vec3::new(1.8, 0.85, 0.55).dot(BT709.as_vec3());
         // (name, naif, brdf, p_V, mean radius [m], atmosphere, disk-averaged ρ̄ of the map or
-        // None for no map, phase [deg]). ρ̄ values: A8's index (`source` strings).
+        // None for no map, map colour, phase [deg]). ρ̄ values: A8's index (`source` strings).
         let cases = [
             (
                 "Moon",
@@ -1333,6 +1753,7 @@ mod tests {
                 1_737_400.0,
                 false,
                 Some(0.1241),
+                Vec3::ONE,
                 60.0,
             ),
             (
@@ -1343,7 +1764,8 @@ mod tests {
                 3_389_500.0,
                 true,
                 Some(0.2550),
-                40.0,
+                red,
+                45.0,
             ),
             (
                 "Earth",
@@ -1353,7 +1775,19 @@ mod tests {
                 6_371_000.0,
                 true,
                 Some(0.3019),
-                90.0,
+                Vec3::ONE,
+                0.0,
+            ),
+            (
+                "Earth",
+                Some(399),
+                Brdf::Lambert,
+                0.434,
+                6_371_000.0,
+                true,
+                Some(0.3019),
+                Vec3::ONE,
+                85.0,
             ),
             (
                 "Venus",
@@ -1363,7 +1797,19 @@ mod tests {
                 6_051_800.0,
                 true,
                 Some(0.95),
-                100.0,
+                Vec3::ONE,
+                105.0,
+            ),
+            (
+                "Titan",
+                Some(606),
+                Brdf::Lambert,
+                0.22,
+                2_574_730.0,
+                true,
+                None,
+                Vec3::ONE,
+                30.0,
             ),
             (
                 "Jupiter",
@@ -1373,6 +1819,7 @@ mod tests {
                 69_911e3,
                 false,
                 Some(0.8072),
+                Vec3::ONE,
                 10.0,
             ),
             (
@@ -1383,79 +1830,290 @@ mod tests {
                 788_900.0,
                 false,
                 None,
+                Vec3::ONE,
                 30.0,
             ),
         ];
-        for (name, naif, brdf, p_v, radius, atmo, map_rho, phase_deg) in cases {
+        let lum = BT709 * sun_color.as_dvec3();
+        for (name, naif, brdf, p_v, radius, atmo, map_rho, colour, phase_deg) in cases {
             let phase = f64::to_radians(phase_deg);
             let rho_point = rho_from_geometric_albedo(brdf, p_v);
             let disk_rho = map_rho.unwrap_or(rho_point);
-            let energy_at = |px: f64| {
-                let dist = radius / (px * 2.0 * (0.5 * fov).tan() / 1080.0).atan().sin();
-                let v = view(naif, brdf, p_v, radius, atmo, dist, phase, px);
-                assert!((proj_radius_px(radius, dist, fov, 1080.0) - px).abs() < 1e-6);
-                let radii = drawn_radii(&v);
-                let light = body_light(&v, radii, Some(disk_rho), true);
-                let drawn_r = (radii.x * radii.y * radii.z).cbrt();
-                let disk = disk_illuminance_lux(brdf, disk_rho, drawn_r, 1.2e5, phase, dist)
-                    * light.phase_correction
-                    * light.flux_match;
-                let pre = star_pre + (scene_pre - star_pre) * light.exposure_mix;
-                // The point path (uni-sim `reflected_lux`): C clamped to ≤ 10 (A3 ruling).
-                let c = naif
-                    .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
-                    .min(MAX_PHASE_CORRECTION);
-                let weight = match brdf {
-                    Brdf::Lambert => 2.0 / 3.0,
-                    Brdf::LunarLambert { l } => l + 2.0 * (1.0 - l) / 3.0,
+            let truth = atmo.then(|| fine_atmo(naif.unwrap(), phase));
+            for eye_adapted in [true, false] {
+                let star_pre = f64::from(exposure_scale(if eye_adapted { -4.0 } else { 10.0 }));
+                let scene_pre = f64::from(exposure_scale(10.0));
+                // (exposed disk + atmosphere, exposed point, exposed target of the cross-fade,
+                // light) at a projected radius of `px`.
+                let energy_at = |px: f64| {
+                    let dist = radius / (px * 2.0 * (0.5 * fov).tan() / 1080.0).atan().sin();
+                    let v = view(naif, brdf, p_v, radius, atmo, dist, phase, px);
+                    assert!((proj_radius_px(radius, dist, fov, 1080.0) - px).abs() < 1e-6);
+                    let radii = drawn_radii(&v);
+                    let light = body_light(
+                        &v,
+                        radii,
+                        Some(disk_rho),
+                        colour,
+                        sun_color,
+                        eye_adapted,
+                        |p| Some(atmo_handover(naif?)?.at(p)),
+                    );
+                    let drawn_r = (radii.x * radii.y * radii.z).cbrt();
+                    let bare = disk_illuminance_lux(brdf, disk_rho, drawn_r, 1.2e5, phase, dist)
+                        * light.phase_correction;
+                    // This pass at k = 1 as B3's pass leaves it, and B3's in-scatter [lx].
+                    let (own, inscatter) = match &truth {
+                        Some(t) => (
+                            bare * (lum * colour.as_dvec3() * t.ground_factor).element_sum(),
+                            lum.dot(t.inscatter) * 1.2e5 * (t.bottom_m / dist).powi(2),
+                        ),
+                        None => (bare, 0.0),
+                    };
+                    let pre = star_pre + (scene_pre - star_pre) * f64::from(light.exposure_mix);
+                    let k = light.flux_match(scene_pre / pre);
+                    // The point path (uni-sim `reflected_lux`): C clamped to ≤ 10 (A3 ruling).
+                    let c = naif
+                        .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
+                        .min(MAX_PHASE_CORRECTION);
+                    assert!((light.phase_correction - c).abs() < 1e-12, "{name}");
+                    let weight = match brdf {
+                        Brdf::Lambert => 2.0 / 3.0,
+                        Brdf::LunarLambert { l } => l + 2.0 * (1.0 - l) / 3.0,
+                    };
+                    let ratio = radius / dist;
+                    let point = rho_point
+                        * weight
+                        * 1.2e5
+                        * ratio
+                        * ratio
+                        * disk_phase_function(brdf, phase)
+                        * c;
+                    let w = light.flux_weight;
+                    let target = pre * ((1.0 - w) * point + w * (own + inscatter));
+                    // Fix round 1's k₀ = (ρ_p/ρ̄)·(R_mean/R_d)², blind to B3: the same factors
+                    // without the atmosphere table (printed for the report).
+                    let old = body_light(
+                        &v,
+                        radii,
+                        Some(disk_rho),
+                        colour,
+                        sun_color,
+                        eye_adapted,
+                        |_| None,
+                    )
+                    .flux_match(scene_pre / pre);
+                    (
+                        k * own * pre + inscatter * scene_pre,
+                        point * star_pre,
+                        target,
+                        light,
+                        k,
+                        old * own * pre + inscatter * scene_pre,
+                    )
                 };
-                let ratio = radius / dist;
-                let point = rho_point
-                    * weight
-                    * 1.2e5
-                    * ratio
-                    * ratio
-                    * disk_phase_function(brdf, phase)
-                    * c;
-                assert!((light.phase_correction - c).abs() < 1e-12, "{name}");
-                (disk * f64::from(pre), point * f64::from(star_pre), light)
-            };
-            let (disk, point, light) = energy_at(1.5);
-            let gap = disk / point - 1.0;
-            eprintln!("{name}: disk/point at 1.5 px = {:.5}", disk / point);
-            assert!(gap.abs() < 0.05, "{name}: disk {disk} vs point {point}");
-            assert_eq!(light.exposure_mix, 0.0, "{name}");
-            // By 4 px: scene exposure and the real rendering (no cross-fade left).
-            let (_, _, light4) = energy_at(4.0);
-            assert_eq!(light4.exposure_mix, 1.0, "{name}");
-            assert!(
-                (light4.flux_match - 1.0).abs() < 1e-12,
-                "{name}: {light4:?}"
-            );
-            // Continuous through the band: the cross-fade stays between k₀ and 1 and the exposure
-            // weight between 0 and 1, and neither steps by more than 3 % of its range between
-            // neighbouring sizes (smoothstep in ln r: at most 1.5 × the mean slope, 1.5 % here).
-            // The exposed energy itself changes by orders of magnitude across the band, from
-            // star_pre to scene_pre: that is the eye-adapted blend's purpose.
-            let k0 = light.flux_match;
-            let mut prev = light;
-            for k in 1..=100 {
-                let (e, _, l) = energy_at(1.5 + 2.5 * f64::from(k) / 100.0);
-                assert!(e.is_finite() && e > 0.0, "{name} step {k}");
-                let (lo, hi) = (k0.min(1.0), k0.max(1.0));
-                assert!(
-                    (lo - 1e-12..=hi + 1e-12).contains(&l.flux_match),
-                    "{name} step {k}"
+                let (disk, point, _, light, k0, old) = energy_at(1.5);
+                let gap = disk / point - 1.0;
+                let mag = |x: f64| -2.5 * x.log10();
+                eprintln!(
+                    "{name} {phase_deg}° eye-adapted {eye_adapted}: (disk + atmosphere)/point at \
+                     1.5 px = {:.4} ({:+.3} mag; fix round 1's k₀ gave {:.4}, {:+.3} mag); \
+                     A {:.3}, B {:.3}, k {k0:.3}",
+                    disk / point,
+                    mag(disk / point),
+                    old / point,
+                    mag(old / point),
+                    light.point_share,
+                    light.inscatter_share,
                 );
-                let dk = (l.flux_match - prev.flux_match).abs();
-                assert!(
-                    dk <= 0.03 * (k0 - 1.0).abs() + 1e-12,
-                    "{name} step {k}: Δk {dk}"
+                assert_eq!(light.flux_weight, 0.0, "{name}");
+                if name == "Titan" {
+                    // Titan's ground is hidden (ground factor < HANDOVER_GROUND_MIN): k = 1, and
+                    // the step at 1.5 px is the atmosphere pass's (it draws at scene exposure
+                    // and does not fade; review I3, out of this pass's reach).
+                    let t = truth.as_ref().unwrap();
+                    assert!((lum * t.ground_factor).element_sum() < HANDOVER_GROUND_MIN);
+                    assert_eq!((light.point_share, light.inscatter_share), (1.0, 0.0));
+                    assert_eq!(k0, 1.0);
+                    if !eye_adapted {
+                        assert!(gap.abs() < 0.3, "Titan, one exposure: {gap}");
+                    }
+                } else {
+                    assert!(gap.abs() < 0.03, "{name}: disk {disk} vs point {point}");
+                }
+                assert_eq!(
+                    light.exposure_mix,
+                    if eye_adapted { 0.0 } else { 1.0 },
+                    "{name}"
                 );
-                let dw = (l.exposure_mix - prev.exposure_mix).abs();
-                assert!((0.0..=0.03).contains(&dw), "{name} step {k}: Δw {dw}");
-                prev = l;
+                // By 4 px: scene exposure and the real rendering (no cross-fade left).
+                let (_, _, _, light4, k4, _) = energy_at(4.0);
+                assert_eq!(light4.exposure_mix, 1.0, "{name}");
+                assert_eq!(light4.flux_weight, 1.0, "{name}");
+                assert_eq!(k4, 1.0, "{name}: {light4:?}");
+                // Through the band the total stays within 3 % of the cross-fade of the point
+                // into the real rendering (k from the table, the rendering from fine_atmo), k
+                // stays in [0, k_max], and the exposure weight steps by at most 3 % between
+                // neighbouring sizes (smoothstep in ln r: at most 1.5 × the mean slope, 1.5 %
+                // here). With one exposure k is linear in w, so it steps by at most 3 % of
+                // |k₀ − 1|. With eye-adapted stars this pass's exposure falls 14 stops across the
+                // band while B3's in-scatter stays at scene_pre, so k must move fast near 4 px
+                // (σ = scene_pre/pre rises from 6e-5 to 1 in the last 1 % of w) for the exposed
+                // total to stay on the cross-fade; the exposed energy itself changes by orders
+                // of magnitude across the band, which is the eye-adapted blend's purpose.
+                let (mut prev, mut prev_k) = (light, k0);
+                for step in 1..=100 {
+                    let (e, _, target, l, k, _) = energy_at(1.5 + 2.5 * f64::from(step) / 100.0);
+                    assert!(e.is_finite() && e > 0.0, "{name} step {step}");
+                    assert!(
+                        (0.0..=f64::from(FLUX_MATCH_MAX)).contains(&k),
+                        "{name} {step}"
+                    );
+                    // (The airless bodies have k = 1 by design: their maps are solved for p_V.)
+                    let fades = light.point_share != 1.0 || light.inscatter_share != 0.0;
+                    if fades && k > 0.0 && k < f64::from(FLUX_MATCH_MAX) {
+                        let off = e / target - 1.0;
+                        assert!(off.abs() < 0.03, "{name} step {step}: {off}");
+                    }
+                    let dk = (k - prev_k).abs();
+                    if !eye_adapted {
+                        assert!(
+                            dk <= 0.03 * (k0 - 1.0).abs() + 1e-6,
+                            "{name} {step}: Δk {dk}"
+                        );
+                    }
+                    let dw = (l.exposure_mix - prev.exposure_mix).abs();
+                    assert!((0.0..=0.03).contains(&dw), "{name} step {step}: Δw {dw}");
+                    (prev, prev_k) = (l, k);
+                }
             }
+        }
+    }
+
+    /// The disk quadrature: its weights cover the disk and shell exactly (π·top²), and over a
+    /// bare Lambert ground it reproduces ⅔Φ(α) (Russell 1916) to 1 % up to 150° (the ground
+    /// factor is a ratio on this same quadrature, so its error largely cancels).
+    #[test]
+    fn disk_quadrature_matches_lambert() {
+        use std::f64::consts::PI;
+        let (r, top) = (6.371e6, 6.471e6);
+        let samples = disk_quadrature(r, top, HANDOVER_GROUND_RINGS, HANDOVER_SHELL_RINGS, 16);
+        let area: f64 = samples.iter().map(|s| s.weight).sum();
+        assert!((area / (PI * top * top) - 1.0).abs() < 1e-3, "{area}");
+        for deg in (0..=150).step_by(10) {
+            let a = f64::from(deg).to_radians();
+            let sun = DVec3::new(a.cos(), a.sin(), 0.0);
+            let lambert: f64 = samples
+                .iter()
+                .filter(|s| s.y * s.y + s.z * s.z < r * r)
+                .map(|s| {
+                    let n = DVec3::new((r * r - s.y * s.y - s.z * s.z).sqrt(), s.y, s.z) / r;
+                    n.dot(sun).max(0.0) / PI * s.weight
+                })
+                .sum::<f64>()
+                / (r * r);
+            let want = 2.0 / 3.0 * disk_phase_function(Brdf::Lambert, a);
+            assert!(
+                (lambert / want - 1.0).abs() < 0.01,
+                "{deg}°: {lambert} vs {want}"
+            );
+        }
+    }
+
+    /// The handover table against B3: Earth's disk with A8's 0.302 composite at 550 nm and phase
+    /// 0 is B3's p₅₅₀ 0.210 (`earth_disk_albedo_w_b1`, same bounds) with in-scatter 0.063 (B3's
+    /// report §6); the ground-light table matches `uni_atmo::ground::ground_lighting`; and the
+    /// table read between its nodes is within 3 % of [`fine_atmo`] at the exact phase.
+    #[test]
+    fn handover_table_matches_b3() {
+        let earth = atmo_handover(399).unwrap();
+        let e0 = earth.at(0.0);
+        let p550 = 0.302 * 2.0 / 3.0 * e0.ground_factor.y + e0.inscatter.y;
+        eprintln!("Earth p550 = {p550:.4} (in-scatter {:.4})", e0.inscatter.y);
+        assert!((0.20..=0.22).contains(&p550), "p550 = {p550}");
+        assert!((e0.inscatter.y - 0.063).abs() < 0.004, "{e0:?}");
+        let p = uni_atmo::earth();
+        let table = GroundLightTable::new(&p);
+        // Within 2 % of the value plus 0.5 % of the overhead Sun's (the scale of every disk
+        // sample): linear interpolation runs above the convex twilight curve near μ_s = 0.
+        let scale = table.lit(1.0).max_element();
+        for mu in [-0.3, -0.05, 0.03, 0.2, 0.5, 0.9] {
+            let (t, sky) = uni_atmo::ground::ground_lighting(Some(&p), p.bottom_radius_m, mu);
+            let want = t.as_dvec3() * mu.max(0.0) + sky.as_dvec3();
+            let got = table.lit(mu);
+            let tol = 0.02 * want.max_element() + 0.005 * scale;
+            assert!(
+                (got - want).abs().max_element() < tol,
+                "μ {mu}: {got} vs {want}"
+            );
+        }
+        assert!(atmo_handover(301).is_none(), "the Moon has no preset");
+        for (naif, deg) in [(399, 45.0), (499, 125.0), (299, 75.0)] {
+            let phase = f64::to_radians(deg);
+            let (table, fine) = (
+                atmo_handover(naif).unwrap().at(phase),
+                fine_atmo(naif, phase),
+            );
+            let rel = |a: DVec3, b: DVec3| ((a - b) / b).abs().max_element();
+            eprintln!(
+                "{naif} at {deg}°: ground factor {:.4} vs {:.4}, in-scatter {:.4} vs {:.4}",
+                table.ground_factor.y, fine.ground_factor.y, table.inscatter.y, fine.inscatter.y
+            );
+            assert!(
+                rel(table.ground_factor, fine.ground_factor) < 0.03,
+                "{naif} {deg}°"
+            );
+            assert!(rel(table.inscatter, fine.inscatter) < 0.03, "{naif} {deg}°");
+        }
+    }
+
+    /// [`flux_match`] (the shader's formula): k = 1 from 4 px on; the point's share minus the
+    /// in-scatter's at 1.5 px; clamped to [0, k_max]; and the shares of the bodies with an
+    /// atmosphere at phase 0 (printed for the report): A 1.6–3, so the bound never binds there.
+    #[test]
+    fn flux_match_cases() {
+        let k = |w: f32, a: f32, b: f32, sigma: f32| flux_match([w, a, b, FLUX_MATCH_MAX], sigma);
+        assert_eq!(k(1.0, 2.5, 0.4, 1.0), 1.0);
+        assert_eq!(k(1.0, 0.0, 0.0, 1.0), 1.0);
+        assert!((k(0.0, 2.5, 0.4, 1.0) - 2.1).abs() < 1e-6);
+        assert!((k(0.0, 2.5, 0.4, 1.0 / 16.0) - 2.475).abs() < 1e-6);
+        assert!((k(0.5, 2.5, 0.4, 1.0) - 1.55).abs() < 1e-6);
+        assert_eq!(k(0.0, 0.5, 3.0, 1.0), 0.0);
+        assert_eq!(k(0.0, 50.0, 0.0, 1.0), FLUX_MATCH_MAX);
+        let sun_color = blackbody_linear_srgb(TEFF_SUN_K);
+        for (naif, p_v, radius, rho_bar) in [
+            (399, 0.434, 6_371_000.0, 0.3019),
+            (499, 0.17, 3_389_500.0, 0.2550),
+            (299, 0.689, 6_051_800.0, 0.95),
+        ] {
+            let mut v = view(
+                Some(naif),
+                Brdf::Lambert,
+                p_v,
+                radius,
+                true,
+                1.0e10,
+                0.0,
+                1.5,
+            );
+            v.sun_rel_m = -v.rel_pos_m.normalize() * AU;
+            let radii = drawn_radii(&v);
+            let light = body_light(&v, radii, Some(rho_bar), Vec3::ONE, sun_color, true, |p| {
+                Some(atmo_handover(naif)?.at(p))
+            });
+            let k1 = light.flux_match(1.0);
+            eprintln!(
+                "{naif} phase 0: A {:.3}, B {:.3}, k at 1.5 px {k1:.3} (one exposure), {:.3} \
+                 (eye-adapted, σ = 1/16)",
+                light.point_share,
+                light.inscatter_share,
+                light.flux_match(1.0 / 16.0)
+            );
+            assert!(
+                (1.5..=3.2).contains(&light.point_share),
+                "{naif}: {light:?}"
+            );
+            assert!(k1 > 1.0 && k1 < f64::from(FLUX_MATCH_MAX), "{naif}: {k1}");
         }
     }
 
@@ -1488,7 +2146,7 @@ mod tests {
             &v,
             radii,
             &cam,
-            &body_light(&v, radii, None, false),
+            &body_light(&v, radii, None, Vec3::ONE, Vec3::ONE, false, |_| None),
             &SurfaceParams {
                 slot: 0,
                 albedo: 0.3,
@@ -1631,7 +2289,7 @@ mod tests {
             panic!("BodyUniform is not a struct");
         };
         assert_eq!(layouter[handle].size as usize, size_of::<BodyUniform>());
-        assert_eq!(size_of::<BodyUniform>(), 224);
+        assert_eq!(size_of::<BodyUniform>(), 240);
         let wgsl: Vec<(String, usize)> = members
             .iter()
             .map(|m| (m.name.clone().unwrap_or_default(), m.offset as usize))
@@ -1647,6 +2305,7 @@ mod tests {
             ("albedo", offset_of!(BodyUniform, albedo)),
             ("maps", offset_of!(BodyUniform, maps)),
             ("extra", offset_of!(BodyUniform, extra)),
+            ("handover", offset_of!(BodyUniform, handover)),
             ("occluders", offset_of!(BodyUniform, occluders)),
         ]
         .map(|(n, o)| (n.to_owned(), o));
@@ -1680,6 +2339,7 @@ mod tests {
         assert_eq!(arity("ring_transmittance"), Some(4));
         assert_eq!(arity("lunar_lambert"), Some(3));
         assert_eq!(arity("sun_visible_fraction"), Some(3));
+        assert_eq!(arity("flux_match"), Some(2));
         let mut group1: Vec<u32> = m
             .global_variables
             .iter()
@@ -1741,7 +2401,7 @@ mod tests {
             disk_rho: None,
             cloud_tops: false,
         };
-        let light = body_light(&s, radii, None, false);
+        let light = body_light(&s, radii, None, Vec3::ONE, Vec3::ONE, false, |_| None);
         let u = body_uniform(
             &s,
             radii,

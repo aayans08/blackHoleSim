@@ -34,7 +34,7 @@ use uni_physics::photometry::{Brdf, rho_from_geometric_albedo};
 const STATS_MAX_WIDTH: u32 = 256;
 
 /// ITU-R BT.709-6 luminance weights of linear R, G, B (item 3.2), as A8's bake uses for ρ.
-const BT709: DVec3 = DVec3::new(0.2126, 0.7152, 0.0722);
+pub(crate) const BT709: DVec3 = DVec3::new(0.2126, 0.7152, 0.0722);
 
 /// The HUD warning for a body drawn without a surface map (exact text, B1 context and
 /// constraints "Honesty labels in M1": `No surface map: uniform albedo`).
