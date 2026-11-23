@@ -1585,12 +1585,8 @@ mod tests {
         );
     }
 
-    /// The CPU twin samples the model in the right frame: the texel toward the Galactic centre
-    /// (ICRS direction from ESA 1997, row 0 of `ICRS_TO_GALACTIC`) holds the model's radiance
-    /// toward the centre, and a camera off the SSB is moved into the model's frame.
-    /// A GPU result with one NaN (or infinite) channel fails the probes' checks: `rel_err_finite` is
-    /// NaN,
-    /// [`worst`] keeps it, and `<=` against a tolerance is false. The old form,
+    /// A GPU result with one NaN (or infinite) channel fails the probes' checks: `rel_err_finite`
+    /// is NaN, [`worst`] keeps it, and `<=` against a tolerance is false. The old form,
     /// `(gpu - cpu).abs().max_element()`, skipped the NaN channel and passed (B9 fix round).
     #[test]
     fn probe_errors_fail_on_a_non_finite_channel() {
@@ -1614,6 +1610,9 @@ mod tests {
         assert!((rel_err_finite(DVec3::splat(1e-5), DVec3::ZERO, 1e-4) - 0.1).abs() < 1e-12);
     }
 
+    /// The CPU twin samples the model in the right frame: the texel toward the Galactic centre
+    /// (ICRS direction from ESA 1997, row 0 of `ICRS_TO_GALACTIC`) holds the model's radiance
+    /// toward the centre, and a camera off the SSB is moved into the model's frame.
     #[test]
     fn band_texel_matches_model() {
         let model = GalaxyModel::milky_way();
