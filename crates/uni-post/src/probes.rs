@@ -17,6 +17,7 @@
 use anyhow::Context as _;
 use glam::{DQuat, DVec3, Mat4, UVec2, Vec2, Vec3, Vec4};
 use uni_core::{CameraView, Epoch, UniversePos, splitmix64};
+use uni_gfx::frame::pre_mix;
 use uni_gfx::probe::ProbeResult;
 use uni_gfx::{
     DEPTH_FORMAT, Exposure, ExposureUniform, FrameBindings, FrameCtx, FrameTargets, GpuContext,
@@ -560,14 +561,14 @@ const HDR_ALPHA_DECOY: f32 = 1.0;
 /// 8 × 8 block at `HDR_MAX` in the top-right corner (clamped), and everywhere else a log-normal
 /// luminance (median 300 cd/m², σ = 1.5 EV; Box–Muller on `splitmix64`) in a warm tint. That
 /// light is at scene exposure (star share 0) except in a 32 × 32 block ([`BAND_BLOCK`]), written
-/// like a body in the 1.5–4 px LOD band at mix(star_pre, scene_pre, w), w = 1 − [`BAND_SHARE`],
-/// with its star share. The block is 0.5 % of the lit pixels, so read ÷ scene_pre it would set
-/// ev_hi.
+/// like a body in the 1.5–4 px LOD band at the log-space pre_mix(star_pre, scene_pre, w) (task
+/// B11), w = 1 − [`BAND_SHARE`], with its star share. The block is 0.5 % of the lit pixels, so
+/// read ÷ scene_pre it would set ev_hi.
 fn lognormal_frame(size: UVec2, scene_pre: f32, star_pre: f32) -> Vec<Vec4> {
     let tint = Vec3::new(1.1, 1.0, 0.8);
     let tint = tint / tint.dot(Vec3::new(0.2126, 0.7152, 0.0722));
     let unit = |h: u64| ((h >> 40) as f32 + 1.0) / (1u64 << 24) as f32; // (0, 1]
-    let band_pre = scene_pre * (1.0 - BAND_SHARE) + star_pre * BAND_SHARE;
+    let band_pre = pre_mix(star_pre, scene_pre, 1.0 - BAND_SHARE);
     (0..size.y)
         .flat_map(|y| (0..size.x).map(move |x| (x, y)))
         .map(|(x, y)| {
@@ -599,8 +600,11 @@ fn lognormal_frame(size: UVec2, scene_pre: f32, star_pre: f32) -> Vec<Vec4> {
 
 /// The meter probe's band block: its corner (x, y) and edge [px].
 const BAND_BLOCK: [u32; 3] = [256, 256, 32];
-/// The band block's star share 1 − w (exact in f16): w = 0.875, about the Moon's at 3.2 px.
-const BAND_SHARE: f32 = 0.125;
+/// The band block's star share 1 − w (exact in f16): w = 0.125, a body at about 1.86 px. With the
+/// log-space blend (task B11) a pixel read ÷ scene_pre is 2^(s·ΔEV) too bright, so the share must
+/// be large for the block to set ev_hi when it is ignored (12.25 EV at the probe's 14-stop gap;
+/// B10's 0.125 gave 11 EV with the linear blend but only 1.75 EV with the log one).
+const BAND_SHARE: f32 = 0.875;
 
 /// Smallest normal f16, 2^−14.
 pub(crate) const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
