@@ -8,14 +8,18 @@
 //!   synchrones join into a curved sheet. A grain's light ∝ its weight (production × √β) ×
 //!   E☉(r) at its own heliocentric distance × a Henyey–Greenstein phase function with g = 0.6
 //!   (the plan's single forward lobe, after Marcus 2007, ICQ 29, 39, whose model is a compound
-//!   forward/backward HG; [`DUST_PHASE_G`]). The phase-averaged tail light is 0.5 × the coma's
-//!   (v0 ratio; card note `uni_ui::theme::NOTE_TAILS`).
+//!   forward/backward HG; [`DUST_PHASE_G`]). The tail's light is 0.5 × the coma's from every
+//!   viewpoint (v0 ratio; card note `uni_ui::theme::NOTE_TAILS`): it is normalised per view
+//!   ([`dust_light_scale`], review C1 I1), so HG only shapes how the light is spread along the
+//!   tail, and the total follows the coma's (SBDB's magnitude law has no phase term).
 //! - **Ion:** straight along the aberrated anti-sunward direction û = normalize(400 km/s · r̂_h −
 //!   v_comet) (Brandt 1968, in *Introduction to the Solar Wind*; ruling 8), 0.3 AU / r_h long (at
 //!   most 1 AU), falling off exponentially along its length, a Gaussian 10⁵ km wide (FWHM)
 //!   across it, CO⁺ blue (427 nm chromaticity, gamut-mapped, then desaturated 50 % toward white),
 //!   0.2 × the coma's light (v0). Drawn as a ribbon that turns about its axis to face the camera,
-//!   with the surface brightness of an optically thin cylinder ([`ion_tail_brightness`]).
+//!   with the surface brightness of an optically thin cylinder ([`ion_tail_brightness`]); from
+//!   afar its σ is widened to at least [`ION_MIN_SIGMA_PX`] with the light across it kept
+//!   ([`ion_tail_drawn_brightness`], review C1 I2), so it never aliases into a beaded line.
 //! - **Which comets, and how often** (ruling round 2, review I13): only the
 //!   [`MAX_TAILED_COMETS`] most prominent comets on screen (brightest `total_v` from the camera)
 //!   get tails ([`tailed_comets`]). A tail is recomputed when the epoch has moved more than
@@ -57,8 +61,17 @@ pub const ION_TAIL_EFOLDS: f64 = 3.0;
 pub const ION_SEGMENTS: u32 = 32;
 /// The ribbon reaches this many σ of the cross-section on each side (light beyond: 5 × 10⁻⁴).
 pub const ION_HALF_WIDTH_SIGMAS: f64 = 3.5;
+/// The ion ribbon's smallest on-screen σ [px] (review C1 I2; the dust sprites' `SPRITE_MIN_PX`
+/// in `comet.wgsl` is the same 0.75 px). From afar the 10⁵ km tail is narrower than a pixel (FWHM
+/// under 1 px beyond ≈ 0.63 AU at 1080 lines and 60°), so the ribbon is drawn with
+/// σ = max(σ_phys, 0.75 px) and a Gaussian renormalised to that σ: the light across the tail is
+/// kept, only spread over more pixels. A Gaussian of σ ≥ 0.75 px sampled at pixel centres sums to
+/// its integral within 2·e^(−2π²σ²) ≈ 3 × 10⁻⁵ (Poisson summation), so the line neither beads nor
+/// breaks into dashes as it moves. Twin of `ION_MIN_SIGMA_PX` in `comet.wgsl`.
+pub const ION_MIN_SIGMA_PX: f64 = 0.75;
 
-/// The dust tail's phase-averaged light as a fraction of the coma's (plan C1, v0).
+/// The dust tail's light as a fraction of the coma's, from every viewpoint (plan C1, v0;
+/// normalised per view by [`dust_light_scale`]).
 pub const DUST_TAIL_LIGHT: f64 = 0.5;
 /// Henyey–Greenstein asymmetry of the dust's phase function (plan C1). Checked 2026-11-23: the
 /// plan cites Marcus 2007 as "Icarus 191"; the paper is Marcus 2007, ICQ 29, 39, and its model is
@@ -129,7 +142,23 @@ pub fn ion_tail_brightness(
     intensity_cd: f64,
     sin_psi: f64,
 ) -> f64 {
-    if !(s_m >= 0.0 && s_m < length_m) {
+    ion_tail_drawn_brightness(s_m, x_m, length_m, intensity_cd, sin_psi, ion_sigma_m())
+}
+
+/// The ion tail as the ribbon draws it: [`ion_tail_brightness`] with the cross-section's σ
+/// widened to `sigma_m` (≥ the physical σ: [`ion_drawn_sigma_m`]) and the Gaussian renormalised
+/// to it, so the light across the tail, and ∫S sin ψ ds dx = I, are unchanged (review C1 I2).
+/// The sin ψ cap keeps the physical width (the axial column is a property of the tail, not of
+/// the pixel). 0 for σ ≤ 0. CPU twin of the shader's; probed on the GPU.
+pub fn ion_tail_drawn_brightness(
+    s_m: f64,
+    x_m: f64,
+    length_m: f64,
+    intensity_cd: f64,
+    sin_psi: f64,
+    sigma_m: f64,
+) -> f64 {
+    if !(s_m >= 0.0 && s_m < length_m && sigma_m > 0.0) {
         return 0.0;
     }
     let lambda = length_m / ION_TAIL_EFOLDS;
@@ -137,9 +166,8 @@ pub fn ion_tail_brightness(
     // ∫₀^L (e^(−s/λ) − e^(−L/λ)) ds.
     let norm = lambda * (1.0 - tip) - length_m * tip;
     let along = ((-s_m / lambda).exp() - tip) / norm;
-    let sigma = ion_sigma_m();
-    let t = x_m / sigma;
-    let across = (-0.5 * t * t).exp() / (std::f64::consts::TAU.sqrt() * sigma);
+    let t = x_m / sigma_m;
+    let across = (-0.5 * t * t).exp() / (std::f64::consts::TAU.sqrt() * sigma_m);
     let sin_eff = sin_psi.max(ION_TAIL_WIDTH_M / length_m);
     intensity_cd * along * across / sin_eff
 }
@@ -147,6 +175,13 @@ pub fn ion_tail_brightness(
 /// σ of the ion tail's Gaussian cross-section [m]: FWHM / (2√(2 ln 2)).
 pub(crate) fn ion_sigma_m() -> f64 {
     ION_TAIL_WIDTH_M / (2.0 * (2.0 * std::f64::consts::LN_2).sqrt())
+}
+
+/// The σ [m] the ion ribbon is drawn with where one pixel spans `pixel_m` metres (at the
+/// ribbon's distance): the physical σ, but at least [`ION_MIN_SIGMA_PX`] pixels. CPU twin of the
+/// shader's `ion_drawn_sigma`; probed on the GPU.
+pub fn ion_drawn_sigma_m(pixel_m: f64) -> f64 {
+    ion_sigma_m().max(ION_MIN_SIGMA_PX * pixel_m)
 }
 
 /// The ion tail's colour, linear Rec. 709 with luminance 1 (module docs).
@@ -161,6 +196,50 @@ pub fn dust_phase(cos_theta: f64) -> f64 {
     let g = DUST_PHASE_G;
     let denom = 1.0 + g * g - 2.0 * g * cos_theta.clamp(-1.0, 1.0);
     (1.0 - g * g) / (denom * denom.sqrt())
+}
+
+/// A grain's share of the dust tail's light before the per-view scale (review C1 I1): its
+/// `weight` × the sunlight at the grain relative to the nucleus's, (r_h/r)², × HG(θ)
+/// ([`dust_phase`]), θ the scattering angle between the Sun → grain and grain → camera
+/// directions (0 = forward). `offset` is the grain's offset from the nucleus, `nucleus_rel` the
+/// nucleus relative to the camera and `sun_rel` the Sun relative to the nucleus [m]. 0 with the
+/// camera within 1 m of the grain (the pass draws nothing there). CPU twin of the shader's
+/// `dust_grain_light`, which `vs_dust` multiplies by `TailGpu::sun.w` ([`dust_light_scale`]);
+/// probed on the GPU.
+pub fn dust_grain_light(offset: DVec3, weight: f64, nucleus_rel: DVec3, sun_rel: DVec3) -> f64 {
+    let rel = nucleus_rel + offset;
+    let dist = rel.length();
+    let helio = offset - sun_rel;
+    let helio2 = helio.length_squared();
+    if !(dist > 1.0 && helio2 > 0.0) {
+        return 0.0;
+    }
+    // E☉ ∝ 1/r²: the grain's sunlight relative to the nucleus's.
+    let lit = sun_rel.length_squared() / helio2;
+    let cos_theta = helio.normalize().dot(-rel / dist);
+    weight * lit * dust_phase(cos_theta)
+}
+
+/// The per-view scale of a dust tail [cd] (review C1 I1; plan C1: "total tail light = 0.5 ×
+/// coma light"): `dust_light_cd` divided by Σᵢ [`dust_grain_light`] over `grains` for this
+/// camera, so the sprites drawn this frame carry exactly `dust_light_cd` from every viewpoint
+/// and the Henyey–Greenstein phase function only shapes how that light is spread along the tail
+/// (forward-scattering grains brighter). 0 when the sum is not positive and finite.
+pub(crate) fn dust_light_scale(
+    dust_light_cd: f64,
+    grains: &[TailGrain],
+    nucleus_rel: DVec3,
+    sun_rel: DVec3,
+) -> f64 {
+    let total: f64 = grains
+        .iter()
+        .map(|g| dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel))
+        .sum();
+    if total > 0.0 && total.is_finite() {
+        dust_light_cd / total
+    } else {
+        0.0
+    }
 }
 
 /// A grain sprite's normalised profile [1/m²] at distance `r` from its centre for width `sigma`:
@@ -270,7 +349,8 @@ pub(crate) struct TailGrain {
     /// Sprite σ [m] (neighbour spacing).
     pub(crate) sigma_m: f64,
     /// Light weight, normalised so Σ wᵢ·(r_h/rᵢ)² = 1 at the refresh epoch (rᵢ the grain's
-    /// heliocentric distance): the pass multiplies by the dust light × (r_h/rᵢ)² × phase.
+    /// heliocentric distance; this keeps the f32 weights near 1/2 048). The pass draws
+    /// [`dust_grain_light`] (w × (r_h/rᵢ)² × phase) × the per-view [`dust_light_scale`].
     pub(crate) weight: f64,
 }
 
@@ -498,7 +578,7 @@ mod tests {
 
     use super::*;
     use crate::comet::luminance;
-    use crate::comet::test_support::{comet_on, static_view};
+    use crate::comet::test_support::{FOV_Y_RAD, HEIGHT_PX, comet_on, static_view};
 
     fn angle_deg(a: DVec3, b: DVec3) -> f64 {
         a.cross(b).length().atan2(a.dot(b)).to_degrees()
@@ -562,6 +642,80 @@ mod tests {
         let c = ion_colour();
         assert!((luminance(c) - 1.0).abs() < 1e-5, "{c}");
         assert!(c.min_element() > 0.0 && c.z > c.y && c.z > c.x, "{c}");
+    }
+
+    /// Review C1 I2: from afar the ion ribbon is drawn at least `ION_MIN_SIGMA_PX` wide, keeps
+    /// the light across it, and the light of one screen row no longer depends on where the line
+    /// falls between pixel centres. Without the floor, 2 AU away (σ = 0.13 px, the whole ribbon
+    /// under one pixel) a row's light swung between 0 and several times its mean.
+    #[test]
+    fn ion_ribbon_has_a_pixel_floor() {
+        // One pixel's side at unit distance: 1 080 lines, 60° (the fixtures' camera).
+        let pixel_rad = 2.0 * (0.5 * FOV_Y_RAD).tan() / HEIGHT_PX;
+        let phys = ion_sigma_m();
+        let (length, intensity, sin_psi) = (0.3 * AU, 2.0e14, 0.8);
+        let s = 0.1 * length;
+        let drawn = |x: f64, sigma: f64| {
+            ion_tail_drawn_brightness(s, x, length, intensity, sin_psi, sigma)
+        };
+        // Light per unit length: ∫ S dx over the ribbon's ±3.5σ (midpoint rule).
+        let across = |sigma: f64| {
+            let half = ION_HALF_WIDTH_SIGMAS * sigma;
+            let n = 4_000;
+            let dx = 2.0 * half / f64::from(n);
+            (0..n)
+                .map(|k| drawn(-half + (f64::from(k) + 0.5) * dx, sigma) * dx)
+                .sum::<f64>()
+        };
+        // A row's light (the samples at pixel centres inside the ribbon, × pixel) as the line
+        // moves by φ = 0 … 39/40 px across them: (max − min) / mean.
+        let row_ripple = |sigma: f64, pixel: f64| {
+            let half = ION_HALF_WIDTH_SIGMAS * sigma;
+            let n = (half / pixel).ceil() as i64 + 1;
+            let sums: Vec<f64> = (0..40)
+                .map(|q| {
+                    let phi = f64::from(q) / 40.0;
+                    (-n..=n)
+                        .map(|k| (k as f64 + phi) * pixel)
+                        .filter(|x| x.abs() < half)
+                        .map(|x| drawn(x, sigma) * pixel)
+                        .sum::<f64>()
+                })
+                .collect();
+            let max = sums.iter().copied().fold(f64::MIN, f64::max);
+            let min = sums.iter().copied().fold(f64::MAX, f64::min);
+            (max - min) * sums.len() as f64 / sums.iter().sum::<f64>()
+        };
+        let reference = across(phys);
+        assert!(reference > 0.0);
+        let mut report = Vec::new();
+        for d_au in [0.05, 0.3, 0.63, 1.0, 1.9, 2.0, 5.0] {
+            let pixel = d_au * AU * pixel_rad;
+            let sigma = ion_drawn_sigma_m(pixel);
+            assert_eq!(sigma, phys.max(ION_MIN_SIGMA_PX * pixel), "{d_au} AU");
+            let fwhm_px = 2.354_820_045 * sigma / pixel;
+            assert!(fwhm_px >= 2.354_820_045 * ION_MIN_SIGMA_PX * (1.0 - 1e-12));
+            let kept = across(sigma) / reference;
+            assert!((kept - 1.0).abs() < 1e-9, "{d_au} AU: light across × {kept}");
+            let ripple = row_ripple(sigma, pixel);
+            assert!(ripple < 5e-3, "{d_au} AU: a row's light ripples by {ripple}");
+            report.push(format!("{d_au} AU: σ {:.2} px, ripple {ripple:.1e}", sigma / pixel));
+        }
+        println!("ion ribbon with the floor: {}", report.join("; "));
+        // The defect the floor fixes: the bare profile 2 AU away.
+        let bare = row_ripple(phys, 2.0 * AU * pixel_rad);
+        println!("without the floor at 2 AU: ripple {bare:.2}");
+        assert!(bare > 1.0, "{bare}");
+        // Up close the floor is inactive: the drawn profile is the physical one.
+        assert_eq!(ion_drawn_sigma_m(1.0e3), phys);
+        assert_eq!(
+            drawn(1.0e7, phys),
+            ion_tail_brightness(s, 1.0e7, length, intensity, sin_psi)
+        );
+        assert_eq!(drawn(0.0, 0.0), 0.0);
+        // Widening lowers the peak by the same factor σ_phys/σ.
+        let wide = 4.0 * phys;
+        assert!((drawn(0.0, wide) / drawn(0.0, phys) - 0.25).abs() < 1e-12);
     }
 
     /// The HG phase function has mean 1 over the sphere and favours forward scattering; the
@@ -634,6 +788,64 @@ mod tests {
                 .sum();
             assert!((lit - 1.0).abs() < 1e-9, "Σ w (r_h/r)² = {lit}");
         }
+    }
+
+    /// Review C1 I1 (plan C1: "total tail light = 0.5 × coma light"): with the per-view scale
+    /// the dust light drawn, Σ scale × `dust_grain_light`, is 0.5 × the coma's from every phase
+    /// angle and distance (inside the tail included), not only averaged over viewing directions.
+    /// The old scale (Σ w (r_h/r)² = 1 at refresh, HG of mean 1) drew Σ `dust_grain_light` of
+    /// that: about 0.16 × at phase 20° and 0.4 × at 90°.
+    #[test]
+    fn dust_tail_light_is_half_the_coma_from_every_view() {
+        let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
+        let t = conic.tp.add_seconds(20.0 * DAY);
+        let (r, _) = heliocentric_state_icrs(&conic, t);
+        let sun_rel = -r;
+        let grains = tail_grains(&dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta), sun_rel);
+        let dust_cd = DUST_TAIL_LIGHT * 3.0e15;
+        let to_sun = sun_rel.normalize();
+        let side = to_sun.any_orthonormal_vector();
+        let mut old = Vec::new();
+        for phase_deg in [0.0_f64, 20.0, 45.0, 90.0, 135.0, 160.0, 175.0] {
+            // The camera seen from the nucleus at the phase angle from the Sun.
+            let a = phase_deg.to_radians();
+            let to_camera = a.cos() * to_sun + a.sin() * side;
+            for delta_au in [0.01, 0.3, 2.0] {
+                let nucleus_rel = -delta_au * AU * to_camera;
+                let light = |g: &TailGrain| {
+                    dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel)
+                };
+                let scale = dust_light_scale(dust_cd, &grains, nucleus_rel, sun_rel);
+                let drawn: f64 = grains.iter().map(|g| scale * light(g)).sum();
+                assert!(
+                    (drawn / dust_cd - 1.0).abs() < 1e-12,
+                    "phase {phase_deg}°, Δ {delta_au} AU: {drawn} of {dust_cd} cd"
+                );
+                if delta_au == 0.3 {
+                    old.push((phase_deg, grains.iter().map(light).sum::<f64>()));
+                }
+            }
+        }
+        println!("old phase-averaged tail light / 0.5 coma by phase: {old:?}");
+        let old_at = |p: f64| old.iter().find(|o| o.0 == p).map_or(f64::NAN, |o| o.1);
+        assert!(old_at(20.0) < 0.3 && old_at(90.0) < 0.55 && old_at(160.0) > 2.5);
+        // Nothing lit, nothing drawn.
+        assert_eq!(dust_light_scale(dust_cd, &[], DVec3::Z, sun_rel), 0.0);
+        let on_grain = -grains[100].offset_m;
+        assert_eq!(dust_grain_light(grains[100].offset_m, 1.0, on_grain, sun_rel), 0.0);
+
+        // Cost of the per-view scale (computed per tailed comet per frame).
+        let clock = std::time::Instant::now();
+        let mut sum = 0.0;
+        for k in 0..64 {
+            let nucleus_rel = -(0.3 + 0.01 * f64::from(k)) * AU * side;
+            sum += dust_light_scale(dust_cd, &grains, nucleus_rel, sun_rel);
+        }
+        println!(
+            "per-view dust scale: {:.1} µs per {GRAINS_PER_TAIL}-grain tail (this build; \
+             {sum:.3e})",
+            clock.elapsed().as_secs_f64() * 1e6 / 64.0
+        );
     }
 
     /// Review I13: with 20 active comets on screen only the 8 brightest by `total_v` get tails;

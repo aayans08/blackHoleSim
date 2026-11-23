@@ -7,15 +7,17 @@
 // - coma (vs_coma / fs_coma): a quad facing the camera through the nucleus, the profile
 //   coma_drawn_brightness (Haser-like K/ρ e^(-ρ/ℓ), softened over one pixel), additive.
 // - ion tail (vs_ion / fs_ion): a ribbon along the tail's axis that turns to face the camera,
-//   ion_tail_brightness, additive.
+//   ion_tail_drawn_brightness (σ at least ION_MIN_SIGMA_PX on screen, light kept), additive.
 // - dust tail (vs_dust / fs_dust): one Gaussian sprite per Finson-Probstein grain, lit by
-//   E☉ ∝ 1/r² at the grain and the Henyey-Greenstein phase function, additive.
+//   E☉ ∝ 1/r² at the grain and the Henyey-Greenstein phase function (dust_grain_light), times
+//   the tail's per-view scale so the drawn grains carry 0.5 × the coma's light, additive.
 //
 // World light: luminance [cd/m²] × scene_pre() (the frame contract); the coma and the tails are
 // optically thin and write nothing to lens_mask (their location 1 has an empty write mask).
 // Everything is camera-relative f32 in root (ICRS) axes. CPU twins (crates/uni-planet/src/comet/):
-// coma_surface_brightness, coma_drawn_brightness, ion_tail_brightness, dust_phase,
-// sprite_profile, nucleus_reflectance; `universe --selftest` compares them on the GPU.
+// coma_surface_brightness, coma_drawn_brightness, ion_tail_brightness,
+// ion_tail_drawn_brightness, ion_drawn_sigma, dust_phase, dust_grain_light, sprite_profile,
+// nucleus_reflectance; `universe --selftest` compares them on the GPU.
 
 #import "common/camera.wgsl"
 #import "common/constants.wgsl"
@@ -29,6 +31,10 @@ const ION_EFOLDS: f32 = 3.0;
 // The ion tail's FWHM [m] (tails::ION_TAIL_WIDTH_M) and the ribbon's half width in σ.
 const ION_WIDTH_M: f32 = 1.0e8;
 const ION_HALF_WIDTH_SIGMAS: f32 = 3.5;
+// The ribbon's smallest on-screen σ [px] (tails::ION_MIN_SIGMA_PX, review C1 I2): a Gaussian of
+// σ ≥ 0.75 px sampled at pixel centres sums to its integral within 2·e^(−2π²σ²) ≈ 3e-5, so a
+// sub-pixel tail neither beads nor breaks into dashes; its light across is kept.
+const ION_MIN_SIGMA_PX: f32 = 0.75;
 // FWHM / σ of a Gaussian: 2√(2 ln 2).
 const FWHM_PER_SIGMA: f32 = 2.354820045;
 // Henyey-Greenstein asymmetry of the dust (tails::DUST_PHASE_G).
@@ -74,7 +80,8 @@ struct ComaGpu {
 struct TailGpu {
     // xyz: nucleus − camera [m]; w: the ion tail's luminous intensity [cd].
     nucleus: vec4<f32>,
-    // xyz: Sun − nucleus [m]; w: the dust tail's phase-averaged luminous intensity [cd].
+    // xyz: Sun − nucleus [m]; w: the dust tail's per-view scale [cd] (tails::dust_light_scale:
+    // 0.5 × the coma's light / Σ dust_grain_light from this camera).
     sun: vec4<f32>,
     // xyz: the ion tail's unit direction; w: its length [m].
     ion_axis: vec4<f32>,
@@ -88,7 +95,7 @@ struct TailGpu {
 struct GrainGpu {
     // xyz: offset from the nucleus [m]; w: the sprite's σ [m].
     offset: vec4<f32>,
-    // x: light weight (Σ w·(r_h/r)² = 1 over the tail); yzw: 0.
+    // x: light weight (Σ w·(r_h/r)² = 1 over the tail at its refresh); yzw: 0.
     weight: vec4<f32>,
 }
 
@@ -114,22 +121,42 @@ fn coma_drawn_brightness(rho: f32, intensity: f32, scale: f32, pixel: f32) -> f3
     return coma_surface_brightness(u, intensity * exp(pixel / l), l);
 }
 
-// The ion tail's surface brightness [cd/m²] on its ribbon at s along and x across the axis, for
-// a tail of `length` carrying `intensity`, seen at sin ψ to its axis. Twin of
-// tails::ion_tail_brightness.
-fn ion_tail_brightness(s: f32, x: f32, length: f32, intensity: f32, sin_psi: f32) -> f32 {
-    if (!(s >= 0.0 && s < length)) {
+// The ion tail as the ribbon draws it [cd/m²], at s along and x across the axis, for a tail of
+// `length` carrying `intensity`, seen at sin ψ to its axis, with its Gaussian cross-section
+// widened to `sigma` (≥ the physical σ) and renormalised (the light across is kept). Twin of
+// tails::ion_tail_drawn_brightness.
+fn ion_tail_drawn_brightness(
+    s: f32,
+    x: f32,
+    length: f32,
+    intensity: f32,
+    sin_psi: f32,
+    sigma: f32,
+) -> f32 {
+    if (!(s >= 0.0 && s < length && sigma > 0.0)) {
         return 0.0;
     }
     let lambda = length / ION_EFOLDS;
     let tip = exp(-ION_EFOLDS);
     let norm = lambda * (1.0 - tip) - length * tip;
     let along = (exp(-s / lambda) - tip) / norm;
-    let sigma = ION_WIDTH_M / FWHM_PER_SIGMA;
     let t = x / sigma;
     let across = exp(-0.5 * t * t) / (sqrt(TAU) * sigma);
     let sin_eff = max(sin_psi, ION_WIDTH_M / length);
     return intensity * along * across / sin_eff;
+}
+
+// The ion tail's surface brightness [cd/m²] at its physical width (FWHM ION_WIDTH_M). Twin of
+// tails::ion_tail_brightness.
+fn ion_tail_brightness(s: f32, x: f32, length: f32, intensity: f32, sin_psi: f32) -> f32 {
+    let sigma = ION_WIDTH_M / FWHM_PER_SIGMA;
+    return ion_tail_drawn_brightness(s, x, length, intensity, sin_psi, sigma);
+}
+
+// The σ [m] the ribbon is drawn with where a pixel spans `pixel` metres: the physical σ, at
+// least ION_MIN_SIGMA_PX pixels. Twin of tails::ion_drawn_sigma_m.
+fn ion_drawn_sigma(pixel: f32) -> f32 {
+    return max(ION_WIDTH_M / FWHM_PER_SIGMA, ION_MIN_SIGMA_PX * pixel);
 }
 
 // Henyey & Greenstein 1941 (ApJ 93, 70), g = DUST_G, mean 1 over the sphere. Twin of
@@ -138,6 +165,28 @@ fn dust_phase(cos_theta: f32) -> f32 {
     let g = DUST_G;
     let denom = 1.0 + g * g - 2.0 * g * clamp(cos_theta, -1.0, 1.0);
     return (1.0 - g * g) / (denom * sqrt(denom));
+}
+
+// A grain's share of the dust light before the tail's per-view scale: weight × (r_h/r)² (E☉ at
+// the grain relative to the nucleus's) × HG(θ), θ between the Sun → grain and grain → camera
+// directions. `offset`: grain − nucleus, `nucleus_rel`: nucleus − camera, `sun_rel`: Sun −
+// nucleus [m]. 0 with the camera within 1 m of the grain. Twin of tails::dust_grain_light.
+fn dust_grain_light(
+    offset: vec3<f32>,
+    weight: f32,
+    nucleus_rel: vec3<f32>,
+    sun_rel: vec3<f32>,
+) -> f32 {
+    let rel = nucleus_rel + offset;
+    let dist = length(rel);
+    let helio = offset - sun_rel;
+    let helio2 = dot(helio, helio);
+    if (!(dist > 1.0 && helio2 > 0.0)) {
+        return 0.0;
+    }
+    let lit = dot(sun_rel, sun_rel) / helio2;
+    let cos_theta = dot(normalize(helio), -rel / dist);
+    return weight * lit * dust_phase(cos_theta);
 }
 
 // A grain sprite's profile [1/m²]: a Gaussian cut at SPRITE_SIGMAS σ, shifted to 0 there and
@@ -309,8 +358,10 @@ fn fs_coma(in: ComaOut) -> GlowOut {
 
 struct IonOut {
     @builtin(position) clip: vec4<f32>,
-    // x: distance along the axis [m]; y: across it [m]; z: sin ψ (the axis vs the line of sight).
-    @location(0) coords: vec3<f32>,
+    // x: distance along the axis [m]; y: across it [m]; z: sin ψ (the axis vs the line of sight);
+    // w: the drawn σ [m] (ion_drawn_sigma at the vertex's distance; the ribbon's edges sit at
+    // ±ION_HALF_WIDTH_SIGMAS of it, so x/σ is ±3.5 along both edges).
+    @location(0) coords: vec4<f32>,
     @location(1) @interpolate(flat) slot: u32,
 }
 
@@ -324,6 +375,7 @@ fn vs_ion(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) ->
     let s = t.ion_axis.w * a / f32(ION_SEGMENTS);
     let axis = t.ion_axis.xyz;
     let p = t.nucleus.xyz + axis * s;
+    let dist = length(p);
     let dir = normalize(p);
     var side = cross(axis, dir);
     let sin_psi = length(side);
@@ -332,10 +384,13 @@ fn vs_ion(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) ->
     } else {
         side = side / sin_psi;
     }
-    let x = corner.x * ION_HALF_WIDTH_SIGMAS * ION_WIDTH_M / FWHM_PER_SIGMA;
+    // The pixel floor (review C1 I2): `side` is across the line of sight, so one pixel there
+    // spans pixel_size_at(dist) metres.
+    let sigma = ion_drawn_sigma(pixel_size_at(dist));
+    let x = corner.x * ION_HALF_WIDTH_SIGMAS * sigma;
     var out: IonOut;
     out.clip = to_clip(p + side * x);
-    out.coords = vec3<f32>(s, x, sin_psi);
+    out.coords = vec4<f32>(s, x, sin_psi, sigma);
     out.slot = slot;
     return out;
 }
@@ -343,7 +398,8 @@ fn vs_ion(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) ->
 @fragment
 fn fs_ion(in: IonOut) -> GlowOut {
     let t = tails[in.slot];
-    let s = ion_tail_brightness(in.coords.x, in.coords.y, t.ion_axis.w, t.nucleus.w, in.coords.z);
+    let c = in.coords;
+    let s = ion_tail_drawn_brightness(c.x, c.y, t.ion_axis.w, t.nucleus.w, c.z, c.w);
     return glow(t.ion_colour.rgb * s);
 }
 
@@ -373,12 +429,10 @@ fn vs_dust(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> D
         return out;
     }
     let dir = rel / dist;
-    // Sunlight at the grain relative to the nucleus's, (r_h/r)², and the scattering angle
-    // between the Sun → grain and grain → camera directions.
-    let helio = grain.offset.xyz - t.sun.xyz;
-    let lit = dot(t.sun.xyz, t.sun.xyz) / dot(helio, helio);
-    let cos_theta = dot(normalize(helio), -dir);
-    var intensity = t.sun.w * grain.weight.x * lit * dust_phase(cos_theta);
+    // The grain's light (E☉ ∝ 1/r², HG) × the tail's per-view scale: the grains carry 0.5 × the
+    // coma's light from this camera (review C1 I1).
+    var intensity =
+        t.sun.w * dust_grain_light(grain.offset.xyz, grain.weight.x, t.nucleus.xyz, t.sun.xyz);
     let px = pixel_size_at(dist);
     var sigma = max(grain.offset.w, SPRITE_MIN_PX * px);
     let sigma_max = SPRITE_MAX_PX * px;

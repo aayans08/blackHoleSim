@@ -14,7 +14,10 @@
 //! radius ([`nucleus::nucleus_illuminance_lux`], which the app's nucleus point should use too);
 //! the coma carries the total minus that, floored at 0 ([`coma::coma_intensity_cd`]); the dust
 //! tail adds 0.5 × and the ion tail 0.2 × the coma's light (v0 ratios, card note
-//! `uni_ui::theme::NOTE_TAILS`).
+//! `uni_ui::theme::NOTE_TAILS`), from every viewpoint: the dust tail is normalised per view
+//! ([`tails::dust_light_scale`]), so its phase function only shapes where along the tail the
+//! light is. A dust sprite nearer than its `SPRITE_MAX_PX` cut (a camera inside the tail) and an
+//! ion tail seen end-on lose some of that light (approximate; stated where they are drawn).
 //!
 //! **Pass.** One render pass, timer label "comets" (no sub-pass, so no extra label): the nuclei
 //! (opaque, depth write, `lens_mask.g` and `.a`), then the comae, ion tails and dust sprites
@@ -56,9 +59,10 @@ use self::nucleus::{
 };
 use self::tails::{
     DUST_TAIL_LIGHT, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
-    KEPLER_SOLVE_US, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_phase, dust_reach_estimate_m,
-    ion_colour, ion_sigma_m, ion_tail_brightness, ion_tail_dir, ion_tail_length_m, is_active,
-    sprite_profile, tailed_comets,
+    KEPLER_SOLVE_US, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light,
+    dust_light_scale, dust_phase, dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m,
+    ion_sigma_m, ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m,
+    is_active, sprite_profile, tailed_comets,
 };
 use crate::body::{exposure_weight, lens_mask_target, sphere_in_view};
 
@@ -172,7 +176,8 @@ pub(crate) struct ComaGpu {
 pub(crate) struct TailGpu {
     /// xyz: nucleus − camera [m], root axes; w: the ion tail's luminous intensity [cd].
     pub(crate) nucleus: [f32; 4],
-    /// xyz: Sun − nucleus [m]; w: the dust tail's phase-averaged luminous intensity [cd].
+    /// xyz: Sun − nucleus [m]; w: the dust tail's per-view scale [cd] (`tails::dust_light_scale`:
+    /// 0.5 × the coma's light / Σ `dust_grain_light` for this camera; 0 without a dust tail).
     pub(crate) sun: [f32; 4],
     /// xyz: the ion tail's direction (unit); w: its length [m].
     pub(crate) ion_axis: [f32; 4],
@@ -311,7 +316,10 @@ pub(crate) fn plan_frame(
             .tails
             .get(&view.id)
             .map_or_else(|| dust_reach_estimate_m(view.r_au), |t| t.reach_m);
-        let ion_reach = ion_tail_length_m(view.r_au) + ION_HALF_WIDTH_SIGMAS * ion_sigma_m();
+        // The ribbon's half width with its pixel floor at its farthest point (review C1 I2).
+        let ion_length = ion_tail_length_m(view.r_au);
+        let ion_reach = ion_length
+            + ION_HALF_WIDTH_SIGMAS * ion_drawn_sigma_m(pixel_rad * (d + ion_length));
         let reach = dust_reach.max(ion_reach).max(half);
         if sphere_in_view(camera, aspect, rel, reach) {
             candidates.push(view.clone());
@@ -328,11 +336,21 @@ pub(crate) fn plan_frame(
         } else {
             ION_TAIL_LIGHT * intensity
         };
+        // Per view (review C1 I1): the grains drawn from this camera carry 0.5 × the coma's
+        // light. These are the grains `upload` puts on the GPU this frame.
+        let dust_scale = manager.tails.get(&view.id).map_or(0.0, |t| {
+            dust_light_scale(
+                DUST_TAIL_LIGHT * intensity,
+                &t.grains,
+                view.nucleus_rel_m,
+                view.sun_rel_m,
+            )
+        });
         plan.tails.push(TailDraw {
             id: view.id,
             gpu: TailGpu {
                 nucleus: vec4(view.nucleus_rel_m, ion_light),
-                sun: vec4(view.sun_rel_m, DUST_TAIL_LIGHT * intensity),
+                sun: vec4(view.sun_rel_m, dust_scale),
                 ion_axis: vec4(axis, ion_tail_length_m(view.r_au)),
                 ion_colour: rgb0(ion_rgb),
                 dust_colour: rgb0(sun_colour),
@@ -875,9 +893,16 @@ pub(crate) const COMET_PROBE_WGSL: &str = r#"// probe/planet_comet.wgsl: `univer
 @group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
 @group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
 
-// Twins of ION_PROBE_INTENSITY_CD and SPRITE_PROBE_SIGMA_M in comet/mod.rs.
+// Twins of ION_PROBE_INTENSITY_CD, ION_PROBE_PIXEL_M, SPRITE_PROBE_SIGMA_M and the DUST_PROBE_*
+// constants in comet/mod.rs.
 const ION_PROBE_INTENSITY: f32 = 1.0e14;
+const ION_PROBE_PIXEL: f32 = 1.2e8;
 const SPRITE_PROBE_SIGMA: f32 = 3.0e7;
+const DUST_PROBE_SUN_X: f32 = -1.8e11;
+const DUST_PROBE_SUN_Y: f32 = 2.0e10;
+const DUST_PROBE_OFFSET: f32 = 1.0e10;
+const DUST_PROBE_NUCLEUS: f32 = 1.0e11;
+const DUST_PROBE_WEIGHT: f32 = 4.8828125e-4;
 
 // in: (ρ, I, ℓ, pixel); out: (coma_surface_brightness, coma_drawn_brightness, 0, 0).
 @compute @workgroup_size(64, 1, 1)
@@ -894,40 +919,75 @@ fn cs_coma(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 }
 
-// in: (s, x, L, sin ψ); out.x: ion_tail_brightness at ION_PROBE_INTENSITY, out.y: at s = x = 0.
+// in: (s, x, L, sin ψ); out: (ion_tail_brightness at ION_PROBE_INTENSITY,
+// ion_tail_drawn_brightness at the σ of a pixel of ION_PROBE_PIXEL × s/L, that σ
+// (ion_drawn_sigma), 0).
 @compute @workgroup_size(64, 1, 1)
 fn cs_ion(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= arrayLength(&probe_in)) {
         return;
     }
     let c = probe_in[gid.x];
+    let sigma = ion_drawn_sigma(ION_PROBE_PIXEL * c.x / c.z);
     probe_out[gid.x] = vec4<f32>(
         ion_tail_brightness(c.x, c.y, c.z, ION_PROBE_INTENSITY, c.w),
-        ion_tail_brightness(0.0, 0.0, c.z, ION_PROBE_INTENSITY, c.w),
-        0.0,
+        ion_tail_drawn_brightness(c.x, c.y, c.z, ION_PROBE_INTENSITY, c.w, sigma),
+        sigma,
         0.0,
     );
 }
 
 // in: (cos θ, r/σ, μ₀, μ); out: (dust_phase, sprite_profile at σ = SPRITE_PROBE_SIGMA,
-// nucleus_reflectance, 0).
+// nucleus_reflectance, dust_grain_light of the grain at (r/σ, μ₀, μ) × DUST_PROBE_OFFSET from a
+// nucleus at (cos θ, 0.5, −1) × DUST_PROBE_NUCLEUS, the Sun at (DUST_PROBE_SUN_X, _Y, 0)).
 @compute @workgroup_size(64, 1, 1)
 fn cs_phase(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= arrayLength(&probe_in)) {
         return;
     }
     let c = probe_in[gid.x];
+    let offset = vec3<f32>(c.y, c.z, c.w) * DUST_PROBE_OFFSET;
+    let nucleus = vec3<f32>(c.x, 0.5, -1.0) * DUST_PROBE_NUCLEUS;
+    let sun = vec3<f32>(DUST_PROBE_SUN_X, DUST_PROBE_SUN_Y, 0.0);
     probe_out[gid.x] = vec4<f32>(
         dust_phase(c.x),
         sprite_profile(c.y * SPRITE_PROBE_SIGMA, SPRITE_PROBE_SIGMA),
         nucleus_reflectance(c.z, c.w),
-        0.0,
+        dust_grain_light(offset, DUST_PROBE_WEIGHT, nucleus, sun),
     );
 }
 "#;
 
 /// The ion tail's intensity in the probe [cd] (twin of `ION_PROBE_INTENSITY`).
 const ION_PROBE_INTENSITY_CD: f64 = 1.0e14;
+/// The ion probe's pixel scale [m] (twin of `ION_PROBE_PIXEL`): case (s, x, L, sin ψ) draws the
+/// ribbon for a pixel of `ION_PROBE_PIXEL_M` × s/L ([`ion_probe_pixel_m`]), so the cases with
+/// s/L > 0.47 are widened by the pixel floor and the others are not.
+const ION_PROBE_PIXEL_M: f64 = 1.2e8;
+/// The grain-light probe's geometry (twins of `DUST_PROBE_*`): the Sun relative to the nucleus
+/// [m], the grain offset's and the nucleus's scales [m], and the grain's weight.
+const DUST_PROBE_SUN_M: DVec3 = DVec3::new(-1.8e11, 2.0e10, 0.0);
+const DUST_PROBE_OFFSET_M: f64 = 1.0e10;
+const DUST_PROBE_NUCLEUS_M: f64 = 1.0e11;
+const DUST_PROBE_WEIGHT: f64 = 1.0 / 2_048.0;
+
+/// The pixel size [m] the ion probe's case `c` = (s, x, L, sin ψ) widens the ribbon for.
+fn ion_probe_pixel_m(c: &[f32; 4]) -> f64 {
+    ION_PROBE_PIXEL_M * f64::from(c[0]) / f64::from(c[2])
+}
+
+/// The grain-light geometry of phase-probe case `c` = (cos θ, r/σ, μ₀, μ), as `cs_phase` builds
+/// it: the grain's offset (r/σ, μ₀, μ) × 10¹⁰ m, the nucleus at (cos θ, 0.5, −1) × 10¹¹ m from
+/// the camera, the Sun at [`DUST_PROBE_SUN_M`] from the nucleus. Returns (offset, nucleus_rel,
+/// sun_rel).
+fn dust_probe_geometry(c: &[f32; 4]) -> (DVec3, DVec3, DVec3) {
+    let [a, b, d, e] = c.map(f64::from);
+    (
+        DVec3::new(b, d, e) * DUST_PROBE_OFFSET_M,
+        DVec3::new(a, 0.5, -1.0) * DUST_PROBE_NUCLEUS_M,
+        DUST_PROBE_SUN_M,
+    )
+}
 /// The sprite σ in the probe [m] (twin of `SPRITE_PROBE_SIGMA`).
 const SPRITE_PROBE_SIGMA_M: f64 = 3.0e7;
 /// Largest relative |GPU − CPU| of the coma profiles (plan C1: ±1e-3). A handful of f32
@@ -938,7 +998,9 @@ const COMA_PROBE_TOLERANCE: f64 = 1e-3;
 /// profile's peak) (near the tip the profile is a difference of two exponentials, which f32
 /// resolves only to ~1e-7 of the peak).
 const TAIL_PROBE_TOLERANCE: f64 = 1e-3;
-/// Largest relative |GPU − CPU| of the HG phase function, and absolute of the reflectance.
+/// Largest relative |GPU − CPU| of the HG phase function, the grain light and the ribbon's
+/// drawn σ, and absolute of the reflectance (a few f32 operations: ~1e-6; the HG's slope
+/// amplifies an error in cos θ by at most 3g/(1 − g)² ≈ 11).
 const PHASE_PROBE_TOLERANCE: f64 = 1e-4;
 
 /// Coma probe inputs: 64 cases (ρ, I, ℓ, pixel) over ρ/ℓ from 10⁻³ to 20, three scales, three
@@ -1025,8 +1087,9 @@ fn probe_result(name: &str, outcome: anyhow::Result<(bool, String)>) -> ProbeRes
 
 /// C1's probes, called from [`crate::gpu_probes`] after it registered the crate's shaders:
 /// `coma_surface_brightness` and `coma_drawn_brightness` (64 radii, ±1e-3, plan C1),
-/// `ion_tail_brightness` and `sprite_profile` (64 cases each), `dust_phase` and
-/// `nucleus_reflectance` (64 cases).
+/// `ion_tail_brightness`, `ion_tail_drawn_brightness` and `ion_drawn_sigma` (64 cases, both
+/// sides of the pixel floor), `dust_phase`, `sprite_profile`, `nucleus_reflectance` and
+/// `dust_grain_light` (64 cases).
 pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     lib.add(COMET_PROBE_WGSL_PATH, COMET_PROBE_WGSL);
     let lib = &*lib;
@@ -1053,17 +1116,31 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
     let ion = || -> anyhow::Result<(bool, String)> {
         let input = ion_probe_inputs();
         let out = run_probe(gpu, lib, "cs_ion", &input)?;
-        let err = worst(input.iter().zip(&out).map(|(c, g)| {
+        let (mut exact, mut drawn, mut sigmas) = (Vec::new(), Vec::new(), Vec::new());
+        for (c, g) in input.iter().zip(&out) {
             let [s, x, l, sin_psi] = c.map(f64::from);
-            let peak = ion_tail_brightness(0.0, 0.0, l, ION_PROBE_INTENSITY_CD, sin_psi);
-            let cpu = ion_tail_brightness(s, x, l, ION_PROBE_INTENSITY_CD, sin_psi);
-            rel(g[0], cpu, 1e-3 * peak)
-        }));
+            let i = ION_PROBE_INTENSITY_CD;
+            let peak = ion_tail_brightness(0.0, 0.0, l, i, sin_psi);
+            exact.push(rel(g[0], ion_tail_brightness(s, x, l, i, sin_psi), 1e-3 * peak));
+            let sigma = ion_drawn_sigma_m(ion_probe_pixel_m(c));
+            let peak = ion_tail_drawn_brightness(0.0, 0.0, l, i, sin_psi, sigma);
+            let cpu = ion_tail_drawn_brightness(s, x, l, i, sin_psi, sigma);
+            drawn.push(rel(g[1], cpu, 1e-3 * peak));
+            sigmas.push(rel(g[2], sigma, f64::MIN_POSITIVE));
+        }
+        let (exact, drawn, sigmas) = (
+            worst(exact.into_iter()),
+            worst(drawn.into_iter()),
+            worst(sigmas.into_iter()),
+        );
         Ok((
-            err <= TAIL_PROBE_TOLERANCE,
+            exact <= TAIL_PROBE_TOLERANCE
+                && drawn <= TAIL_PROBE_TOLERANCE
+                && sigmas <= PHASE_PROBE_TOLERANCE,
             format!(
-                "{} cases, max |GPU − CPU| {err:.1e} of max(|CPU|, 1e-3 peak) (tolerance \
-                 {TAIL_PROBE_TOLERANCE:.0e})",
+                "{} cases, max |GPU − CPU| of max(|CPU|, 1e-3 peak): exact {exact:.1e}, drawn \
+                 (pixel floor) {drawn:.1e} (tolerance {TAIL_PROBE_TOLERANCE:.0e}); \
+                 ion_drawn_sigma rel {sigmas:.1e} (tolerance {PHASE_PROBE_TOLERANCE:.0e})",
                 input.len()
             ),
         ))
@@ -1073,27 +1150,34 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
         let out = run_probe(gpu, lib, "cs_phase", &input)?;
         let sigma = SPRITE_PROBE_SIGMA_M;
         let peak = sprite_profile(0.0, sigma);
-        let (mut hg, mut sprite, mut refl) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut hg, mut sprite, mut refl, mut grain) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (c, g) in input.iter().zip(&out) {
             let [cos_theta, r, mu0, mu] = c.map(f64::from);
             hg.push(rel(g[0], dust_phase(cos_theta), f64::MIN_POSITIVE));
             sprite.push(rel(g[1], sprite_profile(r * sigma, sigma), 1e-3 * peak));
             let cpu = uni_physics::photometry::reflectance(NUCLEUS_BRDF, mu0, mu);
             refl.push((f64::from(g[2]) - cpu).abs());
+            let (offset, nucleus_rel, sun_rel) = dust_probe_geometry(c);
+            let cpu = dust_grain_light(offset, DUST_PROBE_WEIGHT, nucleus_rel, sun_rel);
+            grain.push(rel(g[3], cpu, f64::MIN_POSITIVE));
         }
-        let (hg, sprite, refl) = (
+        let (hg, sprite, refl, grain) = (
             worst(hg.into_iter()),
             worst(sprite.into_iter()),
             worst(refl.into_iter()),
+            worst(grain.into_iter()),
         );
         Ok((
             hg <= PHASE_PROBE_TOLERANCE
                 && sprite <= TAIL_PROBE_TOLERANCE
-                && refl <= PHASE_PROBE_TOLERANCE,
+                && refl <= PHASE_PROBE_TOLERANCE
+                && grain <= PHASE_PROBE_TOLERANCE,
             format!(
                 "{} cases: dust_phase rel {hg:.1e}, sprite_profile {sprite:.1e}, \
-                 nucleus_reflectance abs {refl:.1e} (tolerances {PHASE_PROBE_TOLERANCE:.0e}, \
-                 {TAIL_PROBE_TOLERANCE:.0e}, {PHASE_PROBE_TOLERANCE:.0e})",
+                 nucleus_reflectance abs {refl:.1e}, dust_grain_light rel {grain:.1e} \
+                 (tolerances {PHASE_PROBE_TOLERANCE:.0e}, {TAIL_PROBE_TOLERANCE:.0e}, \
+                 {PHASE_PROBE_TOLERANCE:.0e}, {PHASE_PROBE_TOLERANCE:.0e})",
                 input.len()
             ),
         ))
@@ -1183,12 +1267,13 @@ mod tests {
     use std::mem::{offset_of, size_of};
 
     use glam::DQuat;
-    use uni_core::{AU, UniversePos};
+    use uni_core::{AU, DAY, UniversePos};
     use uni_gfx::{ShaderLib, validate_wgsl};
+    use uni_physics::smallbody::{conic_from_perihelion, heliocentric_state_icrs};
     use wgpu::naga;
 
-    use super::tails::{GRAINS_PER_TAIL, ION_SEGMENTS};
-    use super::test_support::static_view;
+    use super::tails::{GRAINS_PER_TAIL, ION_MIN_SIGMA_PX, ION_SEGMENTS, dust_grain_light};
+    use super::test_support::{comet_on, static_view};
     use super::*;
     use crate::body::exposure_weight;
 
@@ -1268,6 +1353,54 @@ mod tests {
         let mut m = TailManager::default();
         let plan = plan_frame(&scene(vec![behind], false), &camera(), VIEWPORT, 0.0, &mut m, 0);
         assert!(plan.comae.is_empty() && plan.tails.is_empty());
+    }
+
+    /// Review C1 I1: the tail record's dust scale (`TailGpu::sun.w`) makes the grains the pass
+    /// draws (`dust_grain_light` × sun.w, from the record's f32 positions and weights) carry
+    /// 0.5 × the coma's light from whichever side the camera sees the comet.
+    #[test]
+    fn dust_light_is_half_the_coma_in_every_view() {
+        let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
+        let t = conic.tp.add_seconds(20.0 * DAY);
+        let (r, _) = heliocentric_state_icrs(&conic, t);
+        let to_sun = -r.normalize();
+        let side = to_sun.any_orthonormal_vector();
+        let xyz = |v: [f32; 4]| DVec3::new(v[0].into(), v[1].into(), v[2].into());
+        for phase_deg in [10.0_f64, 90.0, 160.0] {
+            let a = phase_deg.to_radians();
+            let to_camera = a.cos() * to_sun + a.sin() * side;
+            let view = comet_on(5, conic, t, r + 0.4 * AU * to_camera, 8.0, 10.0);
+            let look = CameraView {
+                orient: DQuat::from_rotation_arc(DVec3::NEG_Z, view.nucleus_rel_m.normalize()),
+                ..camera()
+            };
+            let scene = CometScene {
+                comets: vec![view.clone()],
+                epoch: t,
+                eye_adapted: false,
+            };
+            let mut manager = TailManager::default();
+            let plan = plan_frame(&scene, &look, VIEWPORT, 0.0, &mut manager, usize::MAX);
+            assert_eq!(plan.tails.len(), 1, "phase {phase_deg}°");
+            assert!(plan.tails[0].dust_version.is_some());
+            let gpu = plan.tails[0].gpu;
+            let drawn: f64 = manager.tails[&view.id]
+                .grains
+                .iter()
+                .map(|g| {
+                    let weight = f64::from(g.weight as f32);
+                    let offset = g.offset_m.as_vec3().as_dvec3();
+                    f64::from(gpu.sun[3])
+                        * dust_grain_light(offset, weight, xyz(gpu.nucleus), xyz(gpu.sun))
+                })
+                .sum();
+            let want = DUST_TAIL_LIGHT * coma_intensity_cd(&view);
+            assert!(want > 0.0);
+            assert!(
+                (drawn / want - 1.0).abs() < 1e-5,
+                "phase {phase_deg}°: {drawn} of {want} cd"
+            );
+        }
     }
 
     /// naga's layout of one struct of `comet.wgsl`: its size and (name, offset) members.
@@ -1383,6 +1516,9 @@ mod tests {
         assert_eq!(arity("coma_surface_brightness"), Some(3));
         assert_eq!(arity("coma_drawn_brightness"), Some(4));
         assert_eq!(arity("ion_tail_brightness"), Some(5));
+        assert_eq!(arity("ion_tail_drawn_brightness"), Some(6));
+        assert_eq!(arity("ion_drawn_sigma"), Some(1));
+        assert_eq!(arity("dust_grain_light"), Some(4));
         assert_eq!(arity("dust_phase"), Some(1));
         assert_eq!(arity("sprite_profile"), Some(2));
         assert_eq!(arity("nucleus_reflectance"), Some(2));
@@ -1395,24 +1531,13 @@ mod tests {
             .collect();
         group1.sort_unstable();
         assert_eq!(group1, (0..COMET_BINDINGS).collect::<Vec<_>>());
-        let scalar = |name: &str| {
-            let (_, c) = m
-                .constants
-                .iter()
-                .find(|(_, c)| c.name.as_deref() == Some(name))
-                .unwrap_or_else(|| panic!("const {name}"));
-            match m.global_expressions[c.init] {
-                naga::Expression::Literal(naga::Literal::F32(v)) => f64::from(v),
-                naga::Expression::Literal(naga::Literal::U32(v)) => f64::from(v),
-                ref e => panic!("const {name} = {e:?}"),
-            }
-        };
-        let f32_of = |x: f64| f64::from(x as f32);
+        let scalar = |name: &str| wgsl_scalar(&m, name);
         assert_eq!(scalar("GRAINS_PER_TAIL"), GRAINS_PER_TAIL as f64);
         assert_eq!(scalar("ION_SEGMENTS"), f64::from(ION_SEGMENTS));
         assert_eq!(scalar("ION_EFOLDS"), f32_of(tails::ION_TAIL_EFOLDS));
         assert_eq!(scalar("ION_WIDTH_M"), f32_of(tails::ION_TAIL_WIDTH_M));
         assert_eq!(scalar("ION_HALF_WIDTH_SIGMAS"), f32_of(tails::ION_HALF_WIDTH_SIGMAS));
+        assert_eq!(scalar("ION_MIN_SIGMA_PX"), f32_of(ION_MIN_SIGMA_PX));
         assert_eq!(scalar("DUST_G"), f32_of(tails::DUST_PHASE_G));
         assert_eq!(scalar("SPRITE_SIGMAS"), f32_of(tails::SPRITE_SIGMAS));
         assert_eq!(scalar("COMA_EXTENT_SCALES"), f32_of(coma::COMA_EXTENT_SCALES));
@@ -1421,6 +1546,53 @@ mod tests {
             uni_physics::photometry::Brdf::Lambert => 0.0,
         };
         assert_eq!(scalar("NUCLEUS_L"), f32_of(nucleus_l));
+    }
+
+    /// The value of the scalar WGSL constant `name` in `m`.
+    fn wgsl_scalar(m: &naga::Module, name: &str) -> f64 {
+        let (_, c) = m
+            .constants
+            .iter()
+            .find(|(_, c)| c.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("const {name}"));
+        match m.global_expressions[c.init] {
+            naga::Expression::Literal(naga::Literal::F32(v)) => f64::from(v),
+            naga::Expression::Literal(naga::Literal::U32(v)) => f64::from(v),
+            ref e => panic!("const {name} = {e:?}"),
+        }
+    }
+
+    fn f32_of(x: f64) -> f64 {
+        f64::from(x as f32)
+    }
+
+    /// The probe shader composes with `comet.wgsl` and validates, has the three compute entry
+    /// points, and its constants equal the Rust twins the CPU side of the probes uses.
+    #[test]
+    fn comet_probe_shader_validates() {
+        let mut lib = ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        lib.add(COMET_PROBE_WGSL_PATH, COMET_PROBE_WGSL);
+        let src = lib.compose(COMET_PROBE_WGSL_PATH).unwrap();
+        let m = validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        for entry in ["cs_coma", "cs_ion", "cs_phase"] {
+            assert!(
+                m.entry_points
+                    .iter()
+                    .any(|e| e.name == entry && e.stage == naga::ShaderStage::Compute),
+                "no entry point {entry}"
+            );
+        }
+        let scalar = |name: &str| wgsl_scalar(&m, name);
+        assert_eq!(scalar("ION_PROBE_INTENSITY"), f32_of(ION_PROBE_INTENSITY_CD));
+        assert_eq!(scalar("ION_PROBE_PIXEL"), f32_of(ION_PROBE_PIXEL_M));
+        assert_eq!(scalar("SPRITE_PROBE_SIGMA"), f32_of(SPRITE_PROBE_SIGMA_M));
+        assert_eq!(scalar("DUST_PROBE_SUN_X"), f32_of(DUST_PROBE_SUN_M.x));
+        assert_eq!(scalar("DUST_PROBE_SUN_Y"), f32_of(DUST_PROBE_SUN_M.y));
+        assert_eq!(scalar("DUST_PROBE_OFFSET"), f32_of(DUST_PROBE_OFFSET_M));
+        assert_eq!(scalar("DUST_PROBE_NUCLEUS"), f32_of(DUST_PROBE_NUCLEUS_M));
+        assert_eq!(scalar("DUST_PROBE_WEIGHT"), f32_of(DUST_PROBE_WEIGHT));
+        assert_eq!(DUST_PROBE_SUN_M.z, 0.0);
     }
 
     /// The probe inputs: 64 cases each, inside each twin's domain, spanning the ranges the pass
@@ -1436,9 +1608,23 @@ mod tests {
         let ion = ion_probe_inputs();
         assert_eq!(ion.len(), 64);
         assert!(ion.iter().all(|c| c[0] >= 0.0 && c[0] < c[2] && c[3] > 0.0));
+        // Both sides of the ribbon's pixel floor (review C1 I2).
+        let floored = |c: &[f32; 4]| ION_MIN_SIGMA_PX * ion_probe_pixel_m(c) > ion_sigma_m();
+        assert!(ion.iter().filter(|c| floored(c)).count() >= 16);
+        assert!(ion.iter().filter(|c| !floored(c)).count() >= 16);
         let phase = phase_probe_inputs();
         assert_eq!(phase.len(), 64);
         assert!(phase.iter().any(|c| c[0] < -0.9) && phase.iter().any(|c| c[0] > 0.9));
         assert!(phase.iter().any(|c| c[2] <= 0.0) && phase.iter().any(|c| c[3] <= 0.0));
+        // The grain-light geometry (review C1 I1): never degenerate, forward and back scattering.
+        let mut cos = Vec::new();
+        for c in &phase {
+            let (offset, nucleus_rel, sun_rel) = dust_probe_geometry(c);
+            let (rel, helio) = (nucleus_rel + offset, offset - sun_rel);
+            assert!(rel.length() > 1e10 && helio.length() > 1e11, "{c:?}");
+            cos.push(helio.normalize().dot(-rel.normalize()));
+            assert!(dust_grain_light(offset, DUST_PROBE_WEIGHT, nucleus_rel, sun_rel) > 0.0);
+        }
+        assert!(cos.iter().any(|&c| c > 0.5) && cos.iter().any(|&c| c < -0.5), "{cos:?}");
     }
 }
