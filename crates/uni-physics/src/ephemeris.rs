@@ -523,4 +523,273 @@ mod tests {
             .expect("Earth")
             .inverse()
     }
+
+    /// One M1 bookmark that can show moons with Horizons spots, as the plan's table "M1 capture
+    /// bookmarks" states it (docs/superpowers/plans/2026-11-22-m1-solar-system.md).
+    struct PlanView {
+        name: &'static str,
+        /// The system's planet: Horizons' centre for the moons, and the pole that sets the
+        /// camera's elevation and its "up".
+        planet: NaifId,
+        /// The body the camera is placed from and looks at: the planet, or a moon.
+        anchor: NaifId,
+        moons: &'static [NaifId],
+        dist_km: f64,
+        /// Camera elevations above the planet's equator [°]; empty: any (0.5° steps).
+        elevations: &'static [f64],
+        /// Sun–anchor–camera phase angles allowed [°].
+        phase_deg: (f64, f64),
+        fov_y_deg: f64,
+        /// "Lit limb left": the Sun projects within 18° of the image's −x axis.
+        lit_limb_left: bool,
+    }
+
+    /// The plan's geometry for each bookmark (table "M1 capture bookmarks"): `start` (#1),
+    /// `mars-reference-angle` (#5), `jupiter-galileans` (#6), `jupiter-disk` (#7),
+    /// `saturn-ring-plane` (#8: 4° above the lit face, the south one), `saturn-night-side` (#10)
+    /// and `titan-backlit` (#14). The exact phases (60°, 150°) get the intent test's ±1 %, the
+    /// "≈ 45°" ±5° and titan-backlit's 160° ±2°; upper bounds (< 10°, ≤ 1°) are scanned from 0°;
+    /// "in its equatorial plane ±2°" in 0.5° steps; the other elevations are as stated.
+    /// Distances are nominal. A moon in a planet's shadow still counts (conservative).
+    const PLAN_VIEWS: [PlanView; 7] = [
+        PlanView {
+            name: "start",
+            planet: 399,
+            anchor: 399,
+            moons: &[301],
+            dist_km: 60_000.0,
+            elevations: &[],
+            phase_deg: (59.4, 60.6),
+            fov_y_deg: 60.0,
+            lit_limb_left: false,
+        },
+        PlanView {
+            name: "mars-reference-angle",
+            planet: 499,
+            anchor: 499,
+            moons: &[401, 402],
+            dist_km: 8_210.0,
+            elevations: &[],
+            phase_deg: (40.0, 50.0),
+            fov_y_deg: 60.0,
+            lit_limb_left: true,
+        },
+        PlanView {
+            name: "jupiter-galileans",
+            planet: 599,
+            anchor: 599,
+            moons: &[501, 502, 503, 504],
+            dist_km: 5.0e6,
+            elevations: &[-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0],
+            phase_deg: (0.0, 10.0),
+            fov_y_deg: 30.0,
+            lit_limb_left: false,
+        },
+        PlanView {
+            name: "jupiter-disk",
+            planet: 599,
+            anchor: 599,
+            moons: &[501, 502, 503, 504],
+            dist_km: 3.0e6,
+            elevations: &[],
+            phase_deg: (0.0, 1.0),
+            fov_y_deg: 3.5,
+            lit_limb_left: false,
+        },
+        PlanView {
+            name: "saturn-ring-plane",
+            planet: 699,
+            anchor: 699,
+            moons: &[601, 602, 603, 604, 605, 606, 607, 608],
+            dist_km: 1.5e6,
+            elevations: &[-4.0],
+            phase_deg: (0.0, 10.0),
+            fov_y_deg: 20.0,
+            lit_limb_left: false,
+        },
+        PlanView {
+            name: "saturn-night-side",
+            planet: 699,
+            anchor: 699,
+            moons: &[601, 602, 603, 604, 605, 606, 607, 608],
+            dist_km: 1.5e6,
+            elevations: &[25.0],
+            phase_deg: (148.5, 151.5),
+            fov_y_deg: 20.0,
+            lit_limb_left: false,
+        },
+        PlanView {
+            name: "titan-backlit",
+            planet: 699,
+            anchor: 606,
+            moons: &[601, 602, 603, 604, 605, 607, 608],
+            dist_km: 60_000.0,
+            elevations: &[],
+            phase_deg: (158.0, 162.0),
+            fov_y_deg: 20.0,
+            lit_limb_left: false,
+        },
+    ];
+
+    /// Moons measured above 1 px at a plan view, with their bound (the measured worst + 10 %),
+    /// for the lead's ruling (ruling 10; A2 report, fix round 2). Self-checking: each entry
+    /// must still exceed 1 px. Measured worst (placements showing the moon, all of them ≥ 1 px
+    /// unless stated):
+    /// - `saturn-ring-plane`: Mimas 1.742 px (181 of 181), Dione 1.155 px (≥ 1 px at 142 of
+    ///   181); no placement has every moon under 1 px.
+    /// - `saturn-night-side`: Mimas 2.446 px (76 of 76); no placement has every moon under 1 px.
+    /// - `titan-backlit`: Iapetus 5.569 px, in frame at 588 of 10 274 placements; the other 9 686
+    ///   have every moon under 1 px.
+    ///
+    /// Mimas misses Horizons by 1 072 km along track at the spot (Meeus ch. 46, 0.34°), Dione
+    /// by 469 km and Iapetus by 6 216 km (0.17 % of a): inside the brief's 2 % ceilings, but the
+    /// cameras are close (1.5 × 10⁶ km at fov 20°: 1 px ≈ 400–600 km; 60 000 km from Titan).
+    const OVER_ONE_PIXEL: [(&str, NaifId, f64); 4] = [
+        ("saturn-ring-plane", 601, 1.92),
+        ("saturn-ring-plane", 604, 1.27),
+        ("saturn-night-side", 601, 2.69),
+        ("titan-backlit", 608, 6.13),
+    ];
+
+    /// Whether the segment from `cam` to `p` passes within `r` of `c` (a disc in front of `p`).
+    fn occulted(cam: DVec3, p: DVec3, c: DVec3, r: f64) -> bool {
+        let d = p - cam;
+        let s = (c - cam).dot(d) / d.length_squared();
+        s > 0.0 && s < 1.0 && (cam + s * d - c).length() < r
+    }
+
+    /// Ruling 10 at the plan's bookmark geometry (A2 fix round 2, review r1 I2 and I3). At the
+    /// 2026-11-20 00:00 UTC spot epoch (B9 Step 5) and every camera placement the plan's
+    /// geometry allows (azimuth about the planet's pole in 0.1° steps from the Sun's; the stated
+    /// elevations; the phase range), the angle between each moon's theory position and its
+    /// Horizons spot as seen from the camera, in pixels of the 1920 × 1080 capture, for every
+    /// moon inside the frame and not behind the planet or the anchor (polar-radius spheres, so
+    /// fewer count as hidden). The camera looks at the anchor, "up" along the planet's pole
+    /// (the error's size does not depend on the roll). Prints each moon's worst; fails at 1 px
+    /// except the listed spots. B9's intent tests on `bookmarks/m1.ron` stay authoritative.
+    #[test]
+    fn bookmark_moon_errors_at_plan_geometry() {
+        use crate::standish::golden::{epoch_of, horizons_spots, pos_m};
+        const SPOT_JD: f64 = 2_461_364.500_8;
+        let e = eph();
+        let t = epoch_of(SPOT_JD);
+        let polar_radius = |id: NaifId| by_naif(id).expect("body").radii_m.z;
+        let mut failures = Vec::new();
+        for view in &PLAN_VIEWS {
+            let pole = crate::rotation::pole_icrs(view.planet, t).expect("pole");
+            let rel = |id: NaifId| {
+                if id == view.planet {
+                    DVec3::ZERO
+                } else {
+                    e.position_rel_parent(id, t).expect("moon")
+                }
+            };
+            let anchor = rel(view.anchor);
+            let sun_from_planet = -e.position_rel_parent(view.planet, t).expect("planet");
+            let sun = (sun_from_planet - anchor).normalize();
+            let e1 = (sun - sun.dot(pole) * pole).normalize();
+            let e2 = pole.cross(e1);
+            let focal_px = 540.0 / (view.fov_y_deg.to_radians() / 2.0).tan();
+            let moons: Vec<(NaifId, DVec3, DVec3)> = view
+                .moons
+                .iter()
+                .map(|&id| {
+                    let spot = horizons_spots(id, view.planet)
+                        .into_iter()
+                        .find(|s| (s.jd_tdb - SPOT_JD).abs() < 1e-6)
+                        .expect("2026-11-20 spot");
+                    (id, rel(id), pos_m(&spot))
+                })
+                .collect();
+            let elevations: Vec<f64> = if view.elevations.is_empty() {
+                (-180..=180).map(|k| f64::from(k) * 0.5).collect()
+            } else {
+                view.elevations.to_vec()
+            };
+            // Per moon: placements showing it, those at ≥ 1 px, and the worst (px, elevation,
+            // azimuth, phase).
+            let mut stats: Vec<(NaifId, u32, u32, [f64; 4])> =
+                view.moons.iter().map(|&id| (id, 0, 0, [0.0; 4])).collect();
+            let (mut placements, mut clean) = (0_u32, 0_u32);
+            for &el in &elevations {
+                for k in -1_800..1_800 {
+                    let az = f64::from(k) / 10.0;
+                    let (sin_a, cos_a) = az.to_radians().sin_cos();
+                    let (sin_e, cos_e) = el.to_radians().sin_cos();
+                    let dir = cos_e * (cos_a * e1 + sin_a * e2) + sin_e * pole;
+                    let phase = dir.dot(sun).clamp(-1.0, 1.0).acos().to_degrees();
+                    if phase < view.phase_deg.0 || phase > view.phase_deg.1 {
+                        continue;
+                    }
+                    let fwd = -dir;
+                    let up = (pole - pole.dot(fwd) * fwd).normalize();
+                    let right = fwd.cross(up);
+                    let sun_in_image = sun - sun.dot(fwd) * fwd;
+                    if view.lit_limb_left && sun_in_image.dot(right) > -0.95 * sun_in_image.length()
+                    {
+                        continue;
+                    }
+                    placements += 1;
+                    let cam = anchor + dir * view.dist_km * 1e3;
+                    let project = |p: DVec3| {
+                        let v = p - cam;
+                        let z = v.dot(fwd);
+                        (z, focal_px * v.dot(right) / z, focal_px * v.dot(up) / z)
+                    };
+                    let mut all_under = true;
+                    for (&(_, model, truth), stat) in moons.iter().zip(stats.iter_mut()) {
+                        let (z, x, y) = project(truth);
+                        let hidden = occulted(cam, truth, DVec3::ZERO, polar_radius(view.planet))
+                            || occulted(cam, truth, anchor, polar_radius(view.anchor));
+                        if z <= 0.0 || x.abs() > 960.0 || y.abs() > 540.0 || hidden {
+                            continue;
+                        }
+                        let (_, xm, ym) = project(model);
+                        let px = (xm - x).hypot(ym - y);
+                        stat.1 += 1;
+                        if px >= 1.0 {
+                            stat.2 += 1;
+                            all_under = false;
+                        }
+                        if px > stat.3[0] {
+                            stat.3 = [px, el, az, phase];
+                        }
+                    }
+                    clean += u32::from(all_under);
+                }
+            }
+            assert!(placements > 0, "{}: no placement fits the plan", view.name);
+            println!(
+                "{}: {placements} placements, {clean} with every moon in frame under 1 px",
+                view.name
+            );
+            for &(id, shown, over, [px, el, az, phase]) in &stats {
+                if shown == 0 {
+                    println!("  {id}: never in frame");
+                    continue;
+                }
+                println!(
+                    "  {id}: in frame at {shown}, ≥ 1 px at {over}; worst {px:.3} px (elevation {el:+.1}°, azimuth {az:+.1}° from the Sun's, phase {phase:.2}°)"
+                );
+                let listed = OVER_ONE_PIXEL
+                    .iter()
+                    .find(|&&(name, naif, _)| name == view.name && naif == id);
+                match listed {
+                    Some(&(_, _, bound)) if px >= bound => {
+                        failures.push(format!(
+                            "{} {id}: {px:.3} px ≥ its bound {bound}",
+                            view.name
+                        ));
+                    }
+                    Some(_) if px <= 1.0 => failures.push(format!(
+                        "{} {id} is now under 1 px: drop it from OVER_ONE_PIXEL",
+                        view.name
+                    )),
+                    None if px >= 1.0 => failures.push(format!("{} {id}: {px:.3} px", view.name)),
+                    _ => {}
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 }

@@ -47,6 +47,17 @@
 //!   (URA184) and Neptune's (NEP098) disagree with their WGCCRE |Ẇ| by 0.006–2.9 °/d under
 //!   either reading, and the remaining moons have no independent rate.
 //!
+//! Known data problem (A2 fix round 2; for the lead and A9): the SAT441 rows' epoch angles
+//! do not match Horizons' sat441. With the page's angles as baked (checked against the page
+//! 2026-11-23), the mean longitude in each row's Laplace frame is off by a near-constant amount
+//! at all four spots 1950–2050: Enceladus +5°, Tethys −60°, Dione −151°, Rhea −157°, Titan
+//! −150° to −163°, Hyperion −121° to −145°, Iapetus +139° to +147° (truth − model); Mimas
+//! −22° to +50° (its 44° libration is not in the elements). The rates agree, and no single
+//! epoch shift explains the offsets. Every other system's rows agree with Horizons to ≤ 0.25°
+//! (Triton ≤ 3°), so the frame and angle conventions here are not the cause. Affected: Saturn's
+//! eight beyond ±3000 yr, where their phase is anyway unknown after decades. Saturn's other
+//! rows, which place their moons inside the window, are unchecked: none has a Horizons spot.
+//!
 //! Further refinements (A2 decisions; measured against Horizons in the A2 report):
 //! - Deimos and Triton: JPL's P (1.2625 d, 5.8792 d) is 0.0134°/d and 0.0244°/d off their
 //!   mean longitude rates, so they drift 131° and 240° by 2026-11-20. Both are synchronous, so

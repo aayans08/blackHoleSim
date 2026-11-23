@@ -32,6 +32,20 @@
 //! is independent of the Horizons goldens that test it. Meeus's book, which states the unit
 //! the theory uses, was not available.
 //!
+//! Ruling 10 at the bookmarks (A2 fix round 2, review r1 I3), measured at the plan's geometry
+//! (`ephemeris::tests::bookmark_moon_errors_at_plan_geometry`, every camera placement the plan
+//! allows, the 2026-11-20 spot): Mimas is 1.43–1.74 px off at `saturn-ring-plane` and up to
+//! 2.45 px at `saturn-night-side`, Dione up to 1.16 px at `saturn-ring-plane`, and Iapetus up
+//! to 5.6 px at `titan-backlit` where it is in frame; the other moons stay under 1 px. Mimas's
+//! miss is the theory's along track (1 072 km = 0.34° at the spot; radial 162 km, normal
+//! 68 km), so neither the length unit nor the equator changes it. Tried and not kept: Saturn's
+//! WGCCRE 2015 pole as the equator of Mimas … Dione (Meeus's fixed B1950 equator is 0.024°
+//! from it) halves Dione's normal error (310 → 152 km at the spot) but adds along-track error
+//! (325 → 417 km) and worsens Enceladus, so Dione only goes from 1.155 to 1.093 px and Mimas
+//! from 1.742 to 1.660 px. A better theory (for example TASS 1.7, Vienne & Duriez 1995,
+//! A&A 297, 588, whose series are a data file to download) needs the lead; whether it would
+//! reach 1 px there is untested.
+//!
 //! Validity: outside ±3000 yr of J2000 ([`crate::ephemeris::MOON_THEORY_WINDOW_CY`]) this
 //! module returns the value at the nearer window edge and the Ephemeris uses the moons' JPL
 //! mean elements instead.

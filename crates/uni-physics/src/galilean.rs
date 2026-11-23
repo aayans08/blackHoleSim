@@ -514,9 +514,13 @@ mod tests {
 
     /// Spots over the brief's 1 000 km ceiling, asserted at their measured error + 10 % and
     /// listed in the A2 report for the lead (ruling 10, still to rule): E5 as Meeus truncates it,
-    /// 54 yr past the end of Lieske's 1891–1996 fit, drifts along track (radial errors are
-    /// 46–65 km there). Measured with the 71 418 km unit: Ganymede 1 893 km, Callisto 1 432 km
-    /// (1 906 and 1 542 with 71 398 km). Self-checking: each must still exceed 1 000 km.
+    /// 54 yr past the end of Lieske's 1891–1996 fit, drifts along track. Measured with the
+    /// 71 418 km unit, split into radial / along-track / normal: Ganymede +63 / +1 892 / +13 km
+    /// (1 893 km), Callisto −46 / −1 430 / −46 km (1 432 km); 1 906 and 1 542 km with 71 398 km.
+    /// No m1 bookmark shows them at 2050: at the bookmark epoch (2026-11-20) every Galilean is
+    /// ≤ 0.084 px at every placement `jupiter-galileans` allows, and none is in the
+    /// `jupiter-disk` frame (`ephemeris::tests::bookmark_moon_errors_at_plan_geometry`).
+    /// Self-checking: each must still exceed 1 000 km.
     const OVER_CEILING: [(i32, f64, f64); 2] =
         [(503, 2_469_807.5, 2_090.0), (504, 2_469_807.5, 1_580.0)];
 
