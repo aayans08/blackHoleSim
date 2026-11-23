@@ -16,21 +16,24 @@
 // one atomic per bin holds both: count << 16 | step sum (a workgroup has at most 256 pixels per
 // bin: count ≤ 256, step sum ≤ 3840 < 2^16).
 //
-// Star share (B6 fix round 1, review r0 Important 1; the lead's ruling is pending): hdr alpha at
-// this pass is the pixel's star share s = 1 - w, where w = lod_exposure_mix is the weight its
-// writer used in pre = mix(star_pre(), scene_pre(), w). The meter divides by
+// Star share (B6 fix rounds 1-2, review r0 Important 1; the lead's ruling is pending):
+// lens_mask.a at this pass is the pixel's star share s = 1 - w, where w = lod_exposure_mix is the
+// weight its writer used in pre = mix(star_pre(), scene_pre(), w), composited with the Max blend
+// the writers' lens_mask target already has. The meter divides hdr's Y by
 // mix(scene_pre(), star_pre(), s). s = 0, the clear value and what every writer leaves while it
-// masks alpha out, is the plan's rule (÷ scene_pre) exactly. A body in the 1.5-4 px band read
-// ÷ scene_pre grows 2^(EV_scene - EV_star) with the scene EV, which runs the loop away
+// masks lens_mask alpha out, is the plan's rule (÷ scene_pre) exactly. hdr's own alpha is not
+// read. A body in the 1.5-4 px band read ÷ scene_pre grows 2^(EV_scene - EV_star) with the scene
+// EV, which runs the loop away; with a Max-composited share no reading grows with the scene EV
 // (crates/uni-post/src/histogram.rs module docs).
 //
 // CPU twins (crates/uni-post/src/histogram.rs): meter_pre, meter_luminance, meter_pixel (the
 // per-pixel step of cs_histogram), meter_bin, Histogram::meter (meter_reduce here, same order
 // of operations). The constants are checked against Rust by
-// `post_shaders_validate`; MeterBins and ExposureState by `post_layouts_match_wgsl`.
+// `post_shaders_validate`; MeterBins and ExposureState by `post_layouts_match_wgsl`; the
+// bindings by `meter_reads_the_share_from_lens_mask`.
 //
 // Bindings: group 0 = the renderer's (scene_pre, star_pre); group 1: 0 meter_hdr, 1 meter_bins,
-// 2 meter_state.
+// 2 meter_state, 3 meter_lens_mask.
 
 #import "common/camera.wgsl"
 #import "common/color.wgsl"
@@ -78,6 +81,8 @@ struct ExposureState {
 @group(1) @binding(0) var meter_hdr: texture_2d<f32>;
 @group(1) @binding(1) var<storage, read_write> meter_bins: MeterBins;
 @group(1) @binding(2) var<storage, read_write> meter_state: ExposureState;
+// The frame's lens_mask (same size as hdr); only its alpha, the star share, is read.
+@group(1) @binding(3) var meter_lens_mask: texture_2d<f32>;
 
 // cs_histogram: count << 16 | step sum per bin.
 var<workgroup> wg_packed: array<atomic<u32>, 256>;
@@ -103,7 +108,7 @@ fn meter_luminance(rgb: vec3<f32>, pre: f32) -> f32 {
     return l;
 }
 
-// The pre-exposure a pixel was written with, from its star share s (hdr alpha, not NaN):
+// The pre-exposure a pixel was written with, from its star share s (lens_mask alpha, not NaN):
 // mix(scene_pre, star_pre, s), s clamped to [0, 1]; s = 0 gives scene_pre() exactly.
 fn meter_pre(s: f32) -> f32 {
     return mix(scene_pre(), star_pre(), clamp(s, 0.0, 1.0));
@@ -131,10 +136,11 @@ fn cs_histogram(
     workgroupBarrier();
     let dims = textureDimensions(meter_hdr);
     if (gid.x < dims.x && gid.y < dims.y) {
-        let px = textureLoad(meter_hdr, vec2<i32>(gid.xy), 0);
+        let p = vec2<i32>(gid.xy);
+        let s = textureLoad(meter_lens_mask, p, 0).a;
         // A NaN star share: the pixel's pre is unknown, so it is not metered.
-        if (!is_nan(px.a)) {
-            let l = meter_luminance(px.rgb, meter_pre(px.a));
+        if (!is_nan(s)) {
+            let l = meter_luminance(textureLoad(meter_hdr, p, 0).rgb, meter_pre(s));
             if (l >= METER_MIN_CD_M2 && !is_nan(l)) {
                 let b = meter_bin(l);
                 atomicAdd(&wg_packed[b.x], (1u << 16u) | b.y);

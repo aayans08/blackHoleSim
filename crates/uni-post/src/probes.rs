@@ -4,8 +4,9 @@
 //! and compares what the GPU wrote with the CPU twin:
 //! - `meter_histogram`: the meter and the resolve on a 512² frame (a quarter black, an 8 × 8
 //!   block clamped at `HDR_MAX`, a 32 × 32 block written at a blended pre-exposure with its star
-//!   share in alpha, the rest log-normal luminance) vs [`meter_pixel`], [`Histogram::meter`]
-//!   and [`target_ev`]: lit_px ±0.1 %, ev_avg, ev_hi and the target ±0.05 EV.
+//!   share in `lens_mask` alpha, the rest log-normal luminance; `hdr` alpha a decoy 1) vs
+//!   [`meter_pixel`], [`Histogram::meter`] and [`target_ev`]: lit_px ±0.1 %, ev_avg, ev_hi and
+//!   the target ±0.05 EV.
 //! - `exposure_resolve`: the resolve for 16 settings and states vs [`next_adapted_ev`] and
 //!   [`resolve_exposure`] (±1e-6 relative), and the read-back ring against the last of them.
 //! - `bloom_impulse`: the whole bloom on impulses (one above `BLOOM_INPUT_MAX`) at strength 1
@@ -70,7 +71,7 @@ fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
     let cpu = Histogram::from_luminances(
         frame
             .iter()
-            .map(|c| meter_pixel(c.to_array(), scene_pre, star_pre)),
+            .map(|c| meter_pixel(c.truncate().to_array(), c.w, scene_pre, star_pre)),
     )
     .meter(total)
     .context("the synthetic frame has lit pixels")?;
@@ -99,7 +100,9 @@ fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
         })),
     );
     let targets = probe_targets(&gpu.device, size);
-    upload_hdr(gpu, &targets, &frame);
+    let (hdr, lens_mask) = meter_targets(&frame);
+    upload_rgba16f(gpu, &targets.hdr, size, &hdr);
+    upload_rgba16f(gpu, &targets.lens_mask, size, &lens_mask);
     let ctx = probe_ctx(size, 1.0 / 60.0);
     meter.prepare(gpu, &ctx, &targets);
     resolve.prepare(gpu, &ctx, &targets);
@@ -257,7 +260,7 @@ fn check_bloom(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
     )?;
     let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let targets = probe_targets(&gpu.device, size);
-    upload_hdr(gpu, &targets, &rgba);
+    upload_rgba16f(gpu, &targets.hdr, size, &rgba);
     let ctx = probe_ctx(size, 1.0 / 60.0);
     // One empty renderer frame uploads the camera uniform (the composite reads its viewport).
     let upload = renderer.render(gpu, &ctx, &targets.hdr_view);
@@ -455,7 +458,8 @@ fn probe_ctx(size: UVec2, dt_real_s: f64) -> FrameCtx {
     }
 }
 
-/// Frame targets of `size` whose `hdr` the probes can write (`COPY_DST`) and read (`COPY_SRC`).
+/// Frame targets of `size` whose `hdr` the probes can write (`COPY_DST`) and read (`COPY_SRC`),
+/// and whose `lens_mask` they can write (`COPY_DST`).
 fn probe_targets(device: &wgpu::Device, size: UVec2) -> FrameTargets {
     let target = |label: &str, format: wgpu::TextureFormat, usage: wgpu::TextureUsages| {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -485,7 +489,11 @@ fn probe_targets(device: &wgpu::Device, size: UVec2) -> FrameTargets {
             | wgpu::TextureUsages::COPY_DST,
     );
     let (depth, depth_view) = target("probe depth", DEPTH_FORMAT, attach);
-    let (lens_mask, lens_mask_view) = target("probe lens mask", LENS_MASK_FORMAT, attach);
+    let (lens_mask, lens_mask_view) = target(
+        "probe lens mask",
+        LENS_MASK_FORMAT,
+        attach | wgpu::TextureUsages::COPY_DST,
+    );
     FrameTargets {
         size,
         hdr,
@@ -497,8 +505,8 @@ fn probe_targets(device: &wgpu::Device, size: UVec2) -> FrameTargets {
     }
 }
 
-/// Writes `rgba` (row-major) into `targets.hdr` as f16.
-fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgba: &[Vec4]) {
+/// Writes `rgba` (row-major) into the Rgba16Float `texture` of `size` as f16.
+fn upload_rgba16f(gpu: &GpuContext, texture: &wgpu::Texture, size: UVec2, rgba: &[Vec4]) {
     let bytes: Vec<u8> = rgba
         .iter()
         .flat_map(|c| c.to_array())
@@ -506,7 +514,7 @@ fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgba: &[Vec4]) {
         .collect();
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &targets.hdr,
+            texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -514,24 +522,47 @@ fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgba: &[Vec4]) {
         &bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(targets.size.x * 8),
-            rows_per_image: Some(targets.size.y),
+            bytes_per_row: Some(size.x * 8),
+            rows_per_image: Some(size.y),
         },
         wgpu::Extent3d {
-            width: targets.size.x,
-            height: targets.size.y,
+            width: size.x,
+            height: size.y,
             depth_or_array_layers: 1,
         },
     );
 }
 
+/// The `hdr` and `lens_mask` texels of the meter probe's frame ([`lognormal_frame`]: colour and
+/// star share), written as the frame contract proposes. `hdr` alpha is [`HDR_ALPHA_DECOY`]
+/// everywhere, so a meter that read the share from `hdr` would fail the probe. `lens_mask` holds
+/// `g` = 1 where lit (body coverage) and the star share in alpha.
+fn meter_targets(frame: &[Vec4]) -> (Vec<Vec4>, Vec<Vec4>) {
+    frame
+        .iter()
+        .map(|c| {
+            let lit = if c.truncate() == Vec3::ZERO { 0.0 } else { 1.0 };
+            (
+                c.truncate().extend(HDR_ALPHA_DECOY),
+                Vec4::new(0.0, lit, 0.0, c.w),
+            )
+        })
+        .unzip()
+}
+
+/// What the meter probe writes into `hdr` alpha: 1, as uni-rel's debug background does. It is
+/// not a star share; read as one it would put every pixel at star exposure.
+const HDR_ALPHA_DECOY: f32 = 1.0;
+
 /// The meter probe's frame at scene pre-exposure `scene_pre` and star pre-exposure `star_pre`,
-/// already rounded to f16: the left quarter black (not lit), an 8 × 8 block at `HDR_MAX` in the
-/// top-right corner (clamped), and everywhere else a log-normal luminance (median 300 cd/m²,
-/// σ = 1.5 EV; Box–Muller on `splitmix64`) in a warm tint. That light is at scene exposure (star
-/// share 0 in alpha) except in a 32 × 32 block ([`BAND_BLOCK`]), written like a body in the
-/// 1.5–4 px LOD band at mix(star_pre, scene_pre, w), w = 1 − [`BAND_SHARE`], with its star share
-/// in alpha. The block is 0.5 % of the lit pixels, so read ÷ scene_pre it would set ev_hi.
+/// already rounded to f16: per pixel the pre-exposed `hdr` colour (xyz) and the star share (w,
+/// which [`meter_targets`] puts in `lens_mask` alpha). The left quarter is black (not lit), an
+/// 8 × 8 block at `HDR_MAX` in the top-right corner (clamped), and everywhere else a log-normal
+/// luminance (median 300 cd/m², σ = 1.5 EV; Box–Muller on `splitmix64`) in a warm tint. That
+/// light is at scene exposure (star share 0) except in a 32 × 32 block ([`BAND_BLOCK`]), written
+/// like a body in the 1.5–4 px LOD band at mix(star_pre, scene_pre, w), w = 1 − [`BAND_SHARE`],
+/// with its star share. The block is 0.5 % of the lit pixels, so read ÷ scene_pre it would set
+/// ev_hi.
 fn lognormal_frame(size: UVec2, scene_pre: f32, star_pre: f32) -> Vec<Vec4> {
     let tint = Vec3::new(1.1, 1.0, 0.8);
     let tint = tint / tint.dot(Vec3::new(0.2126, 0.7152, 0.0722));
@@ -572,7 +603,7 @@ const BAND_BLOCK: [u32; 3] = [256, 256, 32];
 const BAND_SHARE: f32 = 0.125;
 
 /// Smallest normal f16, 2^−14.
-const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
+pub(crate) const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
 
 /// IEEE 754 binary16 bits of `x`, rounded to nearest even, for 0 and every finite |x| in the
 /// normal f16 range [2^−14, 65504], which is all the probes write. Smaller values flush to 0.
@@ -681,7 +712,7 @@ mod tests {
             Histogram::from_luminances(
                 frame
                     .iter()
-                    .map(|c| meter_pixel(c.to_array(), scene_pre, star_for_band)),
+                    .map(|c| meter_pixel(c.truncate().to_array(), c.w, scene_pre, star_for_band)),
             )
             .meter(size.x * size.y)
             .unwrap()
@@ -701,6 +732,23 @@ mod tests {
         assert!(band as f32 / lit > 0.005, "{band} of {lit}");
         let ignored = read(scene_pre);
         assert!(ignored.ev_hi > m.ev_hi + 5.0, "{m:?} vs {ignored:?}");
+        // What the GPU probe uploads (fix round 2): the share in lens_mask alpha and a decoy
+        // in hdr alpha. Read from lens_mask it is the CPU reading above; read from hdr alpha
+        // (every pixel at star exposure) every EV falls by 14 (10 − (−4)), so the probe tells
+        // which channel the shader reads.
+        let (hdr, mask) = meter_targets(&frame);
+        let pick = |share: &dyn Fn(Vec4, Vec4) -> f32| {
+            Histogram::from_luminances(hdr.iter().zip(&mask).map(|(h, k)| {
+                meter_pixel(h.truncate().to_array(), share(*h, *k), scene_pre, star_pre)
+            }))
+            .meter(size.x * size.y)
+            .unwrap()
+        };
+        assert_eq!(pick(&|_, k| k.w), m);
+        let decoy = pick(&|h, _| h.w);
+        assert!(decoy.ev_avg < m.ev_avg - 5.0, "{m:?} vs {decoy:?}");
+        assert!(mask.iter().all(|k| k.w == 0.0 || k.w == BAND_SHARE));
+        assert!(hdr.iter().all(|h| h.w == HDR_ALPHA_DECOY));
         // The resolve cases: 16, each with finite expectations.
         let cases = resolve_cases();
         assert_eq!(cases.len(), 16);

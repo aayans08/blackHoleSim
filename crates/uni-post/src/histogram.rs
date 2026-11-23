@@ -20,7 +20,8 @@
 //! atomic). [`Histogram`] is the exact CPU twin; [`meter_histogram`] (counts only, bin centres)
 //! differs from it by at most half a bin.
 //!
-//! ## Star share in `hdr` alpha (fix round 1, review r0 Important 1; needs the lead's ruling)
+//! ## Star share in `lens_mask` alpha (fix rounds 1–2, review r0 Important 1; needs the lead's
+//! ruling)
 //!
 //! The plan's rule divides every pixel by `scene_pre`. A body whose projected radius is in the
 //! 1.5–4 px LOD band is written at pre = mix(star_pre, scene_pre, w) (`uni_planet::
@@ -28,20 +29,32 @@
 //! (1 − w)·2^(EV_scene − EV_star) + w times too bright. That reading grows with the scene EV, a
 //! positive feedback: an Earth at 12 px with the Moon at 3.2 px ran the exposure to EV 40
 //! (`earth_moon_band_pair_settles`). The meter therefore reads the pixel's **star share**
-//! s = 1 − w from `hdr` alpha and divides by [`meter_pre`] = mix(scene_pre, star_pre, s):
-//! - s = 0 is the clear value (`Renderer` clears `hdr` to 0) and what every pass leaves while
-//!   its colour target masks alpha out (all of them at fix round 1). Such pixels read exactly
-//!   as the plan's rule, so nothing changes until a writer stores s.
+//! s = 1 − w from `lens_mask` alpha and divides `hdr`'s Y by [`meter_pre`] = mix(scene_pre,
+//! star_pre, s):
+//! - s = 0 is the clear value (`Renderer` clears `lens_mask` to 0) and what every pass leaves
+//!   while its `lens_mask` target masks alpha out (all of them at fix round 2). Such pixels read
+//!   exactly as the plan's rule, so nothing changes until a writer stores s.
 //! - The encoding is 1 − w, not w, for two reasons. Zero (the clear value) then means scene
 //!   exposure. And f16's relative precision lands where the feedback is sensitive (w → 1):
-//!   a stored s is off by ≤ 2⁻¹¹ relative, and so is the pre the meter recovers.
-//! - Mixed pixels: if the writers composite s exactly like their premultiplied colour
-//!   (s_out = coverage·s + (1 − coverage)·s_dst), the meter reads the pre-weighted mean of the
-//!   luminances in the pixel, within their range at every EV, so no feedback
-//!   (`mixed_band_pixel_reads_within_its_luminances`).
+//!   a stored s is off by ≤ 2⁻¹¹ relative, and so is the pre the meter recovers. A share below
+//!   f16's smallest normal (2⁻¹⁴) may be flushed to 0 on store, which would feed back again, so
+//!   writers snap w to 1 there (`band_share_below_f16_normal_needs_the_snap`).
+//! - Why `lens_mask` alpha and not `hdr` alpha (fix round 2): every pre-meter writer already
+//!   has a `lens_mask` target with a Max blend on colour and alpha (it writes `g` = coverage),
+//!   so storing s is a write-mask bit and one expression per writer, and it works for instanced
+//!   draws with a per-instance w (star surfaces). Nothing writes `lens_mask` alpha before the
+//!   lens pass (pass 10), whereas `hdr` alpha is set to 1 by uni-rel's debug background and
+//!   would take a coverage value from any writer that unmasked it.
+//! - Mixed pixels: with the share composited by Max, contributor i of a pixel (luminance L_i,
+//!   written at pre(s_i)) is read as L_i·pre(s_i)/pre(s_max), and that ratio never grows with
+//!   the scene EV, so no pixel's reading can feed back. With eye-adapted stars and a scene EV at
+//!   or above the star EV (the sunlit case) pre(s_max) ≥ pre(s_i), so a pixel also never reads
+//!   above its brightest contributor; a band body over black reads exactly
+//!   (`mixed_band_pixel_never_feeds_back`).
 //! - Not built here: the writers (B1 body, B2 rings and star surfaces) must store s, and the
-//!   frame contract (uni-gfx `targets.rs`) must state it. Until they do, a band body next to a
-//!   metered one still runs the loop away. The fix round 1 report gives the exact change.
+//!   frame contract (uni-gfx `targets.rs`, whose `lens_mask` alpha is "reserved for M3") must
+//!   state it. Until they do, a band body next to a metered one still runs the loop away. The
+//!   fix round 2 report gives the exact change.
 
 use anyhow::Context as _;
 use uni_gfx::{
@@ -134,25 +147,26 @@ pub fn meter_luminance(pre_rgb: [f32; 3], pre: f32) -> f32 {
 }
 
 /// The pre-exposure the light in an `hdr` pixel was written with, from the pixel's star share
-/// `star_share` (its alpha at the meter, see the module docs): mix(`scene_pre`, `star_pre`, s) =
-/// `scene_pre`·(1 − s) + `star_pre`·s (WGSL `mix`, same order), with s clamped to [0, 1]. s = 0
-/// gives `scene_pre` exactly. A NaN share gives NaN (the pixel is not metered). Twin of
-/// `meter_pre` in `histogram.wgsl`.
+/// `star_share` (its `lens_mask` alpha at the meter, see the module docs): mix(`scene_pre`,
+/// `star_pre`, s) = `scene_pre`·(1 − s) + `star_pre`·s (WGSL `mix`, same order), with s
+/// clamped to [0, 1]. s = 0 gives `scene_pre` exactly. A NaN share gives NaN (the pixel is not
+/// metered). Twin of `meter_pre` in `histogram.wgsl`.
 pub fn meter_pre(scene_pre: f32, star_pre: f32, star_share: f32) -> f32 {
     // f32::clamp keeps NaN, so a NaN share stays NaN here.
     let s = star_share.clamp(0.0, 1.0);
     scene_pre * (1.0 - s) + star_pre * s
 }
 
-/// What `cs_histogram` reads from one pre-exposed `hdr` texel `rgba`: its world luminance
-/// [cd/m²], [`meter_luminance`] at [`meter_pre`]`(scene_pre, star_pre, rgba[3])`. A NaN alpha
-/// returns NaN, which [`meter_bin`] treats as not lit (the GPU skips the pixel on its bits).
-pub fn meter_pixel(rgba: [f32; 4], scene_pre: f32, star_pre: f32) -> f32 {
-    let [r, g, b, s] = rgba;
-    if s.is_nan() {
+/// What `cs_histogram` reads from one pixel: its world luminance [cd/m²], [`meter_luminance`]
+/// of the pre-exposed `hdr` colour `hdr_rgb` at [`meter_pre`]`(scene_pre, star_pre,
+/// star_share)`, where `star_share` is the pixel's `lens_mask` alpha (see the module docs). A
+/// NaN share returns NaN, which [`meter_bin`] treats as not lit (the GPU skips the pixel on its
+/// bits).
+pub fn meter_pixel(hdr_rgb: [f32; 3], star_share: f32, scene_pre: f32, star_pre: f32) -> f32 {
+    if star_share.is_nan() {
         return f32::NAN;
     }
-    meter_luminance([r, g, b], meter_pre(scene_pre, star_pre, s))
+    meter_luminance(hdr_rgb, meter_pre(scene_pre, star_pre, star_share))
 }
 
 /// The bin and sub-bin step (0..[`METER_BIN_STEPS`]) of world luminance `l_cd_m2`, or `None`
@@ -321,9 +335,9 @@ pub struct ExposureMeter {
     bins: wgpu::Buffer,
     /// The auto-exposure state ([`ExposureStateGpu`]) shared with the resolve pass.
     state: wgpu::Buffer,
-    /// The bind group over the current `targets.hdr_view`; `None` until the first `encode` and
-    /// after a resize.
-    binding: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    /// The bind group over the current `targets.hdr_view` and `targets.lens_mask_view`; `None`
+    /// until the first `encode` and after a resize.
+    binding: Option<MeterBinding>,
 }
 
 impl ExposureMeter {
@@ -383,9 +397,10 @@ impl ExposureMeter {
     }
 }
 
-/// [`METER_GROUP`]: binding 0 the hdr target (read with `textureLoad`, so any float format
-/// binds), 1 the bins, 2 the auto-exposure state.
-fn meter_layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+/// [`METER_GROUP`]: binding 0 the hdr target, 1 the bins, 2 the auto-exposure state, 3 the
+/// lens mask (its alpha is the star share). Both textures are read with `textureLoad`, so any
+/// float format binds.
+fn meter_layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
     let storage = |binding: u32, size: usize| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -396,36 +411,41 @@ fn meter_layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
         },
         count: None,
     };
-    [
-        wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
+    let texture = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
         },
+        count: None,
+    };
+    [
+        texture(0),
         storage(1, std::mem::size_of::<MeterBinsGpu>()),
         storage(2, std::mem::size_of::<ExposureStateGpu>()),
+        texture(3),
     ]
 }
 
-/// The meter's bind group for `targets.hdr_view`, rebuilt if `binding` was made for another
-/// view. A free function over the fields so the caller can keep borrowing the others.
+/// The views a meter bind group was made for (`hdr`, `lens_mask`) and the bind group.
+type MeterBinding = ([wgpu::TextureView; 2], wgpu::BindGroup);
+
+/// The meter's bind group for `targets.hdr_view` and `targets.lens_mask_view`, rebuilt if
+/// `binding` was made for other views. A free function over the fields so the caller can keep
+/// borrowing the others.
 fn meter_bind_group<'a>(
-    binding: &'a mut Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    binding: &'a mut Option<MeterBinding>,
     layout: &wgpu::BindGroupLayout,
     bins: &wgpu::Buffer,
     state: &wgpu::Buffer,
     device: &wgpu::Device,
     targets: &FrameTargets,
 ) -> &'a wgpu::BindGroup {
-    if binding
-        .as_ref()
-        .is_some_and(|(view, _)| *view != targets.hdr_view)
-    {
+    if binding.as_ref().is_some_and(|([hdr, mask], _)| {
+        *hdr != targets.hdr_view || *mask != targets.lens_mask_view
+    }) {
         *binding = None;
     }
     let (_, bind_group) = binding.get_or_insert_with(|| {
@@ -445,9 +465,16 @@ fn meter_bind_group<'a>(
                     binding: 2,
                     resource: state.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&targets.lens_mask_view),
+                },
             ],
         });
-        (targets.hdr_view.clone(), bind_group)
+        (
+            [targets.hdr_view.clone(), targets.lens_mask_view.clone()],
+            bind_group,
+        )
     });
     bind_group
 }
@@ -457,7 +484,8 @@ impl RenderFeature for ExposureMeter {
         NAME
     }
 
-    /// Nothing to upload: the meter reads `scene_pre()` and `star_pre()` from group 0 and `hdr`.
+    /// Nothing to upload: the meter reads `scene_pre()` and `star_pre()` from group 0, and `hdr`
+    /// and `lens_mask` from its own group.
     fn prepare(&mut self, _gpu: &GpuContext, _ctx: &FrameCtx, _targets: &FrameTargets) {}
 
     /// One compute pass: `cs_histogram` over every pixel, then `cs_reduce` in one workgroup.
@@ -495,7 +523,7 @@ impl RenderFeature for ExposureMeter {
         pass.dispatch_workgroups(1, 1, 1);
     }
 
-    /// Drops the bind group over the old hdr view; the next `encode` binds the new one.
+    /// Drops the bind group over the old views; the next `encode` binds the new ones.
     fn resize(&mut self, _gpu: &GpuContext, _targets: &FrameTargets) {
         self.binding = None;
     }
@@ -594,29 +622,63 @@ mod tests {
         t * t * (3.0 - 2.0 * t)
     }
 
-    /// An f32 stored in and read back from an f16 channel of `hdr` (Rgba16Float).
+    /// An f32 stored in and read back from an f16 channel of `hdr` or `lens_mask` (both
+    /// Rgba16Float); values below f16's smallest normal flush to 0.
     fn f16(x: f32) -> f32 {
         crate::probes::f16_value(crate::probes::f16_bits(x))
     }
 
-    /// One grey world-light pixel of luminance `l` [cd/m²] as the frame contract writes it: at
-    /// pre = mix(star_pre, scene_pre, w) (body.wgsl, rings.wgsl, star_surface.wgsl; w =
-    /// `lod_exposure_mix`, 1 for a body of 4 px or more), clamped at `HDR_MAX`, with its star
-    /// share 1 − w in alpha, stored as f16.
-    fn hdr_pixel(l: f32, w: f32, scene_pre: f32, star_pre: f32) -> [f32; 4] {
-        let pre = star_pre * (1.0 - w) + scene_pre * w;
-        let v = f16((l * pre).min(HDR_MAX));
-        [v, v, v, f16(1.0 - w)]
+    /// f16's smallest normal, 2^−14.
+    const F16_MIN_NORMAL: f32 = crate::probes::F16_MIN_NORMAL;
+
+    /// The pre-exposure a writer uses for light with scene-exposure weight `w`: mix(star_pre,
+    /// scene_pre, w) (body.wgsl, rings.wgsl, star_surface.wgsl; w = `lod_exposure_mix`, 1 for a
+    /// body of 4 px or more).
+    fn writer_pre(w: f32, scene_pre: f32, star_pre: f32) -> f32 {
+        star_pre * (1.0 - w) + scene_pre * w
     }
 
-    /// The meter's reading of world-light pixels `(l, w)` ([`hdr_pixel`]) rendered at scene EV
+    /// One grey world-light pixel of luminance `l` [cd/m²] fully covered by one writer, as the
+    /// frame contract writes it: hdr = l·[`writer_pre`] clamped at `HDR_MAX`, and the star
+    /// share 1 − w in lens_mask.a, both stored as f16. Returns (hdr rgb, lens_mask.a).
+    fn band_pixel(l: f32, w: f32, scene_pre: f32, star_pre: f32) -> ([f32; 3], f32) {
+        let v = f16((l * writer_pre(w, scene_pre, star_pre)).min(HDR_MAX));
+        ([v; 3], f16(1.0 - w))
+    }
+
+    /// The meter's reading of world-light pixels `(l, w)` ([`band_pixel`]) rendered at scene EV
     /// `ev` and star EV `star_ev`; the rest of the `total_px` frame is black.
     fn meter_frame(px: &[(f32, f32)], total_px: u32, ev: f32, star_ev: f32) -> Option<Meter> {
         let (scene_pre, star_pre) = (exposure_scale(ev), exposure_scale(star_ev));
         Histogram::from_luminances(px.iter().map(|&(l, w)| {
-            meter_pixel(hdr_pixel(l, w, scene_pre, star_pre), scene_pre, star_pre)
+            let (rgb, share) = band_pixel(l, w, scene_pre, star_pre);
+            meter_pixel(rgb, share, scene_pre, star_pre)
         }))
         .meter(total_px)
+    }
+
+    /// One pixel after two draws, composited as the frame contract does: `back` (if any) fully
+    /// covering it, then `front` with coverage `c` on top. A layer is (luminance [cd/m²], w).
+    /// - hdr: premultiplied "over", c·L_f·pre(w_f) + (1 − c)·L_b·pre(w_b) (the writers'
+    ///   `PREMULTIPLIED_ALPHA_BLENDING`), clamped at `HDR_MAX`;
+    /// - lens_mask.a: the Max of the layers' shares 1 − w (the writers' lens_mask Max blend),
+    ///   each written only where its coverage is > 0.
+    ///
+    /// Both stored as f16. Returns (hdr rgb, lens_mask.a, the unclamped hdr value).
+    fn composite(
+        back: Option<(f32, f32)>,
+        front: (f32, f32),
+        c: f32,
+        scene_pre: f32,
+        star_pre: f32,
+    ) -> ([f32; 3], f32, f32) {
+        let (lf, wf) = front;
+        let (lb, wb) = back.unwrap_or((0.0, 1.0));
+        let raw = c * lf * writer_pre(wf, scene_pre, star_pre)
+            + (1.0 - c) * lb * writer_pre(wb, scene_pre, star_pre);
+        let v = f16(raw.min(HDR_MAX));
+        let share = (1.0 - wb).max(if c > 0.0 { 1.0 - wf } else { 0.0 });
+        ([v; 3], f16(share), raw)
     }
 
     #[test]
@@ -810,8 +872,8 @@ mod tests {
 
     #[test]
     fn meter_pixel_divides_by_its_own_pre() {
-        // Fix round 1 (review r0 Important 1): hdr alpha is the pixel's star share s, and the
-        // meter divides by mix(scene_pre, star_pre, s).
+        // Fix rounds 1 and 2 (review r0 Important 1): lens_mask.a is the pixel's star share s,
+        // and the meter divides hdr's Y by mix(scene_pre, star_pre, s).
         let (scene, star) = (exposure_scale(15.0), exposure_scale(NIGHT_EV100));
         let rgbs = [
             [0.3, 0.5, 0.9],
@@ -819,31 +881,79 @@ mod tests {
             [0.0, 0.0, HDR_MAX],
             [HDR_MAX; 3],
         ];
-        for [r, g, b] in rgbs {
-            // s = 0 (the clear value, and every writer that leaves alpha alone) is the brief's
-            // rule exactly: Y ÷ scene_pre.
-            let zero = meter_pixel([r, g, b, 0.0], scene, star);
-            assert_eq!(zero.to_bits(), meter_luminance([r, g, b], scene).to_bits());
-            assert_eq!(meter_pixel([r, g, b, -1.0], scene, star), zero);
+        for rgb in rgbs {
+            // s = 0 (the clear value, and every writer that leaves lens_mask.a alone) is the
+            // brief's rule exactly: Y ÷ scene_pre.
+            let zero = meter_pixel(rgb, 0.0, scene, star);
+            assert_eq!(zero.to_bits(), meter_luminance(rgb, scene).to_bits());
+            assert_eq!(meter_pixel(rgb, -1.0, scene, star), zero);
             // s = 1: star exposure; s = 2 and +∞ clamp to it.
-            let one = meter_luminance([r, g, b], star);
-            assert_eq!(meter_pixel([r, g, b, 1.0], scene, star), one);
-            assert_eq!(meter_pixel([r, g, b, 2.0], scene, star), one);
-            assert_eq!(meter_pixel([r, g, b, f32::INFINITY], scene, star), one);
+            let one = meter_luminance(rgb, star);
+            assert_eq!(meter_pixel(rgb, 1.0, scene, star), one);
+            assert_eq!(meter_pixel(rgb, 2.0, scene, star), one);
+            assert_eq!(meter_pixel(rgb, f32::INFINITY, scene, star), one);
             // Between: the writer's mix(star_pre, scene_pre, w) with w = 1 − s.
-            let quarter = meter_luminance([r, g, b], scene * 0.75 + star * 0.25);
-            assert_eq!(meter_pixel([r, g, b, 0.25], scene, star), quarter);
+            let quarter = meter_luminance(rgb, scene * 0.75 + star * 0.25);
+            assert_eq!(meter_pixel(rgb, 0.25, scene, star), quarter);
             // A NaN share: the pixel's pre is unknown, so it is not metered.
-            assert_eq!(meter_bin(meter_pixel([r, g, b, f32::NAN], scene, star)), None);
+            assert_eq!(meter_bin(meter_pixel(rgb, f32::NAN, scene, star)), None);
         }
         // The HDR_MAX bound is taken at the pixel's own pre.
         let half = scene * 0.5 + star * 0.5;
         assert_eq!(
-            meter_pixel([0.0, 0.0, HDR_MAX, 0.5], scene, star),
+            meter_pixel([0.0, 0.0, HDR_MAX], 0.5, scene, star),
             HDR_MAX / half
         );
         assert_eq!(meter_pre(scene, star, 0.0), scene);
         assert_eq!(meter_pre(scene, star, 1.0), star);
+    }
+
+    #[test]
+    fn meter_reads_the_share_from_lens_mask() {
+        // Fix round 2: the share comes from lens_mask.a (group 1, binding 3), not from hdr's
+        // alpha, which pre-meter passes leave at 0 (bodies, rings, star surfaces, atmospheres)
+        // or set to 1 (uni-rel's debug background) and must not be read as a share. The WGSL
+        // bindings and the Rust bind group layout agree.
+        let mut lib = uni_gfx::ShaderLib::with_common();
+        crate::register_shaders(&mut lib);
+        let src = lib.compose(crate::HISTOGRAM_WGSL).unwrap();
+        let m = uni_gfx::validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        let mut own: Vec<(u32, String)> = m
+            .global_variables
+            .iter()
+            .filter_map(|(_, v)| {
+                let b = v.binding.as_ref()?;
+                (b.group == METER_GROUP).then(|| (b.binding, v.name.clone().unwrap_or_default()))
+            })
+            .collect();
+        own.sort();
+        let names = ["meter_hdr", "meter_bins", "meter_state", "meter_lens_mask"];
+        let want: Vec<(u32, String)> = (0u32..)
+            .zip(names.map(str::to_owned))
+            .collect();
+        assert_eq!(own, want);
+        let entries = meter_layout_entries();
+        assert_eq!(entries.len(), names.len());
+        for (k, e) in entries.iter().enumerate() {
+            assert_eq!(e.binding, k as u32);
+        }
+        for k in [0, 3] {
+            assert!(
+                matches!(
+                    entries[k].ty,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }
+                ),
+                "binding {k}: {:?}",
+                entries[k].ty
+            );
+        }
+        // The pass reads the share from lens_mask's alpha, and hdr only for its colour.
+        assert!(src.contains("textureLoad(meter_lens_mask, p, 0).a"), "{src}");
+        assert!(src.contains("textureLoad(meter_hdr, p, 0).rgb"), "{src}");
     }
 
     #[test]
@@ -853,7 +963,8 @@ mod tests {
         // so drawn at mix(star_pre, scene_pre, w); eye-adapted stars at EV −4; settle (τ = 0).
         // Read ÷ scene_pre, the Moon's pixels grow by 2^(EV − EV_star) with the scene EV and the
         // loop runs to EV100_MAX (review: −4 → 15.1 → 26.1 → 37.2 → 40, a black frame). Read ÷
-        // their own pre (star share in alpha), they read their true luminance and it settles.
+        // their own pre (star share in lens_mask.a), they read their true luminance and it
+        // settles.
         //
         // Lambert stand-ins at 1 AU (E = 1.259e5 lux, star_illuminance_lux(−26.74)), for the
         // loop's stability rather than an absolute EV: Earth's disk composite ρ = 0.302 (ruling
@@ -910,42 +1021,107 @@ mod tests {
     }
 
     #[test]
-    fn mixed_band_pixel_reads_within_its_luminances() {
-        // Fix round 1: a pixel part-covered (coverage c) by a body in the LOD band (luminance
-        // lb, star share sb = 1 − w) over world light at scene exposure (ld, share 0), with the
-        // share composited like the colour ("over", premultiplied alpha): colour
-        // c·lb·pre(sb) + (1 − c)·ld·pre(0), share c·sb. pre(s) = mix(scene_pre, star_pre, s) is
-        // affine in s, so pre(c·sb) = c·pre(sb) + (1 − c)·pre(0) and the meter reads the
-        // pre-weighted mean of lb and ld: within [min, max] at every scene EV, so it cannot feed
-        // back. Swept over the whole EV range, with f16 storage.
-        let star = exposure_scale(NIGHT_EV100);
+    fn mixed_band_pixel_never_feeds_back() {
+        // Fix round 2: lens_mask.a is composited with Max (the blend the writers' lens_mask
+        // target already has), so a pixel's share s_max is ≥ each contributor's share s_i, and
+        // contributor i (luminance L_i, written at pre(s_i)) is read as L_i·pre(s_i)/pre(s_max).
+        // With x = scene_pre/star_pre that ratio is (x(1 − s_i) + s_i)/(x(1 − s_max) + s_max),
+        // whose derivative in x has the sign of s_max − s_i ≥ 0. It is therefore non-increasing
+        // in the scene EV: a fixed scene never reads brighter because the exposure rose, which is
+        // the loop's positive feedback (review r0 Important 1). With eye-adapted stars and a
+        // scene EV ≥ the star EV (star_pre ≥ scene_pre, the sunlit case where the runaway
+        // happened) pre(s_max) ≥ every pre(s_i), so a pixel also never reads above its
+        // brightest contributor. A band body over black reads c·L exactly. Swept over scene EV
+        // −30…40 with f16 storage.
+        let star_ev = NIGHT_EV100;
+        let star = exposure_scale(star_ev);
+        // (back, front): luminance [cd/m²] and w; w = 1 is a body at 4 px or more.
+        let cases: [(Option<(f32, f32)>, (f32, f32)); 9] = [
+            // A band body over black (the sky before the band pass).
+            (None, (5000.0, 0.87)),
+            (None, (2.0, 0.99)),
+            // A band body in front of a body at scene exposure.
+            (Some((100.0, 1.0)), (5000.0, 0.87)),
+            (Some((5000.0, 1.0)), (100.0, 0.5)),
+            (Some((3.0e4, 1.0)), (2.0, 0.99)),
+            // A body at scene exposure in front of a band body: Max keeps the band's share.
+            (Some((5000.0, 0.87)), (100.0, 1.0)),
+            (Some((2.0, 0.5)), (3.0e4, 1.0)),
+            // A band body in front of another.
+            (Some((5000.0, 0.5)), (100.0, 0.99)),
+            (Some((100.0, 0.99)), (5000.0, 0.5)),
+        ];
         let mut checked = 0;
-        for ev in (-30..=40).map(|e| e as f32) {
-            let scene = exposure_scale(ev);
+        for (back, front) in cases {
             for c in [0.1f32, 0.5, 0.9, 1.0] {
-                for w in [0.0f32, 0.5, 0.87, 0.99] {
-                    for (lb, ld) in [(5000.0f32, 100.0f32), (100.0, 5000.0), (2.0, 3.0e4)] {
-                        let pre_b = star * (1.0 - w) + scene * w;
-                        let raw = c * lb * pre_b + (1.0 - c) * ld * scene;
-                        let v = f16(raw.min(HDR_MAX));
-                        let l = meter_pixel([v, v, v, f16(c * (1.0 - w))], scene, star);
-                        let (lo, hi) = (lb.min(ld), lb.max(ld));
-                        assert!(
-                            l <= hi * 1.002,
-                            "EV {ev}, c {c}, w {w}, ({lb}, {ld}): read {l} > {hi}"
-                        );
-                        // Unclipped, the reading is also not below the dimmer one.
-                        if raw < HDR_MAX && v >= 6.2e-5 {
-                            assert!(
-                                l >= lo * 0.998,
-                                "EV {ev}, c {c}, w {w}, ({lb}, {ld}): read {l} < {lo}"
-                            );
-                        }
-                        checked += 1;
+                // The previous EV's reading, while the pixel is neither clipped nor flushed.
+                let mut prev: Option<(f32, f32)> = None;
+                for ev in (-30..=40).map(|e| e as f32) {
+                    let scene = exposure_scale(ev);
+                    let (rgb, share, raw) = composite(back, front, c, scene, star);
+                    let l = meter_pixel(rgb, share, scene, star);
+                    let hi = back.map_or(front.0, |b| b.0.max(front.0));
+                    let at = format!("{back:?} under {front:?}, c {c}, EV {ev}: read {l}");
+                    if ev >= star_ev {
+                        assert!(l <= hi * 1.002, "{at} > {hi}");
                     }
+                    let clean = raw < HDR_MAX && rgb[0] >= F16_MIN_NORMAL;
+                    if back.is_none() && clean {
+                        assert!((l / (c * front.0) - 1.0).abs() < 2e-3, "{at}");
+                    }
+                    if let (true, Some((ev0, l0))) = (clean, prev) {
+                        assert!(l <= l0 * 1.0025, "{at} > {l0} at EV {ev0}");
+                    }
+                    prev = clean.then_some((ev, l));
+                    checked += 1;
                 }
             }
         }
-        assert_eq!(checked, 71 * 4 * 4 * 3);
+        assert_eq!(checked, 9 * 4 * 71);
+    }
+
+    #[test]
+    fn band_share_below_f16_normal_needs_the_snap() {
+        // Fix round 2, evidence for the writer-side rule. A share 1 − w below f16's smallest
+        // normal (2^−14) may be flushed to 0 when lens_mask is stored (Metal does not promise
+        // f16 subnormals in a render target; `f16` here flushes them as well). The meter then
+        // divides by scene_pre light that was written at pre(w) = scene_pre + (1 − w)·(star_pre −
+        // scene_pre), over-reading it by 1 + (1 − w)·(2^(EV − EV_star) − 1), which still grows
+        // with the scene EV. The Moon at w = 1 − 6·10⁻⁵ (radius ≈ 3.982 px) next to the 12-px
+        // Earth therefore still runs away. With the snap the writers need (w = 1 when 1 − w <
+        // 2^−14, applied before both the pre and the share, so they agree) it settles on the
+        // true-luminance reading.
+        let e = 1.259e5f32;
+        let earth = lambert_sphere(12.0, 0.0, 0.302 * e / PI);
+        let moon = lambert_sphere(3.982, 0.0, 0.18 * e / PI);
+        let w = 1.0 - 6.0e-5f32;
+        assert!(1.0 - w < F16_MIN_NORMAL && f16(1.0 - w) == 0.0);
+        let snap = |w: f32| if 1.0 - w < F16_MIN_NORMAL { 1.0 } else { w };
+        let run = |w: f32| {
+            let px: Vec<(f32, f32)> = earth
+                .iter()
+                .map(|&l| (l, 1.0))
+                .chain(moon.iter().map(|&l| (l, w)))
+                .collect();
+            settle_with(
+                |ev| meter_frame(&px, FRAME_PX, ev, NIGHT_EV100),
+                NIGHT_EV100,
+                16,
+            )
+        };
+        let truth = target_ev(
+            Histogram::from_luminances(earth.iter().chain(&moon).copied()).meter(FRAME_PX),
+            0.0,
+        );
+        let snapped = run(snap(w));
+        assert!(
+            snapped[3..].iter().all(|ev| (ev - truth).abs() < 0.05),
+            "snapped: {snapped:?} vs true {truth}"
+        );
+        let flushed = run(w);
+        assert!(
+            flushed[16] > truth + 3.0 && flushed[16] > flushed[15],
+            "flushed share: {flushed:?} vs true {truth}"
+        );
     }
 }
