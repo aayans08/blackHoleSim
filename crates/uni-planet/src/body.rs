@@ -4,8 +4,9 @@
 //! [`crate::CAP_RINGS`] × [`crate::CAP_SEGMENTS`], circumscribed) in the body's unit-sphere space,
 //! makes it camera-relative in f64 and only then casts to f32. The fragment shader
 //! (`shaders/body.wgsl`) re-intersects the exact ellipsoid ([`ray_ellipsoid`]); the mesh supplies
-//! only coverage and vertex depth (never `frag_depth`). A camera inside a body: the body draws
-//! nothing and [`BodyRenderer::warnings`] reports "Inside <name>".
+//! only coverage and vertex depth (never `frag_depth`). A camera inside a body's solid radii: the
+//! body draws nothing and [`BodyRenderer::warnings`] reports "Inside <name>". A camera between
+//! Venus's surface and its cloud deck sees the solid radii drawn, with no warning ([`placement`]).
 //!
 //! **Near-surface precision (review I5).** The CPU passes c = |o_unit|² − 1 from f64 with the
 //! unit-space camera o_unit; the shader solves the quadratic in the stable form (Haines et al.
@@ -134,8 +135,9 @@ pub(crate) struct CameraUnit {
     pub c: f64,
 }
 
-/// The ellipsoid the pass draws: the body's radii, or for Venus its cloud deck
+/// The ellipsoid the pass draws from outside it: the body's radii, or for Venus its cloud deck
 /// [`VENUS_CLOUD_TOP_M`] (70 km, Titov et al. 2018) above them, where the cloud-top map lives.
+/// Under the deck [`placement`] draws the solid radii instead.
 pub(crate) fn drawn_radii(view: &BodyView) -> DVec3 {
     if view.naif == Some(VENUS) {
         view.radii_m + DVec3::splat(VENUS_CLOUD_TOP_M)
@@ -144,12 +146,53 @@ pub(crate) fn drawn_radii(view: &BodyView) -> DVec3 {
     }
 }
 
-/// The camera in unit-sphere space, or `None` when it is inside the drawn ellipsoid (or on it,
-/// or anything is non-finite): the body is then not drawn.
+/// The camera in the unit-sphere space of the ellipsoid `radii`, or `None` when it is inside
+/// that ellipsoid (or on it, or anything is non-finite). [`placement`] decides what is drawn.
 pub(crate) fn camera_unit(view: &BodyView, radii: DVec3) -> Option<CameraUnit> {
     let o = (view.orient.inverse() * -view.rel_pos_m) / radii;
     let c = o.length_squared() - 1.0;
     (o.is_finite() && c > 0.0 && c.is_finite()).then_some(CameraUnit { o, c })
+}
+
+/// What the pass does with one body this frame.
+#[derive(Clone, Debug)]
+pub(crate) enum Placement {
+    /// Draw the ellipsoid of `radii`; the camera `cam` is outside it.
+    Draw { radii: DVec3, cam: CameraUnit },
+    /// Draw nothing; the HUD warning says why.
+    Skip(String),
+}
+
+/// Where the camera is relative to `view` (named `name` in warnings), and so what is drawn
+/// (review I2, lead ruling of fix round 1; Review Focus 2: a body never vanishes because the
+/// camera crossed its proxy):
+/// - outside the drawn ellipsoid ([`drawn_radii`]): that ellipsoid;
+/// - between the solid radii and the drawn ones (Venus, 0–70 km up, under its cloud deck): the
+///   solid radii, the surface under the deck, with no warning; the atmosphere pass draws the
+///   clouds and haze around the camera. Venus has no surface map, so the solid sphere carries
+///   the cloud-top map;
+/// - inside (or on) the solid body: nothing, "Inside <name>";
+/// - non-finite view data: nothing, and a warning that does not claim the camera is inside.
+pub(crate) fn placement(view: &BodyView, name: &str) -> Placement {
+    let drawn = drawn_radii(view);
+    if let Some(cam) = camera_unit(view, drawn) {
+        return Placement::Draw { radii: drawn, cam };
+    }
+    if drawn != view.radii_m
+        && let Some(cam) = camera_unit(view, view.radii_m)
+    {
+        return Placement::Draw {
+            radii: view.radii_m,
+            cam,
+        };
+    }
+    let o = (view.orient.inverse() * -view.rel_pos_m) / view.radii_m;
+    let c = o.length_squared() - 1.0;
+    if o.is_finite() && c.is_finite() && c <= 0.0 {
+        Placement::Skip(format!("Inside {name}"))
+    } else {
+        Placement::Skip(format!("Not drawn: non-finite position or radii ({name})"))
+    }
 }
 
 /// `x` (camera-relative) turned `delta` [rad] further from the unit direction `axis`, at the same
@@ -246,7 +289,14 @@ pub(crate) struct BodyLight {
 ///   k = k₀ + (1 − k₀)·w, w = [`lod_exposure_mix`] (0 at 1.5 px, 1 at 4 px), with
 ///   k₀ = (ρ(p_V)/ρ̄)·(R_mean/R_drawn)²: at 1.5 px the disk sends the point's flux (Venus is drawn
 ///   at its cloud tops, 1.2 % larger), and from 4 px on its real rendering. Airless bodies keep
-///   k = 1 (their maps are solved for p_V).
+///   k = 1 (their maps are solved for p_V). Without the map statistics (`disk_rho` `None`, a 2k
+///   copy missing; the HUD says so, review I1) k₀ = 1.
+///   **Precondition (review I3, open, awaiting a lead ruling):** k₀ makes this pass alone carry the
+///   point's whole flux at 1.5 px, so the total is continuous only if the atmosphere pass (B3)
+///   fades its own light by the same w. uni-atmo does not do that yet: once B3's in-scatter is
+///   calibrated to W-B1's target (ground + atmosphere = point), Earth at 1.5 px is
+///   (0.651 + 0.349)/0.651 ≈ 1.54× the point (+0.47 mag). Not fixable inside this pass: it does
+///   not know B3's disk share.
 /// - The exposure weight is w while eye-adapted stars are in effect, else 1 (scene exposure).
 pub(crate) fn body_light(
     view: &BodyView,
@@ -692,10 +742,12 @@ impl BodyRenderer {
         });
         for view in order {
             let name = self.name_of(scene, view);
-            let radii = drawn_radii(view);
-            let Some(cam) = camera_unit(view, radii) else {
-                self.warnings.push(format!("Inside {name}"));
-                continue;
+            let (radii, cam) = match placement(view, &name) {
+                Placement::Draw { radii, cam } => (radii, cam),
+                Placement::Skip(warning) => {
+                    self.warnings.push(warning);
+                    continue;
+                }
             };
             // Off screen (the snapshot lists every resolved body): skip it, with two pixels of
             // margin at its distance for the AA rim and the pushed outline.
@@ -1703,5 +1755,77 @@ mod tests {
         assert_eq!([u.extra[1], u.extra[2]], [7.0e7, 1.4e8]);
         assert_eq!(u.albedo, [0.7, 0.7, 0.7, 0.0]);
         assert!((f64::from(u.cam_unit[3]) - cam.c).abs() <= cam.c * 1e-7);
+    }
+
+    /// Review I2 (lead ruling, fix round 1) and Review Focus 2: "inside" means inside the SOLID
+    /// body. A camera 35 km above Venus's solid surface, under its 70 km cloud deck, still sees
+    /// Venus: the pass draws the solid radii (the surface under the deck) with no warning. Above
+    /// the deck the deck is drawn; inside the solid body nothing is, with "Inside Venus". A view
+    /// with non-finite data is skipped without claiming the camera is inside anything (m7).
+    #[test]
+    fn camera_under_the_venus_deck_draws_the_solid_body() {
+        let r = 6_051_800.0;
+        let at = |naif: i32, altitude_m: f64| {
+            view(
+                Some(naif),
+                Brdf::Lambert,
+                0.689,
+                r,
+                true,
+                r + altitude_m,
+                0.3,
+                1e4,
+            )
+        };
+        let deck = DVec3::splat(r + uni_atmo::VENUS_CLOUD_TOP_M);
+        // 35 km up: between the surface and the deck. Drawn at the solid radii, no warning.
+        let v = at(VENUS, 35e3);
+        let Placement::Draw { radii, cam } = placement(&v, "Venus") else {
+            panic!("35 km above Venus: {:?}", placement(&v, "Venus"));
+        };
+        assert_eq!(radii, v.radii_m);
+        let want_c = ((r + 35e3) / r).powi(2) - 1.0;
+        assert!(
+            (cam.c / want_c - 1.0).abs() < 1e-9,
+            "c {} vs {want_c}",
+            cam.c
+        );
+        // It is a real draw: finite mesh, camera outside the drawn ellipsoid.
+        let mesh = mesh_vertices(&v, radii, &cam, 1e-4);
+        assert_eq!(mesh.len(), CAP_VERTICES);
+        assert!(mesh.iter().flatten().all(|x| x.is_finite()));
+        // Just above the surface (1 m) and just below the deck (69.9 km): the same.
+        for h in [1.0, 69.9e3] {
+            let v = at(VENUS, h);
+            assert!(
+                matches!(placement(&v, "Venus"), Placement::Draw { radii, .. } if radii == v.radii_m),
+                "{h} m"
+            );
+        }
+        // Above the deck (100 km): the deck is drawn.
+        let v = at(VENUS, 100e3);
+        assert!(matches!(placement(&v, "Venus"), Placement::Draw { radii, .. } if radii == deck));
+        // Inside the solid body (10 km down, and at the centre): nothing, "Inside Venus".
+        for h in [-10e3, -r] {
+            match placement(&at(VENUS, h), "Venus") {
+                Placement::Skip(w) => assert_eq!(w, "Inside Venus", "{h} m"),
+                p => panic!("{h} m: {p:?}"),
+            }
+        }
+        // Earth has no deck: 35 km up draws its radii, 10 km down is inside.
+        let e = at(399, 35e3);
+        assert!(
+            matches!(placement(&e, "Earth"), Placement::Draw { radii, .. } if radii == e.radii_m)
+        );
+        assert!(
+            matches!(placement(&at(399, -10e3), "Earth"), Placement::Skip(w) if w == "Inside Earth")
+        );
+        // Non-finite view data: skipped, and the warning does not say "Inside".
+        let mut bad = at(VENUS, 35e3);
+        bad.rel_pos_m = DVec3::NAN;
+        match placement(&bad, "Venus") {
+            Placement::Skip(w) => assert!(!w.contains("Inside") && w.contains("Venus"), "{w}"),
+            p => panic!("NaN position drawn: {p:?}"),
+        }
     }
 }

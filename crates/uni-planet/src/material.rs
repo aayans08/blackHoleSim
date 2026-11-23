@@ -42,6 +42,11 @@ pub(crate) fn no_map_warning(name: &str) -> String {
     format!("No surface map: uniform albedo ({name})")
 }
 
+/// What a mapped body without CPU statistics loses, appended to its "Surface map incomplete"
+/// warning (review I1, fix round 1).
+pub(crate) const NO_STATS_NOTE: &str =
+    "no map statistics: sprite tint and point-to-disk flux match unavailable";
+
 /// Normal reflectance ρ of a body drawn without a map: `rho_from_geometric_albedo(brdf, p_V)`
 /// (review I4), the same ρ as the point path (uni-sim `reflected_lux`), so the point ↔ disk
 /// handover does not pop. A NaN (negative p_V) gives 0.
@@ -103,6 +108,12 @@ pub(crate) struct MapStats {
     rows: Vec<StatsRow>,
 }
 
+/// Whether the CPU statistics can read `tex`: uncompressed `format` (no CPU BC decoder) with
+/// at least one mip.
+fn cpu_readable(tex: &TexFile, format: TexFormat) -> bool {
+    tex.format == format && !tex.mips.is_empty()
+}
+
 /// The first mip of `tex` at most [`STATS_MAX_WIDTH`] wide (the last one if none is).
 fn stats_level(tex: &TexFile) -> usize {
     (0..tex.mips.len())
@@ -114,19 +125,22 @@ impl MapStats {
     /// Row means of `albedo` (an `Rgba8UnormSrgb` 2k copy) × `albedo_scale`, with Earth's
     /// `clouds` (an `R8Unorm` coverage map and its scale s_c) composited per texel as
     /// (1 − c)·ρ_ground + c·s_c (ruling W-B2). `None` for a BC texture (no CPU decoder) or an
-    /// empty one; a cloud map in another format is ignored.
+    /// empty one, and also when `clouds` is given but cannot be read that way: ground-only
+    /// statistics would not describe the clouded disk that is drawn (review I1).
     pub(crate) fn from_maps(
         albedo: &TexFile,
         albedo_scale: f32,
         clouds: Option<(&TexFile, f32)>,
     ) -> Option<Self> {
-        if albedo.format != TexFormat::Rgba8UnormSrgb || albedo.mips.is_empty() {
+        if !cpu_readable(albedo, TexFormat::Rgba8UnormSrgb) {
+            return None;
+        }
+        if clouds.is_some_and(|(c, _)| !cpu_readable(c, TexFormat::R8Unorm)) {
             return None;
         }
         let level = stats_level(albedo);
         let (w, h) = albedo.mip_size(level);
         let texels = &albedo.mips[level];
-        let clouds = clouds.filter(|(c, _)| c.format == TexFormat::R8Unorm && !c.mips.is_empty());
         let cloud_mip = clouds.map(|(c, scale)| {
             let level = (0..c.mips.len())
                 .find(|&l| c.mip_size(l).0 == w)
@@ -330,11 +344,20 @@ impl MaterialTable {
         name: &str,
     ) -> (SurfaceParams, Vec<String>) {
         if let Some(entry) = naif.and_then(|n| self.mapped.get(&n)) {
-            let warnings = entry
-                .note
-                .iter()
-                .map(|note| format!("Surface map incomplete ({name}; {note})"))
-                .collect();
+            // Without statistics the W-B1 cross-fade runs with k₀ = 1 and the sprite stays
+            // solar-coloured: say so (review I1, lead ruling of fix round 1).
+            let mut notes: Vec<&str> = entry.note.iter().map(String::as_str).collect();
+            if entry.stats.is_none() {
+                notes.push(NO_STATS_NOTE);
+            }
+            let warnings = if notes.is_empty() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "Surface map incomplete ({name}; {})",
+                    notes.join("; ")
+                )]
+            };
             let surface = SurfaceParams {
                 slot: entry.slot,
                 albedo: entry.albedo_scale,
@@ -490,58 +513,129 @@ pub(crate) struct LoadedPair {
     pub note: Option<String>,
 }
 
-/// Loads one body's maps from `map_dir` onto the GPU: the BC files when `bc`, else (or when a BC
-/// file cannot be read) the 2k uncompressed copies; and the CPU statistics from the 2k copies. An
-/// albedo map that cannot be loaded at all is an `Err` (the body draws uniform albedo); a cloud
-/// map that cannot is a note.
+/// What [`load_maps`] produced: one body's maps as `upload` returned them, the statistics and
+/// the notes for the HUD.
+pub(crate) struct MapsLoad<T> {
+    pub albedo: T,
+    pub clouds: Option<T>,
+    pub stats: Option<MapStats>,
+    pub note: Option<String>,
+}
+
+/// One map on the GPU: its BC file when `bc` (falling back to the 2k copy, with a note, when the
+/// BC file cannot be read or uploaded), else its 2k copy. Also returns the 2k copy for the CPU
+/// statistics, or why it could not be read: on the BC path the GPU does not need it, so its
+/// failure is not an error here, but it must not vanish either (review I1).
+fn map_to_gpu<T>(
+    info: &MapInfo,
+    bc: bool,
+    read: &impl Fn(&str) -> anyhow::Result<TexFile>,
+    upload: &mut impl FnMut(&str, &TexFile) -> anyhow::Result<T>,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<(T, anyhow::Result<TexFile>)> {
+    let small = read(&info.fallback_file);
+    if bc {
+        match read(&info.file).and_then(|t| upload(&info.file, &t)) {
+            Ok(gpu) => return Ok((gpu, small)),
+            Err(err) => notes.push(format!("{err:#}; using the 2k copy")),
+        }
+    }
+    let small = small?;
+    let gpu = upload(&info.fallback_file, &small)?;
+    Ok((gpu, Ok(small)))
+}
+
+/// [`load_pair`] with the file reader and the GPU upload passed in (the unit tests run it
+/// without a GPU). `read(file)` returns the texture or an error that names the file;
+/// `upload(label, texture)` puts it on the GPU, labelled with its file name.
+///
+/// The statistics describe exactly what is drawn: the ground map's 2k copy and, when a cloud
+/// layer is drawn, the cloud map's 2k copy. If either copy is missing or cannot be read on the
+/// CPU there are no statistics (never ground-only statistics under drawn clouds), and the note
+/// says which file; [`MaterialTable::surface_for`] then adds [`NO_STATS_NOTE`] and the W-B1
+/// cross-fade runs with k₀ = 1 (review I1, lead ruling of fix round 1). There is no CPU BC
+/// decoder to fall back on (brief, round 2).
+pub(crate) fn load_maps<T>(
+    pair: &MapPair,
+    bc: bool,
+    read: impl Fn(&str) -> anyhow::Result<TexFile>,
+    mut upload: impl FnMut(&str, &TexFile) -> anyhow::Result<T>,
+) -> anyhow::Result<MapsLoad<T>> {
+    let albedo = pair.albedo.as_ref().context("no albedo map")?;
+    let mut notes = Vec::new();
+    let (albedo_gpu, albedo_2k) = map_to_gpu(albedo, bc, &read, &mut upload, &mut notes)?;
+    let (clouds_gpu, clouds_2k) = match &pair.clouds {
+        Some(info) => match map_to_gpu(info, bc, &read, &mut upload, &mut notes) {
+            Ok((gpu, small)) => (Some(gpu), Some((info, small))),
+            Err(err) => {
+                notes.push(format!("{err:#}; no cloud layer"));
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+    let mut copy = |small: anyhow::Result<TexFile>| match small {
+        Ok(tex) => Some(tex),
+        Err(err) => {
+            notes.push(format!("{err:#}"));
+            None
+        }
+    };
+    let albedo_2k = copy(albedo_2k);
+    let clouds_2k = clouds_2k.map(|(info, small)| (info, copy(small)));
+    let stats = match (&albedo_2k, &clouds_2k) {
+        (Some(ground), None) => MapStats::from_maps(ground, albedo.albedo_scale, None),
+        (Some(ground), Some((info, Some(clouds)))) => MapStats::from_maps(
+            ground,
+            albedo.albedo_scale,
+            Some((clouds, info.albedo_scale)),
+        ),
+        // A 2k copy is missing: already noted.
+        _ => None,
+    };
+    if stats.is_none()
+        && let Some(ground) = &albedo_2k
+        && clouds_2k.as_ref().is_none_or(|(_, c)| c.is_some())
+    {
+        // Both copies were read, but not in the formats the CPU reads.
+        let mut formats = format!("{}: {:?}", albedo.fallback_file, ground.format);
+        if let Some((info, Some(clouds))) = &clouds_2k {
+            formats += &format!(", {}: {:?}", info.fallback_file, clouds.format);
+        }
+        notes.push(format!(
+            "2k copies not readable on the CPU ({formats}; it reads Rgba8UnormSrgb and R8Unorm)"
+        ));
+    }
+    Ok(MapsLoad {
+        albedo: albedo_gpu,
+        clouds: clouds_gpu,
+        stats,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    })
+}
+
+/// Loads one body's maps from `map_dir` onto the GPU through [`load_maps`]: the BC files when
+/// `bc`, else (or when a BC file cannot be read) the 2k uncompressed copies; and the CPU
+/// statistics from the 2k copies. An albedo map that cannot be loaded at all is an `Err` (the
+/// body draws uniform albedo); a cloud map that cannot, or a 2k copy missing on the BC path, is a
+/// note.
 pub(crate) fn load_pair(
     gpu: &GpuContext,
     map_dir: &Path,
     pair: &MapPair,
     bc: bool,
 ) -> anyhow::Result<LoadedPair> {
-    let albedo = pair.albedo.as_ref().context("no albedo map")?;
     let read = |file: &str| -> anyhow::Result<TexFile> {
         load_tex(&map_dir.join(file)).map_err(|e| anyhow!("{file}: {e}"))
     };
-    let mut notes = Vec::new();
-    // The GPU copy of one map, and the 2k copy read on the CPU (kept for the statistics).
-    let mut to_gpu = |info: &MapInfo| -> anyhow::Result<(wgpu::Texture, Option<TexFile>)> {
-        let small = read(&info.fallback_file);
-        if bc {
-            match read(&info.file).and_then(|t| upload_tex(gpu, &info.file, &t)) {
-                Ok(texture) => return Ok((texture, small.ok())),
-                Err(err) => notes.push(format!("{err:#}; using the 2k copy")),
-            }
-        }
-        let small = small?;
-        Ok((upload_tex(gpu, &info.fallback_file, &small)?, Some(small)))
-    };
-    let (albedo_gpu, albedo_2k) = to_gpu(albedo)?;
-    let (clouds_gpu, clouds_2k) = match pair.clouds.as_ref().map(|c| (c, to_gpu(c))) {
-        Some((info, Ok((texture, small)))) => {
-            (Some(texture), small.map(|s| (s, info.albedo_scale)))
-        }
-        Some((_, Err(err))) => {
-            notes.push(format!("{err:#}; no cloud layer"));
-            (None, None)
-        }
-        None => (None, None),
-    };
-    let stats = albedo_2k.as_ref().and_then(|a| {
-        MapStats::from_maps(
-            a,
-            albedo.albedo_scale,
-            clouds_2k.as_ref().map(|(c, s)| (c, *s)),
-        )
-    });
+    let maps = load_maps(pair, bc, read, |label, tex| upload_tex(gpu, label, tex))?;
     Ok(LoadedPair {
         maps: GpuMaps {
-            albedo: albedo_gpu,
-            clouds: clouds_gpu,
+            albedo: maps.albedo,
+            clouds: maps.clouds,
         },
-        stats,
-        note: (!notes.is_empty()).then(|| notes.join("; ")),
+        stats: maps.stats,
+        note: maps.note,
     })
 }
 
@@ -601,14 +695,15 @@ mod tests {
         ]
     }
 
-    /// A loader that "loads" every pair, numbering the slots from 1 (slot 0 is the default).
+    /// A loader that "loads" every pair, numbering the slots from 1 (slot 0 is the default), with
+    /// the statistics of a mid-grey map.
     fn ok_loader() -> impl FnMut(i32, &MapPair) -> anyhow::Result<Loaded> {
         let mut next = 0;
         move |_, pair| {
             next += 1;
             Ok(Loaded {
                 slot: next,
-                stats: None,
+                stats: MapStats::from_maps(&solid_rgba(16, [128, 128, 128, 255]), 1.0, None),
                 clouds: pair.clouds.is_some(),
                 note: None,
             })
@@ -746,12 +841,16 @@ mod tests {
                 eprintln!("skipped {naif}: {} absent", albedo.fallback_file);
                 continue;
             };
-            let clouds = pair.clouds.as_ref().map(|c| {
-                (
-                    uni_data::load_tex(&dir.join(&c.fallback_file)).unwrap(),
-                    c.albedo_scale,
-                )
-            });
+            let clouds = match &pair.clouds {
+                Some(c) => match uni_data::load_tex(&dir.join(&c.fallback_file)) {
+                    Ok(tex) => Some((tex, c.albedo_scale)),
+                    Err(_) => {
+                        eprintln!("skipped {naif}: {} absent", c.fallback_file);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let stats = MapStats::from_maps(
                 &ground,
                 albedo.albedo_scale,
@@ -765,7 +864,157 @@ mod tests {
                 let c = stats.mean_rgb().unwrap();
                 assert!(c.x > c.y && c.y > c.z, "Mars is red: {c}");
             }
+            if naif == 399 {
+                // Review I1's sub-case: the ground alone, what statistics would have described
+                // had the cloud copy been dropped. The clouds must raise ρ̄.
+                let ground_only = MapStats::from_maps(&ground, albedo.albedo_scale, None)
+                    .unwrap()
+                    .disk_rho(brdf);
+                eprintln!("Earth ground only: ρ̄ {ground_only:.4}");
+                assert!(ground_only < got);
+            }
         }
+    }
+
+    /// In-memory map files for [`load_maps`]: Earth's BC albedo and clouds (their texels are never
+    /// read on the CPU) and the 2k copies whose names are in `small`.
+    fn earth_files(small: &[&str]) -> HashMap<String, TexFile> {
+        let bc = TexFile {
+            format: TexFormat::Bc7RgbaUnormSrgb,
+            ..solid_rgba(512, [0; 4])
+        };
+        let mut files = HashMap::from([
+            ("earth_albedo.big".to_owned(), bc.clone()),
+            ("earth_clouds.big".to_owned(), bc),
+        ]);
+        for &name in small {
+            let tex = match name {
+                "earth_albedo.rgba2k.big" => solid_rgba(512, [200, 100, 50, 255]),
+                "earth_clouds.rgba2k.big" => solid_r8(512, 102),
+                other => panic!("no test file {other}"),
+            };
+            files.insert(name.to_owned(), tex);
+        }
+        files
+    }
+
+    /// Runs [`load_maps`] on Earth's pair over `files`; the "GPU" records which file it got.
+    fn load_earth(files: &HashMap<String, TexFile>, bc: bool) -> anyhow::Result<MapsLoad<String>> {
+        let pair = maps_by_body(&index()).remove(&399).unwrap();
+        let read = |file: &str| {
+            files
+                .get(file)
+                .cloned()
+                .ok_or_else(|| anyhow!("{file}: not found"))
+        };
+        load_maps(&pair, bc, read, |label, _| Ok(label.to_owned()))
+    }
+
+    /// The table body.rs builds, with `load` as its loader (slot 1).
+    fn table_with(load: anyhow::Result<MapsLoad<String>>) -> MaterialTable {
+        let mut load = Some(load);
+        MaterialTable::build(&index()[..2], &[], |_, _| {
+            let maps = load.take().unwrap()?;
+            Ok(Loaded {
+                slot: 1,
+                stats: maps.stats,
+                clouds: maps.clouds.is_some(),
+                note: maps.note,
+            })
+        })
+    }
+
+    /// Review I1 (fix round 1): on the BC path the GPU gets the BC files, but the statistics
+    /// (W-B1's ρ̄ and the sprite tint) come from the 2k copies. A 2k copy that is missing or
+    /// unreadable there must reach the HUD, not vanish: without it Earth at 1.5 px pops by
+    /// ~0.83 mag (k₀ falls back to 1) and its sprite loses its tint.
+    #[test]
+    fn missing_2k_copy_on_the_bc_path_is_reported() {
+        const BOTH: [&str; 2] = ["earth_albedo.rgba2k.big", "earth_clouds.rgba2k.big"];
+        // Everything present: BC on the GPU, statistics from the 2k copies, no note.
+        let all = load_earth(&earth_files(&BOTH), true).unwrap();
+        assert_eq!(all.albedo, "earth_albedo.big");
+        assert_eq!(all.clouds.as_deref(), Some("earth_clouds.big"));
+        assert!(all.stats.is_some());
+        assert_eq!(all.note, None);
+        let (earth, w) = table_with(Ok(all)).surface_for(Some(399), Brdf::Lambert, 0.434, "Earth");
+        assert!(w.is_empty() && earth.disk_rho.is_some(), "{w:?}");
+
+        // The albedo's 2k copy is missing: the BC map still draws, the statistics are gone,
+        // and the HUD says which file and what it costs.
+        let load = load_earth(&earth_files(&BOTH[1..]), true).unwrap();
+        assert_eq!(load.albedo, "earth_albedo.big");
+        assert!(load.stats.is_none());
+        assert_eq!(
+            load.note.as_deref(),
+            Some("earth_albedo.rgba2k.big: not found")
+        );
+        let table = table_with(Ok(load));
+        let (earth, w) = table.surface_for(Some(399), Brdf::Lambert, 0.434, "Earth");
+        assert!(earth.has_map && earth.disk_rho.is_none());
+        assert_eq!(
+            w,
+            [format!(
+                "Surface map incomplete (Earth; earth_albedo.rgba2k.big: not found; {NO_STATS_NOTE})"
+            )]
+        );
+        assert_eq!(table.mean_albedo_rgb(399), None);
+
+        // The clouds' 2k copy is missing while the BC clouds draw: ground-only statistics would
+        // describe a different planet (ρ̄ without its clouds), so there are none, and a note.
+        let load = load_earth(&earth_files(&BOTH[..1]), true).unwrap();
+        assert_eq!(load.clouds.as_deref(), Some("earth_clouds.big"));
+        assert!(load.stats.is_none());
+        assert_eq!(
+            load.note.as_deref(),
+            Some("earth_clouds.rgba2k.big: not found")
+        );
+        let (_, w) = table_with(Ok(load)).surface_for(Some(399), Brdf::Lambert, 0.434, "Earth");
+        assert_eq!(
+            w,
+            [format!(
+                "Surface map incomplete (Earth; earth_clouds.rgba2k.big: not found; {NO_STATS_NOTE})"
+            )]
+        );
+
+        // Without BC the 2k copies are what draws: no cloud copy, no cloud layer, and the
+        // ground-only statistics then match what is drawn.
+        let load = load_earth(&earth_files(&BOTH[..1]), false).unwrap();
+        assert_eq!(load.albedo, "earth_albedo.rgba2k.big");
+        assert_eq!(load.clouds, None);
+        assert!(load.stats.is_some());
+        assert_eq!(
+            load.note.as_deref(),
+            Some("earth_clouds.rgba2k.big: not found; no cloud layer")
+        );
+        // Without BC and without the albedo's 2k copy there is nothing to draw: an error.
+        assert!(load_earth(&earth_files(&BOTH[1..]), false).is_err());
+        // A missing BC file falls back to the 2k copy, which also gives the statistics.
+        let mut files = earth_files(&BOTH);
+        files.remove("earth_albedo.big");
+        let load = load_earth(&files, true).unwrap();
+        assert_eq!(load.albedo, "earth_albedo.rgba2k.big");
+        assert!(load.stats.is_some());
+        assert_eq!(
+            load.note.as_deref(),
+            Some("earth_albedo.big: not found; using the 2k copy")
+        );
+        // Both 2k copies read, but the cloud copy is not R8: no statistics, and the note names
+        // the formats (never ground-only statistics under the drawn BC clouds).
+        let mut files = earth_files(&BOTH);
+        files.insert(
+            "earth_clouds.rgba2k.big".to_owned(),
+            solid_rgba(512, [102; 4]),
+        );
+        let load = load_earth(&files, true).unwrap();
+        assert!(load.clouds.is_some() && load.stats.is_none());
+        assert_eq!(
+            load.note.as_deref(),
+            Some(
+                "2k copies not readable on the CPU (earth_albedo.rgba2k.big: Rgba8UnormSrgb, \
+                 earth_clouds.rgba2k.big: Rgba8UnormSrgb; it reads Rgba8UnormSrgb and R8Unorm)"
+            )
+        );
     }
 
     /// sRGB decoding (IEC 61966-2-1): the end points, the linear toe and mid grey.
@@ -803,5 +1052,8 @@ mod tests {
             ..ground.clone()
         };
         assert!(MapStats::from_maps(&bc, 1.0, None).is_none());
+        // A cloud map the CPU cannot read (not R8) gives none either: ground-only statistics
+        // would not describe the clouded disk that is drawn (review I1, fix round 1).
+        assert!(MapStats::from_maps(&ground, 0.5, Some((&ground, 1.0))).is_none());
     }
 }
