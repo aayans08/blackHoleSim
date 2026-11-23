@@ -18,7 +18,8 @@
 //! - **Cancel.** Esc cancels an aim, else aborts a goto (mode Free), else the app collapses the
 //!   card, else deselects: the navigator takes the Esc press only when it cancelled something.
 //!   Any movement-key press or a mouse-look drag over [`AIM_ARM_DRAG_PX`] during a goto aborts
-//!   it.
+//!   it. Both count from the launch: the input of the launch's own frame (with the F press,
+//!   or with the click that `pick` handled before the update) does not abort it.
 //! - **Goto** ([`crate::goto`]): turn first, then accelerate–cruise–decelerate. Every drop-out
 //!   (cruise's and a goto's arrival) leaves free flight at `DROPOUT_SPEED_MPS`, 1 km/s.
 //! - **Anchor.** A goto target with a frame is followed by reanchoring to it; a frameless one
@@ -158,8 +159,14 @@ pub struct Navigator {
     aim: Option<(ObjectId, f64)>,
     /// A drag or a movement key armed the aim (module docs).
     armed: bool,
-    /// Raw mouse motion since mouse look began [raw units].
+    /// Raw mouse motion since mouse look began, or since the last launch [raw units].
     drag_px: f64,
+    /// Set by every launch, cleared at the end of every [`Navigator::update`] (review r0 I1). A
+    /// launch made before an update (a click through `pick`, or `goto_selected` called by the
+    /// app) is not aborted by that update's presses and mouse motion, which came with it. A
+    /// launch inside an update (F, a full aim ring) comes after that update's abort check, and
+    /// the next update's input aborts it as usual.
+    launched: bool,
     /// The goto in flight; `None` until the first update after one is asked for.
     flight: Option<GotoFlight>,
 }
@@ -180,6 +187,7 @@ impl Navigator {
             aim: None,
             armed: false,
             drag_px: 0.0,
+            launched: false,
             flight: None,
         }
     }
@@ -267,6 +275,20 @@ impl Navigator {
         }
         let dragged = self.drag_px > AIM_ARM_DRAG_PX;
 
+        // The abort and arming check runs before F, C and Esc, so it acts only on a goto that
+        // was flying before this frame's presses (review r0 I1). A goto launched since the last
+        // update by a click (`pick`, which the app runs before this) came with this frame's
+        // input: that input neither aborts it nor re-arms the aim, and its drag counts from
+        // the next frame. F below launches after this check, and `begin_goto` resets the drag.
+        if self.launched {
+            self.drag_px = 0.0;
+        } else if moved || dragged {
+            if matches!(self.mode, FlightMode::Goto { .. }) {
+                self.stop_flight();
+            }
+            self.armed = true;
+        }
+
         if input.take_pressed_once(Action::Cruise) {
             self.toggle_cruise();
         }
@@ -282,12 +304,6 @@ impl Navigator {
                 self.stop_flight();
             }
             self.armed = false;
-        }
-        if matches!(self.mode, FlightMode::Goto { .. }) && (moved || dragged) {
-            self.stop_flight();
-        }
-        if moved || dragged {
-            self.armed = true;
         }
 
         let mut speed_mps = cam.speed_mps();
@@ -348,6 +364,9 @@ impl Navigator {
             speed_mps = cam.speed_mps();
         }
 
+        // From the next frame on, input comes after any launch made so far.
+        self.launched = false;
+
         let flying = matches!(self.mode, FlightMode::Goto { .. });
         let progress = flight_step.filter(|_| flying);
         NavStatus {
@@ -368,7 +387,8 @@ impl Navigator {
     }
 
     /// Switches to a goto to `id` (one already flying there goes on); clears and disarms the
-    /// aim. The flight itself is set up by the next [`Self::update`].
+    /// aim, and counts the mouse-look drag (and, for a launch before [`Self::update`], the
+    /// presses) from here. The flight itself is set up by the next [`Self::update`].
     fn begin_goto(&mut self, id: ObjectId) {
         if self.mode != (FlightMode::Goto { target: id }) {
             self.mode = FlightMode::Goto { target: id };
@@ -377,6 +397,7 @@ impl Navigator {
         self.aim = None;
         self.armed = false;
         self.drag_px = 0.0;
+        self.launched = true;
     }
 
     /// Back to free flight, the goto (if any) dropped.
@@ -1067,6 +1088,11 @@ mod tests {
         assert_eq!(last.mode, FlightMode::Goto { target: earth });
         assert_eq!(last.selected, Some(earth));
         assert!(last.aim.is_none());
+        // The launch came after its frame's input, so a press in the next frame aborts it.
+        input.on_key(KeyCode::KeyD, true, false);
+        input.on_key(KeyCode::KeyD, false, false);
+        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 1, |_| true);
+        assert_eq!((out[0].mode, out[0].dropout), (FlightMode::Free, None));
     }
 
     #[test]
@@ -1122,6 +1148,88 @@ mod tests {
             let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 1, |_| true);
             assert_eq!(out[0].mode, FlightMode::Free, "{abort}");
             assert_eq!(out[0].dropout, None, "{abort}");
+        }
+    }
+
+    #[test]
+    fn goto_launch_survives_the_input_of_its_own_frame() {
+        // Review r0 I1. A goto launched by F, or by a click on a destination (`pick`, which the
+        // app runs before `update`), is not aborted by the input that came in the same frame:
+        // mouse look held with more than 4 units of motion (the drag of the whole hold, and this
+        // frame's), or a movement-key tap. A drag counts from the launch, and a press after the
+        // launch frame still aborts.
+        let mut world = testkit::world();
+        let earth = id(&world, "Earth");
+        let start = world.position(earth).offset(DVec3::Z * 1e9);
+        let at = glam::Vec2::new(100.0, 500.0);
+        let snap = uni_sim::snapshot::Snapshot {
+            pick: vec![PickItem {
+                id: earth,
+                screen_px: at,
+                dist_m: 1e9,
+                priority: 3,
+            }],
+            destinations: vec![Destination {
+                id: earth,
+                kind: ObjectKind::Planet,
+                rel_pos_m: DVec3::NEG_Z * 1e9,
+                dist_m: 1e9,
+                screen_px: Some(at),
+                proj_radius_px: 2.0,
+            }],
+            ..Default::default()
+        };
+        let tap = |input: &mut InputState, code: KeyCode| {
+            input.on_key(code, true, false);
+            input.on_key(code, false, false);
+        };
+        let one = |nav: &mut Navigator,
+                   cam: &mut crate::camera::FlyCamera,
+                   world: &mut uni_sim::world::World,
+                   input: &mut InputState| {
+            run(nav, cam, world, input, false, DT, 1, |_| true).remove(0)
+        };
+        let flying = FlightMode::Goto { target: earth };
+        for launch in ["F", "click"] {
+            for extra in ["look", "key"] {
+                let case = format!("{launch} + {extra}");
+                let mut cam = camera(&world, start, DVec3::X);
+                let mut nav = Navigator::new();
+                let mut input = InputState::new();
+                if extra == "look" {
+                    // Steering with the right button held: the drag of the hold is over 4 units
+                    // before the launch.
+                    input.set_looking(true);
+                    input.add_mouse_delta(DVec2::new(10.0, 0.0));
+                    let s = one(&mut nav, &mut cam, &mut world, &mut input);
+                    assert_eq!(s.mode, FlightMode::Free, "{case}");
+                    input.add_mouse_delta(DVec2::new(10.0, 0.0));
+                } else {
+                    tap(&mut input, KeyCode::KeyW);
+                }
+                if launch == "F" {
+                    nav.selected = Some(earth);
+                    tap(&mut input, KeyCode::KeyF);
+                } else {
+                    assert_eq!(nav.pick(&snap, at, 12.0), Some(earth), "{case}");
+                }
+                let s = one(&mut nav, &mut cam, &mut world, &mut input);
+                assert_eq!((s.mode, s.dropout), (flying, None), "{case}: the launch frame");
+                assert!(s.to_go_m.is_some(), "{case}: the flight runs");
+                let s = one(&mut nav, &mut cam, &mut world, &mut input);
+                assert_eq!(s.mode, flying, "{case}: the frame after the launch");
+                if extra == "look" {
+                    // The drag counts from the launch: 3 units keep the goto, 2 more abort it.
+                    input.add_mouse_delta(DVec2::new(3.0, 0.0));
+                    let s = one(&mut nav, &mut cam, &mut world, &mut input);
+                    assert_eq!(s.mode, flying, "{case}: 3 units since the launch");
+                    input.add_mouse_delta(DVec2::new(0.0, 2.0));
+                } else {
+                    tap(&mut input, KeyCode::KeyW);
+                }
+                let s = one(&mut nav, &mut cam, &mut world, &mut input);
+                assert_eq!((s.mode, s.dropout), (FlightMode::Free, None), "{case}: aborted after");
+            }
         }
     }
 
