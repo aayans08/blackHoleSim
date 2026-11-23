@@ -880,8 +880,9 @@ const LIMB_TOLERANCE: f32 = 1e-5;
 // - the packed id of each layer's nearest granule, bit for bit (the inputs keep every point at
 //   least GRAN_PROBE_TIE_MARGIN from a lane's centre, and every granule of an ambiguously wrapped
 //   cube-edge cell that far beyond F2, so f32 noise cannot change it);
-// - |GPU − CPU| ≤ GRAN_VALUE_TOLERANCE + |∇G|·GRAN_ANGLE_TOLERANCE_RAD, with |∇G| measured on the
-//   CPU twin by central differences.
+// - |GPU − CPU| ≤ GRAN_VALUE_TOLERANCE + (|∇G₀| + |∇G₁|)·GRAN_ANGLE_TOLERANCE_RAD, with each
+//   layer's slope |∇Gₖ| measured on the CPU twin by central differences (`gran_slope`: the
+//   layers' f32 displacements are independent, review r1 N1).
 
 /// Value tolerance where the pattern is flat (inside a granule only rounding differs): the
 /// brief's ±1e-4.
@@ -890,7 +891,7 @@ const GRAN_VALUE_TOLERANCE: f32 = 1e-4;
 /// ulps of a unit vector's components in [0.5, 1) and 0.05 % of the Sun's cell (0.08 % of the
 /// 4000 K probe star's), so a displaced pattern, a wrong lane width or a wrong contrast still fails.
 const GRAN_ANGLE_TOLERANCE_RAD: f32 = 1e-6;
-/// Central-difference step [rad] for |∇G|: 0.2 % of the Sun's cell, 0.7 % of a lane.
+/// Central-difference step [rad] for the layers' slopes: 0.2 % of the Sun's cell, 0.7 % of a lane.
 const GRAN_SLOPE_STEP_RAD: f64 = 4e-6;
 /// Smallest F2 − F1 [cells] of either layer at a probe point, and smallest distance beyond F2 of
 /// an ambiguously wrapped cell's granule: far more than f32 noise moves a distance (≤ 8e-4 cells
@@ -931,24 +932,40 @@ fn gran_probe_expected(&(p, cell, radius, t): &GranProbeCase) -> GranProbeOut {
     }
 }
 
-/// |∇G| [1/rad] of the CPU twin at the probe point, by central differences along two
-/// orthonormal tangents (steps built in f64, cast once to f32 as the GPU input is).
-fn gran_slope(&(p, cell, radius, t): &GranProbeCase) -> f32 {
+/// The two layers' terms of G − 1 at the probe point, RMS·wₖ·vₖ/√(w₀² + w₁²) (what
+/// [`granulation`] sums), in f64 from the f32 layer values. For the probe's slope only.
+fn gran_layer_terms(&(p, cell, radius, t): &GranProbeCase) -> [f64; 2] {
+    let [near0, near1] = gran_layers(p.normalize(), cell, radius, t);
+    let phase0 = t / GRAN_PERIOD_S;
+    let (w0, w1) = (gran_weight(phase0), gran_weight(phase0 + 0.5));
+    let k = f64::from(GRANULATION_RMS_550) / f64::from(w0 * w0 + w1 * w1).sqrt();
+    let v = |near: Nearest| f64::from((near.intensity() - GRAN_MEAN) / GRAN_SIGMA);
+    [k * f64::from(w0) * v(near0), k * f64::from(w1) * v(near1)]
+}
+
+/// Each layer's gradient [1/rad] of its term of G at the probe point, as a tangent vector, by
+/// central differences along two orthonormal tangents (steps built in f64, cast once to f32 as
+/// the GPU input is). ∇G is their sum.
+fn gran_layer_gradients(&(p, cell, radius, t): &GranProbeCase) -> [DVec3; 2] {
     let p64 = p.as_dvec3().normalize();
     let e1 = p64.any_orthonormal_vector();
     let e2 = p64.cross(e1);
     let h = GRAN_SLOPE_STEP_RAD;
     let at = |dir: DVec3, s: f64| {
-        f64::from(granulation(
-            (p64 + dir * s).normalize().as_vec3(),
-            cell,
-            radius,
-            t,
-        ))
+        gran_layer_terms(&((p64 + dir * s).normalize().as_vec3(), cell, radius, t))
     };
-    let d1 = (at(e1, h) - at(e1, -h)) / (2.0 * h);
-    let d2 = (at(e2, h) - at(e2, -h)) / (2.0 * h);
-    d1.hypot(d2) as f32
+    let (a1, b1, a2, b2) = (at(e1, h), at(e1, -h), at(e2, h), at(e2, -h));
+    [0, 1].map(|k| (e1 * (a1[k] - b1[k]) + e2 * (a2[k] - b2[k])) / (2.0 * h))
+}
+
+/// The probe's slope [1/rad] at the probe point: |∇G₀| + |∇G₁|, the two layers' slopes added
+/// (review r1 N1). The GPU rounds each layer on its own (`gran_feature` computes its own `tan`
+/// and `normalize` per salt), so the two layers' f32 displacements are independent and their
+/// errors can add where their gradients oppose; the combined |∇G| would understate that. By the
+/// triangle inequality this is ≥ |∇G|.
+fn gran_slope(case: &GranProbeCase) -> f32 {
+    let [g0, g1] = gran_layer_gradients(case);
+    (g0.length() + g1.length()) as f32
 }
 
 /// The cells `gran_wrap` might return for cell (`ci`, `cj`) of `face` under f32 noise: its own
@@ -1105,9 +1122,9 @@ fn granulation_probe_inputs() -> Vec<GranProbeCase> {
 
 /// The granulation probe's verdict on the GPU's answers `out` for `cases`: pass when every
 /// point's cell hash and both nearest-granule ids match the CPU twin bit for bit and its value is
-/// within GRAN_VALUE_TOLERANCE + |∇G|·GRAN_ANGLE_TOLERANCE_RAD. The detail also reports the
-/// largest |GPU − CPU|/|∇G| over lane points (the angle by which the GPU's pattern sits apart),
-/// so a failure says how much wider the tolerance would have to be.
+/// within GRAN_VALUE_TOLERANCE + [`gran_slope`]·GRAN_ANGLE_TOLERANCE_RAD. The detail also reports
+/// the largest |GPU − CPU|/slope over lane points (the angle by which the GPU's pattern sits
+/// apart), so a failure says how much wider the tolerance would have to be.
 fn gran_probe_verdict(cases: &[GranProbeCase], out: &[GranProbeOut]) -> (bool, String) {
     if out.len() != cases.len() {
         return (
@@ -1143,8 +1160,9 @@ fn gran_probe_verdict(cases: &[GranProbeCase], out: &[GranProbeOut]) -> (bool, S
         format!(
             "{} points ({lane_points} in lanes): {hash_bad} cell-hash and {id_bad} nearest-granule \
              mismatches, {value_bad} values out of tolerance; max |GPU − CPU| {worst:.1e}, \
-             max error/tolerance {worst_ratio:.2}, max lane error/|∇G| {worst_angle:.1e} rad \
-             (tolerance {GRAN_VALUE_TOLERANCE:.0e} + |∇G|·{GRAN_ANGLE_TOLERANCE_RAD:.0e} rad)",
+             max error/tolerance {worst_ratio:.2}, max lane error/slope {worst_angle:.1e} rad \
+             (tolerance {GRAN_VALUE_TOLERANCE:.0e} + (|∇G₀| + |∇G₁|)·{GRAN_ANGLE_TOLERANCE_RAD:.0e} \
+             rad)",
             cases.len()
         ),
     )
@@ -1764,8 +1782,9 @@ mod tests {
 
     /// Review I1: the granulation probe passes what f32 noise does to the pattern (each point
     /// moved by 3e-7 rad, 2.5× the review's worst estimate of 1.2e-7 rad), which the brief's flat
-    /// ±1e-4 does not, and still fails a displaced pattern, a wrong contrast, one wrong
-    /// nearest-granule id, one wrong cell hash and a NaN.
+    /// ±1e-4 does not, also when the two layers move independently (review r1 N1), and still
+    /// fails a displaced pattern, a wrong contrast, one wrong nearest-granule id, one wrong cell
+    /// hash and a NaN.
     #[test]
     fn granulation_probe_accepts_f32_noise_and_rejects_pattern_errors() {
         let cases = granulation_probe_inputs();
@@ -1804,6 +1823,67 @@ mod tests {
             );
             assert!(pass, "{detail}");
             assert!(flat_rejects(&noisy) > 0);
+        }
+        // Review r1 N1: the GPU rounds each layer on its own, so the layers move independently.
+        // Worst case: each layer moved 3e-7 rad along its own gradient, so both errors add. The
+        // value is 1 + G₀(p + δ₀) + G₁(p + δ₁); the ids and hash stay (the inputs keep every
+        // point ≥ 0.02 cells from a tie, and 3e-7 rad is 1.6e-4 of the Sun's cell).
+        let delta = 3e-7;
+        let (mut combined_rejects, mut opposed) = (0, 0);
+        let per_layer: Vec<GranProbeOut> = cases
+            .iter()
+            .zip(&exact)
+            .map(|(&(p, cell, radius, t), e)| {
+                let grads = gran_layer_gradients(&(p, cell, radius, t));
+                let p64 = p.as_dvec3().normalize();
+                let term = |k: usize| {
+                    let q = (p64 + grads[k].normalize_or_zero() * delta).normalize();
+                    gran_layer_terms(&(q.as_vec3(), cell, radius, t))[k]
+                };
+                let value = (1.0 + term(0) + term(1)) as f32;
+                // What the combined |∇G| tolerance (fix round 1) would have said.
+                let combined = (grads[0] + grads[1]).length() as f32;
+                let err = (value - e.value).abs();
+                combined_rejects += usize::from(
+                    !(err <= GRAN_VALUE_TOLERANCE + combined * GRAN_ANGLE_TOLERANCE_RAD),
+                );
+                // The slope is never below the combined |∇G| (triangle inequality).
+                assert!(gran_slope(&(p, cell, radius, t)) >= combined * (1.0 - 1e-6));
+                opposed += usize::from(grads[0].dot(grads[1]) < 0.0);
+                GranProbeOut { value, ..*e }
+            })
+            .collect();
+        let (pass, detail) = gran_probe_verdict(&cases, &per_layer);
+        eprintln!(
+            "each layer 3e-7 rad along its own gradient: {detail}; {opposed} points with opposed \
+             layer gradients; the combined |∇G| tolerance rejects {combined_rejects}"
+        );
+        assert!(pass, "{detail}");
+        // Independent random per-layer directions, three seeds.
+        for seed in [5, 6, 7] {
+            let mut state = seed;
+            let mut tangent = |p64: DVec3| {
+                state = splitmix64(state);
+                let angle = (state >> 11) as f64 / (1_u64 << 53) as f64 * std::f64::consts::TAU;
+                let e1 = p64.any_orthonormal_vector();
+                e1 * angle.cos() + p64.cross(e1) * angle.sin()
+            };
+            let random: Vec<GranProbeOut> = cases
+                .iter()
+                .zip(&exact)
+                .map(|(&(p, cell, radius, t), e)| {
+                    let p64 = p.as_dvec3().normalize();
+                    let mut term = |k: usize| {
+                        let q = (p64 + tangent(p64) * delta).normalize();
+                        gran_layer_terms(&(q.as_vec3(), cell, radius, t))[k]
+                    };
+                    let value = (1.0 + term(0) + term(1)) as f32;
+                    GranProbeOut { value, ..*e }
+                })
+                .collect();
+            let (pass, detail) = gran_probe_verdict(&cases, &random);
+            eprintln!("independent 3e-7 rad per layer, seed {seed}: {detail}");
+            assert!(pass, "{detail}");
         }
         // The pattern displaced by 2e-5 rad (about 1 % of the Sun's cell).
         let (pass, detail) = gran_probe_verdict(&cases, &moved(2e-5, 4));

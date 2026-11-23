@@ -49,7 +49,8 @@ fn ring_phase(cos_alpha: f32, lit_face: bool) -> f32 {
 // lit at μ₀ and seen at μ (cosines from the ring normal), times 2 so that an opaque layer seen
 // from the Sun's direction gives 1 (twin of uni_planet::rings::ring_layer_factor): first-order
 // scattering in a slab (Chandrasekhar 1960, Radiative Transfer), the "classical single-scattering
-// model" of Saturn's rings (Cuzzi, French & Dones 2002, Icarus 158, 199):
+// model" of Saturn's rings (Cuzzi, French & Dones 2002, Icarus 158, 199; the lit face is eq. 6 of
+// Salo & French 2010, Icarus 210, 785, with ρ = A/8):
 //   lit face:   2 μ₀/(μ₀ + μ) · (1 − e^{−τ(1/μ₀ + 1/μ)})
 //   unlit face: 2 μ₀/(μ₀ − μ) · (e^{−τ/μ₀} − e^{−τ/μ}),  2 (τ/μ) e^{−τ/μ} at μ = μ₀.
 const RING_MU_MIN: f32 = 1e-6;

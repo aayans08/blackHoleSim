@@ -18,16 +18,17 @@
 //!
 //! The brief writes the lit face as ρ·α·P and the unlit face as ρ·α(1 − α)·HG(+0.6), with no
 //! dependence on where the Sun and the camera are. B2 keeps ρ and P exactly and replaces the
-//! opacity factors by the classical single-scattering layer (decision recorded in the B2
-//! report): it equals the brief's ρ·P for an opaque ring seen from the Sun's direction, makes
+//! opacity factors by the classical single-scattering layer (Salo & French 2010, Icarus 210,
+//! 785, eq. 6; decision recorded in the B2 report, awaiting the lead's ruling, review I2): it
+//! equals the brief's ρ·P for an opaque ring seen from the Sun's direction, makes
 //! both faces go dark when the Sun is in the ring plane (equinox; the brief's form would keep
 //! them fully lit), keeps the opaque B ring dark on its unlit face while the C ring, the Cassini
 //! division and the A ring glow there, and brightens thin rings seen at a slant. The test
 //! `ring_photometry_with_the_real_profile` compares the two with the committed profile at the
 //! plan's Saturn bookmarks: the B ring's lit face at `saturn-ring-plane` is I/F 0.48 here (0.32 in
-//! the brief's form); the unlit face at `saturn-night-side` is 0.004–0.032 here (0.027–0.063),
-//! both far below the 0.35 the plan's exposure table assumed. [`ring_i_over_f`] is the CPU twin
-//! for re-deriving those exposure rows.
+//! the brief's form); the unlit face at `saturn-night-side` is 0.0035–0.031 here (0.027–0.063
+//! in the brief's form; region means), both far below the 0.35 the plan's exposure table
+//! assumed. [`ring_i_over_f`] is the CPU twin for re-deriving those exposure rows.
 //!
 //! Approximations (labelled by the card note): the texture's colour is not a measured
 //! reflectance; one phase function for every ring; no multiple scattering, Saturnshine, moon
@@ -438,11 +439,22 @@ pub fn ring_phase(cos_alpha: f32, lit_face: bool) -> f32 {
 ///
 /// First-order (single) scattering in a plane-parallel slab (Chandrasekhar 1960, *Radiative
 /// Transfer*, diffuse reflection and transmission to first order), the "classical
-/// single-scattering model" that fits HST photometry of the A, C and inner B rings (Cuzzi, French
-/// & Dones 2002, Icarus 158, 199; see also Cuzzi et al. 1984, *Planetary Rings*, pp. 73–199): I/F = (ϖ₀P/4)·μ₀/(μ₀ + μ)·(1 − e^{−τ(1/μ₀ + 1/μ)}) reflected and
-/// (ϖ₀P/4)·μ₀/(μ₀ − μ)·(e^{−τ/μ₀} − e^{−τ/μ}) transmitted, with ρ = ϖ₀/8 so the factor here is
+/// single-scattering model" of Saturn's rings that fits HST photometry of the A, C and inner B
+/// rings (Cuzzi, French & Dones 2002, Icarus 158, 199; see also Cuzzi et al. 1984, *Planetary
+/// Rings*, pp. 73–199):
+/// - reflected: I/F = (A·P/4)·μ₀/(μ₀ + μ)·(1 − e^{−τ(1/μ₀ + 1/μ)}), with A the particles' Bond
+///   albedo (ϖ₀). This is eq. 6 of Salo & French 2010 (Icarus 210, 785; arXiv:1007.0349, §3.1,
+///   with μ′ = μ₀ = |sin B′| for the Sun and μ = |sin B| for the observer), read there in fix
+///   round 2;
+/// - transmitted: I/F = (A·P/4)·μ₀/(μ₀ − μ)·(e^{−τ/μ₀} − e^{−τ/μ}) (Chandrasekhar 1960).
+///
+/// With ρ ≡ A/8 (here ρ is the texture's colour, not a measured albedo) the factor is:
 /// - lit face: 2μ₀/(μ₀ + μ)·(1 − e^{−τ(1/μ₀ + 1/μ)});
 /// - unlit face: 2μ₀/(μ₀ − μ)·(e^{−τ/μ₀} − e^{−τ/μ}), and its limit 2(τ/μ)·e^{−τ/μ} at μ = μ₀.
+///
+/// The brief's lit-face factor α is this model's with the geometry factor 2μ₀/(μ₀ + μ) divided
+/// out and the slant path 2/μ_eff = 1/μ₀ + 1/μ replaced by the normal one: Salo & French 2010,
+/// footnote 2, write (μ + μ₀)/(2μ₀)·(I/F) = (A·P/8)·(1 − e^{−2τ/μ_eff}), i.e. ρ·P·α_eff.
 ///
 /// 0 when τ ≤ 0 or μ₀ ≤ 0 (no particles, or the Sun in the ring plane).
 pub fn ring_layer_factor(tau: f32, mu0: f32, mu: f32, lit_face: bool) -> f32 {
@@ -469,7 +481,7 @@ pub fn ring_layer_factor(tau: f32, mu0: f32, mu: f32, lit_face: bool) -> f32 {
 /// normal, `lit_face` whether the camera is on the Sun's side. The CPU twin of the composition in
 /// `rings.wgsl`'s `fs_main` (per channel there; `rho` here is one channel or a luminance), for
 /// re-deriving the Saturn bookmarks' exposure (review I2: with the committed profile the unlit
-/// face at `saturn-night-side` is 0.003–0.04 of E/π, not the plan's 0.35; see
+/// face at `saturn-night-side` is 0.0035–0.031 of E/π, region means, not the plan's 0.35; see
 /// `ring_photometry_with_the_real_profile`).
 pub fn ring_i_over_f(
     rho: f32,
@@ -1037,12 +1049,14 @@ mod tests {
     fn ring_photometry_with_the_real_profile() {
         let path = uni_data::data_dir().join("baked/saturn_rings.ron");
         let profile = uni_data::load_ring_profile(&path).expect("the committed saturn_rings.ron");
-        // Region radii [km]: NASA NSSDCA Saturnian Rings Fact Sheet.
+        // Region radii [km]: NASA NSSDCA Saturnian Rings Fact Sheet (D. R. Williams, last
+        // updated 19 April 2022): C 74 658–91 975, B 91 975–117 507, A 122 340–136 780; the
+        // Cassini division is the gap between the B ring's outer and the A ring's inner edge.
         let regions = [
-            ("C ring", 74_500.0, 92_000.0),
-            ("B ring", 92_000.0, 117_580.0),
-            ("Cassini division", 117_580.0, 122_170.0),
-            ("A ring", 122_170.0, 136_775.0),
+            ("C ring", 74_658.0, 91_975.0),
+            ("B ring", 91_975.0, 117_507.0),
+            ("Cassini division", 117_507.0, 122_340.0),
+            ("A ring", 122_340.0, 136_780.0),
         ];
         // Rec. 709 luminance of the profile's linear colour (the sunlight's colour has luminance 1).
         let lum = |s: &[f32; 4]| 0.2126 * s[0] + 0.7152 * s[1] + 0.0722 * s[2];
