@@ -133,7 +133,7 @@ const PLUTO: NaifId = 999;
 const CHARON: NaifId = 901;
 
 /// GM [m³/s²] of a body in [`crate::bodies`]; 0 for one that is not there.
-fn gm(naif: NaifId) -> f64 {
+pub(crate) fn gm(naif: NaifId) -> f64 {
     by_naif(naif).map_or(0.0, |b| b.gm_m3s2)
 }
 
@@ -311,7 +311,8 @@ mod tests {
     use crate::sat_elements::test_support::jpl_sats;
     use crate::standish::{Planet, heliocentric_state_icrs};
 
-    const YEAR_S: f64 = 365.25 * 86_400.0;
+    /// Julian year: 365.25 d of `uni_core::DAY` (IAU; `uni_core` has no year constant).
+    const YEAR_S: f64 = 365.25 * uni_core::DAY;
 
     fn eph() -> Ephemeris {
         Ephemeris::new(jpl_sats())

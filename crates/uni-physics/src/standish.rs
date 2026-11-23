@@ -229,8 +229,9 @@ pub(crate) const fn ssb_fitted(p: Planet) -> bool {
 
 /// The page's state of `p` [m, m/s], ICRS axes, about the origin its elements fit: the Sun,
 /// or the SSB where [`ssb_fitted`]. In the [`HANDOVER_BAND_CY`] just outside each end of
-/// Table 1's window it is the blend of Tables 1 and 2 (A1b, Table 1 past its window); [`crate::ssb`]'s Sun offset, and
-/// so Neptune's heliocentric state, are built from these blended states.
+/// Table 1's window (1780–1800 and 2050–2070) it is the blend of Tables 1 and 2 (A1b, Table 1
+/// past its window); [`crate::ssb`]'s Sun offset, and so Neptune's heliocentric state, are
+/// built from these blended states.
 pub(crate) fn fitted_state_icrs(p: Planet, t: Epoch) -> (DVec3, DVec3) {
     let t_cy = t.julian_centuries();
     let Some((w, w_rate_per_cy)) = handover_weight(t_cy) else {
@@ -390,7 +391,7 @@ pub(crate) mod golden {
 
     /// The TDB epoch of a Julian date (TDB).
     pub(crate) fn epoch_of(jd_tdb: f64) -> Epoch {
-        Epoch::from_days_since_j2000(jd_tdb - 2_451_545.0)
+        crate::smallbody::epoch_from_jd_tdb(jd_tdb)
     }
 
     pub(crate) fn pos_m(s: &EphemSpot) -> DVec3 {

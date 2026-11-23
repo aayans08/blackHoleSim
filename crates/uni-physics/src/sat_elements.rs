@@ -373,13 +373,9 @@ mod tests {
 
     use super::test_support::jpl_sat;
     use super::*;
-    use crate::bodies::by_naif;
+    use crate::ephemeris::gm;
     use crate::frames::ecliptic_j2000_to_icrs;
     use crate::standish::golden::{epoch_of, horizons_spots, pos_m};
-
-    fn gm(naif: NaifId) -> f64 {
-        by_naif(naif).map_or(0.0, |b| b.gm_m3s2)
-    }
 
     /// The mean longitude λ = Ω + ω + M [°] of a prograde orbit at `t`, unreduced.
     fn mean_longitude_deg(el: &SatElements, t: Epoch) -> f64 {

@@ -249,6 +249,11 @@ fn mallama_hilton_v1(naif: NaifId, a: f64) -> Option<f64> {
         }
         699 if a <= 6.0 => poly(a, &[-8.95, -3.7e-4, 6.16e-4]),
         699 => poly(a, &[-8.94, 2.446e-4, 2.672e-4, -1.505e-6, 4.767e-9]),
+        // Uranus and Neptune: the phase terms are applied at every α. Mallama & Hilton's reference
+        // code (as ported in Skyfield's `magnitudelib`) applies them only beyond geocentric
+        // limits of 3.1° (Uranus) and 1.9° (Neptune); inside those the smooth law differs by
+        // at most 0.02 mag (A3 review r1 item 3, from memory of the port, not checked against
+        // the paper), which is the criterion for keeping the smooth law for rendering.
         799 => poly(a, &[-7.110, 6.587e-3, 1.045e-4]),
         899 => poly(a, &[-7.00, 7.944e-3, 9.617e-5]),
         _ => return None,

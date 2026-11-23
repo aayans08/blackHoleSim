@@ -26,7 +26,7 @@ use crate::standish::{self, Planet};
 const JD_J2000: f64 = 2_451_545.0;
 
 /// The epoch of a TDB Julian Date.
-fn epoch_from_jd_tdb(jd_tdb: f64) -> Epoch {
+pub(crate) fn epoch_from_jd_tdb(jd_tdb: f64) -> Epoch {
     Epoch::from_days_since_j2000(jd_tdb - JD_J2000)
 }
 
@@ -89,13 +89,13 @@ pub fn heliocentric_state_icrs(c: &Conic, t: Epoch) -> (DVec3, DVec3) {
 
 /// RK4 step as a fraction of the local dynamical time √(d³/GM), d the distance to the Sun or to
 /// any perturbing planet.
-const STEP_ETA: f64 = 1.0e-3;
+pub const STEP_ETA: f64 = 1.0e-3;
 /// Longest step [s]: 2 days, so the planets' motion (Mercury: 88 days) is resolved in the
 /// indirect terms even where the small body is far out and slow. With 10 days, Mercury's
 /// indirect term alone moved Halley's 1986 position by 4 km between two step sizes.
 /// Together with [`STEP_ETA`] it keeps the integrator's own error under 1 km over Halley's 18
 /// years from 1968 to 1986 (`perturbed_integrator_reproduces_two_body`).
-const MAX_STEP_S: f64 = 2.0 * DAY;
+pub const MAX_STEP_S: f64 = 2.0 * DAY;
 /// Step cap: at Halley's rate (6848 steps for 18 years) it covers about 5 × 10⁴ years. Beyond
 /// it (or for a body falling into the Sun, where the step shrinks to 0) the integration stops
 /// and returns NaN.
@@ -245,7 +245,7 @@ mod tests {
 
     /// JD 2451545.0 TDB is J2000.0.
     fn at_jd(jd_tdb: f64) -> Epoch {
-        Epoch::from_days_since_j2000(jd_tdb - 2_451_545.0)
+        epoch_from_jd_tdb(jd_tdb)
     }
 
     /// Specific orbital energy v²/2 − μ/r [J/kg].
@@ -359,7 +359,8 @@ mod tests {
     /// pinned as a record of the data's limit: it fails if the elements change. Its propagation
     /// matches a two-body solution of the same elements written separately in Python (Newton on
     /// Kepler's equation, perifocal P/Q vectors, rotation by ε₀; the script is not in the repo,
-    /// so the vector below is a regression pin) to 100 m.
+    /// so the vector below is a regression pin of this code's output, not an independent check)
+    /// to 100 m.
     /// (2) [`perturbed_state_icrs`], the eight planets integrated from the same 1968 state, meets
     /// the brief's 0.5 % bound with room to spare: measured 4990 km, 3.8e-5 of r, 4.5″.
     #[test]
@@ -489,10 +490,17 @@ mod tests {
     /// date (2026-11-20) and at Halley's next perihelion (2061-07-28): a measured record for the
     /// card's label, no Horizons golden there. Non-gravitational forces from the 1986 passage
     /// (about 4 days per orbit in T_p) are in neither path.
+    ///
+    /// Measured (dev profile): 2026-11-20 r 35.001 au, 2.809e7 km = 5.365e-3 of r; 2061-07-28
+    /// r 0.598 au, 4.854e8 km = 5.423e0 of r (the 1968 two-body orbit has the wrong period, so
+    /// it is on the far side of the Sun). The bounds bracket those values by about 30 %.
     #[test]
     fn halley_two_body_drift_after_1986() {
         let (c, epoch) = halley();
-        for (label, jd) in [("2026-11-20", 2_461_364.5), ("2061-07-28", 2_474_033.5)] {
+        for (label, jd, lo, hi) in [
+            ("2026-11-20", 2_461_364.5, 4e-3, 7e-3),
+            ("2061-07-28", 2_474_033.5, 4.0, 7.0),
+        ] {
             let t = at_jd(jd);
             let (r2, _) = heliocentric_state_icrs(&c, t);
             let (rp, _) = perturbed_state_icrs(&c, epoch, t);
@@ -503,7 +511,7 @@ mod tests {
                 rp.length() / AU,
                 (r2 - rp).length() / 1e3
             );
-            assert!(rp.is_finite() && rel > 0.0);
+            assert!(rp.is_finite() && (lo..hi).contains(&rel), "{label}: drift {rel:.3e} of r");
         }
     }
 
