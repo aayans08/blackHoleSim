@@ -22,18 +22,16 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: the M1 Wave A gate (A10, 2026-11-23; ledger
-> `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`). 632 unit tests pass, 1 ignored (workspace lib +
-> bins). On the M3, `universe --selftest` passes 4/4 (pcg3d bit-exact, AgX 1.5e-5, Binet 1.27e-4 rad, cube_dir
-> 1.0e-7); `--capture bookmarks/m0.ron` renders 6/6, every PNG bit-identical to the `m0` captures; the shadow
-> measures 158.745 px (GR: 158.745). Wave A's crates are not drawn yet, so the M0 numbers below still hold.
-> Measured before Wave A (M0 final-review fix wave): every GPU pass time valid; `--bench` at 1920×1080: sky views 0.9–1.3 ms GPU per frame; `start`
-> (lens scale 0.5) 38.7 ms GPU, 25.6 fps serial; `bh-shadow-30M` (lens scale 1.0) 157 ms. At the window's
-> 1728×1080 internal size, `start` runs at 27 fps. The brute-force lens pass is ground truth only; M3 replaces it.
-> The window itself was not run in this wave, so its FPS is still unmeasured; the HUD now shows it.
-> Capture sheet after this wave (lead re-run at `caee1f3`, with the bench table): https://claude.ai/artifact/826GQeJr5fJL542uRbm9sx
-> The older M0 sheet (https://claude.ai/artifact/Ld8A6nHFkfFfYHESX3CBxE) shows timings corrupted by a Metal query-resolve
-> race (tonemap 0.00 ms, stars 1.1–4.7 ms); don't quote them.
+> **Updated by the lead after each wave.** Last update: the M1 Wave B gate (B9, 2026-11-23, HEAD `dc61b36` + docs;
+> ledger `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`). On the M3: `universe --selftest` 45/45 PASS (every
+> crate's GPU probes); `--capture bookmarks/m1.ron --hdr` renders 19/19 with no GPU error; the plan's numeric checks
+> 28/29 PASS (row 19's seam ratio ruled N/A at 30 M); the M0 shadow regression (bookmark `bh-shadow-30M-grid`) measures
+> 158.745 px. `--bench bookmarks/m1-bench.ron --sustained 60`: 8/8 views within GPU p95 ≤ 16 ms, CPU p95 ≤ 4 ms,
+> interval p95 ≤ 16.7 ms (143–252 fps on a quiet machine; 110–209 fps with builds running). Per-pass budgets
+> re-baselined by ruling: band 0.6 ms, histogram 0.6 ms (≈0.4 ms per pass boundary on this GPU). The app window runs
+> the full Wave B stack (FlyCamera controls; Wave C adds navigation and the HUD). Wave B capture sheet:
+> https://claude.ai/artifact/CxNGdYe4roydB4AvvuhTh7 ; engine sky before/after: https://claude.ai/artifact/58pKRE6QDzjqQLM9CrtkLN
+> Older sheets (M0): https://claude.ai/artifact/826GQeJr5fJL542uRbm9sx (the earlier Ld8A… sheet has corrupted timings).
 
 What exists now:
 ```
@@ -48,8 +46,9 @@ crates/
                 (RenderFeature, Renderer, FrameBindings), shared (SharedInput<T>), env (cube_dir twin), probe
                 (compute probes for --selftest), shader (ShaderLib #import + naga validate), capture, proj
                 (reversed-Z infinite); shaders/common/*.wgsl
-  uni-post/     upscale (internal → output) + AgX tonemap + TPDF dither pass on pre-exposed HDR; CPU twin
-                uni_post::agx
+  uni-post/     histogram auto-exposure (meter samples 1 px per 2×2 block, decodes lens_mask.a star share with
+                pre_mix), dual star exposure (default star EV −6.5), bloom (6 levels), upscale + AgX tonemap +
+                TPDF dither; CPU twins [M1 B6, B9h]
   uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks;
                 anchor (camera parented to a body frame, resolve_bookmark) [M1 A6]
   uni-data/     loaders: BSC5, AT-HYG 3-D stars + names, maps (BC7/BC4 .big + 2k fallbacks, index.ron),
@@ -65,21 +64,27 @@ crates/
                 release), honesty flags, near-star index; comets start from data/baked/comets_2026.ron and
                 catch up after date jumps under the "catching up" label [M1 A4, A4r, A4p]
   uni-procgen/  galaxy model v0 (+ galaxy.wgsl), faint-star luminosity function [M1 A5]
-  uni-sky/      StarField: energy-conserving erf-integrated PSF splats, Moffat glare, Planck LUT
-  uni-rel/      binet CPU tracer (golden-tested); LensTracer compute pass (writes only its traced rectangle,
-                lens_mask); DebugSkyBackground (the M0 debug grid, drawn only while the lens is traced); LensScale
-  uni-ui/       egui HUD v0 (windowed + headless) and unit formatting
-  uni-app/      binary `universe`: windowed app (internal ~1080 lines, upscaled to the window);
-                `--capture <bookmarks.ron> --out <dir> [--size WxH] [--frames N] [--hud]`;
-                `--bench <bookmarks.ron> [--size WxH] [--frames N]`; `--selftest`. World (TestBH-1: 10 M☉ at
-                SSB + 1000 AU), scene wiring, F12 saves a view bookmark
-  uni-planet/, uni-atmo/   doc comment only (M1 Wave B)
-  The app still draws the M0 world: Wave A's crates are not wired into uni-app yet (Wave B, B9).
+  uni-sky/      StarField3 (AT-HYG 333 294 stars in 3-D sectors, eye-glare halo fitted to CIE glare, vivid colours
+                labelled, Young 1967 twinkle under an atmosphere), points (reflected bodies at the blended exposure),
+                band v0 + environment cubemap (procedural dust/star-cloud detail + 12 named clouds, labelled), M0
+                BSC5 StarField fallback; band and catalogue stars have no depth test (lens_mask only) [M1 B4, B5, B4L, B9c]
+  uni-rel/      binet CPU tracer (golden-tested); LensTracer (environment = the band cubemap, or the M0 debug grid with
+                LensEnv::DebugGrid; skips pixels with a body in front); DebugSkyBackground; LensScale [M1 B7]
+  uni-planet/   analytic ellipsoid bodies with BC7 maps (proxy cap mesh, exact limb), star surfaces (limb darkening,
+                granulation), Saturn's rings (Salo & French 2010 layer), eclipse/LOD twins; Wave C comet stubs [M1 B0–B2, B10, B11]
+  uni-atmo/     Hillaire 2020 atmospheres for Earth, Mars, Venus, Titan (dual-source and grey variants; half-res
+                march, 16–24 steps), ground lighting, scintillation [M1 B3, B9p]
+  uni-ui/       egui HUD v0 + Wave C stubs (theme, panels, cards, overlay) [C0]
+  uni-app/      binary `universe`: the window opens at bookmarks/m1.ron "start" with the full Wave B stack;
+                `--capture <ron> --out <dir> [--size] [--frames] [--hud] [--hdr]` (capture JSON v2: settle then
+                Manual, pre-bloom HDR sidecar, per-pass durations from pass_end_ms, projected/regions/samples/flux);
+                `--bench <ron> [--sustained s] [--json out]`; `--selftest` (every crate's GPU probes).
 tools/bake/     bin `uni-bake`: bsc5, athyg, exo, map, rings, sbdb, sats, facts, horizons, comets-epoch
                 (raw inputs in data/cache/, outputs in data/baked/)
 tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html>`, `contact --captures <dir> --out <png>
                 [--width 2400]` (one labelled grid PNG), `shadow --png <f> --expected-px <r> --tol <t>`
 bookmarks/m0.ron             the six M0 capture bookmarks (RON, implicit_some)
+bookmarks/m1.ron, m1-bench.ron  the 19 M1 capture bookmarks (intent-tested) and the 8 bench views; sky-v1.ron
 data/baked/bsc5.bin          Yale Bright Star Catalogue, 9096 stars (CDS V/50), committed
 archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old CLAUDE.md (reference only)
 archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
