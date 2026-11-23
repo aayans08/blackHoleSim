@@ -733,6 +733,9 @@ struct AsteroidOrbit {
     /// Unit vectors toward periapsis and 90° ahead of it, ICRS.
     p: DVec3,
     q: DVec3,
+    /// The semi-minor axis a√(1 − e²) [m], found once (task A4p): a state is the Kepler solve
+    /// and a few multiply-adds.
+    b_m: f64,
 }
 
 impl AsteroidOrbit {
@@ -744,6 +747,8 @@ impl AsteroidOrbit {
             r.node_deg.to_radians(),
             r.argp_deg.to_radians(),
         );
+        let p = ecliptic_j2000_to_icrs(rot.x_axis);
+        let q = ecliptic_j2000_to_icrs(rot.y_axis);
         AsteroidOrbit {
             a_m,
             e: r.e,
@@ -751,24 +756,33 @@ impl AsteroidOrbit {
             period_s: std::f64::consts::TAU / n_rad_s,
             m0_rad: r.m0_deg.to_radians(),
             epoch: epoch_from_jd(r.epoch_jd_tdb),
-            p: ecliptic_j2000_to_icrs(rot.x_axis),
-            q: ecliptic_j2000_to_icrs(rot.y_axis),
+            p,
+            q,
+            b_m: a_m * (1.0 - r.e * r.e).sqrt(),
         }
+    }
+
+    /// The eccentric anomaly at `t`. Whole periods are removed from Δt first, so the mean
+    /// anomaly keeps its precision at any epoch.
+    fn eccentric_anomaly(&self, t: Epoch) -> f64 {
+        let dt = t.seconds_since(self.epoch);
+        let dt = dt - self.period_s * (dt / self.period_s).round();
+        solve_kepler(self.m0_rad + self.n_rad_s * dt, self.e)
+    }
+
+    /// Heliocentric position [m], ICRS axes: [`AsteroidOrbit::state`]'s first half.
+    fn position(&self, t: Epoch) -> DVec3 {
+        let (sin_e, cos_e) = self.eccentric_anomaly(t).sin_cos();
+        self.p * (self.a_m * (cos_e - self.e)) + self.q * (self.b_m * sin_e)
     }
 
     /// Heliocentric position [m] and velocity [m/s], ICRS axes.
     fn state(&self, t: Epoch) -> (DVec3, DVec3) {
-        // Whole periods are removed from Δt first, so the mean anomaly keeps its precision at
-        // any epoch.
-        let dt = t.seconds_since(self.epoch);
-        let dt = dt - self.period_s * (dt / self.period_s).round();
-        let ea = solve_kepler(self.m0_rad + self.n_rad_s * dt, self.e);
-        let (sin_e, cos_e) = ea.sin_cos();
-        let b = self.a_m * (1.0 - self.e * self.e).sqrt();
+        let (sin_e, cos_e) = self.eccentric_anomaly(t).sin_cos();
         let e_dot = self.n_rad_s / (1.0 - self.e * cos_e);
         (
-            self.p * (self.a_m * (cos_e - self.e)) + self.q * (b * sin_e),
-            (self.q * (b * cos_e) - self.p * (self.a_m * sin_e)) * e_dot,
+            self.p * (self.a_m * (cos_e - self.e)) + self.q * (self.b_m * sin_e),
+            (self.q * (self.b_m * cos_e) - self.p * (self.a_m * sin_e)) * e_dot,
         )
     }
 }
@@ -789,6 +803,9 @@ pub struct World {
     pub(crate) cached: Vec<UniversePos>,
     /// The ephemeris bodies, parents first.
     pub(crate) ephem_order: Vec<ObjectId>,
+    /// Parallel to `ephem_order`: the position in `ephem_order` of each body's parent (`None`
+    /// for the Sun, whose parent is the SSB).
+    ephem_parent: Vec<Option<usize>>,
     pub(crate) sun: Option<ObjectId>,
     comets: Vec<CometOrbit>,
     /// The registry object of each comet orbit.
@@ -839,6 +856,7 @@ impl World {
             epoch,
             cached: Vec::new(),
             ephem_order: Vec::new(),
+            ephem_parent: Vec::new(),
             sun: None,
             comets: Vec::new(),
             comet_objects: Vec::new(),
@@ -1009,6 +1027,8 @@ impl World {
         if naif == SUN && self.sun.is_none() {
             self.sun = Some(id);
         }
+        let slot = parent.and_then(|p| self.ephem_order.iter().position(|&x| x == p));
+        self.ephem_parent.push(slot);
         self.ephem_order.push(id);
         id
     }
@@ -1370,8 +1390,59 @@ impl World {
         }
     }
 
-    /// Re-evaluates every cached position at `self.epoch`: one source evaluation per body.
+    /// Re-evaluates every cached position at `self.epoch`: one source evaluation per body, and
+    /// the comets', asteroids' and TestBH-1's states on scoped worker threads (ruling 3).
+    ///
+    /// Every small body is placed from its own orbit and the cached Sun alone, and written by
+    /// exactly one worker, so the result does not depend on the thread count. The ephemeris
+    /// bodies (a few hundred, each a parent-chain sum) run on the calling thread meanwhile.
     fn refresh_states(&mut self) {
+        let t = self.epoch;
+        let Some(sun_id) = self.sun else {
+            self.refresh_ephemeris();
+            self.refresh_small_bodies();
+            return;
+        };
+        // The Sun's parent is the SSB: its position needs no other body.
+        let sun_naif = self.objects[sun_id as usize].naif.unwrap_or_default();
+        if self.objects[sun_id as usize].parent.is_some() {
+            self.refresh_ephemeris();
+            self.refresh_small_bodies();
+            return;
+        }
+        let sun = add_rel(
+            UniversePos::default(),
+            rel_or_zero(&*self.source, sun_naif, t),
+        );
+        let ephem = {
+            let work = SmallWork {
+                physical: &self.physical,
+                comets: &self.comets,
+                asteroids: &self.asteroids,
+                lenses: &self.lenses,
+                sun,
+            };
+            let source = &*self.source;
+            let (objects, order, parents) = (&self.objects, &self.ephem_order, &self.ephem_parent);
+            let ephem_pass = || {
+                let mut out: Vec<UniversePos> = Vec::with_capacity(order.len());
+                for (slot, &id) in order.iter().enumerate() {
+                    let parent = parents[slot].map_or(UniversePos::default(), |p| out[p]);
+                    let naif = objects[id as usize].naif.unwrap_or_default();
+                    out.push(add_rel(parent, rel_or_zero(source, naif, t)));
+                }
+                out
+            };
+            run_small_work(&work, &mut self.cached, t, ephem_pass)
+        };
+        for (&id, pos) in self.ephem_order.iter().zip(ephem) {
+            self.cached[id as usize] = pos;
+        }
+    }
+
+    /// The ephemeris bodies at `self.epoch`, parents first (the serial path, and the test
+    /// reference).
+    fn refresh_ephemeris(&mut self) {
         let t = self.epoch;
         for &id in &self.ephem_order {
             let info = &self.objects[id as usize];
@@ -1381,28 +1452,24 @@ impl World {
             let naif = info.naif.unwrap_or_default();
             self.cached[id as usize] = add_rel(parent, rel_or_zero(&*self.source, naif, t));
         }
-        self.refresh_small_bodies();
     }
 
-    /// Comets, asteroids and TestBH-1 at `self.epoch`, relative to the cached Sun.
+    /// Comets, asteroids and TestBH-1 at `self.epoch`, relative to the cached Sun (the serial
+    /// path, and the test reference for [`World::refresh_states`]).
     fn refresh_small_bodies(&mut self) {
         let t = self.epoch;
         let sun = self
             .sun
             .map_or(UniversePos::default(), |s| self.cached[s as usize]);
-        for k in 0..self.cached.len() {
-            let helio = match self.physical[k].source {
-                Source::Comet(c) => self.comets[c].state(t).0,
-                Source::Asteroid(a) => self.asteroids[a].state(t).0,
-                Source::BlackHole(l) => {
-                    self.cached[k] = self.lenses[l].pos;
-                    continue;
-                }
-                Source::Ephem | Source::Star => continue,
-            };
-            if helio.is_finite() {
-                self.cached[k] = add_rel(sun, helio);
-            }
+        let work = SmallWork {
+            physical: &self.physical,
+            comets: &self.comets,
+            asteroids: &self.asteroids,
+            lenses: &self.lenses,
+            sun,
+        };
+        for (k, slot) in self.cached.iter_mut().enumerate() {
+            work.place(k, slot, t);
         }
     }
 
@@ -1517,6 +1584,77 @@ impl World {
             self.cached[self.comet_objects[k] as usize] = add_rel(sun, helio);
         }
     }
+}
+
+/// What placing a comet, asteroid or TestBH-1 reads: borrowed from the [`World`] (everything
+/// but its `cached`), plus the cached Sun.
+struct SmallWork<'a> {
+    physical: &'a [Physical],
+    comets: &'a [CometOrbit],
+    asteroids: &'a [AsteroidOrbit],
+    lenses: &'a [Lens],
+    sun: UniversePos,
+}
+
+impl SmallWork<'_> {
+    /// Object `k`'s cached position at `t` into `slot`; the ephemeris bodies and stars are left
+    /// alone, and a non-finite state keeps the old position.
+    fn place(&self, k: usize, slot: &mut UniversePos, t: Epoch) {
+        let helio = match self.physical[k].source {
+            Source::Comet(c) => self.comets[c].state(t).0,
+            Source::Asteroid(a) => self.asteroids[a].position(t),
+            Source::BlackHole(l) => {
+                *slot = self.lenses[l].pos;
+                return;
+            }
+            Source::Ephem | Source::Star => return,
+        };
+        if helio.is_finite() {
+            *slot = add_rel(self.sun, helio);
+        }
+    }
+}
+
+/// Objects per work item of [`run_small_work`].
+const SMALL_CHUNK: usize = 256;
+
+/// Places every small body of `cached` (ids `0..cached.len()`) at `t` on up to
+/// [`std::thread::available_parallelism`] threads: the calling thread and scoped helpers
+/// (ruling 3). A shared queue hands out [`SMALL_CHUNK`]-object slices of `cached`; each slot is
+/// written by one thread from its own orbit alone, so the result does not depend on the
+/// thread count or the schedule. The calling thread first runs `main_job` (returned), then
+/// takes chunks too. A helper's panic is re-raised.
+fn run_small_work<R>(
+    work: &SmallWork<'_>,
+    cached: &mut [UniversePos],
+    t: Epoch,
+    main_job: impl FnOnce() -> R,
+) -> R {
+    let chunks = Mutex::new(cached.chunks_mut(SMALL_CHUNK).enumerate());
+    let take = || chunks.lock().unwrap_or_else(PoisonError::into_inner).next();
+    let drain = || {
+        while let Some((c, slice)) = take() {
+            for (i, slot) in slice.iter_mut().enumerate() {
+                work.place(c * SMALL_CHUNK + i, slot, t);
+            }
+        }
+    };
+    let n_chunks = work.physical.len().div_ceil(SMALL_CHUNK);
+    let helpers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(n_chunks)
+        .saturating_sub(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..helpers).map(|_| scope.spawn(drain)).collect();
+        let out = main_job();
+        drain();
+        for h in handles {
+            if let Err(panic) = h.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+        out
+    })
 }
 
 /// Runs comet re-osculation `jobs` (comet index, most steps) toward `t` on up to
@@ -3038,11 +3176,12 @@ mod tests {
         assert!(err < 10.0, "{steps} chunks vs one integration: {err} m");
         println!(
             "Halley 1968 → 1986 in {steps} short steps ({:.2}–{:.0} days), {err:.2} m from one \
-             integration, mean {:.3} ms, slowest {:.3} ms (unoptimised uni-sim test build)",
+             integration, mean {:.3} ms, slowest {:.3} ms ({} uni-sim test build)",
             shortest / DAY,
             longest / DAY,
             total / f64::from(steps) * 1e3,
-            slowest * 1e3
+            slowest * 1e3,
+            profile()
         );
     }
 
@@ -3685,7 +3824,7 @@ mod tests {
             "{} objects ({} cached, {} comets); load {:.0} ms, World::new {:.0} ms (comets \
              settled), tick {:.2} ms, slowest tick after a 30-year jump {:.2} ms and after a \
              warp past 200 years {:.2} ms, tick back to the start date {:.2} ms, worst snapshot \
-             {:.2} ms (unoptimised uni-sim test build)",
+             {:.2} ms ({} uni-sim test build)",
             world.objects().len(),
             world.cached.len(),
             world.comets.len(),
@@ -3695,13 +3834,14 @@ mod tests {
             jump * 1e3,
             warp * 1e3,
             back * 1e3,
-            worst * 1e3
+            worst * 1e3,
+            profile()
         );
         println!(
             "jump to 2020-07-15: {stale_2020} comets stale, all caught up in {ticks_2020} ticks \
              (mean {:.2} ms, slowest {:.2} ms); jump to start + 10 yr: drawn Halley caught up \
              in {ticks_drawn} ticks (mean {:.2} ms, slowest {:.2} ms), {still} of {} comets \
-             still lagging then; {} checkpoints in all (unoptimised uni-sim test build)",
+             still lagging then; {} checkpoints in all ({} uni-sim test build)",
             total_2020 / f64::from(ticks_2020 - 1) * 1e3,
             slowest_2020 * 1e3,
             total_drawn / f64::from(ticks_drawn - 1) * 1e3,
@@ -3711,9 +3851,99 @@ mod tests {
                 .comets
                 .iter()
                 .map(|c| c.checkpoints.len())
-                .sum::<usize>()
+                .sum::<usize>(),
+            profile()
         );
         assert!(back < 0.1, "{back} s");
         assert!(worst < 0.25, "{worst} s");
+    }
+
+    /// The build profile, for printed timings.
+    fn profile() -> &'static str {
+        if cfg!(debug_assertions) {
+            "unoptimised"
+        } else {
+            "optimised (release)"
+        }
+    }
+
+    /// The pre-A4p asteroid position: the perifocal axes scaled at every call.
+    fn reference_asteroid_position(o: &AsteroidOrbit, t: Epoch) -> DVec3 {
+        let dt = t.seconds_since(o.epoch);
+        let dt = dt - o.period_s * (dt / o.period_s).round();
+        let (sin_e, cos_e) = solve_kepler(o.m0_rad + o.n_rad_s * dt, o.e).sin_cos();
+        let b = o.a_m * (1.0 - o.e * o.e).sqrt();
+        o.p * (o.a_m * (cos_e - o.e)) + o.q * (b * sin_e)
+    }
+
+    /// Task A4p: the threaded refresh with precomputed asteroid axes places every cached
+    /// object within 1 mm of the straightforward path (ephemeris loop, then each small body
+    /// from the old per-call formula), at the start date and at two others.
+    #[test]
+    fn refresh_matches_reference_path() {
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let mut world = World::new(data, date("2026-11-20T00:00:00Z"));
+        let mut checked = 0;
+        for when in [
+            "2026-11-20T00:00:00Z",
+            "1999-03-01T12:00:00Z",
+            "2150-07-04T06:00:00Z",
+        ] {
+            world.time.set_epoch(date(when));
+            world.tick(0.0);
+            let t = world.epoch();
+            let fast = world.cached.clone();
+            world.refresh_ephemeris();
+            let sun = world.cached[world.sun.expect("sun") as usize];
+            for k in 0..world.cached.len() {
+                let helio = match world.physical[k].source {
+                    Source::Comet(c) => world.comets[c].state(t).0,
+                    Source::Asteroid(a) => reference_asteroid_position(&world.asteroids[a], t),
+                    Source::BlackHole(l) => {
+                        world.cached[k] = world.lenses[l].pos;
+                        continue;
+                    }
+                    Source::Ephem | Source::Star => continue,
+                };
+                if helio.is_finite() {
+                    world.cached[k] = add_rel(sun, helio);
+                }
+            }
+            for (k, (a, b)) in fast.iter().zip(&world.cached).enumerate() {
+                let d = a.delta_from(*b).length();
+                assert!(d < 1e-3, "{when}: object {k} differs by {d} m");
+                checked += 1;
+            }
+        }
+        assert!(checked > 20_000, "{checked}");
+    }
+
+    /// Prints the steady tick's split (release: `--release -- --nocapture tick_split`).
+    #[test]
+    fn tick_split() {
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let mut world = World::new(data, date("2026-11-20T00:00:00Z"));
+        world.tick(1.0 / 60.0);
+        let n = 100;
+        let per = |f: &mut dyn FnMut()| {
+            let c0 = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            c0.elapsed().as_secs_f64() / f64::from(n) * 1e3
+        };
+        let eph = per(&mut || world.refresh_ephemeris());
+        let small = per(&mut || world.refresh_small_bodies());
+        let full = per(&mut || world.refresh_states());
+        let reo = per(&mut || world.reosculate_comets());
+        let tick = per(&mut || {
+            world.tick(1.0 / 60.0);
+        });
+        println!(
+            "tick split ({}): ephemeris {eph:.3} ms, small bodies serial {small:.3} ms, \
+             refresh_states (threaded) {full:.3} ms, idle comet pass {reo:.3} ms, whole steady \
+             tick at rate 1 {tick:.3} ms",
+            profile()
+        );
     }
 }
