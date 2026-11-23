@@ -200,6 +200,8 @@ pub fn mars() -> AtmosphereParams {
 ///   the Cornette–Shanks g (module docs). The test `mie_derivations_reproduce_the_presets`
 ///   re-derives these numbers.
 /// - Ground albedo 0.76: the cloud deck's Bond albedo (Haus et al. 2016, Icarus 272, 178), grey.
+///   That is band-integrated, used here in every channel (approximate; it feeds only the
+///   multiple-scattering LUT's ground bounce).
 pub fn venus() -> AtmosphereParams {
     let bottom = 6_051_800.0 + VENUS_CLOUD_TOP_M;
     let top = bottom + 60_000.0;

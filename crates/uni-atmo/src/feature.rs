@@ -1372,6 +1372,26 @@ mod tests {
         disk_reflectance(p, ground, 0.0, n, 1)
     }
 
+    /// Spherical albedo A = p·q = 2∫₀^π p·Φ(α)·sin α dα (Russell 1916, ApJ 43, 173) per channel
+    /// over a Lambert ground, with `phases` midpoints in α and [`disk_reflectance`]'s
+    /// `rings` × `sectors` grid at each.
+    fn spherical_albedo(
+        p: &AtmosphereParams,
+        ground: Vec3,
+        phases: usize,
+        rings: usize,
+        sectors: usize,
+    ) -> DVec3 {
+        let d_alpha = std::f64::consts::PI / phases as f64;
+        (0..phases)
+            .map(|i| {
+                let a = d_alpha * (i as f64 + 0.5);
+                disk_reflectance(p, ground, a, rings, sectors).as_dvec3()
+                    * (2.0 * a.sin() * d_alpha)
+            })
+            .sum()
+    }
+
     /// The same preset with no air at all: every coefficient 0, so a bare Lambert sphere.
     fn airless(p: AtmosphereParams) -> AtmosphereParams {
         AtmosphereParams {
@@ -1406,30 +1426,47 @@ mod tests {
     }
 
     /// Review I4 (ruling W-B1): physical air cannot bring Earth's disk up to the catalogue p_V
-    /// 0.434.
-    /// - Over a uniform Lambert ground of albedo ρ, p₅₅₀ is affine in ρ. With this atmosphere the
-    ///   ρ that would reach 0.434 is ≈ 0.76. A Lambert sphere's Bond albedo is ρ (the air changes
-    ///   it by a few per cent), and Earth's is 0.294: both catalogue values are NASA NSSDCA's
-    ///   Earth fact sheet, baked in `data/baked/body_facts.ron`. So p_V and the Bond albedo
-    ///   cannot both hold for any Lambert Earth; the real Earth's phase integral
-    ///   q = A/p = 0.294/0.434 = 0.68 is well below a Lambert sphere's 3/2. The gap is in the
-    ///   phase law of the clouds and ground (backscatter toward phase 0), not in the air.
-    ///   `report_numbers` integrates this model over phase: over A8's 0.302 composite its Bond
-    ///   albedo at 550 nm is 0.292 (Earth's 0.294), with p 0.210 and q 1.39.
-    /// - Nor does more air help: ×2 and ×3 the whole column (Rayleigh, aerosol, ozone) leaves
-    ///   p₅₅₀ over A8's 0.302 composite at ≤ 0.22, because the thicker air dims the ground as much
-    ///   as it adds.
+    /// 0.434 (NASA NSSDCA Earth fact sheet, baked in `data/baked/body_facts.ron`).
+    ///
+    /// Terms: p is the geometric albedo and A = p·q the spherical albedo, with q the phase
+    /// integral (Russell 1916). The model's values are per wavelength, here 550 nm, its green
+    /// channel, near V. A Bond albedo is A integrated over the solar spectrum.
+    /// - Over a uniform Lambert ground of albedo ρ the model's reflectance is affine in ρ: the
+    ///   in-scatter and the LUTs do not depend on the map's ρ. So p₅₅₀ reaches 0.434 at one ρ*,
+    ///   ≈ 0.76.
+    /// - Integrated over phase at that ρ*, the model's A₅₅₀ is 0.609 (q 1.40). No catalogue
+    ///   gives Earth's spherical albedo at 550 nm. The check therefore uses a deliberately
+    ///   generous visible-band ceiling, A_VIS_MAX = 0.35, above every measured value to hand:
+    ///   - NSSDCA's Bond albedo 0.294 (bolometric);
+    ///   - 0.297 ± 0.005 from optical earthshine photometry (Goode et al. 2001, GRL 28(9),
+    ///     1671, doi:10.1029/2000GL012580).
+    ///
+    ///   Comparing 550 nm with band-integrated values is approximate, but the gap is not: A₅₅₀(ρ*)
+    ///   is about twice the measured values, and the test requires more than 1.5 × the ceiling
+    ///   (0.525).
+    /// - So a Lambert Earth can match p_V or Earth's spherical albedo, not both. The real
+    ///   Earth's phase integral is q = A/p_V ≤ 0.35/0.434 = 0.81, against ≈ 1.4–1.5 for this
+    ///   model (a bare Lambert sphere has 3/2). The gap is in the phase law of the clouds and
+    ///   ground (backscatter toward phase 0), not in the air.
+    /// - Nor does more air help. With ×2 and ×3 the whole column (Rayleigh, aerosol, ozone),
+    ///   p₅₅₀ over A8's 0.302 composite stays ≤ 0.22, because the thicker air dims the ground as
+    ///   much as it adds.
+    ///
+    /// Phase quadrature: 8 midpoints of 22.5°, 16 rings × 8 sectors. On the same grid a bare
+    /// Lambert sphere of albedo ρ* gives A = 1.014·ρ* (closed form ρ*; `report_numbers`).
     #[test]
     fn w_b1_p_v_needs_a_non_lambert_earth() {
         const P_V: f64 = 0.434;
-        const BOND: f64 = 0.294;
+        const A_VIS_MAX: f64 = 0.35;
         let e = earth();
         let p0 = disk_albedo(&e, Vec3::ZERO, 200).y as f64;
         let p1 = disk_albedo(&e, Vec3::ONE, 200).y as f64;
         let rho_needed = (P_V - p0) / (p1 - p0);
+        let a_550 = spherical_albedo(&e, Vec3::splat(rho_needed as f32), 8, 16, 8).y;
         assert!(
-            rho_needed > 2.0 * BOND,
-            "Lambert ground reaching p_V: {rho_needed}"
+            a_550 > 1.5 * A_VIS_MAX,
+            "Lambert ground reaching p_V: ρ* {rho_needed:.3}, A₅₅₀ {a_550:.3}, q {:.2}",
+            a_550 / P_V
         );
         for k in [2.0f32, 3.0] {
             let thick = AtmosphereParams {
@@ -1695,20 +1732,30 @@ mod tests {
                 disk_albedo(&rayleigh, Vec3::splat(0.302), 300)
             );
         }
-        // Bond albedo A = p·q = 2∫₀^π p·Φ(α)·sin α dα (Russell 1916), 12 midpoints of 15°.
+        // Spherical albedo A = p·q per channel (550 nm in the middle; not a Bond albedo, which is
+        // band-integrated), 12 midpoints of 15°, 32 rings × 12 sectors.
         for (name, p) in [("Earth", earth()), ("bare Lambert", airless(earth()))] {
-            let n = 12;
-            let mut bond = DVec3::ZERO;
-            for i in 0..n {
-                let a = std::f64::consts::PI * (i as f64 + 0.5) / n as f64;
-                bond += disk_reflectance(&p, Vec3::splat(0.302), a, 32, 12).as_dvec3()
-                    * (2.0 * a.sin() * std::f64::consts::PI / n as f64);
-            }
+            let a = spherical_albedo(&p, Vec3::splat(0.302), 12, 32, 12);
             let p0 = disk_albedo(&p, Vec3::splat(0.302), 600).as_dvec3();
             println!(
-                "W-B1 {name} over 0.302: Bond albedo {bond:.4}, p {p0:.4}, phase integral q {:.3}",
-                bond.y / p0.y
+                "W-B1 {name} over 0.302: spherical albedo {a:.4}, p {p0:.4}, phase integral q {:.3}",
+                a.y / p0.y
             );
         }
+        // `w_b1_p_v_needs_a_non_lambert_earth`'s grid (8 phases, 16 × 8): Earth at the ρ* that
+        // reaches p_V, and the bare Lambert control (closed form A = ρ).
+        let (q0, q1) = (
+            disk_albedo(&e, Vec3::ZERO, 200).y as f64,
+            disk_albedo(&e, Vec3::ONE, 200).y as f64,
+        );
+        let rho_star = (0.434 - q0) / (q1 - q0);
+        let a_star = spherical_albedo(&e, Vec3::splat(rho_star as f32), 8, 16, 8);
+        let a_bare = spherical_albedo(&airless(earth()), Vec3::splat(rho_star as f32), 8, 16, 8);
+        println!(
+            "W-B1 test grid: Earth ρ* {rho_star:.4}: A {a_star:.4} (q₅₅₀ {:.3}); bare Lambert at ρ*: \
+             A {a_bare:.4} against {rho_star:.4} ({:+.2} %)",
+            a_star.y / 0.434,
+            (a_bare.y / rho_star - 1.0) * 100.0
+        );
     }
 }
