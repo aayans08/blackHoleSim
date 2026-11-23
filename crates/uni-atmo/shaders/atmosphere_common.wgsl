@@ -10,8 +10,15 @@
 // the shell follows the oblate ground. A ray parameter t is a true distance in metres.
 //
 // Bindings: group 0 camera (common/camera.wgsl); group 1 the draw (uniform with a dynamic offset)
-// and the depth target; group 2 the atmosphere: binding 1 transmittance LUT and 3 sampler (from
-// atmo/ground_lighting.wgsl), 4 multiple-scattering LUT, 5 parameters.
+// and the depth target, and for the composite the two half-resolution scratch targets; group 2
+// the atmosphere: binding 1 transmittance LUT and 3 sampler (from atmo/ground_lighting.wgsl), 4
+// multiple-scattering LUT, 5 parameters.
+//
+// The pass (task B9p, plan fallback ladder steps 1-3): the march runs at half resolution into
+// two scratch targets (atmo_march_half), a full-resolution composite upsamples them where the
+// neighbouring samples belong to the same ray geometry and marches the rest exactly
+// (atmo_composite), and the dual variant's mask takes T from the transmittance-LUT ratio
+// (atmo_view_transmittance).
 
 #import "common/camera.wgsl"
 #import "common/constants.wgsl"
@@ -54,19 +61,30 @@ struct AtmoDrawGpu {
     rect: vec4<f32>,
     // x: exposure mix w, the body's (0 = star_pre, 1 = scene_pre; snapped to 1 when
     // 1 - w < 2^-14, uni_atmo::feature::atmo_exposure_mix); y: 1 = draw a fullscreen triangle;
-    // z: depth surfaces lower than this above the ground [m] are the body's own ground; w: 0.
+    // z: depth surfaces lower than this above the ground [m] are the body's own ground; w: the
+    // draw's index + 1 (it tags the draw's half-resolution samples).
     misc: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> atmo_draw: AtmoDrawGpu;
 @group(1) @binding(1) var atmo_depth: texture_depth_2d;
+// The half-resolution scratch targets (the composite's group 1 only): rgb the pre-exposed
+// in-scattered light (atmo_light), a the segment length [km]; rgb the transmittance, a the
+// draw's index + 1 (0 where nothing was marched: the clear value).
+@group(1) @binding(2) var atmo_half_light: texture_2d<f32>;
+@group(1) @binding(3) var atmo_half_trans: texture_2d<f32>;
 // Multiple-scattering LUT (32 x 32, Rgba16Float): Psi_ms [1/sr per lux].
 @group(2) @binding(4) var atmo_multiscatter_lut: texture_2d<f32>;
 @group(2) @binding(5) var<uniform> atmo_params: AtmoParamsGpu;
 
-// Twins of uni_atmo::lut::{MARCH_STEPS, MARCH_STEPS_LIMB, LUT_GROUND_OFFSET_M}.
+// Twins of uni_atmo::lut::{MARCH_STEPS, MARCH_STEPS_LIMB, LUT_GROUND_OFFSET_M}: the LUT passes'
+// and the probes' march.
 const ATMO_MARCH_STEPS: f32 = 32.0;
 const ATMO_MARCH_STEPS_LIMB: f32 = 48.0;
+// Twins of uni_atmo::lut::{VIEW_MARCH_STEPS, VIEW_MARCH_STEPS_LIMB}: the per-pixel view march
+// (plan fallback ladder, atmosphere step 2, task B9p: 32 -> 16 and 48 -> 24).
+const ATMO_VIEW_MARCH_STEPS: f32 = 16.0;
+const ATMO_VIEW_MARCH_STEPS_LIMB: f32 = 24.0;
 const ATMO_LUT_GROUND_OFFSET_M: f32 = 1.0;
 
 // What a ray picks up through the atmosphere.
@@ -108,9 +126,15 @@ fn atmo_medium(h_m: f32) -> AtmoMedium {
 // Unified Volumetric Rendering in Frostbite", slide 28), with a series below x = 1e-3. Twin of
 // uni_atmo::lut::step_integral.
 fn atmo_step_integral(ext: vec3<f32>, dt: f32) -> vec3<f32> {
+    return atmo_step_integral_with(ext, dt, exp(-ext * dt));
+}
+
+// atmo_step_integral given the step's transmittance tr = exp(-ext dt), which the march needs
+// anyway (one exp per step instead of two; task B9p).
+fn atmo_step_integral_with(ext: vec3<f32>, dt: f32, tr: vec3<f32>) -> vec3<f32> {
     let x = ext * dt;
     let series = dt * (1.0 - 0.5 * x + x * x / 6.0);
-    let exact = (1.0 - exp(-x)) / max(ext, vec3<f32>(1e-30));
+    let exact = (1.0 - tr) / max(ext, vec3<f32>(1e-30));
     return select(exact, series, x < vec3<f32>(1e-3));
 }
 
@@ -200,13 +224,24 @@ fn atmo_ray_sphere(o: vec3<f32>, d: vec3<f32>, radius: f32) -> vec2<f32> {
     return vec2<f32>((-b - s) / a, (-b + s) / a);
 }
 
-// Steps for a segment of length len: 32, rising linearly to 48 as len goes from H to 2H,
-// H = sqrt(top^2 - bottom^2). Twin of uni_atmo::lut::step_count.
-fn atmo_step_count(len: f32) -> f32 {
+// Steps for a segment of length len: `base`, rising linearly to `limb` as len goes from H to 2H,
+// H = sqrt(top^2 - bottom^2). Twin of uni_atmo::lut::step_count_between.
+fn atmo_step_count_between(len: f32, base: f32, limb: f32) -> f32 {
     let bottom = atmo_params.radii.x;
     let top = atmo_params.radii.y;
     let h = sqrt((top - bottom) * (top + bottom));
-    return ATMO_MARCH_STEPS + (ATMO_MARCH_STEPS_LIMB - ATMO_MARCH_STEPS) * clamp((len - h) / h, 0.0, 1.0);
+    return base + (limb - base) * clamp((len - h) / h, 0.0, 1.0);
+}
+
+// The LUT passes' and probes' step count: 32, rising to 48. Twin of uni_atmo::lut::step_count.
+fn atmo_step_count(len: f32) -> f32 {
+    return atmo_step_count_between(len, ATMO_MARCH_STEPS, ATMO_MARCH_STEPS_LIMB);
+}
+
+// The view march's step count: 16, rising to 24 (ladder step 2). Twin of
+// uni_atmo::lut::view_step_count.
+fn atmo_view_step_count(len: f32) -> f32 {
+    return atmo_step_count_between(len, ATMO_VIEW_MARCH_STEPS, ATMO_VIEW_MARCH_STEPS_LIMB);
 }
 
 // A half-segment's step boundary k, measured from its dense end: len * min((k/c)^2, 1).
@@ -234,15 +269,16 @@ fn atmo_march_step(
 ) {
     let r = length(pos);
     let m = atmo_medium(r - atmo_params.radii.x);
+    let tr = exp(-m.extinction * dt);
     if (scatter) {
         let mu_s = dot(pos, sun) / r;
         let t_sun = atmo_sun_lut_transmittance(r, mu_s);
         let psi = atmo_lut_multiscatter(r, mu_s);
         let single = m.rayleigh * phases.rayleigh + m.mie * phases.mie + m.layer2 * phases.layer2;
         let s = t_sun * single + psi * (m.rayleigh + m.mie + m.layer2);
-        (*acc).inscatter += (*acc).transmittance * s * atmo_step_integral(m.extinction, dt);
+        (*acc).inscatter += (*acc).transmittance * s * atmo_step_integral_with(m.extinction, dt, tr);
     }
-    (*acc).transmittance *= exp(-m.extinction * dt);
+    (*acc).transmittance *= tr;
 }
 
 // Marches from o (body-centred position) along d over [t0, t1] with the Sun in the unit
@@ -250,8 +286,23 @@ fn atmo_march_step(
 // the planet's shadow) with Rayleigh and per-channel Cornette-Shanks phases, plus Psi_ms x
 // sigma_s (Hillaire 2020 section 5.5), integrated per step. The segment is split at the closest
 // approach to the centre and each half's steps are spaced quadratically from that densest
-// point; each step is sampled at its midpoint. Twin of uni_atmo::lut::march.
+// point; each step is sampled at its midpoint. atmo_step_count steps (the LUT passes and the
+// probes). Twin of uni_atmo::lut::march.
 fn atmo_march(o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32, sun: vec3<f32>, nu: f32, scatter: bool) -> AtmoSegment {
+    return atmo_march_n(o, d, t0, t1, sun, nu, scatter, atmo_step_count(t1 - t0));
+}
+
+// atmo_march with n steps. Twin of uni_atmo::lut::march_steps.
+fn atmo_march_n(
+    o: vec3<f32>,
+    d: vec3<f32>,
+    t0: f32,
+    t1: f32,
+    sun: vec3<f32>,
+    nu: f32,
+    scatter: bool,
+    n: f32,
+) -> AtmoSegment {
     var acc = AtmoSegment(vec3<f32>(0.0), vec3<f32>(1.0));
     let len = t1 - t0;
     if (!(len > 0.0)) {
@@ -262,7 +313,6 @@ fn atmo_march(o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32, sun: vec3<f32>, nu: 
         atmo_cornette_shanks(atmo_params.mie_g.xyz, nu),
         atmo_cornette_shanks(atmo_params.layer2_g.xyz, nu),
     );
-    let n = atmo_step_count(len);
     let tc = clamp(-dot(o, d) / dot(d, d), t0, t1);
     let len_a = tc - t0;
     let len_b = t1 - tc;
@@ -368,23 +418,41 @@ fn atmo_view_ray(pix: vec2<f32>) -> AtmoViewRay {
     return ray;
 }
 
-// What pixel `pix` (the fragment position; floored to the pixel index) picks up through the
-// atmosphere. Discards pixels whose ray misses the shell.
-fn atmo_segment(pix: vec2<f32>) -> AtmoSegment {
-    let ray = atmo_view_ray(floor(pix));
-    if (!ray.valid) {
-        discard;
+// Transmittance along the segment from o over len (o + d·t, the ray's own parameterisation)
+// from the transmittance LUT, without a march (Bruneton 2017, GetTransmittance): T(r0, mu0) /
+// T(r1, mu1) for a ray that misses the ground, T(r1, -mu1) / T(r0, -mu0) for one that hits it
+// (both then read toward the top), clamped to 1. Plan fallback ladder, atmosphere step 1 (task
+// B9p): the mask pass's `g`. With the camera outside the shell (every Solar System bookmark) one
+// of the two factors is 1 and the result is one LUT read; from inside, near-horizon rays divide
+// two small numbers and lose precision. CPU twin: uni_atmo::feature::segment_transmittance_lut.
+fn atmo_segment_lut_transmittance(o: vec3<f32>, d: vec3<f32>, len: f32) -> vec3<f32> {
+    let bottom = atmo_params.radii.x;
+    let dn = normalize(d);
+    let r0 = length(o);
+    let mu0 = dot(o, dn) / r0;
+    let e = o + d * len;
+    let r1 = length(e);
+    let mu1 = dot(e, dn) / r1;
+    var num: vec3<f32>;
+    var den: vec3<f32>;
+    if (atmo_ray_hits_ground(bottom, r0, mu0)) {
+        num = atmo_lut_transmittance(r1, -mu1);
+        den = atmo_lut_transmittance(r0, -mu0);
+    } else {
+        num = atmo_lut_transmittance(r0, mu0);
+        den = atmo_lut_transmittance(r1, mu1);
     }
-    return atmo_march(ray.o, ray.d, 0.0, ray.len, atmo_draw.sun.xyz, ray.nu, true);
+    return min(num / max(den, vec3<f32>(1e-30)), vec3<f32>(1.0));
 }
 
-// Only the transmittance of atmo_segment (the same steps; the mask pass). Discards like it.
+// The transmittance of pixel `pix`'s ray (the fragment position) from the LUT ratio (the mask
+// pass; ladder step 1). Discards like atmo_composite.
 fn atmo_view_transmittance(pix: vec2<f32>) -> vec3<f32> {
     let ray = atmo_view_ray(floor(pix));
     if (!ray.valid) {
         discard;
     }
-    return atmo_march(ray.o, ray.d, 0.0, ray.len, atmo_draw.sun.xyz, ray.nu, false).transmittance;
+    return atmo_segment_lut_transmittance(ray.o, ray.d, ray.len);
 }
 
 // Inscattered light per lux -> pre-exposed hdr: x sun illuminance x the Sun's colour (light 0,
@@ -408,6 +476,92 @@ fn atmo_light(inscatter_per_lux: vec3<f32>) -> vec3<f32> {
 // uni_atmo::feature::atmo_star_share.
 fn atmo_star_share() -> f32 {
     return 1.0 - atmo_draw.misc.x;
+}
+
+// ---- Half resolution (plan fallback ladder, atmosphere step 3; task B9p) ------------------------
+
+// Largest relative difference between a half-resolution sample's segment length and the pixel's
+// own for the sample to be used. A ray that grazes the ground and one that just misses it differ
+// by a factor of about 2, a ray stopped by a body in front by more; inside one geometry the length
+// changes by under 10 % per sample except in the outermost few kilometres of the shell, where the
+// light is faint and the pixel is marched instead. Twin of uni_atmo::feature::UPSAMPLE_LEN_TOL.
+const ATMO_UPSAMPLE_LEN_TOL: f32 = 0.1;
+// Segment lengths are stored in km (f16 holds up to 65504 km at 1e-3 relative).
+const ATMO_KM_PER_M: f32 = 1e-3;
+
+// The march pass's outputs (two scratch targets, no blending).
+struct AtmoHalfOut {
+    @location(0) light: vec4<f32>,
+    @location(1) trans: vec4<f32>,
+}
+
+// The march of half-resolution texel `half_pos` (the fragment position): the exact ray of
+// full-resolution pixel 2 x the texel index (pixel_dir and the depth there), so even pixels get
+// their own march back. Discards where that ray misses the shell (the clear value stays).
+fn atmo_march_half(half_pos: vec2<f32>) -> AtmoHalfOut {
+    let ray = atmo_view_ray(2.0 * floor(half_pos));
+    if (!ray.valid) {
+        discard;
+    }
+    let s = atmo_march_n(
+        ray.o, ray.d, 0.0, ray.len, atmo_draw.sun.xyz, ray.nu, true, atmo_view_step_count(ray.len)
+    );
+    return AtmoHalfOut(
+        vec4<f32>(atmo_light(s.inscatter), ray.len * ATMO_KM_PER_M),
+        vec4<f32>(s.transmittance, atmo_draw.misc.w),
+    );
+}
+
+// What the composite applies to a pixel: hdr = hdr x transmittance + light.
+struct AtmoComposite {
+    // Pre-exposed in-scattered light (atmo_light).
+    light: vec3<f32>,
+    transmittance: vec3<f32>,
+}
+
+// Pixel `pos` (the fragment position) from the half-resolution samples: the bilinear neighbours
+// (pixel p lies at p/2 in samples: even pixels on a sample, odd ones halfway), keeping only
+// samples of this draw whose segment length is within ATMO_UPSAMPLE_LEN_TOL of the pixel's own
+// (the depth-aware upsample, generalised to the ray's end: a body, the ground or the shell);
+// with none kept, the pixel's own exact march (CPU twin: segment_radiance). Discards pixels whose
+// ray misses the shell. CPU twin of the weights: uni_atmo::feature::upsample_weights.
+fn atmo_composite(pos: vec2<f32>) -> AtmoComposite {
+    let pix = floor(pos);
+    let ray = atmo_view_ray(pix);
+    if (!ray.valid) {
+        discard;
+    }
+    let len_km = ray.len * ATMO_KM_PER_M;
+    let ip = vec2<i32>(pix);
+    let base = ip / 2;
+    let odd = vec2<f32>(ip % 2);
+    let last = vec2<i32>(textureDimensions(atmo_half_light)) - vec2<i32>(1);
+    var light = vec3<f32>(0.0);
+    var trans = vec3<f32>(0.0);
+    var wsum = 0.0;
+    for (var k = 0; k < 4; k++) {
+        let o = vec2<i32>(k & 1, k >> 1u);
+        let wx = select(1.0 - 0.5 * odd.x, 0.5 * odd.x, o.x == 1);
+        let wy = select(1.0 - 0.5 * odd.y, 0.5 * odd.y, o.y == 1);
+        let w = wx * wy;
+        if (w > 0.0) {
+            let q = min(base + o, last);
+            let l = textureLoad(atmo_half_light, q, 0);
+            let t = textureLoad(atmo_half_trans, q, 0);
+            if (t.a == atmo_draw.misc.w && abs(l.a - len_km) <= ATMO_UPSAMPLE_LEN_TOL * len_km) {
+                light += w * l.rgb;
+                trans += w * t.rgb;
+                wsum += w;
+            }
+        }
+    }
+    if (wsum > 0.0) {
+        return AtmoComposite(light / wsum, trans / wsum);
+    }
+    let s = atmo_march_n(
+        ray.o, ray.d, 0.0, ray.len, atmo_draw.sun.xyz, ray.nu, true, atmo_view_step_count(ray.len)
+    );
+    return AtmoComposite(atmo_light(s.inscatter), s.transmittance);
 }
 
 // The screen quad bounding the shell (rect, 6 vertices), or a fullscreen triangle (vertices

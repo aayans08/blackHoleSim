@@ -40,10 +40,17 @@ pub const MULTISCATTER_SQRT_DIRS: u32 = 8;
 pub const MULTISCATTER_STEPS: u32 = 20;
 /// Cosine-weighted rings × azimuths of the sky-irradiance hemisphere integral.
 pub const IRRADIANCE_DIRS: [u32; 2] = [16, 16];
-/// View-march steps: 32, rising smoothly to 48 on long limb paths (B3 brief).
+/// March steps of the irradiance LUT and the probes: 32, rising smoothly to 48 on long limb
+/// paths (B3 brief; the per-pixel view march used these until task B9p).
 pub const MARCH_STEPS: f64 = 32.0;
 /// See [`MARCH_STEPS`].
 pub const MARCH_STEPS_LIMB: f64 = 48.0;
+/// Per-pixel view-march steps: 16, rising smoothly to 24 on long limb paths (plan fallback
+/// ladder, atmosphere step 2, task B9p: the pass measured 8.2 ms at `earth-map-closeup` with
+/// 32–48). `march_converges` gives the error against a 1024-step reference.
+pub const VIEW_MARCH_STEPS: f64 = 16.0;
+/// See [`VIEW_MARCH_STEPS`].
+pub const VIEW_MARCH_STEPS_LIMB: f64 = 24.0;
 /// LUT texels for the ground row are evaluated this far above the bottom radius [m], so the
 /// integrals never start exactly on the sphere (Hillaire's PLANET_RADIUS_OFFSET plays this
 /// role).
@@ -392,6 +399,14 @@ fn sun_transmittance_with(p: &AtmosphereParams, t: &Table, r: f64, mu_s: f64) ->
     t.sample(transmittance_uv(p, r, mu_s))
 }
 
+/// The transmittance LUT at (r clamped to the shell, μ), no ground test. Twin of
+/// `atmo_lut_transmittance`.
+pub(crate) fn lut_transmittance(luts: &CpuLuts, r: f64, mu: f64) -> DVec3 {
+    let p = luts.params();
+    let r = r.clamp(p.bottom_radius_m, p.top_radius_m);
+    luts.transmittance().sample(transmittance_uv(p, r, mu))
+}
+
 /// The CPU LUTs for `params`, shared by every caller with equal parameters (a small cache: the
 /// four presets plus a few test variants).
 pub(crate) fn cpu_luts(params: &AtmosphereParams) -> Arc<CpuLuts> {
@@ -530,9 +545,21 @@ impl March {
 /// from the ground to the top). Continuous in `len`, so no seam appears where it changes. Twin
 /// of `atmo_step_count`.
 pub(crate) fn step_count(p: &AtmosphereParams, len: f64) -> f64 {
+    step_count_between(p, len, MARCH_STEPS, MARCH_STEPS_LIMB)
+}
+
+/// The view march's step count: [`VIEW_MARCH_STEPS`], rising to [`VIEW_MARCH_STEPS_LIMB`] like
+/// [`step_count`]. Twin of `atmo_view_step_count`.
+pub(crate) fn view_step_count(p: &AtmosphereParams, len: f64) -> f64 {
+    step_count_between(p, len, VIEW_MARCH_STEPS, VIEW_MARCH_STEPS_LIMB)
+}
+
+/// `base` steps, rising linearly to `limb` as `len` goes from H to 2H. Twin of
+/// `atmo_step_count_between`.
+fn step_count_between(p: &AtmosphereParams, len: f64, base: f64, limb: f64) -> f64 {
     let (b, t) = (p.bottom_radius_m, p.top_radius_m);
     let h = ((t - b) * (t + b)).sqrt();
-    MARCH_STEPS + (MARCH_STEPS_LIMB - MARCH_STEPS) * ((len - h) / h).clamp(0.0, 1.0)
+    base + (limb - base) * ((len - h) / h).clamp(0.0, 1.0)
 }
 
 /// Positions of a half-segment's steps, measured from its dense end: q_k = L·min((k/c)², 1),

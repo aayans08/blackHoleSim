@@ -44,7 +44,10 @@ use uni_gfx::{
     RenderFeature, ShaderLib, SharedInput,
 };
 
-use crate::lut::{AtmosphereSet, March, cpu_luts, march, ray_sphere};
+use crate::lut::{
+    AtmosphereSet, March, cpu_luts, lut_transmittance, march_steps, ray_hits_ground, ray_sphere,
+    view_step_count,
+};
 use crate::params::AtmosphereParams;
 
 /// The atmospheres to draw this frame (set by the app before `Renderer::render`).
@@ -294,9 +297,53 @@ pub fn segment_radiance(
         return empty;
     };
     let luts = cpu_luts(params);
-    // Re-centred at the entry point, as the shader does.
-    let m: March = march(&luts, ro + rd * t0, rd, 0.0, t1 - t0, sun);
+    // Re-centred at the entry point, with the view march's step count, as the shader does.
+    let n = view_step_count(params, t1 - t0);
+    let m: March = march_steps(&luts, ro + rd * t0, rd, 0.0, t1 - t0, sun, n);
     (m.inscatter.as_vec3(), m.transmittance.as_vec3())
+}
+
+/// The transmittance along the same segment as [`segment_radiance`] from the transmittance LUT,
+/// without a march (Bruneton 2017, `GetTransmittance`): T(r₀, μ₀)/T(r₁, μ₁) for a ray that
+/// misses the ground, T(r₁, −μ₁)/T(r₀, −μ₀) for one that hits it, clamped to 1. The mask pass's
+/// `g` (plan fallback ladder, atmosphere step 1; task B9p). Twin of
+/// `atmo_segment_lut_transmittance`. With the camera outside the shell it is one LUT read; from
+/// inside, near-horizon rays divide two small numbers (see the test). Non-finite input, an empty
+/// segment or a camera inside the body gives 1.
+pub fn segment_transmittance_lut(
+    params: &AtmosphereParams,
+    ro_m: DVec3,
+    rd: DVec3,
+    t_max_m: f64,
+) -> Vec3 {
+    let rd = rd.normalize_or_zero();
+    if rd == DVec3::ZERO || t_max_m.is_nan() {
+        return Vec3::ONE;
+    }
+    let Some(ro) = camera_origin(params, ro_m) else {
+        return Vec3::ONE;
+    };
+    let Some((t0, t1)) = segment_bounds(params, ro, rd, t_max_m) else {
+        return Vec3::ONE;
+    };
+    let luts = cpu_luts(params);
+    let (o, e) = (ro + rd * t0, ro + rd * t1);
+    let (r0, r1) = (o.length(), e.length());
+    let (mu0, mu1) = (o.dot(rd) / r0, e.dot(rd) / r1);
+    let (num, den) = if ray_hits_ground(params, r0, mu0) {
+        (
+            lut_transmittance(&luts, r1, -mu1),
+            lut_transmittance(&luts, r0, -mu0),
+        )
+    } else {
+        (
+            lut_transmittance(&luts, r0, mu0),
+            lut_transmittance(&luts, r1, mu1),
+        )
+    };
+    (num / den.max(DVec3::splat(1e-30)))
+        .min(DVec3::ONE)
+        .as_vec3()
 }
 
 /// Disk-integrated reflectance of a body with this atmosphere over a uniform Lambert ground of
@@ -572,15 +619,71 @@ pub(crate) fn lens_mask_target() -> wgpu::ColorTargetState {
     }
 }
 
-/// The pipelines of one variant.
+/// The pipelines of one variant. Both start with the half-resolution march into the scratch
+/// targets (`fs_march`, task B9p).
 enum Pipelines {
-    /// Dual-source colour pipeline into `hdr`, then the `lens_mask` (g and a) pipeline.
+    /// The march; the dual-source composite into `hdr`; the `lens_mask` (g and a) pipeline.
     Dual {
+        march: wgpu::RenderPipeline,
         color: wgpu::RenderPipeline,
         mask: wgpu::RenderPipeline,
     },
-    /// One pipeline into `hdr` (grey transmittance) and `lens_mask` (g and a).
-    Grey(wgpu::RenderPipeline),
+    /// The march; one composite into `hdr` (grey transmittance) and `lens_mask` (g and a).
+    Grey {
+        march: wgpu::RenderPipeline,
+        composite: wgpu::RenderPipeline,
+    },
+}
+
+/// Format of the half-resolution scratch targets (light + segment length [km]; transmittance +
+/// draw tag), task B9p.
+const SCRATCH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Largest relative difference between a half-resolution sample's segment length and the pixel's
+/// own for the composite to use the sample (twin of `ATMO_UPSAMPLE_LEN_TOL`). A ray that grazes
+/// the ground and one that just misses it differ by a factor of about 2, and a ray stopped by a
+/// body in front by more; within one geometry the length changes by under 10 % per sample except
+/// in the outermost kilometres of the shell, where the light is faint and the pixel is marched
+/// instead.
+pub const UPSAMPLE_LEN_TOL: f32 = 0.1;
+
+/// The half-resolution size the march runs at for an internal size `size`: half, rounded up, so
+/// full-resolution pixel p reads samples ⌊p/2⌋ and ⌊p/2⌋ + 1 (clamped).
+pub fn half_size(size: glam::UVec2) -> glam::UVec2 {
+    glam::UVec2::new(size.x.div_ceil(2), size.y.div_ceil(2)).max(glam::UVec2::ONE)
+}
+
+/// CPU twin of the composite's sample weights (`atmo_composite`): for full-resolution pixel
+/// `pix` with segment length `len_km`, the bilinear weights of samples ⌊pix/2⌋ + (0,0), (1,0),
+/// (0,1), (1,1) (even coordinates sit on a sample, odd ones halfway), keeping only those whose
+/// (length [km], draw tag) is valid for this draw (`tag`) and within [`UPSAMPLE_LEN_TOL`] of
+/// `len_km`, renormalised. `None` when none is kept: the composite marches the pixel itself.
+pub fn upsample_weights(
+    pix: glam::UVec2,
+    len_km: f32,
+    tag: f32,
+    samples: [(f32, f32); 4],
+) -> Option<[f32; 4]> {
+    let odd = (pix % 2).as_vec2();
+    let mut w = [0.0_f32; 4];
+    let mut sum = 0.0;
+    for (k, (len_s, tag_s)) in samples.into_iter().enumerate() {
+        let wx = if k & 1 == 1 {
+            0.5 * odd.x
+        } else {
+            1.0 - 0.5 * odd.x
+        };
+        let wy = if k >> 1 == 1 {
+            0.5 * odd.y
+        } else {
+            1.0 - 0.5 * odd.y
+        };
+        if wx * wy > 0.0 && tag_s == tag && (len_s - len_km).abs() <= UPSAMPLE_LEN_TOL * len_km {
+            w[k] = wx * wy;
+            sum += w[k];
+        }
+    }
+    (sum > 0.0).then(|| w.map(|x| x / sum))
 }
 
 /// One draw recorded in `prepare`.
@@ -599,13 +702,28 @@ pub struct AtmosphereFeature {
     /// (NAIF id, parameters, group 2) per atmosphere of the set.
     atmos: Vec<(i32, AtmosphereParams, wgpu::BindGroup)>,
     pipelines: Pipelines,
+    /// Group 1 of the march and the mask: draw uniform + depth.
     draw_bgl: wgpu::BindGroupLayout,
+    /// Group 1 of the composite: draw uniform + depth + the two scratch targets.
+    composite_bgl: wgpu::BindGroupLayout,
     draw_buffer: wgpu::Buffer,
     /// Byte stride between draws in `draw_buffer` (the device's uniform offset alignment).
     stride: u32,
-    /// Group 1 (draw uniform + depth) for the current targets; rebuilt on resize.
-    draw_group: Option<wgpu::BindGroup>,
+    /// Group 1 bind groups and scratch targets for the current targets; rebuilt on resize.
+    bound: Option<Bound>,
     draws: Vec<DrawCmd>,
+}
+
+/// What [`AtmosphereFeature`] binds for one set of frame targets.
+struct Bound {
+    /// Group 1 of the march and the mask.
+    draw_group: wgpu::BindGroup,
+    /// Group 1 of the composite.
+    composite_group: wgpu::BindGroup,
+    /// The half-resolution scratch targets: light + length, transmittance + tag.
+    light_view: wgpu::TextureView,
+    trans_view: wgpu::TextureView,
+    _textures: [wgpu::Texture; 2],
 }
 
 impl AtmosphereFeature {
@@ -644,43 +762,68 @@ impl AtmosphereFeature {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let draw_entries = [
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(size_of::<AtmoDrawGpu>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ];
+        let scratch_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let draw_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("atmo draw bgl"),
+            entries: &draw_entries,
+        });
+        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("atmo composite bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(size_of::<AtmoDrawGpu>() as u64),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                draw_entries[0],
+                draw_entries[1],
+                scratch_entry(2),
+                scratch_entry(3),
             ],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("atmo layout"),
-            bind_group_layouts: &[Some(camera_bgl), Some(&draw_bgl), Some(set.view_bgl())],
-            immediate_size: 0,
-        });
+        let layout_with = |label: &str, group1: &wgpu::BindGroupLayout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(camera_bgl), Some(group1), Some(set.view_bgl())],
+                immediate_size: 0,
+            })
+        };
+        let layout = layout_with("atmo layout", &draw_bgl);
+        let composite_layout = layout_with("atmo composite layout", &composite_bgl);
         let pipeline = |label: &str,
+                        layout: &wgpu::PipelineLayout,
                         module: &wgpu::ShaderModule,
                         fs: &str,
                         targets: &[Option<wgpu::ColorTargetState>]| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module,
                     entry_point: Some("vs_atmosphere"),
@@ -708,11 +851,26 @@ impl AtmosphereFeature {
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
+        // The half-resolution march writes both scratch targets, no blending.
+        let scratch = [
+            Some(wgpu::ColorTargetState {
+                format: SCRATCH_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+            Some(wgpu::ColorTargetState {
+                format: SCRATCH_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+        ];
         let pipelines = match modules {
             (Some(dual), Some(mask), _) => Pipelines::Dual {
+                march: pipeline("atmosphere march", &layout, &dual, "fs_march", &scratch),
                 // dst·T + src: source 1 is the per-channel transmittance.
                 color: pipeline(
                     "atmosphere",
+                    &composite_layout,
                     &dual,
                     "fs_dual",
                     &[Some(wgpu::ColorTargetState {
@@ -728,29 +886,33 @@ impl AtmosphereFeature {
                         write_mask: wgpu::ColorWrites::COLOR,
                     })],
                 ),
-                mask: pipeline("atmosphere mask", &mask, "fs_mask", &[mask_target]),
+                mask: pipeline("atmosphere mask", &layout, &mask, "fs_mask", &[mask_target]),
             },
-            (_, _, Some(grey)) => Pipelines::Grey(pipeline(
-                "atmosphere",
-                &grey,
-                "fs_grey",
-                &[
-                    // dst·(1 − α) + L.
-                    Some(wgpu::ColorTargetState {
-                        format: HDR_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: keep_alpha,
+            (_, _, Some(grey)) => Pipelines::Grey {
+                march: pipeline("atmosphere march", &layout, &grey, "fs_march", &scratch),
+                composite: pipeline(
+                    "atmosphere",
+                    &composite_layout,
+                    &grey,
+                    "fs_grey",
+                    &[
+                        // dst·(1 − α) + L.
+                        Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            blend: Some(wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: keep_alpha,
+                            }),
+                            write_mask: wgpu::ColorWrites::COLOR,
                         }),
-                        write_mask: wgpu::ColorWrites::COLOR,
-                    }),
-                    mask_target,
-                ],
-            )),
+                        mask_target,
+                    ],
+                ),
+            },
             _ => anyhow::bail!("atmosphere: no shader variant"),
         };
         if let Some(err) = pollster::block_on(scope.pop()) {
@@ -766,33 +928,80 @@ impl AtmosphereFeature {
             atmos,
             pipelines,
             draw_bgl,
+            composite_bgl,
             draw_buffer,
             stride,
-            draw_group: None,
+            bound: None,
             draws: Vec::new(),
         })
     }
 
-    /// (Re)creates group 1 against `targets` (the depth view changes with the targets).
+    /// (Re)creates the half-resolution scratch targets and the group 1 bind groups against
+    /// `targets` (the depth view and the size change with the targets).
     fn bind_targets(&mut self, gpu: &GpuContext, targets: &FrameTargets) {
-        self.draw_group = Some(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let device = &gpu.device;
+        let half = half_size(targets.size);
+        let scratch = |label: &str| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: half.x,
+                    height: half.y,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: SCRATCH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+        };
+        let light = scratch("atmo half light");
+        let trans = scratch("atmo half transmittance");
+        let light_view = light.create_view(&Default::default());
+        let trans_view = trans.create_view(&Default::default());
+        let uniform = wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.draw_buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(size_of::<AtmoDrawGpu>() as u64),
+            }),
+        };
+        let depth = wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+        };
+        let draw_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atmo draw bg"),
             layout: &self.draw_bgl,
+            entries: &[uniform.clone(), depth.clone()],
+        });
+        let composite_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atmo composite bg"),
+            layout: &self.composite_bgl,
             entries: &[
+                uniform,
+                depth,
                 wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.draw_buffer,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(size_of::<AtmoDrawGpu>() as u64),
-                    }),
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&light_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&trans_view),
                 },
             ],
-        }));
+        });
+        self.bound = Some(Bound {
+            draw_group,
+            composite_group,
+            light_view,
+            trans_view,
+            _textures: [light, trans],
+        });
     }
 
     /// Records the draws of one pass (pipeline and group 0 already set).
@@ -811,7 +1020,7 @@ impl RenderFeature for AtmosphereFeature {
     }
 
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
-        if self.draw_group.is_none() {
+        if self.bound.is_none() {
             self.bind_targets(gpu, targets);
         }
         self.draws.clear();
@@ -824,10 +1033,12 @@ impl RenderFeature for AtmosphereFeature {
                 let Some(atmo) = self.atmos.iter().position(|a| a.0 == draw.naif) else {
                     continue;
                 };
-                let Some(u) = draw_uniform(&self.atmos[atmo].1, draw, ctx.view_rot, ctx.proj)
+                let Some(mut u) = draw_uniform(&self.atmos[atmo].1, draw, ctx.view_rot, ctx.proj)
                 else {
                     continue;
                 };
+                // The tag of this draw's half-resolution samples (task B9p).
+                u.misc[3] = (uniforms.len() + 1) as f32;
                 let offset = self.stride * uniforms.len() as u32;
                 let vertices = if u.misc[1] > 0.5 { 3 } else { 6 };
                 self.draws.push(DrawCmd {
@@ -856,58 +1067,83 @@ impl RenderFeature for AtmosphereFeature {
         if self.draws.is_empty() {
             return;
         }
-        if self.draw_group.is_none() {
+        if self.bound.is_none() {
             self.bind_targets(gpu, targets);
         }
-        let Some(group1) = self.draw_group.clone() else {
+        let Some(bound) = self.bound.as_ref() else {
             return;
         };
-        let attachment = |view| {
+        let attachment = |view, load| {
             Some(wgpu::RenderPassColorAttachment {
                 view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load,
                     store: wgpu::StoreOp::Store,
                 },
             })
         };
-        match &self.pipelines {
-            Pipelines::Dual { color, mask } => {
-                for (label, pipeline, view) in [
-                    ("atmosphere", color, &targets.hdr_view),
-                    ("atmosphere mask", mask, &targets.lens_mask_view),
-                ] {
-                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some(label),
-                        color_attachments: &[attachment(view)],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: timer.render_writes(label),
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, frame.camera, &[]);
-                    self.record(&mut pass, &group1);
-                }
-            }
-            Pipelines::Grey(pipeline) => {
-                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("atmosphere"),
-                    color_attachments: &[
-                        attachment(&targets.hdr_view),
-                        attachment(&targets.lens_mask_view),
-                    ],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: timer.render_writes("atmosphere"),
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, frame.camera, &[]);
-                self.record(&mut pass, &group1);
-            }
+        // The half-resolution march (task B9p): both scratch targets cleared to 0 (tag 0 = no
+        // sample), every draw in order (a later draw overwrites an earlier one's samples where
+        // they overlap; the composite then marches those pixels itself, by the tag).
+        let (march, composite, mask) = match &self.pipelines {
+            Pipelines::Dual { march, color, mask } => (march, color, Some(mask)),
+            Pipelines::Grey { march, composite } => (march, composite, None),
+        };
+        let clear = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("atmosphere march"),
+                color_attachments: &[
+                    attachment(&bound.light_view, clear),
+                    attachment(&bound.trans_view, clear),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.render_writes("atmosphere"),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(march);
+            pass.set_bind_group(0, frame.camera, &[]);
+            self.record(&mut pass, &bound.draw_group);
+        }
+        // The full-resolution composite into hdr (and, grey variant, lens_mask).
+        {
+            let load = wgpu::LoadOp::Load;
+            let views: &[_] = if mask.is_some() {
+                &[attachment(&targets.hdr_view, load)]
+            } else {
+                &[
+                    attachment(&targets.hdr_view, load),
+                    attachment(&targets.lens_mask_view, load),
+                ]
+            };
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("atmosphere composite"),
+                color_attachments: views,
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.render_writes("atmosphere composite"),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(composite);
+            pass.set_bind_group(0, frame.camera, &[]);
+            self.record(&mut pass, &bound.composite_group);
+        }
+        // Dual variant: lens_mask g and a (g from the transmittance-LUT ratio).
+        if let Some(mask) = mask {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("atmosphere mask"),
+                color_attachments: &[attachment(&targets.lens_mask_view, wgpu::LoadOp::Load)],
+                depth_stencil_attachment: None,
+                timestamp_writes: timer.render_writes("atmosphere mask"),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(mask);
+            pass.set_bind_group(0, frame.camera, &[]);
+            self.record(&mut pass, &bound.draw_group);
         }
     }
 
@@ -1052,7 +1288,7 @@ mod tests {
         for (path, entries) in [
             (
                 crate::ATMOSPHERE_DUAL_WGSL,
-                &["vs_atmosphere", "fs_dual"][..],
+                &["vs_atmosphere", "fs_dual", "fs_march"][..],
             ),
             (
                 crate::ATMOSPHERE_MASK_WGSL,
@@ -1066,7 +1302,7 @@ mod tests {
         for (path, entries) in [
             (
                 crate::ATMOSPHERE_GREY_WGSL,
-                &["vs_atmosphere", "fs_grey"][..],
+                &["vs_atmosphere", "fs_grey", "fs_march"][..],
             ),
             (crate::TRANSMITTANCE_LUT_WGSL, &["cs_transmittance"][..]),
             (crate::MULTISCATTER_LUT_WGSL, &["cs_multiscatter"][..]),
@@ -1095,11 +1331,134 @@ mod tests {
         (target - cam).normalize()
     }
 
-    /// The 32–48-step march is within 1 % of a 1024-step reference (inscatter, relative to its
-    /// largest channel) and within 1e-3 in transmittance (1 % where T > 0.01), on vertical,
-    /// horizontal and limb paths.
+    /// The composite's upsample (ladder step 3, task B9p): even pixels copy their own sample,
+    /// odd ones average their neighbours, a neighbour of another geometry (length off by more
+    /// than 10 %: the ground's edge, a body in front) or another draw is left out, and with none
+    /// left the pixel is marched. The WGSL constant matches.
+    #[test]
+    fn upsample_weights_follow_the_ray_geometry() {
+        use glam::UVec2;
+        let same = [(100.0, 1.0); 4];
+        assert_eq!(
+            upsample_weights(UVec2::new(4, 6), 100.0, 1.0, same),
+            Some([1.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            upsample_weights(UVec2::new(5, 6), 100.0, 1.0, same),
+            Some([0.5, 0.5, 0.0, 0.0])
+        );
+        assert_eq!(
+            upsample_weights(UVec2::new(5, 7), 104.0, 1.0, same),
+            Some([0.25; 4])
+        );
+        // One neighbour past the horizon (twice as long), one of another draw.
+        let edge = [(100.0, 1.0), (200.0, 1.0), (100.0, 2.0), (95.0, 1.0)];
+        assert_eq!(
+            upsample_weights(UVec2::new(5, 7), 100.0, 1.0, edge),
+            Some([0.5, 0.0, 0.0, 0.5])
+        );
+        // Nothing alike: marched. An unmarched sample (tag 0) never matches a draw.
+        assert_eq!(upsample_weights(UVec2::new(5, 7), 300.0, 1.0, edge), None);
+        assert_eq!(
+            upsample_weights(UVec2::new(4, 6), 100.0, 1.0, [(100.0, 0.0); 4]),
+            None
+        );
+        assert_eq!(half_size(UVec2::new(1920, 1080)), UVec2::new(960, 540));
+        assert_eq!(half_size(UVec2::new(1727, 1)), UVec2::new(864, 1));
+        let src = include_str!("../shaders/atmosphere_common.wgsl");
+        assert!(src.contains(&format!(
+            "const ATMO_UPSAMPLE_LEN_TOL: f32 = {:?};",
+            UPSAMPLE_LEN_TOL
+        )));
+    }
+
+    /// The mask pass's LUT-ratio transmittance (ladder step 1, task B9p) against the march's.
+    /// `g` = 1 − luminance(T) is the sky occlusion, and it only matters where the ray reaches the
+    /// sky: where it ends on the ground or on a body, that surface's own coverage (g = 1, Max)
+    /// hides the sky anyway. Sky rays (from space through the limb arc at 5, 20 and 50 % of the
+    /// shell, from inside up and 10° up): |Δg| ≤ 0.005. Ground and body rays from space (one LUT
+    /// read): |Δg| ≤ 0.005. Ground rays from inside divide two small LUT values: Titan 10° down
+    /// is off by 0.036 in g (blue T 6e-10 against 0.083), hidden by the ground's g = 1; they are
+    /// only checked to be finite and in [0, 1].
+    #[test]
+    fn lut_ratio_transmittance_matches_the_march() {
+        for (name, p) in [
+            ("Earth", earth()),
+            ("Mars", mars()),
+            ("Venus", venus()),
+            ("Titan", titan()),
+        ] {
+            let (b, top) = (p.bottom_radius_m, p.top_radius_m);
+            let space = DVec3::new(3.0 * b, 0.0, 0.0);
+            let inside = DVec3::new(0.0, 0.0, b + 1e3);
+            let sun = DVec3::new(0.3, 0.9, 0.3).normalize();
+            // (camera, direction, depth, checked to 0.005).
+            let cases: [(DVec3, DVec3, f64, bool); 9] = [
+                (space, -DVec3::X, f64::INFINITY, true),
+                (
+                    space,
+                    limb_ray(&p, space, 30.0, -0.02 * b),
+                    f64::INFINITY,
+                    true,
+                ),
+                (
+                    space,
+                    limb_ray(&p, space, 30.0, 0.05 * (top - b)),
+                    f64::INFINITY,
+                    true,
+                ),
+                (
+                    space,
+                    limb_ray(&p, space, 30.0, 0.2 * (top - b)),
+                    f64::INFINITY,
+                    true,
+                ),
+                (
+                    space,
+                    limb_ray(&p, space, 30.0, 0.5 * (top - b)),
+                    f64::INFINITY,
+                    true,
+                ),
+                (space, -DVec3::X, 2.0 * b - 0.3 * (top - b), true),
+                (inside, dir_elev(90.0, 0.0), f64::INFINITY, true),
+                (inside, dir_elev(10.0, 0.0), f64::INFINITY, true),
+                (inside, dir_elev(-10.0, 0.0), f64::INFINITY, false),
+            ];
+            for (ro, rd, t_max, checked) in cases {
+                let (_, t_march) = segment_radiance(&p, ro, rd, t_max, sun);
+                let t_lut = segment_transmittance_lut(&p, ro, rd, t_max);
+                let (g_march, g_lut) = (1.0 - lum(t_march), 1.0 - lum(t_lut));
+                let in_range =
+                    t_lut.is_finite() && t_lut.min_element() >= 0.0 && t_lut.max_element() <= 1.0;
+                assert!(
+                    in_range && (!checked || (g_lut - g_march).abs() <= 0.005),
+                    "{name}: ro {ro}, rd {rd}: g LUT {g_lut} vs march {g_march} (T {t_lut} vs \
+                     {t_march})"
+                );
+            }
+        }
+        // Rays that miss the shell, and a camera inside the body, give T = 1.
+        let p = earth();
+        let far = DVec3::new(3.0 * p.bottom_radius_m, 0.0, 0.0);
+        assert_eq!(
+            segment_transmittance_lut(&p, far, DVec3::Y, f64::INFINITY),
+            Vec3::ONE
+        );
+        assert_eq!(
+            segment_transmittance_lut(&p, DVec3::ZERO, DVec3::Y, f64::INFINITY),
+            Vec3::ONE
+        );
+    }
+
+    /// The 32–48-step march (LUT passes, probes) is within 1 % of a 1024-step reference
+    /// (inscatter, relative to its largest channel) and within 1e-3 in transmittance (1 % where
+    /// T > 0.01), on vertical, horizontal and limb paths; the 16–24-step view march within 1 % in
+    /// both.
     #[test]
     fn march_converges() {
+        // The 16–24-step view march (ladder step 2, task B9p) measured 2.3e-3..6.5e-3 in
+        // inscatter and 1.8e-3..3.2e-3 in T on these paths.
+        const VIEW_MARCH_TOLERANCE: f64 = 0.01;
         let p = earth();
         let b = p.bottom_radius_m;
         let luts = cpu_luts(&p);
@@ -1129,7 +1488,7 @@ mod tests {
             let ro = camera_origin(&p, ro).unwrap();
             let (t0, t1) = segment_bounds(&p, ro, rd, f64::INFINITY).unwrap();
             let o = ro + rd * t0;
-            let fast = march(&luts, o, rd, 0.0, t1 - t0, sun);
+            let fast = crate::lut::march(&luts, o, rd, 0.0, t1 - t0, sun);
             let reference = crate::lut::march_steps(&luts, o, rd, 0.0, t1 - t0, sun, 1024.0);
             let l_err = (fast.inscatter - reference.inscatter).abs().max_element()
                 / reference.inscatter.max_element();
@@ -1142,6 +1501,26 @@ mod tests {
             assert!(
                 l_err < 0.01 && t_ok,
                 "{rd}: inscatter {l_err:.2e}, T {t_err}"
+            );
+            // The view march (16–24 steps, ladder step 2): segment_radiance's own count.
+            let view = march_steps(
+                &luts,
+                o,
+                rd,
+                0.0,
+                t1 - t0,
+                sun,
+                view_step_count(&p, t1 - t0),
+            );
+            let lv_err = (view.inscatter - reference.inscatter).abs().max_element()
+                / reference.inscatter.max_element();
+            let tv_err = (view.transmittance - reference.transmittance)
+                .abs()
+                .max_element();
+            println!("{rd:.3}: view march inscatter {lv_err:.2e}, T {tv_err:.2e}");
+            assert!(
+                lv_err < VIEW_MARCH_TOLERANCE && tv_err < VIEW_MARCH_TOLERANCE,
+                "{rd}: view march inscatter {lv_err:.2e}, T {tv_err:.2e}"
             );
         }
     }

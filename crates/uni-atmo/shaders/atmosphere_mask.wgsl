@@ -1,8 +1,8 @@
 // atmo/atmosphere_mask.wgsl: the dual-source variant's second pipeline, writing
 // lens_mask.g = 1 - luminance(T) and lens_mask.a = the star share (atmo_star_share), both with
-// BlendOperation::Max (M1 frame contract, lens_mask channels; lead ruling B6 I1). It repeats the
-// march's steps for the transmittance only (no LUT samples, no scattering), and discards the same
-// pixels as the colour pipeline.
+// BlendOperation::Max (M1 frame contract, lens_mask channels; lead ruling B6 I1). T comes from
+// the transmittance-LUT ratio along the pixel's segment, not a second march (plan fallback
+// ladder, atmosphere step 1; task B9p), and it discards the same pixels as the colour pipeline.
 
 #import "atmo/atmosphere_common.wgsl"
 #import "common/color.wgsl"
