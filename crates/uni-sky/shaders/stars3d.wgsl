@@ -10,7 +10,7 @@
 //      where the sector centre comes relative to an anchor near the camera and the uniform
 //      carries camera − anchor (both f64 differences on the CPU, then f32; design §5.2);
 //   3. m = M_V + 5 log10 d − 5, E = 10^(−0.4 (m + 13.99)) lx (Allen 1973);
-//   4. splat_vertex: M0's PSF sizing at E × twinkle / Ω(θ) × star_pre(), culled below
+//   4. splat_vertex: M0's PSF (imported) sizing at E × twinkle / Ω(θ) × star_pre(), culled below
 //      VISIBILITY_CUTOFF (the twinkle is 1 in space; under an atmosphere it follows Young's 1967
 //      scintillation index on a TDB clock, see twinkle_factor);
 //   5. for a drawn splat only, the colour from B−V through the Planck table, boosted by
@@ -20,14 +20,25 @@
 //
 //   hdr value = E / Ω(θ) × star_pre() × (1 − r)(1 − g) × PSF weight,  Ω(θ) = Ω_c·cos³θ.
 //
+// M0's PSF is used as M0 wrote it, not copied (review r0 I3): this file imports M0's
+// sky/stars.wgsl for its PSF constants, psf_erf, pixel_coverage, moffat, halo_weight,
+// pixel_solid_angle_off_axis, MIN_CLIP_W, CULLED and its `lens_mask` declaration (group 1,
+// binding 1), which both 3-D passes read. The import also brings M0's own pass (StarInstance,
+// `stars` at binding 0, VsOut, vs_main, fs_main), which no 3-D entry point uses, so wgpu leaves
+// it out of the 3-D pipelines; this file's bindings take 2–5 and the point pass's 6–7, so no two
+// globals of a composed module share a slot. The one PSF function of B4's own is
+// stars3d_footprint_radius_px: M0's footprint_radius_px with the 2-px minimum (review m16).
+//
 // CPU twins: crates/uni-sky/src/stars3d.rs (and psf.rs, stars.rs for M0's PSF and solid angle).
 // `shader_constants_match_cpu` keeps the constants equal; `stars3d_points_layouts_match_wgsl`
-// checks the structs; `crate::probes` runs the maths on the GPU under `universe --selftest`.
+// checks the structs; `splat_layouts_match_entry_point_use` checks the bindings against the
+// pipeline layouts; `crate::probes` runs the maths on the GPU under `universe --selftest`.
 
 #import "common/camera.wgsl"
 #import "common/color.wgsl"
 #import "common/constants.wgsl"
 #import "common/hash.wgsl"
+#import "sky/stars.wgsl"
 
 // Twin of `uni_sky::stars3d::StarGpu`: 32 bytes, two vec4s (review m15).
 struct StarGpu {
@@ -38,7 +49,7 @@ struct StarGpu {
     vel_bv_flags: vec4<u32>,
 }
 
-// Twin of `uni_sky::stars3d::StarsParams`: 64 bytes, written once per frame.
+// Twin of `uni_sky::stars3d::StarsParams`: 80 bytes, written once per frame.
 struct StarsParams {
     // xyz: camera − anchor [pc]; w: years since the catalogue epoch (J2000.0).
     camera_years: vec4<f32>,
@@ -58,30 +69,21 @@ struct BvColourLut {
     entries: array<vec4<f32>, 128>,
 }
 
-@group(1) @binding(0) var<storage, read> stars: array<StarGpu>;
-// xyz: sector centre − anchor [pc]; w: 0.
-@group(1) @binding(1) var<storage, read> sectors: array<vec4<f32>>;
+// Group 1 binding 1 is M0's `lens_mask` (sky/stars.wgsl, imported above): uni_gfx's lens mask,
+// r = captured fraction, g = sky occlusion. Read with textureLoad at the fragment's pixel; it has
+// the size of hdr, so the vertex stage reads the attachment size from it. The point pass binds
+// it at the same slot. Binding 0 is M0's `stars`, unused here.
 @group(1) @binding(2) var<uniform> stars_params: StarsParams;
 @group(1) @binding(3) var<uniform> bv_lut: BvColourLut;
-// uni_gfx::LENS_MASK_FORMAT: r = captured fraction, g = sky occlusion. Read with textureLoad at
-// the fragment's pixel; it has the size of hdr, so the vertex stage reads the attachment size
-// from it. The point pass binds it at the same slot.
-@group(1) @binding(4) var lens_mask: texture_2d<f32>;
+// The star records in instance order.
+@group(1) @binding(4) var<storage, read> catalogue: array<StarGpu>;
+// xyz: sector centre − anchor [pc]; w: 0.
+@group(1) @binding(5) var<storage, read> sectors: array<vec4<f32>>;
 
-// PSF constants: M0's, see crates/uni-sky/src/psf.rs for their sources.
-const CORE_SIGMA_PX: f32 = 0.65;
-const HALO_ENERGY_FRACTION: f32 = 0.02;
-const HALO_MIN_LUX: f32 = 1.0e-6;
-const HALO_ALPHA_PX: f32 = 4.0;
-const HALO_BETA: f32 = 2.5;
-const MAX_RADIUS_PX: f32 = 64.0;
-const VISIBILITY_CUTOFF: f32 = 3.0e-5;
+// The PSF constants (CORE_SIGMA_PX, HALO_*, MAX_RADIUS_PX, VISIBILITY_CUTOFF), MIN_CLIP_W and
+// CULLED are M0's, from sky/stars.wgsl; crates/uni-sky/src/psf.rs gives their sources.
 // The 3-D pass's smallest footprint radius (review m16; M0's 3 px is unchanged).
 const STARS3D_MIN_RADIUS_PX: f32 = 2.0;
-// Clip w at or below which a direction is behind the camera or on its plane (M0).
-const MIN_CLIP_W: f32 = 1.0e-6;
-// Clip position for culled vertices: all four coincide (zero area) outside the clip volume.
-const CULLED: vec4<f32> = vec4<f32>(2.0, 2.0, 2.0, 1.0);
 // 1 km/s in pc per Julian year (IAU 1976 year, IAU 2012 B2 parsec).
 const PC_PER_YR_PER_KMS: f32 = 1.02271217e-6;
 // log10(2) and log2(10): WGSL has log2 and exp2 only.
@@ -102,53 +104,12 @@ const TWINKLE_SEED: u32 = 0x7f4a7c15u;
 // An unused entry of StarsParams.suppressed.
 const NO_STAR: u32 = 0xffffffffu;
 
-// psf_erf, pixel_coverage, moffat, halo_weight, pixel_solid_angle_off_axis and (but for its 2-px
-// minimum) footprint_radius_px repeat M0's stars.wgsl, which declares its own bindings and so
-// cannot be imported; shader_constants_match_cpu and the stars3d_psf probe hold them to M0's
-// CPU twins. Review r0 I3, lead's decision: M2 moves them into a binding-free sky/psf.wgsl that
-// both passes import.
-
-// erf(x), Abramowitz & Stegun 1964, eq. 7.1.26 (after Hastings 1955), |error| ≤ 1.5e-7. Twin of
-// `uni_sky::psf::erf` (M0's `psf_erf` in stars.wgsl).
-fn psf_erf(x: f32) -> f32 {
-    let a = abs(x);
-    let t = 1.0 / (1.0 + 0.3275911 * a);
-    let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-        + t * (-1.453152027 + t * 1.061405429))));
-    let y = 1.0 - poly * exp(-a * a);
-    return select(-y, y, x >= 0.0);
-}
-
-// Fraction of a unit-energy 1-D Gaussian (σ = CORE_SIGMA_PX) inside [edge, edge + 1]. Twin of
-// `uni_sky::psf::pixel_coverage`.
-fn pixel_coverage(edge: f32) -> f32 {
-    let k = 1.0 / (sqrt(2.0) * CORE_SIGMA_PX);
-    return max(0.5 * (psf_erf((edge + 1.0) * k) - psf_erf(edge * k)), 0.0);
-}
-
-// Moffat 1969 (A&A 3, 455) profile with unit energy [1/px²]. Twin of `uni_sky::psf::moffat`.
-fn moffat(r: f32) -> f32 {
-    let a2 = HALO_ALPHA_PX * HALO_ALPHA_PX;
-    return (HALO_BETA - 1.0) / (PI * a2) * pow(1.0 + r * r / a2, -HALO_BETA);
-}
-
-// Halo weight of a pixel whose centre is r px from the source, lowered to 0 at the footprint
-// radius and renormalised to unit energy inside it. Twin of `uni_sky::psf::halo_weight`.
-fn halo_weight(r: f32, radius: f32) -> f32 {
-    if (!(r < radius)) {
-        return 0.0;
-    }
-    let a2 = HALO_ALPHA_PX * HALO_ALPHA_PX;
-    let edge = moffat(radius);
-    let inside = 1.0 - pow(1.0 + radius * radius / a2, 1.0 - HALO_BETA)
-        - PI * radius * radius * edge;
-    return (moffat(r) - edge) / inside;
-}
-
 // Footprint radius [px]: where the core and the halo have both fallen below VISIBILITY_CUTOFF,
-// clamped to [STARS3D_MIN_RADIUS_PX, MAX_RADIUS_PX]. Twin of
+// clamped to [STARS3D_MIN_RADIUS_PX, MAX_RADIUS_PX]. M0's footprint_radius_px (sky/stars.wgsl)
+// but for the minimum, which M0 fixes at its own 3 px, so it cannot be called with 2 px.
+// footprint_matches_m0_above_three_px holds the two together above 3 px. Twin of
 // `uni_sky::stars3d::footprint_radius_px`.
-fn footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
+fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     var r = STARS3D_MIN_RADIUS_PX;
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
     if (core_peak > VISIBILITY_CUTOFF) {
@@ -168,14 +129,6 @@ fn star_is_visible(energy: f32, halo_fraction: f32) -> bool {
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
     let halo_peak = halo_fraction * energy * moffat(0.0);
     return core_peak > VISIBILITY_CUTOFF || halo_peak > VISIBILITY_CUTOFF;
-}
-
-// Solid angle [sr] of a pixel θ off the optical axis: Ω_c·cos³θ, Ω_c = (2·tan(fov_y/2)/H)².
-// Twin of `uni_sky::stars::pixel_solid_angle_off_axis` (M0; Pharr, Jakob & Humphreys 2016
-// §5.5.3).
-fn pixel_solid_angle_off_axis(fov_y: f32, height_px: f32, cos_theta: f32) -> f32 {
-    let side = 2.0 * tan(0.5 * fov_y) / height_px;
-    return side * side * cos_theta * cos_theta * cos_theta;
 }
 
 // IEEE 754 binary16 bits (the low 16 bits of h) → f32, exactly: normal numbers by moving the
@@ -275,8 +228,8 @@ fn twinkle_factor(slot: u32, step: u32, phase: f32, sigma: f32) -> f32 {
 }
 
 // Corner (±1, ±1) of index-buffer vertex vi: 0 (−,−), 1 (+,−), 2 (−,+), 3 (+,+); the index
-// buffer draws (0, 1, 2) and (2, 1, 3).
-fn quad_corner(vi: u32) -> vec2<f32> {
+// buffer draws (0, 1, 2) and (2, 1, 3). (M0's quad_corner maps six non-indexed vertices.)
+fn splat_corner(vi: u32) -> vec2<f32> {
     return vec2<f32>(f32(vi & 1u), f32(vi >> 1u)) * 2.0 - 1.0;
 }
 
@@ -329,14 +282,14 @@ fn splat_vertex(
     if (!star_is_visible(energy, h)) {
         return out_culled;
     }
-    let radius = footprint_radius_px(energy, h);
+    let radius = stars3d_footprint_radius_px(energy, h);
     let reach = vec2<f32>(radius + 1.0);
     if (!(all(centre > -reach) && all(centre < size + reach))) {
         return out_culled;
     }
     var out: SplatOut;
     // Half-size R + 0.5 px, so every pixel that overlaps the footprint is shaded.
-    out.pos = vec4<f32>(ndc + quad_corner(vi) * (radius + 0.5) * 2.0 / size, depth, 1.0);
+    out.pos = vec4<f32>(ndc + splat_corner(vi) * (radius + 0.5) * 2.0 / size, depth, 1.0);
     out.centre_px = centre;
     out.radiance = colour * energy;
     out.halo = vec2<f32>(h, radius);
@@ -370,7 +323,7 @@ fn vs_stars(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) 
     if (is_suppressed(slot)) {
         return culled_splat();
     }
-    let star = stars[slot];
+    let star = catalogue[slot];
     let sector_rel = sectors[star.vel_bv_flags.w].xyz - stars_params.camera_years.xyz;
     let p = star_rel_pos_pc(star, sector_rel, stars_params.camera_years.w);
     let d = length(p);

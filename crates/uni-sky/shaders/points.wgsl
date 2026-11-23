@@ -6,8 +6,9 @@
 // The splat itself (projection, E/Ω(θ) × star_pre(), M0's PSF, the 2-px minimum footprint, the
 // cull) is `splat_vertex` and `psf_weight` from sky/stars3d.wgsl, imported here, so a point and
 // a star of equal illuminance and direction leave the same energy. This pass binds only group 1's
-// `lens_mask` (binding 4, declared in stars3d.wgsl), its own instances (binding 5) and its
-// uniform (binding 6).
+// `lens_mask` (binding 1, M0's declaration in sky/stars.wgsl, which stars3d.wgsl imports), its
+// own instances (binding 6) and its uniform (binding 7); bindings 0 and 2–5 are the star passes'
+// and unused here.
 //
 // CPU twins: crates/uni-sky/src/points.rs (`twin::point_splat`, `twin::point_sky_factor`).
 
@@ -28,8 +29,8 @@ struct PointsParams {
     sky: vec4<f32>,
 }
 
-@group(1) @binding(5) var<storage, read> points: array<PointGpu>;
-@group(1) @binding(6) var<uniform> points_params: PointsParams;
+@group(1) @binding(6) var<storage, read> points: array<PointGpu>;
+@group(1) @binding(7) var<uniform> points_params: PointsParams;
 
 // The share of a point's light kept under lens-mask value `mask`. From space 1 − r (review m6):
 // points are depth-tested against bodies instead of using g, so a moon's point in front of a

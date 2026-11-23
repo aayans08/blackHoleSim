@@ -28,9 +28,38 @@ use uni_gfx::{
 
 use crate::POINTS_WGSL;
 use crate::stars3d::{
-    QUAD_INDICES, StarInput, begin_splat_pass, lens_mask_entry, quad_index_buffer, splat_pipeline,
-    vertex_buffer_entry,
+    LENS_MASK_BINDING, QUAD_INDICES, StarInput, begin_splat_pass, lens_mask_entry,
+    quad_index_buffer, splat_pipeline, vertex_buffer_entry,
 };
+
+/// Group-1 binding of the point instances. `points.wgsl` imports `stars3d.wgsl`, and with it
+/// M0's `stars.wgsl`, whose declarations hold bindings 0–5 (the lens mask at
+/// [`LENS_MASK_BINDING`] is the one this pass shares); the point pass's own follow.
+pub(crate) const POINTS_BINDING: u32 = 6;
+/// Group-1 binding of the [`PointsParams`] uniform.
+pub(crate) const POINTS_PARAMS_BINDING: u32 = 7;
+
+/// The point pass's group-1 layout: the lens mask, the instances, the uniform.
+pub(crate) fn points_bgl_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    [
+        lens_mask_entry(),
+        vertex_buffer_entry(
+            POINTS_BINDING,
+            wgpu::BufferBindingType::Storage { read_only: true },
+            size_of::<PointGpu>(),
+        ),
+        wgpu::BindGroupLayoutEntry {
+            binding: POINTS_PARAMS_BINDING,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(size_of::<PointsParams>() as u64),
+            },
+            count: None,
+        },
+    ]
+}
 
 /// One point source (from uni-sim's `PointView`).
 #[derive(Clone, Copy, Debug)]
@@ -97,9 +126,10 @@ const INITIAL_CAPACITY: usize = 256;
 
 /// The point-sprite pass (`RenderFeature` named "points").
 ///
-/// Group 0 is the renderer's. Group 1: binding 4 the lens mask (the declaration it shares with
-/// `stars3d.wgsl`), binding 5 the instances, binding 6 the [`PointsParams`] uniform. The bind
-/// group is rebuilt when the instance buffer grows and in `resize`.
+/// Group 0 is the renderer's. Group 1 ([`points_bgl_entries`]): binding 1 the lens mask (M0's
+/// declaration, which the star pass shares too), binding 6 the instances, binding 7 the
+/// [`PointsParams`] uniform. The bind group is rebuilt when the instance buffer grows and in
+/// `resize`.
 pub struct PointSprites {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
@@ -153,24 +183,7 @@ impl PointSprites {
         let index_buffer = quad_index_buffer(device);
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("points bgl"),
-            entries: &[
-                lens_mask_entry(4),
-                vertex_buffer_entry(
-                    5,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                    size_of::<PointGpu>(),
-                ),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(size_of::<PointsParams>() as u64),
-                    },
-                    count: None,
-                },
-            ],
+            entries: &points_bgl_entries(),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("points layout"),
@@ -223,15 +236,15 @@ impl PointSprites {
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: LENS_MASK_BINDING,
                     resource: wgpu::BindingResource::TextureView(&targets.lens_mask_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 5,
+                    binding: POINTS_BINDING,
                     resource: self.instance_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 6,
+                    binding: POINTS_PARAMS_BINDING,
                     resource: self.params_buffer.as_entire_binding(),
                 },
             ],

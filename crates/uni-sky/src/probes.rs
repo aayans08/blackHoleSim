@@ -3,8 +3,9 @@
 //! - `stars3d_mag_dir`: `star_rel_pos_pc` and `star_apparent_mag` of `stars3d.wgsl` for 64
 //!   packed stars (sector offsets, f16 velocities, proper motion over ±10⁵ yr) against the CPU
 //!   twins: direction within 1e-6 rad, apparent magnitude within 1e-3 mag (brief).
-//! - `stars3d_psf`: the PSF (review m8: `psf_erf`, `pixel_coverage`, `halo_weight`,
-//!   `footprint_radius_px` with its 2-px minimum), `star_is_visible`, `star_lux`,
+//! - `stars3d_psf`: the PSF (review m8: M0's `psf_erf`, `pixel_coverage` and `halo_weight`,
+//!   which `stars3d.wgsl` imports from M0's `stars.wgsl`, and B4's
+//!   `stars3d_footprint_radius_px` with its 2-px minimum), `star_is_visible`, `star_lux`,
 //!   `vivid_color`, `twinkle_factor` and the f16 decoding `f16_bits_to_f32` (exact) against
 //!   their CPU twins.
 //!
@@ -62,7 +63,7 @@ const PSF_PROBE_WGSL: &str = r#"// sky/probe_stars3d_psf.wgsl: `universe --selft
 // Twin of `probes::PsfProbeIn`.
 struct PsfProbeIn {
     // x: edge [px] for psf_erf and pixel_coverage; y: r [px] and z: radius [px] for halo_weight;
-    // w: display energy for footprint_radius_px and star_is_visible.
+    // w: display energy for stars3d_footprint_radius_px and star_is_visible.
     a: vec4<f32>,
     // x: halo fraction; y: slot, z: twinkle step (exact integers) and w: sigma for
     // twinkle_factor.
@@ -75,7 +76,8 @@ struct PsfProbeIn {
 
 // Twin of `probes::PsfProbeOut`.
 struct PsfProbeOut {
-    // psf_erf(a.x), pixel_coverage(a.x), halo_weight(a.y, a.z), footprint_radius_px(a.w, b.x).
+    // psf_erf(a.x), pixel_coverage(a.x), halo_weight(a.y, a.z),
+    // stars3d_footprint_radius_px(a.w, b.x).
     a: vec4<f32>,
     // rgb: vivid_color(c.rgb); w: twinkle_factor(b.y, b.z, d.y, b.w).
     b: vec4<f32>,
@@ -95,7 +97,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = probe_in[gid.x];
     var out: PsfProbeOut;
     out.a = vec4<f32>(psf_erf(c.a.x), pixel_coverage(c.a.x), halo_weight(c.a.y, c.a.z),
-        footprint_radius_px(c.a.w, c.b.x));
+        stars3d_footprint_radius_px(c.a.w, c.b.x));
     out.b = vec4<f32>(vivid_color(c.c.rgb),
         twinkle_factor(u32(c.b.y), u32(c.b.z), c.d.y, c.b.w));
     out.c = vec4<f32>(star_lux(c.c.w), select(0.0, 1.0, star_is_visible(c.a.w, c.b.x)),
@@ -412,7 +414,7 @@ fn nan_max<T: PartialOrd + Copy>(a: T, b: T) -> T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stars3d::tests_support::wgsl_struct;
+    use crate::stars3d::tests_support::{calls, entry, func, wgsl_struct};
     use core::mem::size_of;
     use uni_gfx::validate_wgsl;
     use wgpu::naga;
@@ -439,6 +441,12 @@ mod tests {
             assert_eq!(size, rust, "{name}");
             assert!(vec4_only, "{name}");
         }
+        // The probe measures the 3-D footprint (2-px minimum), which its CPU answer uses, not
+        // M0's 3-px one, which the module also holds (stars3d.wgsl imports M0's PSF, review r0
+        // I3).
+        let cs = entry(&m, "cs_main");
+        assert!(calls(&cs.body, func(&m, "stars3d_footprint_radius_px")));
+        assert!(!calls(&cs.body, func(&m, "footprint_radius_px")));
     }
 
     /// The probes' CPU answers are finite and the inputs span what the brief asks for; a perfect

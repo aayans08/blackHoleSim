@@ -15,7 +15,9 @@
 //!    Moffat halo above 1e-6 lx of steady light) at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as
 //!    M0 (`crate::stars`), culls it when no pixel would rise above `psf::VISIBILITY_CUTOFF`
 //!    ([`star_is_visible`]), and sizes its quad with [`footprint_radius_px`]: M0's rule with a
-//!    2-px minimum ([`STARS3D_MIN_RADIUS_PX`], review m16);
+//!    2-px minimum ([`STARS3D_MIN_RADIUS_PX`], review m16). The PSF's WGSL is M0's own:
+//!    `stars3d.wgsl` imports M0's `stars.wgsl` and lays its group-1 bindings out around M0's
+//!    two (review r0 I3; see [`LENS_MASK_BINDING`]);
 //! 6. for a drawn star only, reads the colour from B−V through a 128-entry Planck table
 //!    (`uni_core::bv_to_teff`, then `uni_core::blackbody_linear_srgb`, luminance 1), boosted by
 //!    [`vivid_color`] while [`StarInput::vivid_colours`] is on.
@@ -122,7 +124,7 @@ pub(crate) const REANCHOR_PC: f64 = 1.0;
 const REC709_Y: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
 
 /// The index buffer of one splat quad: triangles (0, 1, 2) and (2, 1, 3) over the corners of
-/// `quad_corner` in the shaders (0 (−,−), 1 (+,−), 2 (−,+), 3 (+,+)). Four distinct vertices
+/// `splat_corner` in the shaders (0 (−,−), 1 (+,−), 2 (−,+), 3 (+,+)). Four distinct vertices
 /// per instance, so a GPU that reuses transformed vertices runs the vertex stage four times per
 /// star instead of six (unmeasured on the M3).
 pub(crate) const QUAD_INDICES: [u16; 6] = [0, 1, 2, 2, 1, 3];
@@ -322,11 +324,27 @@ pub(crate) fn stars_params(
     }
 }
 
+/// Group-1 binding of `lens_mask` in both splat passes. The declaration is M0's, in
+/// `stars.wgsl`, which `stars3d.wgsl` imports so that both 3-D passes run M0's PSF WGSL itself
+/// rather than a copy (review r0 I3). The import also declares M0's `stars` instance buffer at
+/// binding 0, which neither 3-D pass uses or binds; the 3-D bindings follow from 2 up, so no two
+/// globals of a composed module share a slot (`splat_layouts_match_entry_point_use`).
+pub(crate) const LENS_MASK_BINDING: u32 = 1;
+/// Group-1 binding of the star pass's per-frame [`StarsParams`].
+pub(crate) const STARS_PARAMS_BINDING: u32 = 2;
+/// Group-1 binding of the star pass's B−V colour table ([`BvLut`]).
+pub(crate) const BV_LUT_BINDING: u32 = 3;
+/// Group-1 binding of the star records ([`StarGpu`], instance order), `catalogue` in WGSL.
+pub(crate) const CATALOGUE_BINDING: u32 = 4;
+/// Group-1 binding of the sector centres − anchor [pc].
+pub(crate) const SECTORS_BINDING: u32 = 5;
+
 /// Bind-group-layout entry of the lens mask (read with `textureLoad`, so unfilterable), which
-/// the vertex stage also reads for the attachment size. Shared by the star and point passes.
-pub(crate) fn lens_mask_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+/// the vertex stage also reads for the attachment size. Shared by the star and point passes, at
+/// [`LENS_MASK_BINDING`].
+pub(crate) fn lens_mask_entry() -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
-        binding,
+        binding: LENS_MASK_BINDING,
         visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -354,6 +372,20 @@ pub(crate) fn vertex_buffer_entry(
         },
         count: None,
     }
+}
+
+/// The star pass's group-1 layout: the lens mask, the per-frame uniform, the B−V table, the star
+/// records and the sector centres.
+pub(crate) fn star_bgl_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+    let storage = wgpu::BufferBindingType::Storage { read_only: true };
+    let uniform = wgpu::BufferBindingType::Uniform;
+    [
+        lens_mask_entry(),
+        vertex_buffer_entry(STARS_PARAMS_BINDING, uniform, size_of::<StarsParams>()),
+        vertex_buffer_entry(BV_LUT_BINDING, uniform, size_of::<BvLut>()),
+        vertex_buffer_entry(CATALOGUE_BINDING, storage, size_of::<StarGpu>()),
+        vertex_buffer_entry(SECTORS_BINDING, storage, size_of::<[f32; 4]>()),
+    ]
 }
 
 /// The splat pipeline of the star (`vs_stars`/`fs_stars`, depth `GreaterEqual` at the far plane)
@@ -442,9 +474,10 @@ pub(crate) fn begin_splat_pass<'e>(
 
 /// The 3-D star pass (`RenderFeature` named "stars").
 ///
-/// Group 0 is the renderer's. Group 1: binding 0 the stars (instance order), 1 the sector
-/// centres − anchor, 2 the per-frame [`StarsParams`], 3 the B−V colour table, 4 the lens mask
-/// (rebuilt in `resize`, when the targets are recreated).
+/// Group 0 is the renderer's. Group 1 ([`star_bgl_entries`]): binding 1 the lens mask (M0's
+/// declaration; rebuilt in `resize`, when the targets are recreated), 2 the per-frame
+/// [`StarsParams`], 3 the B−V colour table, 4 the stars (instance order), 5 the sector centres −
+/// anchor. Binding 0 is M0's `stars`, unused here (see [`LENS_MASK_BINDING`]).
 pub struct StarField3 {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
@@ -544,17 +577,9 @@ impl StarField3 {
             wgpu::BufferUsages::UNIFORM,
         );
         let index_buffer = quad_index_buffer(device);
-        let storage = wgpu::BufferBindingType::Storage { read_only: true };
-        let uniform = wgpu::BufferBindingType::Uniform;
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("stars3d bgl"),
-            entries: &[
-                vertex_buffer_entry(0, storage, size_of::<StarGpu>()),
-                vertex_buffer_entry(1, storage, size_of::<[f32; 4]>()),
-                vertex_buffer_entry(2, uniform, size_of::<StarsParams>()),
-                vertex_buffer_entry(3, uniform, size_of::<BvLut>()),
-                lens_mask_entry(4),
-            ],
+            entries: &star_bgl_entries(),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("stars3d layout"),
@@ -609,14 +634,14 @@ impl StarField3 {
             label: Some("stars3d bg"),
             layout: &self.bgl,
             entries: &[
-                buffer(0, &self.star_buffer),
-                buffer(1, &self.sector_buffer),
-                buffer(2, &self.params_buffer),
-                buffer(3, &self.lut_buffer),
                 wgpu::BindGroupEntry {
-                    binding: 4,
+                    binding: LENS_MASK_BINDING,
                     resource: wgpu::BindingResource::TextureView(&targets.lens_mask_view),
                 },
+                buffer(STARS_PARAMS_BINDING, &self.params_buffer),
+                buffer(BV_LUT_BINDING, &self.lut_buffer),
+                buffer(CATALOGUE_BINDING, &self.star_buffer),
+                buffer(SECTORS_BINDING, &self.sector_buffer),
             ],
         }));
     }
@@ -705,8 +730,9 @@ pub(crate) fn star_lux(v_mag: f32) -> f32 {
 /// flux radii (Rigel 13.5 px, the Sun from α Cen 21.0 px) are unchanged. Stars whose core peak
 /// is below 113 × the cutoff keep the 2-px minimum; the shaded pixels then reach at least 2 px
 /// from the centre, which holds ≥ 99.6 % of the σ = 0.65 px core (erf(2/(0.65√2))²), and every
-/// pixel beyond is below the cutoff. Twin of `footprint_radius_px` in `stars3d.wgsl`. NaN gives
-/// the minimum.
+/// pixel beyond is below the cutoff. Twin of `stars3d_footprint_radius_px` in `stars3d.wgsl`
+/// (named apart from M0's `footprint_radius_px`, which the shader imports with M0's PSF). NaN
+/// gives the minimum.
 pub fn footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
     let mut r = STARS3D_MIN_RADIUS_PX;
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
@@ -1007,8 +1033,8 @@ pub(crate) mod twin {
     /// Clip position of a culled vertex: all four coincide outside the clip volume (z > w).
     pub const CULLED: Vec4 = Vec4::new(2.0, 2.0, 2.0, 1.0);
 
-    /// Corner (±1, ±1) of index-buffer vertex `vi`. Twin of `quad_corner`.
-    fn quad_corner(vi: u32) -> Vec2 {
+    /// Corner (±1, ±1) of index-buffer vertex `vi`. Twin of `splat_corner`.
+    fn splat_corner(vi: u32) -> Vec2 {
         Vec2::new((vi & 1) as f32, (vi >> 1) as f32) * 2.0 - 1.0
     }
 
@@ -1059,7 +1085,7 @@ pub(crate) mod twin {
     pub fn vertex(view: &ViewTwin, s: Option<Splat>, vi: u32) -> Vec4 {
         match s {
             None => CULLED,
-            Some(s) => (s.ndc + quad_corner(vi) * (s.radius_px + 0.5) * 2.0 / view.size)
+            Some(s) => (s.ndc + splat_corner(vi) * (s.radius_px + 0.5) * 2.0 / view.size)
                 .extend(s.depth)
                 .extend(1.0),
         }
@@ -1800,8 +1826,9 @@ mod tests {
             )]
         );
 
-        // Group 1 bindings: the star pass's 0–4 and the point pass's own buffers at 5 and 6,
-        // sharing the lens mask at 4.
+        // Group 1 bindings: M0's `stars` at 0 (imported with M0's PSF, used by neither 3-D
+        // pass), the lens mask at 1 (M0's declaration, shared), the star pass's 2–5 and the point
+        // pass's own buffers at 6 and 7.
         let binding = |m: &naga::Module, name: &str| {
             m.global_variables
                 .iter()
@@ -1812,15 +1839,209 @@ mod tests {
         let rb = |binding| naga::ResourceBinding { group: 1, binding };
         for (name, b) in [
             ("stars", 0),
-            ("sectors", 1),
-            ("stars_params", 2),
-            ("bv_lut", 3),
-            ("lens_mask", 4),
-            ("points", 5),
-            ("points_params", 6),
+            ("lens_mask", LENS_MASK_BINDING),
+            ("stars_params", STARS_PARAMS_BINDING),
+            ("bv_lut", BV_LUT_BINDING),
+            ("catalogue", CATALOGUE_BINDING),
+            ("sectors", SECTORS_BINDING),
+            ("points", crate::points::POINTS_BINDING),
+            ("points_params", crate::points::POINTS_PARAMS_BINDING),
         ] {
             assert_eq!(binding(&m, name), rb(b), "{name}");
         }
+    }
+
+    /// Each splat pass's group-1 layout is exactly what its entry points use, checked the way
+    /// wgpu checks a pipeline layout against a shader (naga's per-entry-point global use, which
+    /// includes the functions an entry point calls): every group-1 global `vs_*` or `fs_*` uses
+    /// has an entry of the same kind, at least the shader's size, visible to exactly the stages
+    /// that use it, and every entry is used. No other group is used but the renderer's group 0,
+    /// and no two globals of the composed module share a slot, so M0's `stars` at binding 0,
+    /// which comes with M0's PSF (review r0 I3), cannot clash with a 3-D binding.
+    #[test]
+    fn splat_layouts_match_entry_point_use() {
+        use std::collections::{BTreeMap, HashSet};
+        use wgpu::ShaderStages;
+        for (path, vs, fs, entries) in [
+            (
+                STARS3D_WGSL,
+                "vs_stars",
+                "fs_stars",
+                star_bgl_entries().to_vec(),
+            ),
+            (
+                POINTS_WGSL,
+                "vs_points",
+                "fs_points",
+                crate::points::points_bgl_entries().to_vec(),
+            ),
+        ] {
+            let m = module(path);
+            let caps =
+                naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16;
+            let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+                .validate(&m)
+                .unwrap();
+            let mut slots = HashSet::new();
+            for (_, v) in m.global_variables.iter() {
+                if let Some(b) = &v.binding {
+                    assert!(
+                        slots.insert((b.group, b.binding)),
+                        "{path}: two globals at {b:?}"
+                    );
+                }
+            }
+            // Group-1 binding → (stages that use it, its global).
+            let mut used = BTreeMap::new();
+            for (i, ep) in m.entry_points.iter().enumerate() {
+                let stage = match ep.name.as_str() {
+                    n if n == vs => ShaderStages::VERTEX,
+                    n if n == fs => ShaderStages::FRAGMENT,
+                    _ => continue,
+                };
+                let ep_info = info.get_entry_point(i);
+                for (h, v) in m.global_variables.iter() {
+                    let Some(b) = &v.binding else { continue };
+                    if ep_info[h].is_empty() {
+                        continue;
+                    }
+                    match b.group {
+                        0 => {}
+                        1 => {
+                            used.entry(b.binding).or_insert((ShaderStages::NONE, h)).0 |= stage;
+                        }
+                        g => panic!("{path}: {} uses group {g}", ep.name),
+                    }
+                }
+            }
+            let mut want: Vec<u32> = entries.iter().map(|e| e.binding).collect();
+            want.sort_unstable();
+            assert_eq!(used.keys().copied().collect::<Vec<_>>(), want, "{path}");
+            for e in &entries {
+                let (stages, h) = used[&e.binding];
+                let v = &m.global_variables[h];
+                let name = v.name.as_deref().unwrap_or("?");
+                assert_eq!(e.visibility, stages, "{path}: {name}");
+                let ok = match (&e.ty, v.space) {
+                    (
+                        wgpu::BindingType::Buffer {
+                            ty,
+                            min_binding_size,
+                            ..
+                        },
+                        space,
+                    ) => {
+                        let class = match ty {
+                            wgpu::BufferBindingType::Uniform => naga::AddressSpace::Uniform,
+                            wgpu::BufferBindingType::Storage { read_only } => {
+                                assert!(read_only, "{path}: {name}");
+                                naga::AddressSpace::Storage {
+                                    access: naga::StorageAccess::LOAD,
+                                }
+                            }
+                        };
+                        let size = m.types[v.ty].inner.size(m.to_ctx()) as u64;
+                        class == space && min_binding_size.is_some_and(|s| s.get() >= size)
+                    }
+                    (
+                        wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { .. },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        naga::AddressSpace::Handle,
+                    ) => matches!(
+                        m.types[v.ty].inner,
+                        naga::TypeInner::Image {
+                            dim: naga::ImageDimension::D2,
+                            arrayed: false,
+                            class: naga::ImageClass::Sampled {
+                                kind: naga::ScalarKind::Float,
+                                multi: false,
+                            },
+                        }
+                    ),
+                    _ => false,
+                };
+                assert!(ok, "{path}: {name} does not match its layout entry");
+            }
+            // The lens mask the 3-D passes read is M0's declaration.
+            assert_eq!(
+                m.global_variables[used[&LENS_MASK_BINDING].1]
+                    .name
+                    .as_deref(),
+                Some("lens_mask")
+            );
+        }
+    }
+
+    /// Review r0 I3: the 3-D passes run M0's PSF WGSL itself, not a copy of it. `stars3d.wgsl`
+    /// imports M0's `stars.wgsl`; neither 3-D shader defines a PSF constant or function of M0's
+    /// again; and the splat code calls M0's. Only the footprint radius is B4's own
+    /// (`stars3d_footprint_radius_px`, with review m16's 2-px minimum;
+    /// `footprint_matches_m0_above_three_px` ties it to M0's above 3 px), and the splat does not
+    /// call M0's 3-px one.
+    #[test]
+    fn splat_runs_m0_psf_wgsl() {
+        let own = [
+            ("stars3d.wgsl", include_str!("../shaders/stars3d.wgsl")),
+            ("points.wgsl", include_str!("../shaders/points.wgsl")),
+        ];
+        let import = format!("#import \"{}\"", crate::STARS_SHADER);
+        assert!(own[0].1.lines().any(|l| l.trim() == import));
+        let m0 = module(crate::STARS_SHADER);
+        for f in [
+            "psf_erf",
+            "pixel_coverage",
+            "moffat",
+            "halo_weight",
+            "pixel_solid_angle",
+            "pixel_solid_angle_off_axis",
+            "footprint_radius_px",
+        ] {
+            func(&m0, f);
+            for (file, src) in own {
+                assert!(!src.contains(&format!("fn {f}(")), "{file} defines {f}");
+            }
+        }
+        for c in [
+            "CORE_SIGMA_PX",
+            "HALO_ENERGY_FRACTION",
+            "HALO_MIN_LUX",
+            "HALO_ALPHA_PX",
+            "HALO_BETA",
+            "MAX_RADIUS_PX",
+            "VISIBILITY_CUTOFF",
+            "MIN_CLIP_W",
+            "CULLED",
+        ] {
+            assert!(
+                m0.constants
+                    .iter()
+                    .any(|(_, k)| k.name.as_deref() == Some(c)),
+                "M0 has no {c}"
+            );
+            for (file, src) in own {
+                assert!(!src.contains(&format!("const {c}:")), "{file} defines {c}");
+            }
+        }
+        let m = module(STARS3D_WGSL);
+        let fn_calls = |caller: &str, callee: &str| {
+            calls(&m.functions[func(&m, caller)].body, func(&m, callee))
+        };
+        for (caller, callee) in [
+            ("psf_weight", "pixel_coverage"),
+            ("psf_weight", "halo_weight"),
+            ("pixel_coverage", "psf_erf"),
+            ("splat_vertex", "pixel_solid_angle_off_axis"),
+            ("splat_vertex", "star_is_visible"),
+            ("splat_vertex", "stars3d_footprint_radius_px"),
+            ("stars3d_footprint_radius_px", "moffat"),
+            ("star_is_visible", "moffat"),
+        ] {
+            assert!(fn_calls(caller, callee), "{caller} does not call {callee}");
+        }
+        assert!(!fn_calls("splat_vertex", "footprint_radius_px"));
     }
 
     /// The value of `const name: f32 = <literal>;` (or u32) in `m`.
