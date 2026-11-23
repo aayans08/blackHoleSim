@@ -218,6 +218,8 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         nearest_surface: world.nearest_surface_among(&cam, &near),
         ..Snapshot::default()
     };
+    // The comets drawn, so ticks re-osculate the stale ones first (review r2 P1).
+    let mut shown_comets = Vec::new();
     let pick = |snap: &mut Snapshot, id: ObjectId, rel: DVec3, kind: ObjectKind| {
         if let Some(p) = proj.screen(rel).filter(|&p| proj.on_screen(p, 0.0)) {
             snap.pick.push(PickItem {
@@ -254,21 +256,30 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                     });
                 }
             }
-            _ => {
+            source => {
                 let sun_rel = sun_pos.map_or(DVec3::ZERO, |s| s.delta_from(world.cached[k]));
-                if px >= POINT_LOD_PX {
+                let lux = if px >= POINT_LOD_PX {
                     snap.bodies.push(body_view(world, id, rel, sun_rel, px, &cam, sun_cd));
+                    f64::INFINITY
                 } else if on_screen() {
+                    let lux = reflected_lux(world, id, rel, sun_rel, sun_cd);
                     snap.points.push(PointView {
                         id: Some(id),
                         rel_pos_m: rel,
-                        illuminance_lux: reflected_lux(world, id, rel, sun_rel, sun_cd),
+                        illuminance_lux: lux,
                         color: sun_color,
                     });
+                    lux
+                } else {
+                    continue;
+                };
+                if let Source::Comet(c) = source {
+                    shown_comets.push((c, lux));
                 }
             }
         }
     }
+    world.note_shown_comets(shown_comets);
     if let (Some(sun), Some(sun_pos)) = (world.sun, sun_pos) {
         snap.sun = Some(SunLight {
             rel_pos_m: sun_pos.delta_from(cam),
