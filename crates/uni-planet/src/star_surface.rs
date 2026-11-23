@@ -660,16 +660,31 @@ pub fn granulation(p_unit: Vec3, cell_m: f32, radius_m: f32, t_s: f32) -> f32 {
         return 1.0;
     }
     let p = p_unit.normalize();
-    let n = gran_cells(cell_m, radius_m);
+    let [near0, near1] = gran_layers(p, cell_m, radius_m, t_s);
     let phase0 = t_s / GRAN_PERIOD_S;
     let phase1 = phase0 + 0.5;
-    let salts = [gran_salt(phase0, 0), gran_salt(phase1, 1)];
-    let [(near0, _), (near1, _)] = gran_near2(p, n, salts);
     let v0 = (near0.intensity() - GRAN_MEAN) / GRAN_SIGMA;
     let v1 = (near1.intensity() - GRAN_MEAN) / GRAN_SIGMA;
     let w0 = gran_weight(phase0);
     let w1 = gran_weight(phase1);
     1.0 + GRANULATION_RMS_550 * (w0 * v0 + w1 * v1) / (w0 * w0 + w1 * w1).sqrt()
+}
+
+/// Both layers' two nearest granules at the unit vector `p` at `t_s` (layer 1 half a period
+/// later). Twin of `gran_layers`.
+fn gran_layers(p: Vec3, cell_m: f32, radius_m: f32, t_s: f32) -> [Nearest; 2] {
+    let n = gran_cells(cell_m, radius_m);
+    let phase0 = t_s / GRAN_PERIOD_S;
+    let salts = [gran_salt(phase0, 0), gran_salt(phase0 + 0.5, 1)];
+    let [(near0, _), (near1, _)] = gran_near2(p, n, salts);
+    [near0, near1]
+}
+
+/// The packed lattice id of each layer's nearest granule at `p_unit` at `t_s`: what the
+/// granulation probe compares bit for bit (with the cell hash). Twin of
+/// `granulation_nearest_ids`.
+fn granulation_nearest_ids(p_unit: Vec3, cell_m: f32, radius_m: f32, t_s: f32) -> [u32; 2] {
+    gran_layers(p_unit.normalize(), cell_m, radius_m, t_s).map(|near| near.id1)
 }
 
 /// The `pcg3d` hash of `p_unit`'s own lattice cell for layer 0 at `t_s`: what the granulation
@@ -834,8 +849,9 @@ fn cs_limb(@builtin(global_invocation_id) gid: vec3<u32>) {
     probe_out[gid.x] = vec4<u32>(bitcast<vec3<u32>>(limb_darkening(probe_in[gid.x].x)), 0u);
 }
 
-// in[2i]: (p, t_s), in[2i + 1]: (cell_m, radius_m, 0, 0); out[i].x: granulation as bits,
-// out[i].yzw: the lattice hash of p's own cell (layer 0).
+// in[2i]: (p, t_s), in[2i + 1]: (cell_m, radius_m, 0, 0); out[2i].x: granulation as bits,
+// out[2i].yzw: the lattice hash of p's own cell (layer 0); out[2i + 1].xy: the packed id of each
+// layer's nearest granule.
 @compute @workgroup_size(64, 1, 1)
 fn cs_gran(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (2u * gid.x + 1u >= arrayLength(&probe_in)) {
@@ -844,28 +860,190 @@ fn cs_gran(@builtin(global_invocation_id) gid: vec3<u32>) {
     let a = probe_in[2u * gid.x];
     let b = probe_in[2u * gid.x + 1u];
     let g = granulation(a.xyz, b.x, b.y, a.w);
-    probe_out[gid.x] = vec4<u32>(bitcast<u32>(g), granulation_cell_hash(a.xyz, b.x, b.y, a.w));
+    probe_out[2u * gid.x] = vec4<u32>(bitcast<u32>(g), granulation_cell_hash(a.xyz, b.x, b.y, a.w));
+    probe_out[2u * gid.x + 1u] = vec4<u32>(granulation_nearest_ids(a.xyz, b.x, b.y, a.w), 0u, 0u);
 }
 "#;
 
 /// Largest |GPU − CPU| of a limb-darkening value (Horner's rule; fused multiply–adds differ by
 /// ~1e-7; a wrong coefficient errs by ≥ 1e-3).
 const LIMB_TOLERANCE: f32 = 1e-5;
-/// Largest |GPU − CPU| of a granulation value (B2 brief: ±1e-4). The value is continuous in p,
-/// so an f32 difference in `atan`/`tan` that flips which granule is nearest changes it by a
-/// rounding error only.
-const GRAN_TOLERANCE: f32 = 1e-4;
+
+// The granulation probe (review I1, fix round 1). The value is steep: inside a dark lane it
+// changes by 400–4000 per radian of p (a lane is 0.3 of a 1.87e-3 rad cell on the Sun), so the
+// GPU's and CPU's last-bit differences in `tan`, `atan` and `normalize` move it far more than
+// the brief's flat ±1e-4 allows. Metal also compiles WGSL with fast math (wgpu-hal 30 keeps
+// MTLCompileOptions' default; the MSL specification's fast-math accuracy table derives `tan` as
+// sin·(1/cos) and `x/y` as x·(1/y)). So the probe checks the pattern's discrete structure bit for
+// bit and the value within a tolerance scaled by its local slope:
+// - the `pcg3d` hash of p's own cell (layer 0), bit for bit;
+// - the packed id of each layer's nearest granule, bit for bit (the inputs keep every point at
+//   least GRAN_PROBE_TIE_MARGIN from a lane's centre, and every granule of an ambiguously wrapped
+//   cube-edge cell that far beyond F2, so f32 noise cannot change it);
+// - |GPU − CPU| ≤ GRAN_VALUE_TOLERANCE + |∇G|·GRAN_ANGLE_TOLERANCE_RAD, with |∇G| measured on the
+//   CPU twin by central differences.
+
+/// Value tolerance where the pattern is flat (inside a granule only rounding differs): the
+/// brief's ±1e-4.
+const GRAN_VALUE_TOLERANCE: f32 = 1e-4;
+/// The angle [rad] by which GPU and CPU may place the pattern apart: 1e-6 rad is about 17 f32
+/// ulps of a unit vector's components in [0.5, 1) and 0.05 % of the Sun's cell (0.08 % of the
+/// 4000 K probe star's), so a displaced pattern, a wrong lane width or a wrong contrast still fails.
+const GRAN_ANGLE_TOLERANCE_RAD: f32 = 1e-6;
+/// Central-difference step [rad] for |∇G|: 0.2 % of the Sun's cell, 0.7 % of a lane.
+const GRAN_SLOPE_STEP_RAD: f64 = 4e-6;
+/// Smallest F2 − F1 [cells] of either layer at a probe point, and smallest distance beyond F2 of
+/// an ambiguously wrapped cell's granule: far more than f32 noise moves a distance (≤ 8e-4 cells
+/// at GRAN_ANGLE_TOLERANCE_RAD).
+const GRAN_PROBE_TIE_MARGIN: f32 = 0.02;
+/// A cube-edge-wrapped neighbour cell whose mapped lattice coordinate lies this close [cells] to
+/// an interior cell boundary of the face it lands on may be wrapped to either side by f32 noise
+/// (q's f32 ulp is ≤ 6.1e-5 at n = 841; `atan` and `tan` add a few ulps).
+const GRAN_PROBE_WRAP_NOISE: f32 = 0.005;
+/// Slope [1/rad] above which a probe point counts as "in a lane" for the report's
+/// angle-equivalent error.
+const GRAN_SLOPE_LANE: f32 = 50.0;
 
 /// 64 μ from 0 to 1 inclusive.
 fn limb_probe_inputs() -> Vec<[f32; 4]> {
     (0..64).map(|k| [k as f32 / 63.0, 0.0, 0.0, 0.0]).collect()
 }
 
+/// One granulation probe point: (p, cell_m, radius_m, t_s).
+type GranProbeCase = (Vec3, f32, f32, f32);
+
+/// What the granulation probe reads back for one point (and what the CPU twin predicts).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GranProbeOut {
+    value: f32,
+    /// `pcg3d` hash of p's own cell, layer 0.
+    hash: UVec3,
+    /// Packed lattice id of each layer's nearest granule.
+    ids: [u32; 2],
+}
+
+/// The CPU twin's answer for one probe point.
+fn gran_probe_expected(&(p, cell, radius, t): &GranProbeCase) -> GranProbeOut {
+    GranProbeOut {
+        value: granulation(p, cell, radius, t),
+        hash: granulation_cell_hash(p, cell, radius, t),
+        ids: granulation_nearest_ids(p, cell, radius, t),
+    }
+}
+
+/// |∇G| [1/rad] of the CPU twin at the probe point, by central differences along two
+/// orthonormal tangents (steps built in f64, cast once to f32 as the GPU input is).
+fn gran_slope(&(p, cell, radius, t): &GranProbeCase) -> f32 {
+    let p64 = p.as_dvec3().normalize();
+    let e1 = p64.any_orthonormal_vector();
+    let e2 = p64.cross(e1);
+    let h = GRAN_SLOPE_STEP_RAD;
+    let at = |dir: DVec3, s: f64| {
+        f64::from(granulation(
+            (p64 + dir * s).normalize().as_vec3(),
+            cell,
+            radius,
+            t,
+        ))
+    };
+    let d1 = (at(e1, h) - at(e1, -h)) / (2.0 * h);
+    let d2 = (at(e2, h) - at(e2, -h)) / (2.0 * h);
+    d1.hypot(d2) as f32
+}
+
+/// The cells `gran_wrap` might return for cell (`ci`, `cj`) of `face` under f32 noise: its own
+/// answer, plus the cell across any interior boundary (where `floor` decides; the clamp settles
+/// the outer ones) that the would-be cell centre's mapped lattice coordinate lies within
+/// [`GRAN_PROBE_WRAP_NOISE`] of. A cell inside the face is exact (integer arithmetic). `None`
+/// when two cube faces nearly tie for the mapped point; an exact tie (a corner diagonal, |st.x| =
+/// |st.y| from the same input) is decided identically by both twins. Mirrors [`gran_wrap`] step
+/// for step.
+///
+/// The ambiguity is real at every corner cell: the cell across the edge from corner cell (0, 0)
+/// maps, to first order exactly, onto a cell boundary of the neighbouring face (4.4e-5 cells
+/// from it on the Sun's lattice), so the GPU may legitimately wrap it to the other cell.
+fn gran_wrap_candidates(face: u32, ci: i32, cj: i32, n: i32) -> Option<Vec<UVec3>> {
+    let own = gran_wrap(face, ci, cj, n);
+    if (0..n).contains(&ci) && (0..n).contains(&cj) {
+        return Some(vec![own]);
+    }
+    let nf = n as f32;
+    let a = (Vec2::new(ci as f32, cj as f32) + 0.5) / nf * 2.0 - 1.0;
+    let dir = gran_dir(face, (a * FRAC_PI_4).map(f32::tan));
+    let mut m = dir.abs().to_array();
+    m.sort_by(|x, y| y.total_cmp(x));
+    if m[0] != m[1] && m[0] - m[1] < 1e-5 * m[0] {
+        return None;
+    }
+    let (_, st) = cube_coord(dir);
+    let q = (st.map(f32::atan) * FRAC_4_PI + 1.0) * 0.5 * nf;
+    // Each axis: the index gran_wrap chose, and the other one if q is near an interior boundary.
+    let options = |x: f32, chosen: u32| -> Vec<u32> {
+        let k = x.round();
+        if n >= 2 && k >= 1.0 && k <= nf - 1.0 && (x - k).abs() < GRAN_PROBE_WRAP_NOISE {
+            let other = if chosen as f32 >= k {
+                k as u32 - 1
+            } else {
+                k as u32
+            };
+            vec![chosen, other]
+        } else {
+            vec![chosen]
+        }
+    };
+    let mut cells = Vec::new();
+    for i in options(q.x, own.y) {
+        for j in options(q.y, own.z) {
+            cells.push(UVec3::new(own.x, i, j));
+        }
+    }
+    Some(cells)
+}
+
+/// The probe point's margins [cells]: the smaller F2 − F1 of the two layers, and how far beyond
+/// each layer's F2 the granules of every ambiguously wrapped neighbour cell ([`gran_wrap_candidates`])
+/// lie (0.5 when no wrap is ambiguous, −1 when one is undecidable). With both margins clear,
+/// either wrap gives both twins the same two nearest granules in both layers.
+fn gran_probe_margins(&(p, cell, radius, t): &GranProbeCase) -> (f32, f32) {
+    let p = p.normalize();
+    let n = gran_cells(cell, radius);
+    let nf = n as f32;
+    let layers = gran_layers(p, cell, radius, t);
+    let phase0 = t / GRAN_PERIOD_S;
+    let salts = [gran_salt(phase0, 0), gran_salt(phase0 + 0.5, 1)];
+    let to_cells = 2.0 * nf / std::f32::consts::PI;
+    let (face, st) = cube_coord(p);
+    let q = (st.map(f32::atan) * FRAC_4_PI + 1.0) * 0.5 * nf;
+    let base = q.floor().as_ivec2().clamp(IVec2::ZERO, IVec2::splat(n - 1));
+    let mut wrap = 0.5_f32;
+    for dj in -1..=1 {
+        for di in -1..=1 {
+            match gran_wrap_candidates(face, base.x + di, base.y + dj, n) {
+                None => wrap = -1.0,
+                Some(cells) if cells.len() > 1 => {
+                    for c in cells {
+                        for (near, salt) in layers.iter().zip(salts) {
+                            let (dir, _) = gran_feature(c, salt, nf);
+                            wrap = wrap.min((p - dir).length() * to_cells - near.f2);
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let [l0, l1] = layers;
+    ((l0.f2 - l0.f1).min(l1.f2 - l1.f1), wrap)
+}
+
 /// 256 probe points (p, cell_m, radius_m, t_s): every face, edge and corner cells as well as
-/// random ones, each point 5–95 % of the way across its cell (so GPU and CPU agree on the cell
-/// whose hash is compared bit for bit), on the Sun and (one in four) on a 4000 K star of 3 R☉;
-/// times at epoch boundaries, at the 2^22 s wrap and random. Built in f64, cast once to f32.
-fn granulation_probe_inputs() -> Vec<(Vec3, f32, f32, f32)> {
+/// random ones, on the Sun and (one in four) on a 4000 K star of 3 R☉; times at epoch
+/// boundaries, at the 2^22 s wrap and random. Built in f64, cast once to f32. Each point lies
+/// 5–95 % of the way across its cell (so GPU and CPU agree on the cell whose hash is compared bit
+/// for bit) and is redrawn until both [`gran_probe_margins`] clear [`GRAN_PROBE_TIE_MARGIN`] (so
+/// they agree on each layer's nearest granule); an edge cell's free coordinate avoids the corners,
+/// so the only corner cells are (0, 0) and (n−1, n−1), whose diagonal neighbours tie exactly.
+fn granulation_probe_inputs() -> Vec<GranProbeCase> {
     let mut state = 0x5EED_u64;
     let mut rand = || {
         state = uni_core::splitmix64(state);
@@ -879,44 +1057,97 @@ fn granulation_probe_inputs() -> Vec<(Vec3, f32, f32, f32)> {
             } else {
                 (GRANULE_CELL_SUN_M, R_SUN_M)
             };
-            let n = gran_cells(cell as f32, radius as f32);
+            let (cell, radius) = (cell as f32, radius as f32);
+            let n = gran_cells(cell, radius);
             let last = f64::from(n - 1);
-            let mut cell_ij = || (rand() * f64::from(n)).floor().min(last);
-            let (i, j) = match (k / 6) % 5 {
-                0 => (0.0, 0.0),
-                1 => (last, cell_ij()),
-                2 => (cell_ij(), 0.0),
-                3 => (last, last),
-                _ => (cell_ij(), cell_ij()),
-            };
-            let fx = 0.05 + 0.9 * rand();
-            let fy = 0.05 + 0.9 * rand();
-            let a = 2.0 * (i + fx) / f64::from(n) - 1.0;
-            let b = 2.0 * (j + fy) / f64::from(n) - 1.0;
-            let st = glam::DVec2::new(
-                (a * std::f64::consts::FRAC_PI_4).tan(),
-                (b * std::f64::consts::FRAC_PI_4).tan(),
-            );
-            let face = (k % 6) as u32;
-            let sg = if face % 2 == 0 { 1.0 } else { -1.0 };
-            let v = match face / 2 {
-                0 => DVec3::new(sg, st.x, st.y),
-                1 => DVec3::new(st.y, sg, st.x),
-                _ => DVec3::new(st.x, st.y, sg),
-            };
             let t = if k < times.len() * 8 {
                 times[k % times.len()]
             } else {
                 (rand() * 4_194_304.0).floor() * 0.25
-            };
-            (
-                v.normalize().as_vec3(),
-                cell as f32,
-                radius as f32,
-                t as f32,
-            )
+            } as f32;
+            let face = (k % 6) as u32;
+            let mut case = (Vec3::X, cell, radius, t);
+            for _ in 0..1000 {
+                // A cell index away from the corners (1 ..= n − 2), and any cell index.
+                let inner = 1.0 + (rand() * (last - 1.0)).floor().min(last - 2.0);
+                let any = (rand() * f64::from(n)).floor().min(last);
+                let (i, j) = match (k / 6) % 5 {
+                    0 => (0.0, 0.0),
+                    1 => (last, inner),
+                    2 => (inner, 0.0),
+                    3 => (last, last),
+                    _ => (any, inner),
+                };
+                let fx = 0.05 + 0.9 * rand();
+                let fy = 0.05 + 0.9 * rand();
+                let a = 2.0 * (i + fx) / f64::from(n) - 1.0;
+                let b = 2.0 * (j + fy) / f64::from(n) - 1.0;
+                let st = glam::DVec2::new(
+                    (a * std::f64::consts::FRAC_PI_4).tan(),
+                    (b * std::f64::consts::FRAC_PI_4).tan(),
+                );
+                let sg = if face % 2 == 0 { 1.0 } else { -1.0 };
+                let v = match face / 2 {
+                    0 => DVec3::new(sg, st.x, st.y),
+                    1 => DVec3::new(st.y, sg, st.x),
+                    _ => DVec3::new(st.x, st.y, sg),
+                };
+                case.0 = v.normalize().as_vec3();
+                let (tie, wrap) = gran_probe_margins(&case);
+                if tie >= GRAN_PROBE_TIE_MARGIN && wrap >= GRAN_PROBE_TIE_MARGIN {
+                    break;
+                }
+            }
+            case
         })
         .collect()
+}
+
+/// The granulation probe's verdict on the GPU's answers `out` for `cases`: pass when every
+/// point's cell hash and both nearest-granule ids match the CPU twin bit for bit and its value is
+/// within GRAN_VALUE_TOLERANCE + |∇G|·GRAN_ANGLE_TOLERANCE_RAD. The detail also reports the
+/// largest |GPU − CPU|/|∇G| over lane points (the angle by which the GPU's pattern sits apart),
+/// so a failure says how much wider the tolerance would have to be.
+fn gran_probe_verdict(cases: &[GranProbeCase], out: &[GranProbeOut]) -> (bool, String) {
+    if out.len() != cases.len() {
+        return (
+            false,
+            format!("{} answers for {} points", out.len(), cases.len()),
+        );
+    }
+    let (mut hash_bad, mut id_bad, mut value_bad) = (0, 0, 0);
+    let (mut worst, mut worst_ratio, mut worst_angle) = (0.0_f32, 0.0_f32, 0.0_f32);
+    let mut lane_points = 0;
+    for (case, gpu) in cases.iter().zip(out) {
+        let cpu = gran_probe_expected(case);
+        hash_bad += usize::from(gpu.hash != cpu.hash);
+        id_bad += usize::from(gpu.ids != cpu.ids);
+        let slope = gran_slope(case);
+        let err = (gpu.value - cpu.value).abs();
+        let tol = GRAN_VALUE_TOLERANCE + slope * GRAN_ANGLE_TOLERANCE_RAD;
+        // NaN anywhere fails (`!(err <= tol)`).
+        value_bad += usize::from(!(err <= tol));
+        worst = if worst.is_nan() || err.is_nan() {
+            f32::NAN
+        } else {
+            worst.max(err)
+        };
+        worst_ratio = worst_ratio.max(err / tol);
+        if slope > GRAN_SLOPE_LANE {
+            lane_points += 1;
+            worst_angle = worst_angle.max(err / slope);
+        }
+    }
+    (
+        hash_bad == 0 && id_bad == 0 && value_bad == 0,
+        format!(
+            "{} points ({lane_points} in lanes): {hash_bad} cell-hash and {id_bad} nearest-granule \
+             mismatches, {value_bad} values out of tolerance; max |GPU − CPU| {worst:.1e}, \
+             max error/tolerance {worst_ratio:.2}, max lane error/|∇G| {worst_angle:.1e} rad \
+             (tolerance {GRAN_VALUE_TOLERANCE:.0e} + |∇G|·{GRAN_ANGLE_TOLERANCE_RAD:.0e} rad)",
+            cases.len()
+        ),
+    )
 }
 
 /// B2's probes (`limb_darkening`, `granulation`), called from [`crate::gpu_probes`] after it
@@ -924,7 +1155,12 @@ fn granulation_probe_inputs() -> Vec<(Vec3, f32, f32, f32)> {
 pub(crate) fn star_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     lib.add(STAR_PROBE_WGSL_PATH, STAR_PROBE_WGSL);
     let lib = &*lib;
-    let run = |entry: &str, input: &[[f32; 4]], cases: usize| -> anyhow::Result<Vec<[u32; 4]>> {
+    // `out_per_case` vec4<u32>s per case.
+    let run = |entry: &str,
+               input: &[[f32; 4]],
+               cases: usize,
+               out_per_case: usize|
+     -> anyhow::Result<Vec<[u32; 4]>> {
         let src = lib.compose(STAR_PROBE_WGSL_PATH)?;
         let n = u32::try_from(cases).context("too many probe cases")?;
         let bytes = run_compute(
@@ -932,14 +1168,14 @@ pub(crate) fn star_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRes
             &src,
             entry,
             bytemuck::cast_slice(input),
-            (cases * 16) as u64,
+            (cases * out_per_case * 16) as u64,
             [n.div_ceil(64), 1, 1],
         )?;
         Ok(bytemuck::pod_collect_to_vec(&bytes))
     };
     let limb = || -> anyhow::Result<(bool, String)> {
         let input = limb_probe_inputs();
-        let out = run("cs_limb", &input, input.len())?;
+        let out = run("cs_limb", &input, input.len(), 1)?;
         let mut worst = 0.0_f32;
         for (c, g) in input.iter().zip(&out) {
             let gpu_ld = Vec3::new(
@@ -968,26 +1204,16 @@ pub(crate) fn star_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRes
             .iter()
             .flat_map(|(p, cell, radius, t)| [[p.x, p.y, p.z, *t], [*cell, *radius, 0.0, 0.0]])
             .collect();
-        let out = run("cs_gran", &input, cases.len())?;
-        let (mut worst, mut hash_mismatches) = (0.0_f32, 0);
-        for ((p, cell, radius, t), g) in cases.iter().zip(&out) {
-            let err = (f32::from_bits(g[0]) - granulation(*p, *cell, *radius, *t)).abs();
-            worst = if worst.is_nan() || err.is_nan() {
-                f32::NAN
-            } else {
-                worst.max(err)
-            };
-            if UVec3::new(g[1], g[2], g[3]) != granulation_cell_hash(*p, *cell, *radius, *t) {
-                hash_mismatches += 1;
-            }
-        }
-        Ok((
-            worst <= GRAN_TOLERANCE && hash_mismatches == 0,
-            format!(
-                "{} points, {hash_mismatches} lattice-hash mismatches, max |GPU − CPU| {worst:.1e} (tolerance {GRAN_TOLERANCE:.0e})",
-                cases.len()
-            ),
-        ))
+        let out = run("cs_gran", &input, cases.len(), 2)?;
+        let answers: Vec<GranProbeOut> = out
+            .chunks_exact(2)
+            .map(|g| GranProbeOut {
+                value: f32::from_bits(g[0][0]),
+                hash: UVec3::new(g[0][1], g[0][2], g[0][3]),
+                ids: [g[1][0], g[1][1]],
+            })
+            .collect();
+        Ok(gran_probe_verdict(&cases, &answers))
     };
     let result = |name: &str, outcome: anyhow::Result<(bool, String)>| {
         let (pass, detail) = outcome.unwrap_or_else(|e| (false, format!("{e:#}")));
@@ -1484,21 +1710,150 @@ mod tests {
         );
     }
 
-    /// The probe inputs keep every point at least 5 % of a lattice cell from its cell's edges,
-    /// so the GPU and CPU agree on the cell whose hash the probe compares bit for bit.
+    /// The probe inputs keep every point at least 5 % of a lattice cell from its cell's edges (so
+    /// the GPU and CPU agree on the cell whose hash the probe compares bit for bit), at least
+    /// `GRAN_PROBE_TIE_MARGIN` from either layer's lane centre and with every granule of an
+    /// ambiguously wrapped cube-edge cell that far beyond F2 (so they agree on each layer's
+    /// nearest granule), and still cover corner, edge and inner cells on every face of both
+    /// probe stars.
     #[test]
-    fn star_probe_inputs_stay_inside_cells() {
+    fn star_probe_inputs_are_unambiguous() {
         let inputs = granulation_probe_inputs();
         assert_eq!(inputs.len(), 256);
-        for (p, cell, radius, _t) in &inputs {
-            let n = gran_cells(*cell, *radius);
-            let (_, st) = cube_coord(*p);
+        let (mut corners, mut edges, mut inner) = ([0; 6], [0; 6], 0);
+        let (mut big_star, mut ambiguous) = (0, 0);
+        for case in &inputs {
+            let (p, cell, radius, _t) = *case;
+            let n = gran_cells(cell, radius);
+            let (face, st) = cube_coord(p);
             let q = (st.map(f32::atan) * FRAC_4_PI + 1.0) * 0.5 * n as f32;
             let frac = q - q.floor();
             assert!(
                 frac.min_element() >= 0.04 && frac.max_element() <= 0.96,
                 "{q}"
             );
+            let (tie, wrap) = gran_probe_margins(case);
+            assert!(
+                tie >= GRAN_PROBE_TIE_MARGIN && wrap >= GRAN_PROBE_TIE_MARGIN,
+                "{case:?}: F2 − F1 {tie}, ambiguous-wrap margin {wrap}"
+            );
+            let base = q.floor().as_ivec2().clamp(IVec2::ZERO, IVec2::splat(n - 1));
+            ambiguous += usize::from((-1..=1).any(|dj| {
+                (-1..=1).any(|di| {
+                    gran_wrap_candidates(face, base.x + di, base.y + dj, n).map(|c| c.len())
+                        != Some(1)
+                })
+            }));
+            let on_edge = |x: f32| x < 1.0 || x >= (n - 1) as f32;
+            match (on_edge(q.x), on_edge(q.y)) {
+                (true, true) => corners[face as usize] += 1,
+                (false, false) => inner += 1,
+                _ => edges[face as usize] += 1,
+            }
+            big_star += usize::from(n != gran_cells(GRANULE_CELL_SUN_M as f32, R_SUN_M as f32));
+        }
+        eprintln!(
+            "probe points: corners {corners:?}, edges {edges:?}, inner {inner}; \
+             {ambiguous} with an ambiguous cube-edge wrap (all clear of F2)"
+        );
+        assert!(corners.iter().all(|&c| c >= 2) && edges.iter().all(|&e| e >= 4) && inner >= 40);
+        assert_eq!(big_star, 64);
+        // The corner cells' wraps are ambiguous (see gran_wrap_candidates); they stay in the set.
+        assert!(ambiguous >= 12, "{ambiguous}");
+    }
+
+    /// Review I1: the granulation probe passes what f32 noise does to the pattern (each point
+    /// moved by 3e-7 rad, 2.5× the review's worst estimate of 1.2e-7 rad), which the brief's flat
+    /// ±1e-4 does not, and still fails a displaced pattern, a wrong contrast, one wrong
+    /// nearest-granule id, one wrong cell hash and a NaN.
+    #[test]
+    fn granulation_probe_accepts_f32_noise_and_rejects_pattern_errors() {
+        let cases = granulation_probe_inputs();
+        let exact: Vec<GranProbeOut> = cases.iter().map(gran_probe_expected).collect();
+        let (pass, detail) = gran_probe_verdict(&cases, &exact);
+        assert!(pass, "{detail}");
+        // Every point moved by `delta` [rad] along a random tangent direction.
+        let moved = |delta: f64, seed: u64| -> Vec<GranProbeOut> {
+            let mut state = seed;
+            cases
+                .iter()
+                .map(|&(p, cell, radius, t)| {
+                    state = splitmix64(state);
+                    let angle = (state >> 11) as f64 / (1_u64 << 53) as f64 * std::f64::consts::TAU;
+                    let p64 = p.as_dvec3().normalize();
+                    let e1 = p64.any_orthonormal_vector();
+                    let e2 = p64.cross(e1);
+                    let u = e1 * angle.cos() + e2 * angle.sin();
+                    let q = (p64 + u * delta).normalize().as_vec3();
+                    gran_probe_expected(&(q, cell, radius, t))
+                })
+                .collect()
+        };
+        let flat_rejects = |out: &[GranProbeOut]| {
+            out.iter()
+                .zip(&exact)
+                .filter(|(o, e)| !((o.value - e.value).abs() <= GRAN_VALUE_TOLERANCE))
+                .count()
+        };
+        for seed in [1, 2, 3] {
+            let noisy = moved(3e-7, seed);
+            let (pass, detail) = gran_probe_verdict(&cases, &noisy);
+            eprintln!(
+                "3e-7 rad noise, seed {seed}: {detail}; the flat ±1e-4 rejects {}",
+                flat_rejects(&noisy)
+            );
+            assert!(pass, "{detail}");
+            assert!(flat_rejects(&noisy) > 0);
+        }
+        // The pattern displaced by 2e-5 rad (about 1 % of the Sun's cell).
+        let (pass, detail) = gran_probe_verdict(&cases, &moved(2e-5, 4));
+        eprintln!("2e-5 rad displacement: {detail}");
+        assert!(!pass, "{detail}");
+        // The contrast 0.17 instead of 0.18.
+        let scaled: Vec<GranProbeOut> = exact
+            .iter()
+            .map(|e| GranProbeOut {
+                value: 1.0 + (e.value - 1.0) * (0.17 / GRANULATION_RMS_550),
+                ..*e
+            })
+            .collect();
+        assert!(!gran_probe_verdict(&cases, &scaled).0);
+        // One wrong id, one wrong hash, one NaN, one answer missing.
+        let mut one_id = exact.clone();
+        one_id[100].ids[1] ^= 1;
+        assert!(!gran_probe_verdict(&cases, &one_id).0);
+        let mut one_hash = exact.clone();
+        one_hash[7].hash.x ^= 1;
+        assert!(!gran_probe_verdict(&cases, &one_hash).0);
+        let mut one_nan = exact.clone();
+        one_nan[200].value = f32::NAN;
+        assert!(!gran_probe_verdict(&cases, &one_nan).0);
+        assert!(!gran_probe_verdict(&cases, &exact[1..]).0);
+    }
+
+    /// The refactored twins agree with the pattern's definition: the nearest ids are the
+    /// per-layer search's, and the value is unchanged by sharing `gran_layers`.
+    #[test]
+    fn granulation_nearest_ids_match_the_layer_search() {
+        let (cell, radius) = (GRANULE_CELL_SUN_M as f32, R_SUN_M as f32);
+        let n = gran_cells(cell, radius);
+        let mut state = 9_u64;
+        for k in 0..256 {
+            let p = sphere_point(&mut state);
+            let t = 37.0 * k as f32;
+            let phase0 = t / GRAN_PERIOD_S;
+            let ids = granulation_nearest_ids(p, cell, radius, t);
+            assert_eq!(ids[0], gran_nearest(p, n, gran_salt(phase0, 0)).0.id1);
+            assert_eq!(ids[1], gran_nearest(p, n, gran_salt(phase0 + 0.5, 1)).0.id1);
+            let w0 = gran_weight(phase0);
+            let w1 = gran_weight(phase0 + 0.5);
+            let v = |layer: u32| {
+                let salt = gran_salt(phase0 + 0.5 * layer as f32, layer);
+                (gran_layer(p, n, salt) - GRAN_MEAN) / GRAN_SIGMA
+            };
+            let expected =
+                1.0 + GRANULATION_RMS_550 * (w0 * v(0) + w1 * v(1)) / (w0 * w0 + w1 * w1).sqrt();
+            assert_eq!(granulation(p, cell, radius, t), expected);
         }
     }
 }

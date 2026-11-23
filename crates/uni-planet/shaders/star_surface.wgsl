@@ -8,7 +8,8 @@
 //
 // CPU twins (crates/uni-planet/src/star_surface.rs): `limb_darkening`, `granulation`,
 // `granulation_fade`. Keep the order of operations identical; `universe --selftest` compares
-// limb_darkening (64 μ) and granulation (256 points, the lattice hash bit for bit) on the GPU.
+// limb_darkening (64 μ) and granulation (256 points: the lattice hash and each layer's nearest
+// granule bit for bit, the value within a tolerance scaled by the pattern's slope) on the GPU.
 
 #import "common/camera.wgsl"
 #import "common/hash.wgsl"
@@ -165,18 +166,19 @@ fn gran_weight(phase: f32) -> f32 {
     return 1.0 - abs(2.0 * (phase - floor(phase)) - 1.0);
 }
 
-// Multiplicative granulation intensity at 550 nm, mean 1 (twin of uni_planet::granulation).
-fn granulation(p_unit: vec3<f32>, cell_m: f32, radius_m: f32, t_s: f32) -> f32 {
-    if (!(dot(p_unit, p_unit) > 0.0)) {
-        return 1.0;
-    }
-    let p = normalize(p_unit);
+struct GranLayers {
+    l0: Nearest,
+    l1: Nearest,
+}
+
+// Both layers' two nearest granules at the unit vector p at t_s (layer 1 half a period later):
+// one loop over the 3 × 3 cells around p's (twin of uni_planet's gran_layers).
+fn gran_layers(p: vec3<f32>, cell_m: f32, radius_m: f32, t_s: f32) -> GranLayers {
     let n = gran_cells(cell_m, radius_m);
     let nf = f32(n);
     let phase0 = t_s / GRAN_PERIOD_S;
-    let phase1 = phase0 + 0.5;
     let salt0 = gran_salt(phase0, 0u);
-    let salt1 = gran_salt(phase1, 1u);
+    let salt1 = gran_salt(phase0 + 0.5, 1u);
     let cc = gran_cube(p);
     let q = (atan(cc.st) * FRAC_4_PI + 1.0) * 0.5 * nf;
     let base = clamp(vec2<i32>(floor(q)), vec2<i32>(0), vec2<i32>(n - 1));
@@ -193,11 +195,30 @@ fn granulation(p_unit: vec3<f32>, cell_m: f32, radius_m: f32, t_s: f32) -> f32 {
             near1 = gran_consider(near1, id, length(p - f1.xyz) * to_cells, f1.w);
         }
     }
-    let v0 = (gran_intensity(near0) - GRAN_MEAN) / GRAN_SIGMA;
-    let v1 = (gran_intensity(near1) - GRAN_MEAN) / GRAN_SIGMA;
+    return GranLayers(near0, near1);
+}
+
+// Multiplicative granulation intensity at 550 nm, mean 1 (twin of uni_planet::granulation).
+fn granulation(p_unit: vec3<f32>, cell_m: f32, radius_m: f32, t_s: f32) -> f32 {
+    if (!(dot(p_unit, p_unit) > 0.0)) {
+        return 1.0;
+    }
+    let p = normalize(p_unit);
+    let near = gran_layers(p, cell_m, radius_m, t_s);
+    let phase0 = t_s / GRAN_PERIOD_S;
+    let phase1 = phase0 + 0.5;
+    let v0 = (gran_intensity(near.l0) - GRAN_MEAN) / GRAN_SIGMA;
+    let v1 = (gran_intensity(near.l1) - GRAN_MEAN) / GRAN_SIGMA;
     let w0 = gran_weight(phase0);
     let w1 = gran_weight(phase1);
     return 1.0 + GRAN_RMS_550 * (w0 * v0 + w1 * v1) / sqrt(w0 * w0 + w1 * w1);
+}
+
+// The packed lattice id of each layer's nearest granule at p at t_s (the probe's bit-identical
+// check; twin of uni_planet's granulation_nearest_ids).
+fn granulation_nearest_ids(p_unit: vec3<f32>, cell_m: f32, radius_m: f32, t_s: f32) -> vec2<u32> {
+    let near = gran_layers(normalize(p_unit), cell_m, radius_m, t_s);
+    return vec2<u32>(near.l0.id1, near.l1.id1);
 }
 
 // The lattice hash of p's own cell for layer 0 at t_s (the probe's bit-identical check).

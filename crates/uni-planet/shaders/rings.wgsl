@@ -148,6 +148,8 @@ struct RingFsOut {
 
 // Normal opacities at or above this are treated as this (τ ≤ 9.2), so τ stays finite.
 const RING_ALPHA_MAX: f32 = 0.9999;
+// Profile opacities at or below this are not drawn.
+const RING_ALPHA_DRAWN_MIN: f32 = 1e-5;
 
 @fragment
 fn fs_main(in: RingVsOut) -> RingFsOut {
@@ -157,7 +159,7 @@ fn fs_main(in: RingVsOut) -> RingFsOut {
     // Sampled before any branch (implicit derivatives pick the mip, so the fine structure is
     // averaged, not aliased, when a pixel spans many samples).
     let tex = textureSample(ring_profile, ring_sampler, vec2<f32>(u, 0.5));
-    if (u < 0.0 || u > 1.0 || tex.a <= 1e-5) {
+    if (u < 0.0 || u > 1.0 || tex.a <= RING_ALPHA_DRAWN_MIN) {
         discard;
     }
     let alpha_n = min(tex.a, RING_ALPHA_MAX);
@@ -175,10 +177,13 @@ fn fs_main(in: RingVsOut) -> RingFsOut {
     let mu = max(abs(vn), RING_MU_MIN);
     // The sunlight travels along −s and leaves toward v.
     let phase = ring_phase(-dot(s, v), lit);
+    // The single-scattering layer factor stands where the brief has the opacity factors α (lit
+    // face) and α(1 − α) (unlit face): it depends on the Sun's and the camera's elevations, so
+    // the rings darken at equinox and the opaque B ring is dark on its unlit face (rings.rs).
     let layer = ring_layer_factor(tau, mu0, mu, lit);
     let p_unit = vec3<f32>(in.plane * ring.radii.xy, 0.0);
     let shadow = planet_shadow_on_ring(p_unit, ring.sun_scaled.xyz, ring.sun_scaled.w);
-    // L = (E/π) · ρ · P · layer [cd/m²]: I/F = ρ·P·layer.
+    // L = (E/π) · ρ · P · layer [cd/m²]: I/F = ρ·P·layer (CPU twin: uni_planet::rings::ring_i_over_f).
     let radiance = ring.sun.w * shadow / PI * ring.sun_color.rgb * rho * phase * layer;
     // Opacity along the view ray (slant path τ/μ).
     let alpha_view = 1.0 - exp(-tau / mu);

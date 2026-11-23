@@ -22,8 +22,12 @@
 //! report): it equals the brief's ρ·P for an opaque ring seen from the Sun's direction, makes
 //! both faces go dark when the Sun is in the ring plane (equinox; the brief's form would keep
 //! them fully lit), keeps the opaque B ring dark on its unlit face while the C ring, the Cassini
-//! division and the A ring glow there, and brightens thin rings seen at a slant. The B2 report
-//! compares the two at the plan's Saturn bookmarks.
+//! division and the A ring glow there, and brightens thin rings seen at a slant. The test
+//! `ring_photometry_with_the_real_profile` compares the two with the committed profile at the
+//! plan's Saturn bookmarks: the B ring's lit face at `saturn-ring-plane` is I/F 0.48 here (0.32 in
+//! the brief's form); the unlit face at `saturn-night-side` is 0.004–0.032 here (0.027–0.063),
+//! both far below the 0.35 the plan's exposure table assumed. [`ring_i_over_f`] is the CPU twin
+//! for re-deriving those exposure rows.
 //!
 //! Approximations (labelled by the card note): the texture's colour is not a measured
 //! reflectance; one phase function for every ring; no multiple scattering, Saturnshine, moon
@@ -62,6 +66,13 @@ const UNLIT_G: f32 = 0.6;
 
 /// Cosines below this are treated as this, so 1/μ stays finite. Twin of `RING_MU_MIN`.
 const MU_MIN: f32 = 1e-6;
+
+/// Normal opacities at or above this are treated as this (τ ≤ 9.21), so τ stays finite. Twin of
+/// `RING_ALPHA_MAX`.
+const ALPHA_MAX: f32 = 0.9999;
+
+/// Profile opacities at or below this are not drawn (the pass discards them).
+const ALPHA_DRAWN_MIN: f32 = 1e-5;
 
 /// The Sun's angular radius [rad] at Saturn's mean distance, used by the public
 /// [`planet_shadow_on_ring`] (which has no Sun distance): R☉ / a♄ with R☉ = 6.957e8 m (IAU 2015
@@ -449,6 +460,30 @@ pub fn ring_layer_factor(tau: f32, mu0: f32, mu: f32, lit_face: bool) -> f32 {
         return 2.0 * (tau / mu) * e1;
     }
     2.0 * mu0 / (mu0 - mu) * (e0 - e1)
+}
+
+/// The rings' I/F (radiance over E/π, before the planet's shadow): ρ·P(θ)·A(τ, μ₀, μ), with τ =
+/// −ln(1 − α) from the profile's normal opacity `alpha` (clamped to 0.9999; 0 at or below 1e-5,
+/// which the pass discards), `cos_scatter` the scattering-angle cosine (−1 = backscatter, i.e.
+/// −cos of the phase angle), `mu0` and `mu` the Sun's and the camera's |cosines| from the ring
+/// normal, `lit_face` whether the camera is on the Sun's side. The CPU twin of the composition in
+/// `rings.wgsl`'s `fs_main` (per channel there; `rho` here is one channel or a luminance), for
+/// re-deriving the Saturn bookmarks' exposure (review I2: with the committed profile the unlit
+/// face at `saturn-night-side` is 0.003–0.04 of E/π, not the plan's 0.35; see
+/// `ring_photometry_with_the_real_profile`).
+pub fn ring_i_over_f(
+    rho: f32,
+    alpha: f32,
+    mu0: f32,
+    mu: f32,
+    cos_scatter: f32,
+    lit_face: bool,
+) -> f32 {
+    if !(alpha > ALPHA_DRAWN_MIN) {
+        return 0.0;
+    }
+    let tau = -(1.0 - alpha.min(ALPHA_MAX)).ln();
+    rho * ring_phase(cos_scatter, lit_face) * ring_layer_factor(tau, mu0, mu.max(MU_MIN), lit_face)
 }
 
 /// The f32 core of [`planet_shadow_on_ring`], twin of `planet_shadow_on_ring` in `rings.wgsl`:
@@ -991,6 +1026,110 @@ mod tests {
         assert_eq!(scalar("RING_LIT_G2"), f64::from(LIT_G2));
         assert_eq!(scalar("RING_UNLIT_G"), f64::from(UNLIT_G));
         assert_eq!(scalar("RING_MU_MIN"), f64::from(MU_MIN));
+        assert_eq!(scalar("RING_ALPHA_MAX"), f64::from(ALPHA_MAX));
+        assert_eq!(scalar("RING_ALPHA_DRAWN_MIN"), f64::from(ALPHA_DRAWN_MIN));
+    }
+
+    /// Review I2: the single-scattering layer (as built) against the brief's opacity factors,
+    /// with the committed profile, at the plan's two ring bookmarks and at equinox. Prints the
+    /// per-region I/F that B6/B9 need to re-derive the `saturn-*` exposure rows.
+    #[test]
+    fn ring_photometry_with_the_real_profile() {
+        let path = uni_data::data_dir().join("baked/saturn_rings.ron");
+        let profile = uni_data::load_ring_profile(&path).expect("the committed saturn_rings.ron");
+        // Region radii [km]: NASA NSSDCA Saturnian Rings Fact Sheet.
+        let regions = [
+            ("C ring", 74_500.0, 92_000.0),
+            ("B ring", 92_000.0, 117_580.0),
+            ("Cassini division", 117_580.0, 122_170.0),
+            ("A ring", 122_170.0, 136_775.0),
+        ];
+        // Rec. 709 luminance of the profile's linear colour (the sunlight's colour has luminance 1).
+        let lum = |s: &[f32; 4]| 0.2126 * s[0] + 0.7152 * s[1] + 0.0722 * s[2];
+        // The brief's form: lit ρ·α·P, unlit ρ·α(1 − α)·HG(+0.6), with no elevation dependence.
+        let brief = |s: &[f32; 4], cos_scatter: f32, lit: bool| {
+            let a = s[3];
+            lum(s) * ring_phase(cos_scatter, lit) * if lit { a } else { a * (1.0 - a) }
+        };
+        // The plan's bookmark table (M1 plan, "M1 capture bookmarks", rows 8 and 10): the Sun
+        // 8.5° south of the ring plane on 2026-11-20 (B′); `saturn-ring-plane` 4° above the lit
+        // face at phase < 10° (scattering angle 175°); `saturn-night-side` 25° above the unlit
+        // face at phase 150° (scattering angle 30°); equinox: the Sun 0.06° from the plane.
+        let mu0 = 8.5_f32.to_radians().sin();
+        let mu_plane = 4.0_f32.to_radians().sin();
+        let mu_night = 25.0_f32.to_radians().sin();
+        let back = 175.0_f32.to_radians().cos();
+        let fwd = 30.0_f32.to_radians().cos();
+        let n = profile.samples.len();
+        let dr_km = (profile.outer_m - profile.inner_m) / 1e3 / n as f64;
+        // Per region, the mean over its samples of: α, ρ (luminance), and I/F at ring-plane
+        // (layer, brief), night side (layer, brief), equinox (layer).
+        let mut rows = Vec::new();
+        for (name, r0, r1) in regions {
+            let mut sum = [0.0_f64; 7];
+            let mut count = 0.0;
+            for (i, s) in profile.samples.iter().enumerate() {
+                let r = profile.inner_m / 1e3 + (i as f64 + 0.5) * dr_km;
+                if !(r0..r1).contains(&r) {
+                    continue;
+                }
+                let drawn = s[3] > ALPHA_DRAWN_MIN;
+                let values = [
+                    s[3],
+                    lum(s),
+                    ring_i_over_f(lum(s), s[3], mu0, mu_plane, back, true),
+                    if drawn { brief(s, back, true) } else { 0.0 },
+                    ring_i_over_f(lum(s), s[3], mu0, mu_night, fwd, false),
+                    if drawn { brief(s, fwd, false) } else { 0.0 },
+                    ring_i_over_f(lum(s), s[3], 1e-3, mu_plane, back, true),
+                ];
+                for (acc, v) in sum.iter_mut().zip(values) {
+                    *acc += f64::from(v);
+                }
+                count += 1.0;
+            }
+            assert!(count >= 10.0, "{name}: {count} samples");
+            let mean = sum.map(|v| v / count);
+            eprintln!(
+                "{name:>16}: α {:.3}, ρ {:.3} | ring-plane I/F layer {:.4}, brief {:.4} | \
+                 night-side I/F layer {:.4}, brief {:.4} | equinox lit layer {:.5}",
+                mean[0], mean[1], mean[2], mean[3], mean[4], mean[5], mean[6]
+            );
+            rows.push(mean);
+        }
+        let [c, b, cd, a] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+        // The plan's night-side premise ("unlit face ≈ 0.35 of E/π") holds under neither form.
+        for row in &rows {
+            assert!(row[4] < 0.1 && row[5] < 0.1, "{row:?}");
+        }
+        // The layer keeps the opaque B ring dark on its unlit face, below every other region;
+        // the brief's α(1 − α) makes it brighter than the C ring there.
+        assert!(b[4] < 0.25 * c[4].min(cd[4]) && b[4] < a[4], "{b:?}");
+        assert!(b[5] > c[5], "{b:?} {c:?}");
+        // Lit face at saturn-ring-plane: the B ring is the brightest region, and B9's HDR check
+        // `ring_cassini / ring_b ≤ 0.5` holds on the region means.
+        assert!(b[2] > a[2] && a[2] > cd[2] && a[2] > c[2]);
+        assert!(cd[2] / b[2] <= 0.5, "{}", cd[2] / b[2]);
+        // Equinox: the layer darkens the B ring's lit face ~48× (the brief's form would not
+        // change at all, b[3]); the C ring, ~48× too.
+        assert!(b[6] < 0.03 * b[2] && c[6] < 0.03 * c[2], "{b:?} {c:?}");
+    }
+
+    #[test]
+    fn ring_i_over_f_composes_the_pass() {
+        // An opaque ring seen from the Sun's direction reflects ρ·P (the brief's form at α = 1).
+        let p = ring_phase(-1.0, true);
+        assert!((ring_i_over_f(0.4, 1.0, 0.3, 0.3, -1.0, true) - 0.4 * p).abs() < 1e-5);
+        // α is clamped as in the pass, and what the pass discards is 0.
+        let tau_max = -(1.0 - ALPHA_MAX).ln();
+        assert_eq!(
+            ring_i_over_f(0.4, 1.0, 0.2, 0.5, 0.3, false),
+            0.4 * ring_phase(0.3, false) * ring_layer_factor(tau_max, 0.2, 0.5, false)
+        );
+        assert_eq!(ring_i_over_f(0.4, 1e-5, 0.2, 0.5, 0.3, true), 0.0);
+        assert_eq!(ring_i_over_f(0.4, f32::NAN, 0.2, 0.5, 0.3, true), 0.0);
+        // The camera in the ring plane does not divide by zero.
+        assert!(ring_i_over_f(0.4, 0.5, 0.2, 0.0, 0.3, true).is_finite());
     }
 
     /// The probe inputs exercise every regime on the CPU: umbra, partial penumbra, sunlight.
