@@ -6,10 +6,14 @@
 // ground-irradiance LUTs (Hillaire 2020, CGF 39(4); Bruneton 2017's (r, mu) parameterisation).
 // CPU twin of both functions: `uni_atmo::ground::ground_lighting`.
 //
-// r_m for a point on a body is the atmosphere's bottom radius (atmo_ground.radii.x) plus the
-// point's height above the body's reference surface: the atmosphere follows the body's
-// ellipsoid, so every point on the ground passes the bottom radius. mu_s is the cosine of the
-// Sun's zenith angle about the surface normal.
+// r_m is the point's radius in the atmosphere's frame (uni_atmo::feature::atmosphere_frame:
+// body-fixed axes scaled so the reference ellipsoid becomes the bottom sphere), i.e. the bottom
+// radius (atmo_ground.radii.x) plus the point's height above the body's reference ellipsoid:
+// the atmosphere follows the ellipsoid, so a point on the ground passes radii.x at every
+// latitude (M1 has no terrain). mu_s is the cosine of the Sun's zenith angle about the surface
+// normal. B0's stub read "radius r_m"; this reading is B3's and needs the lead's ruling (B3
+// review I2). If a caller passes length(p_body) instead, Earth's equatorial ground is lit as if
+// 7.1 km up (Mars's 6.7 km): sunsets come out too pale and skylight too weak.
 //
 // The pure helpers below (no bindings) are shared with atmo/atmosphere_common.wgsl, which also
 // reuses this file's transmittance-LUT and sampler bindings for the view march.

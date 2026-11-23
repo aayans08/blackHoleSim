@@ -215,4 +215,8 @@ it adapts any of Hillaire's sample code (MIT): then the MIT notice goes here (M1
 - The LUT parameterisations and the optical-depth quadrature follow the formulas of Eric Bruneton, "Precomputed
   Atmospheric Scattering: a New Implementation" (2017, [ebruneton/precomputed_atmospheric_scattering](https://github.com/ebruneton/precomputed_atmospheric_scattering),
   BSD-3-Clause), reimplemented from its documentation; no code copied.
+- The test-only Mie routine that re-derives the Mars dust and Venus haze coefficients
+  (`crates/uni-atmo/src/params.rs`) implements the BHMIE algorithm of C. F. Bohren and D. R. Huffman, "Absorption
+  and Scattering of Light by Small Particles" (Wiley, 1983), Appendix A, from its published equations; no code
+  copied.
 <!-- /B3 -->

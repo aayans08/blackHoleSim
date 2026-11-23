@@ -13,12 +13,15 @@
 //! (3.0 ms): `g` from the LUT ratio, fewer steps, half resolution.
 //!
 //! **The shell follows the body's ellipsoid.** Each draw maps root axes into the body-fixed frame
-//! (`AtmoDraw::orient`) and scales it by R/(a, b, c), so the body's reference ellipsoid (WGCCRE
-//! 2015 radii, [`body_shape_m`]) becomes the sphere of its mean radius R, which is the
-//! atmosphere's bottom (Venus: R plus the cloud-top height). Heights are then measured from the
-//! real ground at every latitude (Earth's ground is 21 km closer to the centre at the poles
-//! than at the equator; a sphere would make the polar sky 2.75× too thick). Distances along a
-//! ray stay true; angles are distorted by at most the flattening (0.6 % for Mars).
+//! (`AtmoDraw::orient`) and scales it by R/(a, b, c) ([`atmosphere_frame`]), so the body's
+//! reference ellipsoid (WGCCRE 2015 radii, [`body_shape_m`]) becomes the sphere of its mean
+//! radius R, which is the atmosphere's bottom (Venus: R plus the cloud-top height). Heights are
+//! then measured from the real ground at every latitude. Earth's ground is 21.4 km closer to the
+//! centre at the poles than at the equator: with a sphere of radius 6 371 km the polar ground
+//! would lie 14.2 km below the bottom (its lowest 14 km of air missing) and the equatorial ground
+//! 7.1 km above it. Distances along a ray stay true; angles are distorted by at most the
+//! flattening (0.6 % for Mars). The camera-height helpers ([`AtmoDraw::camera_in_daylight`],
+//! [`AtmoDraw::scintillation_strength`]) use the same frame (review I1).
 
 use glam::{DMat3, DQuat, DVec3, Mat4, Vec3};
 use uni_gfx::{
@@ -48,6 +51,33 @@ pub struct AtmoDraw {
     pub sun_rel_m: DVec3,
     /// Solar illuminance at the body [lx].
     pub sun_illuminance_lux: f64,
+}
+
+impl AtmoDraw {
+    /// Camera − body centre in the atmosphere's frame [m] ([`atmosphere_frame`]). Its length
+    /// minus the preset's bottom radius is the camera's height above the body's reference
+    /// ellipsoid (to the flattening: ×R/a on the equator, ×R/c at the poles).
+    pub fn camera_in_atmosphere_frame(&self) -> DVec3 {
+        atmosphere_frame(self.naif, self.orient) * -self.rel_pos_m
+    }
+
+    /// [`crate::camera_in_daylight`] for this draw's camera (review I1): inside the shell that
+    /// follows the ellipsoid, with the Sun, seen from the camera, above the horizon plane of the
+    /// atmosphere's frame (on the ground, the ellipsoid's tangent plane). B9 sets
+    /// `uni_post::ExposureSettings::daylight` from it.
+    pub fn camera_in_daylight(&self, params: &AtmosphereParams) -> bool {
+        let m = atmosphere_frame(self.naif, self.orient);
+        // Sun − camera = (Sun − body) + (body − camera).
+        let to_sun = m * (self.sun_rel_m + self.rel_pos_m);
+        crate::camera_in_daylight(params, m * -self.rel_pos_m, to_sun.normalize_or_zero())
+    }
+
+    /// [`crate::scintillation_strength`] for this draw's camera (review I1): the height is
+    /// measured from the reference ellipsoid, so the strength at sea level is the same at every
+    /// latitude. B9 copies it into `uni_sky::StarInput::scintillation`.
+    pub fn scintillation_strength(&self, params: &AtmosphereParams) -> f32 {
+        crate::scintillation_strength(params, self.camera_in_atmosphere_frame())
+    }
 }
 
 /// Most atmospheres drawn per frame (M1 has four); extra draws are skipped.
@@ -247,8 +277,16 @@ pub fn segment_radiance(
     (m.inscatter.as_vec3(), m.transmittance.as_vec3())
 }
 
-/// The root → scaled-body-frame matrix of a body: R/(a, b, c) × (body-fixed ← ICRS), R = (abc)^⅓.
-fn to_body_frame(naif: i32, orient: DQuat) -> DMat3 {
+/// The atmosphere's frame of body `naif` with body-fixed → ICRS rotation `orient`: the matrix
+/// R/(a, b, c) × (body-fixed ← ICRS), R = (abc)^⅓, from root (ICRS) axes to the body-fixed
+/// axes scaled so the WGCCRE reference ellipsoid ([`body_shape_m`]) becomes the sphere of radius
+/// R. R equals the preset's bottom radius to within 1 m for Earth, 11 m for Mars and 70 m for
+/// Titan. Venus is a sphere, so only the rotation applies and its bottom stays at the cloud
+/// tops. Positions relative to the
+/// body centre and directions mapped by it are what the march, the LUT twins,
+/// [`crate::camera_in_daylight`] and [`crate::scintillation_strength`] take. Bodies without a
+/// [`body_shape_m`] get the rotation only.
+pub fn atmosphere_frame(naif: i32, orient: DQuat) -> DMat3 {
     let to_fixed = DMat3::from_quat(orient.normalize()).transpose();
     match body_shape_m(naif) {
         Some(abc) => {
@@ -302,7 +340,7 @@ pub(crate) fn draw_uniform(
     if !finite || sun_dir == DVec3::ZERO {
         return None;
     }
-    let m = to_body_frame(draw.naif, draw.orient);
+    let m = atmosphere_frame(draw.naif, draw.orient);
     let origin = camera_origin(params, m * -draw.rel_pos_m)?;
     let sun = (m * sun_dir).normalize();
     let height = origin.length() - params.bottom_radius_m;
@@ -1032,34 +1070,20 @@ mod tests {
     /// sphere gives 2A/3).
     #[test]
     fn earth_disk_albedo_w_b1() {
-        let p = earth();
-        let (r, top) = (p.bottom_radius_m, p.top_radius_m);
-        let ground = 0.302;
-        let n = 200;
-        let mut sum = 0.0;
-        for k in 0..n {
-            // Denser toward the limb: b = top·sin(π/2·s).
-            let s = |k: usize| top * (k as f64 / n as f64 * std::f64::consts::FRAC_PI_2).sin();
-            let (b0, b1) = (s(k), s(k + 1));
-            let b = 0.5 * (b0 + b1);
-            let (l, t) = segment_radiance(
-                &p,
-                DVec3::new(1e9, 0.0, b),
-                -DVec3::X,
-                f64::INFINITY,
-                DVec3::X,
-            );
-            let mut radiance = f64::from(l.y);
-            if b < r {
-                let mu = (1.0 - (b / r).powi(2)).sqrt();
-                let (t_sun, sky) = crate::ground::ground_lighting(Some(&p), r, mu);
-                radiance += f64::from(t.y) * ground / std::f64::consts::PI
-                    * (f64::from(t_sun.y) * mu + f64::from(sky.y));
-            }
-            sum += radiance * b * (b1 - b0);
-        }
-        let albedo = sum * std::f64::consts::TAU / (r * r);
+        let albedo = disk_albedo(&earth(), Vec3::splat(0.302), 200).y;
         assert!((0.20..=0.22).contains(&albedo), "p_550 = {albedo}");
+    }
+
+    /// Review I3: Titan's haze albedo in green and blue is fitted to the disk photometry (see
+    /// `params::titan`). At phase 0 over a 0.15 ground the disk has p_V 0.22 (NSSDCA) and
+    /// Harris 1961's p_B/p_V = 0.12/0.21. Red uses DISR's measured albedo, not fitted, and lands
+    /// near Younkin 1974's 0.325 (rescaled to 2 575 km) and Harris's broad-band R of 0.32.
+    #[test]
+    fn titan_disk_matches_its_photometry() {
+        let p = disk_albedo(&titan(), Vec3::splat(0.15), 300);
+        assert!((p.y - 0.22).abs() < 0.005, "{p}");
+        assert!((p.z - 0.22 * 0.12 / 0.21).abs() < 0.005, "{p}");
+        assert!((0.30..0.37).contains(&p.x), "{p}");
     }
 
     /// The screen rectangle contains the projection of every point of the sphere and touches
@@ -1108,7 +1132,7 @@ mod tests {
     fn draw_uniform_follows_the_ellipsoid() {
         let p = earth();
         let orient = DQuat::from_rotation_x(0.4) * DQuat::from_rotation_z(1.1);
-        let m = to_body_frame(399, orient);
+        let m = atmosphere_frame(399, orient);
         let abc = body_shape_m(399).unwrap();
         for fixed in [
             DVec3::new(0.0, 0.0, abc.z),
@@ -1175,6 +1199,58 @@ mod tests {
             .is_none()
         );
         assert!(draw_uniform(&p, &draw(DVec3::NAN), Mat4::IDENTITY, proj).is_none());
+    }
+
+    /// Review I1: [`AtmoDraw::camera_in_daylight`] and [`AtmoDraw::scintillation_strength`]
+    /// measure height from the reference ellipsoid, as the shell does. At sea level on the
+    /// equator (two longitudes) and at the pole of Earth and Mars the strength is the ground
+    /// value (with a sphere, Earth's equator gave exp(−7.1/8) ≈ 0.41 of it); with the Sun
+    /// overhead it is daylight 1 km below the shell's top at every latitude and not 1 km above
+    /// it; with the Sun 5° below the local horizon it is not daylight.
+    #[test]
+    fn daylight_and_scintillation_follow_the_ellipsoid() {
+        let orient = DQuat::from_rotation_x(0.4) * DQuat::from_rotation_z(1.1);
+        for (naif, p) in [(399, earth()), (499, mars())] {
+            let abc = body_shape_m(naif).unwrap();
+            let ground = crate::scintillation_strength(&p, DVec3::new(0.0, 0.0, p.bottom_radius_m));
+            let thick = p.top_radius_m - p.bottom_radius_m;
+            for (up, along) in [
+                (DVec3::X, DVec3::Y),
+                (DVec3::Y, DVec3::Z),
+                (DVec3::Z, DVec3::X),
+            ] {
+                // Body-fixed: the ground point on this axis, `h` above it, the Sun 1 au away
+                // at elevation `elev` toward `along`.
+                let at = |h: f64, elev_deg: f64| {
+                    let cam = up * abc + up * h;
+                    let e = elev_deg.to_radians();
+                    let sun = cam + (up * e.sin() + along * e.cos()) * 1.496e11;
+                    AtmoDraw {
+                        naif,
+                        rel_pos_m: orient * -cam,
+                        orient,
+                        sun_rel_m: orient * sun,
+                        sun_illuminance_lux: 1.0,
+                    }
+                };
+                let s = at(1.0, 90.0).scintillation_strength(&p);
+                assert!(
+                    (s - ground).abs() <= 3e-3 * ground,
+                    "NAIF {naif} {up}: {s} against the ground value {ground}"
+                );
+                assert!(at(1.0, 30.0).camera_in_daylight(&p), "NAIF {naif} {up}");
+                assert!(!at(1.0, -5.0).camera_in_daylight(&p), "NAIF {naif} {up}");
+                assert!(
+                    at(thick - 1e3, 90.0).camera_in_daylight(&p),
+                    "NAIF {naif} {up}"
+                );
+                assert!(
+                    !at(thick + 1e3, 90.0).camera_in_daylight(&p),
+                    "NAIF {naif} {up}"
+                );
+                assert_eq!(at(thick + 1e3, 90.0).scintillation_strength(&p), 0.0);
+            }
+        }
     }
 
     /// Geometric albedo at phase 0 per channel over a Lambert ground (see
@@ -1370,6 +1446,45 @@ mod tests {
                 s(5e3),
                 s(30e3)
             );
+        }
+        // Review I1: sea level on the equator and at the pole, through AtmoDraw (ellipsoid)
+        // and, for comparison, the plain root-axes vector (sphere).
+        for (naif, p) in [(399, earth()), (499, mars())] {
+            let abc = body_shape_m(naif).unwrap();
+            for (where_, cam) in [
+                ("equator", DVec3::new(abc.x, 0.0, 0.0)),
+                ("pole", DVec3::new(0.0, 0.0, abc.z)),
+            ] {
+                let draw = AtmoDraw {
+                    naif,
+                    rel_pos_m: -cam,
+                    orient: DQuat::IDENTITY,
+                    sun_rel_m: DVec3::new(0.0, 0.0, 1.5e11),
+                    sun_illuminance_lux: 1.0,
+                };
+                println!(
+                    "scintillation NAIF {naif} sea level, {where_}: ellipsoid {:.3}, sphere {:.3}",
+                    draw.scintillation_strength(&p),
+                    crate::scintillation_strength(&p, cam)
+                );
+            }
+        }
+        // Review I2: ground lighting at the bottom (B3's r_m) against B1's length(p_body) on the
+        // equator, bottom + (a − bottom).
+        for (name, p, a) in [
+            ("Earth", earth(), body_shape_m(399).unwrap().x),
+            ("Mars", mars(), body_shape_m(499).unwrap().x),
+        ] {
+            let b = p.bottom_radius_m;
+            for mu_s in [1.0, 0.5, 0.1, 0.05, 0.02] {
+                let (t0, e0) = crate::ground::ground_lighting(Some(&p), b, mu_s);
+                let (t1, e1) = crate::ground::ground_lighting(Some(&p), a, mu_s);
+                println!(
+                    "ground lighting {name} equator mu_s {mu_s}: sun T {t0} (r_m bottom) vs {t1} \
+                     (r_m = |p| = bottom + {:.1} km); sky E/E0 {e0} vs {e1}",
+                    (a - b) / 1e3
+                );
+            }
         }
     }
 }

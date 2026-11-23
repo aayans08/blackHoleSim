@@ -7,18 +7,21 @@
 //!
 //! Every preset coefficient names its source below. Where a source could not be read in full
 //! (Wolff et al. 2009's tables, Tomasko et al. 2008's tables), the comment says exactly which
-//! numbers were checked, against what, and which are our own estimates; the task report lists
-//! them. Venus and Titan carry the card label "Atmosphere: simplified haze model
+//! numbers were checked, against what, and which were fitted; the task report lists them. The
+//! Mie-derived Mars and Venus coefficients are re-derived from their cited inputs by the test
+//! `mie_derivations_reproduce_the_presets` (Bohren & Huffman 1983's BHMIE, in this file's
+//! tests). Venus and Titan carry the card label "Atmosphere: simplified haze model
 //! (approximate)" (C4).
 //!
 //! Phase functions are Cornette–Shanks (Cornette & Shanks 1992, Applied Optics 31(16), 3152),
 //! evaluated per channel. As Bruneton 2017 and Hillaire 2020 do for Earth's aerosol (g = 0.8),
-//! Venus's and Titan's asymmetry parameters are used as the Cornette–Shanks g directly.
-//! Cornette–Shanks's own mean cosine is then a little larger, 3g(4 + g²)/(5(2 + g²)) (0.78 for
-//! g = 0.73; `phase_functions_normalised` checks the formula), and its forward peak
-//! correspondingly higher: it stands in, roughly, for the diffraction peak that neither
-//! Henyey–Greenstein nor Cornette–Shanks has. Mars's dust g is instead solved so that this mean
-//! cosine equals the Mie asymmetry (see [`mars`]).
+//! Venus's asymmetry parameters are used as the Cornette–Shanks g directly. Cornette–Shanks's
+//! own mean cosine is then a little larger, 3g(4 + g²)/(5(2 + g²)) (0.78 for g = 0.73;
+//! `phase_functions_normalised` checks the formula), and its forward peak correspondingly
+//! higher: it stands in, roughly, for the diffraction peak that neither Henyey–Greenstein nor
+//! Cornette–Shanks has. Mars's dust g and Titan's haze g are instead solved so that this mean
+//! cosine equals the asymmetry of the Mie computation (see [`mars`]) or of the measured phase
+//! function (see [`titan`]).
 
 use glam::{DVec3, Vec3};
 
@@ -133,8 +136,10 @@ pub fn earth() -> AtmosphereParams {
 /// - Single-scattering albedo (0.972, 0.846, 0.711) and Cornette–Shanks g (0.652, 0.711, 0.780)
 ///   at (680, 550, 440) nm (review I6), from our Mie computation (Bohren & Huffman 1983's
 ///   algorithm, checked against their reference case x = 5.213, m = 1.55: Q_ext 3.10543,
-///   g 0.63314) for spheres with Ehlers et al. 2014's dust refractive index (Applied Optics 53,
-///   1808, "Blue moons and Martian sunsets": n = 1.52, k = (0.001, 0.006, 0.013) at these
+///   g 0.63314; re-derived by the test `mie_derivations_reproduce_the_presets`, over Hansen &
+///   Travis 1974's gamma size distribution) for spheres with Ehlers et al. 2014's dust
+///   refractive index (Applied Optics 53, 1808, "Blue moons and Martian sunsets": n = 1.52,
+///   k = (0.001, 0.006, 0.013) at these
 ///   wavelengths, as tabulated by Schneegans et al. 2020, arXiv:2010.03534, Table 1) and
 ///   Wolff et al. 2009's size distribution (JGR 114, E00D04: r_eff 1.5 µm, v_eff 0.3, the v_eff
 ///   as quoted by Chen-Chen et al. 2019, arXiv:1905.01073). Mie gives the asymmetry ⟨cos Θ⟩
@@ -189,9 +194,11 @@ pub fn mars() -> AtmosphereParams {
 ///   ≈ gas scale height, 4.5 km), sulphuric-acid droplets with r_eff 0.25–0.29 µm and refractive
 ///   index 1.435–1.45 at 0.55 µm, so non-absorbing (single-scattering albedo 1). Per channel,
 ///   from our Mie computation (Bohren & Huffman 1983 algorithm, checked against their
-///   reference case) for a gamma distribution r_eff 0.27 µm, v_eff 0.1, n = 1.44: extinction
-///   relative to 630 nm (0.892, 1.188, 1.429) and asymmetry (0.716, 0.746, 0.760) at
-///   (680, 550, 440) nm, used as the Cornette–Shanks g (module docs).
+///   reference case) for a gamma distribution (Hansen & Travis 1974, Space Sci. Rev. 16, 527)
+///   with r_eff 0.27 µm, v_eff 0.1, n = 1.44: extinction relative to 630 nm
+///   (0.892, 1.188, 1.429) and asymmetry (0.716, 0.746, 0.760) at (680, 550, 440) nm, used as
+///   the Cornette–Shanks g (module docs). The test `mie_derivations_reproduce_the_presets`
+///   re-derives these numbers.
 /// - Ground albedo 0.76: the cloud deck's Bond albedo (Haus et al. 2016, Icarus 272, 178), grey.
 pub fn venus() -> AtmosphereParams {
     let bottom = 6_051_800.0 + VENUS_CLOUD_TOP_M;
@@ -229,18 +236,39 @@ pub fn venus() -> AtmosphereParams {
 ///   i.e. Earth's coefficients per molecule at Bruneton's sea-level 2.547 × 10²⁵ m⁻³; scale height
 ///   k_B T/(m g) = 20.6 km, which keeps the surface density and the column (≈ 11 × Earth's).
 /// - Main haze (the Mie slot): scale height 65 km above 80 km (Tomasko et al. 2008, PSS 56, 669,
-///   as quoted by Vincendon & Langevin 2010, arXiv:1103.3215), total optical depth 2.6 at
-///   1.08 µm (Tomasko et al. 2008, same quote) carried to the visible with the near-IR spectral
-///   exponent 2.2 (Vincendon & Langevin 2010; range 1.8–2.4): τ = (7.2, 11.5, 18.7). The haze
-///   absorbs blue (orange colour): single-scattering albedo (0.93, 0.87, 0.70) and asymmetry
-///   (0.60, 0.65, 0.70) are our estimates of Tomasko et al. 2008's wavelength dependence (their
-///   tables were not accessible to this task; the task report lists these as unchecked).
+///   as quoted by Vincendon & Langevin 2010, arXiv:1103.3215), applied here as one exponential
+///   from the ground (approximate: Tomasko et al. 2008 describe three altitude regions with
+///   different spectral slopes); total optical depth 2.6 at 1.08 µm (Tomasko et al. 2008, same
+///   quote) carried to the visible with the near-IR spectral exponent 2.2 (Vincendon & Langevin
+///   2010; range 1.8–2.4): τ = (7.2, 11.5, 18.7).
+/// - Haze asymmetry, the same in all three channels: Cornette–Shanks g 0.76, whose mean cosine
+///   (module docs) is 0.81. That is the mean cosine of the 3000-monomer fractal-aggregate phase
+///   function that Tomasko et al. 2008 fit to the Huygens DISR data, integrated from their figure
+///   "Phase function of aerosols for different numbers of monomers" as Tomasko presented it
+///   (CHARM telecon 2008-02-26, NASA PDS Atmospheres Node; the digitised curve integrates to 1.01
+///   of 4π). The figure gives no wavelength and their per-wavelength tables could not be read,
+///   so g is not resolved per channel (recorded in the B3 report).
+/// - Haze single-scattering albedo (0.935, 0.857, 0.731) at (680, 550, 440) nm:
+///   - Red is DISR's measured value at 680 nm above 144 km (Tomasko et al. 2008, read to ±0.005
+///     from their albedo figure as presented at CHARM).
+///   - Green and blue are fitted so this model's disk (ground 0.15) has, at phase 0, Titan's
+///     catalogue geometric albedo p_V 0.22 (NASA NSSDCA; the value the app's point flux uses)
+///     and Harris 1961's ratio p_B/p_V = 0.12/0.21 (as reviewed by Veverka 1974, "The Atmosphere
+///     of Titan", NASA SP-340, p. 46). The result, p = (0.337, 0.221, 0.125), is pinned by
+///     `titan_disk_matches_its_photometry`.
+///   - DISR's own green and blue values (0.90 and 0.84 above 144 km; 0.97 and 0.93 at 30–80 km)
+///     make this one-layer model's disk 0.25 mag too bright at 550 nm and 0.54 mag too bright
+///     at 440 nm. The model has no altitude structure, and its phase function is smoother than
+///     the aggregates'.
+///   - Red matches the photometry without a fit. Younkin 1974 (Icarus 21, 219; Table 3-2 of the
+///     SP-340 reprint) gives a narrow-band p(680 nm) of 0.368 at Dollfus's 2 421 km radius,
+///     which is 0.325 at 2 575 km. Harris's broad-band R is 0.32.
 /// - Detached haze layer (layer 2): centred at 500 km (Seignovert et al. 2017, arXiv:1704.00842:
 ///   500 ± 8 km in 2005–2007; West et al. 2011 saw it drop to 380 km by 2010), 40 km full width;
 ///   peak extinction 8.4 × 10⁻⁸ m⁻¹ at 338 nm (number density 2 × 10⁻² cm⁻³ × σ_ext 4.2 ×
-///   10⁻¹² m², Seignovert et al. 2017) carried to the visible with the same exponent 2.2;
-///   single-scattering albedo 0.69 at 338 nm there, taken as (0.90, 0.85, 0.75) in the visible
-///   (our estimate), asymmetry as the main haze.
+///   10⁻¹² m², Seignovert et al. 2017) carried to the visible with the same exponent 2.2. Its
+///   single-scattering albedo and g are the main haze's: it is the same material, and
+///   Seignovert et al. 2017's 0.69 at 338 nm continues the fitted albedo's fall toward the blue.
 /// - Ground albedo 0.15 (approximate; under τ ≈ 10 it barely matters).
 pub fn titan() -> AtmosphereParams {
     let bottom = 2_574_730.0;
@@ -257,10 +285,12 @@ pub fn titan() -> AtmosphereParams {
     let shell = 1.0 - (-(top - bottom) / haze_h).exp();
     let beta = |um: f64| (tau(um) / (haze_h * shell)) as f32;
     let haze_ext = Vec3::new(beta(0.68), beta(0.55), beta(0.44));
-    let haze_albedo = Vec3::new(0.93, 0.87, 0.70);
+    // DISR in red; fitted to the disk photometry in green and blue (see above).
+    let haze_albedo = Vec3::new(0.935, 0.857, 0.731);
     let dhl = |um: f64| (8.4e-8 * (0.338 / um).powf(2.2)) as f32;
     let dhl_ext = Vec3::new(dhl(0.68), dhl(0.55), dhl(0.44));
-    let asym = Vec3::new(0.60, 0.65, 0.70);
+    // Cornette–Shanks g with mean cosine 0.81 (Tomasko et al. 2008's aggregates).
+    let asym = Vec3::splat(0.76);
     AtmosphereParams {
         bottom_radius_m: bottom,
         top_radius_m: top,
@@ -270,7 +300,7 @@ pub fn titan() -> AtmosphereParams {
         mie_extinction: haze_ext,
         mie_scale_height_m: haze_h as f32,
         mie_g: asym,
-        layer2_scattering: dhl_ext * Vec3::new(0.90, 0.85, 0.75),
+        layer2_scattering: dhl_ext * haze_albedo,
         layer2_extinction: dhl_ext,
         layer2_center_m: 500_000.0,
         layer2_width_m: 40_000.0,
@@ -278,7 +308,8 @@ pub fn titan() -> AtmosphereParams {
         ground_albedo: Vec3::splat(0.15),
         source: "Titan: N2 Rayleigh (Fulchignoni et al. 2005) + haze H 65 km, tau(1.08 um) 2.6 \
                  (Tomasko et al. 2008) + detached layer at 500 km (Seignovert et al. 2017); \
-                 simplified haze model",
+                 haze albedo: DISR (Tomasko et al. 2008) in red, fitted to p_V 0.22 and Harris \
+                 1961's B/V in green and blue; simplified haze model",
     }
 }
 
@@ -348,8 +379,15 @@ impl AtmosphereParams {
 /// True when the camera is inside the shell (`|cam_rel_body_m|` below `top_radius_m`) and the
 /// Sun is above its local geometric horizon (`sun_dir`, a unit vector from the camera toward the
 /// Sun, has a positive component along the local up). The app sets
-/// `uni_post::ExposureSettings::daylight` from it (B6's rule; review m12). `cam_rel_body_m` is
-/// camera − body centre [m] in any axes `sun_dir` shares. Non-finite input gives `false`.
+/// `uni_post::ExposureSettings::daylight` from it (B6's rule; review m12). Non-finite input
+/// gives `false`.
+///
+/// `cam_rel_body_m` is camera − body centre [m] and `sun_dir` the Sun's direction, both in the
+/// atmosphere's frame ([`crate::feature::atmosphere_frame`]: body-fixed axes scaled so the
+/// reference ellipsoid is the bottom sphere), because the shell follows the ellipsoid (review
+/// I1). [`crate::AtmoDraw::camera_in_daylight`] does that mapping and is what the app calls. In
+/// plain root axes the test is exact only for a spherical body (Venus); on Earth's equator the
+/// top would sit 7 km low.
 pub fn camera_in_daylight(
     params: &AtmosphereParams,
     cam_rel_body_m: DVec3,
@@ -377,6 +415,12 @@ fn earth_sea_level_rayleigh_tau_550() -> f64 {
 /// centre [m]), in [0, 1]: 0 outside the shell. The app copies it into
 /// `uni_sky::StarInput::scintillation`, and the star pass (B4) drives the twinkle from it
 /// deterministically (owner feedback, 2026-11-22: stars twinkle only under an atmosphere).
+///
+/// `cam_rel_body_m` is in the atmosphere's frame ([`crate::feature::atmosphere_frame`]), so the
+/// height is measured from the reference ellipsoid (review I1);
+/// [`crate::AtmoDraw::scintillation_strength`] does that mapping and is what the app calls. In
+/// plain root axes, Earth's equator at sea level would read 7.1 km up: exp(−7.1/8) ≈ 0.41
+/// instead of 1.
 ///
 /// Model (approximate): scintillation comes from refractive-index turbulence in the air above
 /// the observer, and falls with the observer's altitude as exp(−h/H₀), H₀ = 8 km, the
@@ -513,6 +557,183 @@ mod tests {
         ];
         for p in bad {
             assert!(p.validate().is_err(), "{p:?}");
+        }
+    }
+
+    /// Mie scattering by homogeneous spheres, test-only: Bohren & Huffman 1983 ("Absorption and
+    /// Scattering of Light by Small Particles", Wiley), Appendix A, program BHMIE, and its
+    /// average over Hansen & Travis 1974's gamma size distribution (Space Sci. Rev. 16, 527,
+    /// eq. 2.56). It keeps the derivation of the Mars and Venus coefficients in the repository
+    /// (B3 review I3 and m6).
+    mod mie {
+        use std::ops::{Add, Div, Mul, Sub};
+
+        /// A complex number (re, im).
+        #[derive(Clone, Copy, Debug)]
+        pub struct C(pub f64, pub f64);
+
+        impl Add for C {
+            type Output = C;
+            fn add(self, o: C) -> C {
+                C(self.0 + o.0, self.1 + o.1)
+            }
+        }
+        impl Sub for C {
+            type Output = C;
+            fn sub(self, o: C) -> C {
+                C(self.0 - o.0, self.1 - o.1)
+            }
+        }
+        impl Mul for C {
+            type Output = C;
+            fn mul(self, o: C) -> C {
+                C(self.0 * o.0 - self.1 * o.1, self.0 * o.1 + self.1 * o.0)
+            }
+        }
+        impl Div for C {
+            type Output = C;
+            fn div(self, o: C) -> C {
+                let d = o.0 * o.0 + o.1 * o.1;
+                C(
+                    (self.0 * o.0 + self.1 * o.1) / d,
+                    (self.1 * o.0 - self.0 * o.1) / d,
+                )
+            }
+        }
+        fn re(x: f64) -> C {
+            C(x, 0.0)
+        }
+
+        /// (Q_ext, Q_sca, asymmetry ⟨cos Θ⟩) of a sphere with size parameter `x` = 2πr/λ and
+        /// relative refractive index `m` = n + ik (BHMIE: logarithmic derivative by downward
+        /// recurrence, Riccati–Bessel functions by upward recurrence).
+        pub fn bhmie(x: f64, m: C) -> (f64, f64, f64) {
+            let nstop = (x + 4.05 * x.cbrt() + 2.0) as usize;
+            let y = m * re(x);
+            let ymod = (y.0 * y.0 + y.1 * y.1).sqrt();
+            let nmx = (nstop as f64).max(ymod) as usize + 15;
+            let mut d = vec![re(0.0); nmx + 1];
+            for n in (1..=nmx).rev() {
+                let ny = re(n as f64) / y;
+                d[n - 1] = ny - re(1.0) / (d[n] + ny);
+            }
+            let (mut psi0, mut psi1) = (x.cos(), x.sin());
+            let (mut chi0, mut chi1) = (-x.sin(), x.cos());
+            let mut xi1 = C(psi1, -chi1);
+            let (mut qsca, mut qext, mut gsca) = (0.0, 0.0, 0.0);
+            let (mut an1, mut bn1) = (re(0.0), re(0.0));
+            for n in 1..=nstop {
+                let en = n as f64;
+                let psi = (2.0 * en - 1.0) * psi1 / x - psi0;
+                let chi = (2.0 * en - 1.0) * chi1 / x - chi0;
+                let xi = C(psi, -chi);
+                let da = d[n] / m + re(en / x);
+                let db = d[n] * m + re(en / x);
+                let an = (da * re(psi) - re(psi1)) / (da * xi - xi1);
+                let bn = (db * re(psi) - re(psi1)) / (db * xi - xi1);
+                let w = 2.0 * en + 1.0;
+                qsca += w * (an.0 * an.0 + an.1 * an.1 + bn.0 * bn.0 + bn.1 * bn.1);
+                qext += w * (an.0 + bn.0);
+                gsca += w / (en * (en + 1.0)) * (an.0 * bn.0 + an.1 * bn.1);
+                if n > 1 {
+                    // Re(a_{n−1} a_n* + b_{n−1} b_n*).
+                    let cross = an1.0 * an.0 + an1.1 * an.1 + bn1.0 * bn.0 + bn1.1 * bn.1;
+                    gsca += (en - 1.0) * (en + 1.0) / en * cross;
+                }
+                (psi0, psi1, chi0, chi1) = (psi1, psi, chi1, chi);
+                xi1 = C(psi1, -chi1);
+                (an1, bn1) = (an, bn);
+            }
+            let qsca = qsca * 2.0 / (x * x);
+            (qext * 2.0 / (x * x), qsca, gsca * 4.0 / (x * x * qsca))
+        }
+
+        /// (C_ext, single-scattering albedo, asymmetry) averaged over the gamma distribution
+        /// n(r) ∝ r^((1−3v)/v)·e^(−r/(a·v)) with effective radius `a` [µm] and variance `v`,
+        /// at wavelength `lambda_um`; C_ext in arbitrary units (only ratios are used). Midpoint
+        /// rule with `n` radii on (0, a·(1 + 12√v)].
+        pub fn gamma_average(lambda_um: f64, m: C, a: f64, v: f64, n: usize) -> (f64, f64, f64) {
+            let r_max = a * (1.0 + 12.0 * v.sqrt());
+            let (mut cext, mut csca, mut gw) = (0.0, 0.0, 0.0);
+            for i in 0..n {
+                let r = (i as f64 + 0.5) / n as f64 * r_max;
+                let weight = r.powf((1.0 - 3.0 * v) / v) * (-r / (a * v)).exp();
+                let (qe, qs, g) = bhmie(std::f64::consts::TAU * r / lambda_um, m);
+                let area = std::f64::consts::PI * r * r * weight;
+                cext += qe * area;
+                csca += qs * area;
+                gw += g * qs * area;
+            }
+            (cext, csca / cext, gw / csca)
+        }
+    }
+
+    /// Mean cosine of the Cornette–Shanks phase function with parameter g (module docs).
+    fn cs_mean_cosine(g: f32) -> f64 {
+        let g = f64::from(g);
+        3.0 * g * (4.0 + g * g) / (5.0 * (2.0 + g * g))
+    }
+
+    /// B3 review I3 and m6: the Mie-derived coefficients of [`mars`] and [`venus`] follow from
+    /// their cited inputs. BHMIE first reproduces Bohren & Huffman's own reference case.
+    #[test]
+    fn mie_derivations_reproduce_the_presets() {
+        use mie::{C, bhmie, gamma_average};
+        // Bohren & Huffman 1983, Appendix A test run: r = 0.525 µm, λ = 0.6328 µm, m = 1.55:
+        // Q_ext = Q_sca = 3.10543, g = 0.63314.
+        let (qe, qs, g) = bhmie(std::f64::consts::TAU * 0.525 / 0.6328, C(1.55, 0.0));
+        assert!(
+            (qe - 3.10543).abs() < 1e-5 && (qs - 3.10543).abs() < 1e-5,
+            "{qe} {qs}"
+        );
+        assert!((g - 0.63314).abs() < 1e-5, "{g}");
+
+        let lambda_um = [0.68, 0.55, 0.44];
+        // Mars dust: n 1.52, k (0.001, 0.006, 0.013) (Ehlers et al. 2014 via Schneegans et al.
+        // 2020), r_eff 1.5 µm, v_eff 0.3 (Wolff et al. 2009).
+        let k = [0.001, 0.006, 0.013];
+        let m = mars();
+        let dust: Vec<_> = (0..3)
+            .map(|c| gamma_average(lambda_um[c], C(1.52, k[c]), 1.5, 0.3, 600))
+            .collect();
+        for c in 0..3 {
+            let (cext, ssa, asym) = dust[c];
+            let preset_ssa = f64::from(m.mie_scattering[c] / m.mie_extinction[c]);
+            assert!(
+                (ssa - preset_ssa).abs() < 1e-3,
+                "Mars {c}: ω {ssa} vs {preset_ssa}"
+            );
+            let preset_asym = cs_mean_cosine(m.mie_g[c]);
+            assert!(
+                (asym - preset_asym).abs() < 1e-3,
+                "Mars {c}: ⟨cos⟩ {asym} vs {preset_asym}"
+            );
+            // Grey extinction to ±3.5 % (Mie: 1.03, 1, 0.97).
+            assert!(
+                (cext / dust[1].0 - 1.0).abs() < 0.035,
+                "Mars {c}: {}",
+                cext / dust[1].0
+            );
+        }
+        // Venus upper haze: n 1.44, k 0, r_eff 0.27 µm, v_eff 0.1 (Titov et al. 2018), extinction
+        // relative to 630 nm, where the preset's τ 0.3 is defined.
+        let v = venus();
+        let thick = v.top_radius_m - v.bottom_radius_m;
+        let (c630, ..) = gamma_average(0.63, C(1.44, 0.0), 0.27, 0.1, 600);
+        for c in 0..3 {
+            let (cext, ssa, asym) = gamma_average(lambda_um[c], C(1.44, 0.0), 0.27, 0.1, 600);
+            assert!((ssa - 1.0).abs() < 1e-9, "Venus {c}: ω {ssa}");
+            let preset_ratio = column(v.mie_extinction[c], v.mie_scale_height_m, thick) / 0.3;
+            assert!(
+                (cext / c630 - preset_ratio).abs() < 1e-3,
+                "Venus {c}: {} vs {preset_ratio}",
+                cext / c630
+            );
+            // Used directly as the Cornette–Shanks g (module docs).
+            assert!(
+                (asym - f64::from(v.mie_g[c])).abs() < 1e-3,
+                "Venus {c}: {asym}"
+            );
         }
     }
 }

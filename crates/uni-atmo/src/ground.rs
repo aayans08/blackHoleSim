@@ -10,11 +10,17 @@
 //! [`crate::AtmosphereSet::new`] adds one group per atmosphere over its real transmittance and
 //! irradiance LUTs.
 //!
-//! **r_m for a surface point** is the atmosphere's bottom radius (`atmo_ground.radii.x`) plus the
-//! point's height above the body's reference surface, not its distance from the centre: the
-//! atmosphere follows the body's ellipsoid (see `crate::feature`), so a point on the ground of
-//! an oblate Earth is at the bottom whatever its latitude. mu_s is the cosine of the Sun's
-//! zenith angle about the surface normal.
+//! **r_m for a surface point** is its radius in the atmosphere's frame
+//! ([`crate::feature::atmosphere_frame`]): the atmosphere's bottom radius (`atmo_ground.radii.x`)
+//! plus the point's height above the body's reference ellipsoid, not its distance from the
+//! centre. The atmosphere follows the ellipsoid, so a point on the ground of an oblate Earth is
+//! at the bottom whatever its latitude. mu_s is the cosine of the Sun's zenith angle about the
+//! surface normal.
+//!
+//! B0's stub described r_m only as a "radius". This reading is B3's and needs the lead's ruling
+//! (B3 review I2). A caller that passes `length(p_body)` instead lights Earth's equatorial
+//! ground as if 7.1 km up and Mars's as if 6.7 km up. The B3 report quotes the effect from
+//! `report_numbers`.
 
 use glam::Vec3;
 use uni_gfx::GpuContext;
