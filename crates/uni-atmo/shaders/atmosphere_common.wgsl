@@ -486,6 +486,16 @@ fn atmo_star_share() -> f32 {
 // changes by under 10 % per sample except in the outermost few kilometres of the shell, where the
 // light is faint and the pixel is marched instead. Twin of uni_atmo::feature::UPSAMPLE_LEN_TOL.
 const ATMO_UPSAMPLE_LEN_TOL: f32 = 0.1;
+// Largest spread of the samples' light (largest channel, pre-exposed) relative to the brightest
+// above ATMO_UPSAMPLE_LIGHT_FLOOR, and of their transmittance (largest channel), for the pixel to
+// be interpolated; past either the pixel is marched. A one-pixel haze ring (Venus's night limb at
+// 150 000 km: 48 km of tangent height per pixel, the haze 28 km thick) differs by far more than
+// this between samples two pixels apart; the smooth gradients of a disk or a wide limb arc by
+// less. The floor is under AgX's black (1.75e-4 pre-exposed). Twins of
+// uni_atmo::feature::{UPSAMPLE_LIGHT_STEP, UPSAMPLE_LIGHT_FLOOR, UPSAMPLE_T_STEP}.
+const ATMO_UPSAMPLE_LIGHT_STEP: f32 = 0.5;
+const ATMO_UPSAMPLE_LIGHT_FLOOR: f32 = 0.0001;
+const ATMO_UPSAMPLE_T_STEP: f32 = 0.25;
 // Segment lengths are stored in km (f16 holds up to 65504 km at 1e-3 relative).
 const ATMO_KM_PER_M: f32 = 1e-3;
 
@@ -520,10 +530,11 @@ struct AtmoComposite {
 }
 
 // Pixel `pos` (the fragment position) from the half-resolution samples: the bilinear neighbours
-// (pixel p lies at p/2 in samples: even pixels on a sample, odd ones halfway), keeping only
-// samples of this draw whose segment length is within ATMO_UPSAMPLE_LEN_TOL of the pixel's own
-// (the depth-aware upsample, generalised to the ray's end: a body, the ground or the shell);
-// with none kept, the pixel's own exact march (CPU twin: segment_radiance). Discards pixels whose
+// (pixel p lies at p/2 in samples: even pixels on a sample, odd ones halfway), used when every
+// one of them belongs to this draw with a segment length within ATMO_UPSAMPLE_LEN_TOL of the
+// pixel's own (the depth-aware upsample, generalised to the ray's end: a body, the ground or the
+// shell) and their light and transmittance are alike (ATMO_UPSAMPLE_*_STEP); otherwise the
+// pixel's own exact march (CPU twin: segment_radiance). Discards pixels whose
 // ray misses the shell. CPU twin of the weights: uni_atmo::feature::upsample_weights.
 fn atmo_composite(pos: vec2<f32>) -> AtmoComposite {
     let pix = floor(pos);
@@ -538,7 +549,11 @@ fn atmo_composite(pos: vec2<f32>) -> AtmoComposite {
     let last = vec2<i32>(textureDimensions(atmo_half_light)) - vec2<i32>(1);
     var light = vec3<f32>(0.0);
     var trans = vec3<f32>(0.0);
-    var wsum = 0.0;
+    var alike = true;
+    var l_lo = 3.0e38;
+    var l_hi = 0.0;
+    var t_lo = 3.0e38;
+    var t_hi = 0.0;
     for (var k = 0; k < 4; k++) {
         let o = vec2<i32>(k & 1, k >> 1u);
         let wx = select(1.0 - 0.5 * odd.x, 0.5 * odd.x, o.x == 1);
@@ -548,15 +563,24 @@ fn atmo_composite(pos: vec2<f32>) -> AtmoComposite {
             let q = min(base + o, last);
             let l = textureLoad(atmo_half_light, q, 0);
             let t = textureLoad(atmo_half_trans, q, 0);
-            if (t.a == atmo_draw.misc.w && abs(l.a - len_km) <= ATMO_UPSAMPLE_LEN_TOL * len_km) {
-                light += w * l.rgb;
-                trans += w * t.rgb;
-                wsum += w;
-            }
+            alike = alike && t.a == atmo_draw.misc.w
+                && abs(l.a - len_km) <= ATMO_UPSAMPLE_LEN_TOL * len_km;
+            let lm = max(l.r, max(l.g, l.b));
+            let tm = max(t.r, max(t.g, t.b));
+            l_lo = min(l_lo, lm);
+            l_hi = max(l_hi, lm);
+            t_lo = min(t_lo, tm);
+            t_hi = max(t_hi, tm);
+            light += w * l.rgb;
+            trans += w * t.rgb;
         }
     }
-    if (wsum > 0.0) {
-        return AtmoComposite(light / wsum, trans / wsum);
+    // A thin layer (a haze ring one or two pixels wide) varies faster than the samples: their
+    // light or transmittance differ too much to interpolate, and the pixel is marched.
+    let gentle = !(l_hi - l_lo > ATMO_UPSAMPLE_LIGHT_STEP * l_hi && l_hi > ATMO_UPSAMPLE_LIGHT_FLOOR)
+        && t_hi - t_lo <= ATMO_UPSAMPLE_T_STEP;
+    if (alike && gentle) {
+        return AtmoComposite(light, trans);
     }
     let s = atmo_march_n(
         ray.o, ray.d, 0.0, ray.len, atmo_draw.sun.xyz, ray.nu, true, atmo_view_step_count(ray.len)

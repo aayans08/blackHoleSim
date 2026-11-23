@@ -653,21 +653,46 @@ pub fn half_size(size: glam::UVec2) -> glam::UVec2 {
     glam::UVec2::new(size.x.div_ceil(2), size.y.div_ceil(2)).max(glam::UVec2::ONE)
 }
 
-/// CPU twin of the composite's sample weights (`atmo_composite`): for full-resolution pixel
-/// `pix` with segment length `len_km`, the bilinear weights of samples ⌊pix/2⌋ + (0,0), (1,0),
-/// (0,1), (1,1) (even coordinates sit on a sample, odd ones halfway), keeping only those whose
-/// (length [km], draw tag) is valid for this draw (`tag`) and within [`UPSAMPLE_LEN_TOL`] of
-/// `len_km`, renormalised. `None` when none is kept: the composite marches the pixel itself.
+/// Largest spread of the samples' light (largest channel, pre-exposed) relative to the brightest
+/// above [`UPSAMPLE_LIGHT_FLOOR`] for a pixel to be interpolated (twin of
+/// `ATMO_UPSAMPLE_LIGHT_STEP`). A haze ring one or two pixels wide (Venus's night limb at
+/// 150 000 km: 48 km of tangent height per pixel, the haze 28 km thick) differs by far more
+/// between samples two pixels apart; the smooth gradients of a disk or a wide limb arc by less.
+pub const UPSAMPLE_LIGHT_STEP: f32 = 0.5;
+/// Light below this (pre-exposed; AgX's black is 1.75e-4) is never a reason to march.
+pub const UPSAMPLE_LIGHT_FLOOR: f32 = 1e-4;
+/// Largest spread of the samples' transmittance (largest channel) for a pixel to be interpolated
+/// (twin of `ATMO_UPSAMPLE_T_STEP`).
+pub const UPSAMPLE_T_STEP: f32 = 0.25;
+
+/// One half-resolution sample as the composite reads it: segment length [km], draw tag (index +
+/// 1; 0 = not marched), the light's largest channel (pre-exposed) and the transmittance's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HalfSample {
+    pub len_km: f32,
+    pub tag: f32,
+    pub light_max: f32,
+    pub trans_max: f32,
+}
+
+/// CPU twin of the composite's choice (`atmo_composite`): for full-resolution pixel `pix` with
+/// segment length `len_km` in draw `tag`, the bilinear weights of samples ⌊pix/2⌋ + (0,0),
+/// (1,0), (0,1), (1,1) (even coordinates sit on a sample, odd ones halfway). `None`, and the
+/// composite marches the pixel itself, unless every weighted sample is of this draw, within
+/// [`UPSAMPLE_LEN_TOL`] of `len_km` (the same ray geometry: a body, the ground or the shell ends
+/// it), and the samples' light and transmittance are alike ([`UPSAMPLE_LIGHT_STEP`],
+/// [`UPSAMPLE_T_STEP`]).
 pub fn upsample_weights(
     pix: glam::UVec2,
     len_km: f32,
     tag: f32,
-    samples: [(f32, f32); 4],
+    samples: [HalfSample; 4],
 ) -> Option<[f32; 4]> {
     let odd = (pix % 2).as_vec2();
     let mut w = [0.0_f32; 4];
-    let mut sum = 0.0;
-    for (k, (len_s, tag_s)) in samples.into_iter().enumerate() {
+    let mut alike = true;
+    let (mut l_lo, mut l_hi, mut t_lo, mut t_hi) = (f32::MAX, 0.0_f32, f32::MAX, 0.0_f32);
+    for (k, s) in samples.into_iter().enumerate() {
         let wx = if k & 1 == 1 {
             0.5 * odd.x
         } else {
@@ -678,12 +703,16 @@ pub fn upsample_weights(
         } else {
             1.0 - 0.5 * odd.y
         };
-        if wx * wy > 0.0 && tag_s == tag && (len_s - len_km).abs() <= UPSAMPLE_LEN_TOL * len_km {
+        if wx * wy > 0.0 {
+            alike &= s.tag == tag && (s.len_km - len_km).abs() <= UPSAMPLE_LEN_TOL * len_km;
+            (l_lo, l_hi) = (l_lo.min(s.light_max), l_hi.max(s.light_max));
+            (t_lo, t_hi) = (t_lo.min(s.trans_max), t_hi.max(s.trans_max));
             w[k] = wx * wy;
-            sum += w[k];
         }
     }
-    (sum > 0.0).then(|| w.map(|x| x / sum))
+    let smooth = !(l_hi - l_lo > UPSAMPLE_LIGHT_STEP * l_hi && l_hi > UPSAMPLE_LIGHT_FLOOR)
+        && t_hi - t_lo <= UPSAMPLE_T_STEP;
+    (alike && smooth).then_some(w)
 }
 
 /// One draw recorded in `prepare`.
@@ -1338,7 +1367,13 @@ mod tests {
     #[test]
     fn upsample_weights_follow_the_ray_geometry() {
         use glam::UVec2;
-        let same = [(100.0, 1.0); 4];
+        let s = |len_km: f32, tag: f32, light_max: f32, trans_max: f32| HalfSample {
+            len_km,
+            tag,
+            light_max,
+            trans_max,
+        };
+        let same = [s(100.0, 1.0, 0.2, 0.8); 4];
         assert_eq!(
             upsample_weights(UVec2::new(4, 6), 100.0, 1.0, same),
             Some([1.0, 0.0, 0.0, 0.0])
@@ -1351,25 +1386,67 @@ mod tests {
             upsample_weights(UVec2::new(5, 7), 104.0, 1.0, same),
             Some([0.25; 4])
         );
-        // One neighbour past the horizon (twice as long), one of another draw.
-        let edge = [(100.0, 1.0), (200.0, 1.0), (100.0, 2.0), (95.0, 1.0)];
+        // A smooth gradient (light 0.15..0.2, T 0.7..0.8) is interpolated.
+        let gradient = [
+            s(100.0, 1.0, 0.15, 0.7),
+            s(101.0, 1.0, 0.2, 0.8),
+            s(99.0, 1.0, 0.17, 0.75),
+            s(100.0, 1.0, 0.19, 0.78),
+        ];
         assert_eq!(
-            upsample_weights(UVec2::new(5, 7), 100.0, 1.0, edge),
-            Some([0.5, 0.0, 0.0, 0.5])
+            upsample_weights(UVec2::new(5, 7), 100.0, 1.0, gradient),
+            Some([0.25; 4])
         );
-        // Nothing alike: marched. An unmarched sample (tag 0) never matches a draw.
-        assert_eq!(upsample_weights(UVec2::new(5, 7), 300.0, 1.0, edge), None);
-        assert_eq!(
-            upsample_weights(UVec2::new(4, 6), 100.0, 1.0, [(100.0, 0.0); 4]),
-            None
-        );
+        // Marched: a neighbour past the horizon (twice as long), one of another draw, an
+        // unmarched one (tag 0), a one-pixel haze ring (light 0.03 next to 0.2), a step in T. An
+        // even pixel only looks at its own sample.
+        let mut cases = vec![];
+        for (k, bad) in [
+            s(200.0, 1.0, 0.2, 0.8),
+            s(100.0, 2.0, 0.2, 0.8),
+            s(100.0, 0.0, 0.0, 0.0),
+            s(100.0, 1.0, 0.03, 0.8),
+            s(100.0, 1.0, 0.2, 0.4),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut v = same;
+            v[k % 4] = bad;
+            cases.push((k, v));
+        }
+        for (k, v) in cases {
+            assert_eq!(
+                upsample_weights(UVec2::new(5, 7), 100.0, 1.0, v),
+                None,
+                "{k}"
+            );
+        }
+        let mut far = same;
+        far[3] = s(200.0, 1.0, 0.2, 0.8);
+        assert!(upsample_weights(UVec2::new(4, 6), 100.0, 1.0, far).is_some());
+        // Light under the floor never forces a march.
+        let faint = [
+            s(100.0, 1.0, 1e-5, 0.8),
+            s(100.0, 1.0, 9e-5, 0.8),
+            s(100.0, 1.0, 5e-5, 0.8),
+            s(100.0, 1.0, 1e-5, 0.8),
+        ];
+        assert!(upsample_weights(UVec2::new(5, 7), 100.0, 1.0, faint).is_some());
         assert_eq!(half_size(UVec2::new(1920, 1080)), UVec2::new(960, 540));
         assert_eq!(half_size(UVec2::new(1727, 1)), UVec2::new(864, 1));
         let src = include_str!("../shaders/atmosphere_common.wgsl");
-        assert!(src.contains(&format!(
-            "const ATMO_UPSAMPLE_LEN_TOL: f32 = {:?};",
-            UPSAMPLE_LEN_TOL
-        )));
+        for (name, value) in [
+            ("ATMO_UPSAMPLE_LEN_TOL", UPSAMPLE_LEN_TOL),
+            ("ATMO_UPSAMPLE_LIGHT_STEP", UPSAMPLE_LIGHT_STEP),
+            ("ATMO_UPSAMPLE_LIGHT_FLOOR", UPSAMPLE_LIGHT_FLOOR),
+            ("ATMO_UPSAMPLE_T_STEP", UPSAMPLE_T_STEP),
+        ] {
+            assert!(
+                src.contains(&format!("const {name}: f32 = {value:?};")),
+                "{name}"
+            );
+        }
     }
 
     /// The mask pass's LUT-ratio transmittance (ladder step 1, task B9p) against the march's.
