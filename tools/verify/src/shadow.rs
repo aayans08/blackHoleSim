@@ -8,10 +8,15 @@
 //! parameter b_c = 3√3 M (Synge 1966, MNRAS 131, 463), at 158.745 px at 1920×1080.
 //!
 //! `uni-verify shadow --hdr-json <capture.json> --expected-px <f64> --tol <f64>` does the same
-//! on the HDR sidecar (see `hdr`), for a shadow against the dim band (`bh-lens-band`), whose
-//! tonemapped sky can sit near 2/255. There a pixel is dark when its Rec. 709 luminance ÷
-//! `pre[1]` is below half the frame's median luminance ÷ `pre[1]` (the background: the shadow
-//! covers far less than half the frame, 3.8 % at 158.7 px in 1920×1080).
+//! on the HDR sidecar (see `hdr`), for a shadow against a dim sky whose tonemapped value can sit
+//! near 2/255. There a pixel is dark when its Rec. 709 luminance ÷ `pre[1]` is below half the
+//! frame's median luminance ÷ `pre[1]` (the background: the shadow covers far less than half
+//! the frame, 3.8 % at 158.7 px in 1920×1080). The threshold assumes a sky without large dark
+//! patches next to the shadow, which the lensed Milky Way at `bh-lens-band` (plan row 19) is
+//! not: there its dark lensed lanes joined the shadow and it measured 214.9 px against 158.745
+//! (B9 gate). Lead ruling "row 19 shadow": row 19 has no numeric shadow check (row 18,
+//! `bh-shadow-30M-grid` with the PNG mode, covers the geometry), only its visual and seam
+//! checks; `hdr_shadow_floods_into_a_dark_lensed_lane` shows the failure mode.
 //!
 //! Captures trace one ray per pixel centre (resolution scale 1.0,
 //! crates/uni-rel/src/tracer.rs), so the shadow's edge is hard and its pixel count estimates
@@ -302,6 +307,29 @@ mod tests {
         // No background at all: nothing to threshold against.
         let black = crate::hdr::tests::blank(64, 48, 1.0, [1e-4, 13.33]);
         assert!(shadow_radius_hdr(&black).is_err());
+    }
+
+    /// Why row 19 has no numeric shadow check (lead ruling "row 19 shadow"): a dark lane next
+    /// to the shadow (the lensed band's dust, below half the frame's median) joins the dark
+    /// region at the centre, and the equivalent-disc radius grows past the shadow's 158.745 px,
+    /// as B9 measured at `bh-lens-band` (214.9 px).
+    #[test]
+    fn hdr_shadow_floods_into_a_dark_lensed_lane() {
+        let mut capture = crate::hdr::tests::blank(1920, 1080, 1.0, [1e-4, 13.33]);
+        let (cx, cy) = (960.0, 540.0);
+        for (i, p) in capture.pixels.iter_mut().enumerate() {
+            let (x, y) = ((i % 1920) as f64 + 0.5, (i / 1920) as f64 + 0.5);
+            let rho = (x - cx).hypot(y - cy);
+            // A lane 3 × darker than the sky, 80 px wide, touching the shadow's edge on the
+            // left: below the half-median threshold.
+            let lane = x < cx && (y - cy).abs() < 40.0 && rho < 400.0;
+            let sky = if lane { 0.3e-3 } else { 1e-3 };
+            let v = (sky * (1.0 - antialiased(R - rho))) as f32;
+            *p = [v, v, v, 1.0];
+        }
+        let s = shadow_radius_hdr(&capture).expect("HDR shadow");
+        assert!(s.radius_px > R + 10.0, "{s:?}");
+        assert!(!check_hdr(&capture, R, 1.0).expect("check").pass);
     }
 
     #[test]

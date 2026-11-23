@@ -241,7 +241,7 @@
         eye_adapted: true,
         lens_env: DebugGrid,
     ),
-    // #19 30 M from TestBH-1 on the side away from the Galactic Centre, looking through the hole toward it (the Sun 86.9° off-axis), north up, the band lensed, auto exposure.
+    // #19 30 M from TestBH-1 on the side away from the Galactic Centre, looking through the hole toward it (the Sun 86.9° off-axis), north up, the band lensed, auto exposure. Checks: visual and seam only; no numeric shadow check (lead ruling "row 19 shadow": #18 covers the geometry).
     (
         name: "bh-lens-band",
         view: (

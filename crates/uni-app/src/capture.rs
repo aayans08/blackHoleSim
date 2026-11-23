@@ -15,9 +15,11 @@
 //! The internal render size equals `--size`, so the tonemap reads `hdr` 1:1. GPU times are per
 //! pass **durations** (`scene::pass_durations`; `null` = no valid measurement, never 0; review
 //! I5). Any uncaptured GPU error fails the run (review m6). `<name>.json` holds the M0 keys plus
-//! `ev100`, `honesty`, `projected`, `metrics`, `regions`, `samples`, `features`, `flux`, `notes`,
-//! and with `--hdr` the `hdr` header of `<name>.hdr.bin` (f32 LE RGBA, rows top-down, the
-//! pre-exposed HDR target copied just before bloom); `hud` with `--hud`.
+//! `ev100`, `honesty`, `projected`, `metrics`, `regions`, `samples`, `features`, `flux`, `limbs`,
+//! `notes`, `settled`, and with `--hdr` the `hdr` header of `<name>.hdr.bin` (f32 LE RGBA, rows
+//! top-down, the pre-exposed HDR target copied just before bloom); `hud` with `--hud`. The HDR
+//! taps' copies are timed passes of their own, `tap-world` and `tap-prebloom` in `gpu_ms`
+//! (`crate::tap`); `gpu_frame_ms` includes them.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -131,6 +133,10 @@ pub struct CaptureMetrics {
     /// "auto" or "manual"; for auto, the frames it took to settle.
     pub exposure: &'static str,
     pub settle_frames: u32,
+    /// Whether the exposure the frame was captured at is settled: `false` when Auto exposure
+    /// still moved by [`SETTLE_EV`] or more after [`MAX_SETTLE_FRAMES`] frames (the capture then
+    /// uses the last EVs and says so in `notes`; review B9 r0 minor 8); `true` for Manual.
+    pub settled: bool,
     /// The honesty labels in effect (exact strings).
     pub honesty: Vec<String>,
     #[serde(flatten)]
@@ -239,9 +245,11 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         };
 
         let mut settle_frames = 0;
+        let mut settled = true;
         let last = if auto {
             let min = args.frames.saturating_sub(MANUAL_FRAMES).max(2);
             let mut prev: Option<[f32; 2]> = None;
+            settled = false;
             for i in 0..MAX_SETTLE_FRAMES {
                 render_one(
                     &job,
@@ -264,6 +272,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
                     _ => false,
                 };
                 if still && settle_frames >= min {
+                    settled = true;
                     break;
                 }
                 prev = now;
@@ -354,11 +363,16 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         notes.extend(scene.notices.iter().cloned());
         notes.extend(scene.pass_warnings());
         notes.extend(frame.coverage.warning().map(str::to_owned));
+        if !settled {
+            notes.push(unsettled_note());
+        }
+        let timings = scene.renderer.gpu_ms();
+        notes.extend(crate::scene::duplicate_pass_names(&timings));
         let metrics = CaptureMetrics {
             name: b.name.clone(),
             width: target.size.x,
             height: target.size.y,
-            gpu_ms: pass_durations(&scene.renderer.gpu_ms())
+            gpu_ms: pass_durations(&timings)
                 .into_iter()
                 .map(|(pass, ms)| (pass.to_owned(), ms))
                 .collect(),
@@ -370,6 +384,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             ev100,
             exposure: if auto { "auto" } else { "manual" },
             settle_frames,
+            settled,
             honesty: frame.labels.clone(),
             measured,
             notes,
@@ -430,7 +445,11 @@ fn render_one(
     scene.world_tap.arm(false);
     scene.hdr_tap.arm(false);
     if let Some(hud) = hud.filter(|_| captured) {
-        let perf = Perf::from_renderer(&scene.renderer, gpu, 0.0, 0.0);
+        // The HUD shows this frame's measured CPU time so far (snapshot, inputs and the
+        // renderer's encode; review B9 r0 minor 2: it showed 0.00). fps 0 leaves the fps part
+        // out: a capture has no frame rate.
+        let cpu_so_far_ms = start.elapsed().as_secs_f32() * 1e3;
+        let perf = Perf::from_renderer(&scene.renderer, gpu, 0.0, cpu_so_far_ms);
         let mut notices = job.assets.warnings.clone();
         notices.extend(scene.notices.iter().cloned());
         notices.extend(scene.pass_warnings());
@@ -455,6 +474,14 @@ fn render_one(
     submit_and_wait(gpu, cmds, &format!("capture frame of {:?}", job.name))?;
     scene.renderer.poll_timings(gpu);
     Ok((frame, cpu_ms))
+}
+
+/// The `notes` line of a capture whose Auto exposure did not settle in [`MAX_SETTLE_FRAMES`].
+fn unsettled_note() -> String {
+    format!(
+        "Auto exposure did not settle in {MAX_SETTLE_FRAMES} frames (the EVs still moved by \
+         {SETTLE_EV} or more): captured at the last EVs"
+    )
 }
 
 /// Bookmark names become file names: each must be a plain, unique file stem.
@@ -551,6 +578,7 @@ mod tests {
             ev100: Some([0.0, -4.0]),
             exposure: "manual",
             settle_frames: 0,
+            settled: true,
             honesty: vec!["Lens background: M0 debug grid".to_owned()],
             measured: Measurements::default(),
             notes: Vec::new(),
@@ -579,6 +607,7 @@ mod tests {
                 "height",
                 "honesty",
                 "lens_scale",
+                "limbs",
                 "metrics",
                 "name",
                 "notes",
@@ -586,6 +615,7 @@ mod tests {
                 "regions",
                 "samples",
                 "settle_frames",
+                "settled",
                 "star_count",
                 "width"
             ]
@@ -616,6 +646,26 @@ mod tests {
                 .starts_with("f32 LE RGBA")
         );
         assert_eq!(v["hud"]["card_rows"], serde_json::json!([]));
+    }
+
+    /// Review B9 r0 minor 8: an Auto capture that ran out of settle frames says so in the JSON
+    /// (`settled: false`) and in `notes`.
+    #[test]
+    fn an_unsettled_capture_is_flagged() {
+        let mut m = metrics();
+        m.exposure = "auto";
+        m.settle_frames = MAX_SETTLE_FRAMES;
+        m.settled = false;
+        m.notes.push(unsettled_note());
+        let v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["settled"], serde_json::Value::Bool(false));
+        assert_eq!(v["settle_frames"], 16);
+        let note = v["notes"][0].as_str().unwrap();
+        assert!(note.contains("did not settle in 16 frames"), "{note}");
+        assert_eq!(
+            serde_json::to_value(metrics()).unwrap()["settled"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

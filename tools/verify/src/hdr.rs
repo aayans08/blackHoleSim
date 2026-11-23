@@ -5,9 +5,10 @@
 //! - `hdr: {file, width, height, fov_y_rad, pre: [scene, star], ev100: [scene, star], layout}`;
 //!   `file` is relative to the JSON's directory, `pre` the exposure factors 1/(1.2·2^EV);
 //! - `regions: {name: [[x, y], …]}`, pixel samples (column, row; fractional values are floored);
-//! - `samples: [{x, y, expected_cd_m2: [r, g, b], what}]`;
+//! - `samples: [{x, y, expected_cd_m2: [r, g, b], what, footprint?: [[x, y], …]}]`;
 //! - `features: {name: {x, y, r_min, r_max, angle_deg?, expected_slope?}}`;
-//! - `flux: [{name, x, y, radius_px, expected_lux, mask: [[x, y, r], …]}]`.
+//! - `flux: [{name, x, y, radius_px, expected_lux, neighbour_lux, mask: [[x, y, r], …]}]`;
+//! - `limbs: [{name, strip: [[x, y, expected_cd_m2, sky_t], …], sky: [[x, y], …]}]`.
 //!
 //! Positions (x, y) of features and flux entries are framebuffer pixels: x right, y down, pixel
 //! k spans [k, k + 1], so a pixel's centre is k + 0.5. Luminance is Rec. 709,
@@ -20,8 +21,11 @@
 //!   median). A colour ratio of one region names it as both `--num` and `--den`.
 //! - `stats`: a region's relative RMS of luminance (population standard deviation over the
 //!   mean) and its mean pre-exposed luminance.
-//! - `samples`: each sample pixel's luminance ÷ `pre[0]` against the luminance of
-//!   `expected_cd_m2`, as a relative error.
+//! - `samples`: each sample's luminance ÷ `pre[0]` against the luminance of `expected_cd_m2`,
+//!   as a relative error. With a `footprint` (the pixels that see the map patch the expectation
+//!   averages: 3 × 3 texels of the 2k copy), the measured value is the mean over those pixels,
+//!   since the GPU samples finer mips that resolve detail the patch averages away (lead ruling
+//!   "row 5 Mars samples"); without one, the sample's own pixel.
 //! - `profile`: the least-squares slope of ln(mean Y) against ln(mean ρ) over 1-px annuli from
 //!   `r_min` to `r_max` around the feature, against its `expected_slope`.
 //! - `angle`: the direction of Σ Y·ρ̂ over the pixels in the annulus [`r_min`, `r_max`) whose
@@ -34,7 +38,18 @@
 //!   from the image centre (W/2, H/2); dω = dA·cosθ/r², Pharr, Jakob & Humphreys 2016 §5.5.3).
 //!   R is the entry's `radius_px`, the footprint the star shader used, which holds all of the
 //!   PSF's energy. Y_bg is the median of Y over the annulus R ≤ ρ < 1.5 R, skipping pixels inside
-//!   any `mask` disk, so the band behind the star is subtracted.
+//!   any `mask` disk, so the band behind the star is subtracted. The expectation is the star's
+//!   own `expected_lux` plus `neighbour_lux` (lead ruling "row 15 flux", Wave B gate): the drawn
+//!   illuminance of every other star or point whose footprint centre lies inside R, which B4L's
+//!   wider halo footprints put inside R (18 % of Rigel's light at `sky-orion-3d`). A capture JSON
+//!   without `neighbour_lux` reads 0.
+//! - `limb`: the world light integrated across a limb (lead ruling "row 13 Venus haze"):
+//!   E = Σ (Y_i − Y_sky·t_i)·Ω_i ÷ `pre[0]` over the entry's `strip` against the CPU twin's
+//!   Σ L_i·Ω_i, both in lux. Y_sky is the median of Y over the entry's `sky` pixels (the band and
+//!   stars beyond the limb, pre-exposed at the star exposure); t_i, the pixel's sky share, is what
+//!   the passes keep of the sky behind it (the view transmittance's luminance, 0 on the body).
+//!   Ω_i as for `flux`. Integrating over every pixel across the limb makes a haze band thinner
+//!   than a pixel count by its light, not by where its sub-pixel peak lands.
 
 use crate::{Verdict, pass_word};
 use anyhow::{Context, bail};
@@ -85,6 +100,9 @@ pub struct Sample {
     pub expected_cd_m2: [f64; 3],
     #[serde(default)]
     pub what: String,
+    /// The pixels to average (see the module docs); empty: the sample's own pixel.
+    #[serde(default)]
+    pub footprint: Vec<[f64; 2]>,
 }
 
 /// One `features` entry: a centre and an annulus [px].
@@ -101,7 +119,8 @@ pub struct Feature {
 }
 
 /// One `flux` entry: a star's position [px], its footprint radius [px], its expected
-/// illuminance [lx] and the other footprints [x, y, r] to leave out of the background annulus.
+/// illuminance [lx], the illuminance of the other sources whose footprint centre lies inside R
+/// [lx], and the other footprints [x, y, r] to leave out of the background annulus.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FluxEntry {
     pub name: String,
@@ -109,8 +128,30 @@ pub struct FluxEntry {
     pub y: f64,
     pub radius_px: f64,
     pub expected_lux: f64,
+    /// Light of the other stars and points centred inside R [lx] (0 when absent).
+    #[serde(default)]
+    pub neighbour_lux: f64,
     #[serde(default)]
     pub mask: Vec<[f64; 3]>,
+}
+
+impl FluxEntry {
+    /// What the sum inside R should read [lx]: the star's own illuminance plus its neighbours'
+    /// (lead ruling "row 15 flux").
+    pub fn expected_total_lux(&self) -> f64 {
+        self.expected_lux + self.neighbour_lux
+    }
+}
+
+/// One `limbs` entry: the pixels across a limb with the twin's world light and their sky
+/// share, and the sky pixels beyond it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LimbEntry {
+    pub name: String,
+    /// [x, y, expected luminance [cd/m²] (world light), sky share t].
+    pub strip: Vec<[f64; 4]>,
+    #[serde(default)]
+    pub sky: Vec<[f64; 2]>,
 }
 
 /// The part of a capture JSON the HDR checks read.
@@ -126,6 +167,8 @@ struct CaptureJson {
     features: BTreeMap<String, Feature>,
     #[serde(default)]
     flux: Vec<FluxEntry>,
+    #[serde(default)]
+    limbs: Vec<LimbEntry>,
 }
 
 /// A capture's HDR image (pre-exposed linear RGBA, row-major, top row first) and the
@@ -138,6 +181,7 @@ pub struct HdrCapture {
     pub samples: Vec<Sample>,
     pub features: BTreeMap<String, Feature>,
     pub flux: Vec<FluxEntry>,
+    pub limbs: Vec<LimbEntry>,
 }
 
 impl HdrCapture {
@@ -202,6 +246,7 @@ impl HdrCapture {
             samples: json.samples,
             features: json.features,
             flux: json.flux,
+            limbs: json.limbs,
         })
     }
 
@@ -595,6 +640,8 @@ pub struct SampleResult {
     pub expected_cd_m2: f64,
     /// measured / expected − 1.
     pub rel_err: f64,
+    /// Pixels averaged (1 without a footprint).
+    pub pixels: usize,
 }
 
 pub fn samples(cap: &HdrCapture) -> anyhow::Result<Vec<SampleResult>> {
@@ -605,10 +652,22 @@ pub fn samples(cap: &HdrCapture) -> anyhow::Result<Vec<SampleResult>> {
     cap.samples
         .iter()
         .map(|s| {
-            let (x, y) = cap.pixel_at(s.x, s.y).with_context(|| {
-                format!("sample {:?} ({}, {}) is off the image", s.what, s.x, s.y)
-            })?;
-            let measured = cap.luminance(x, y) / pre;
+            let own = [[s.x, s.y]];
+            let points: &[[f64; 2]] = if s.footprint.is_empty() {
+                &own
+            } else {
+                &s.footprint
+            };
+            let lums = points
+                .iter()
+                .map(|&[px, py]| {
+                    let (x, y) = cap.pixel_at(px, py).with_context(|| {
+                        format!("sample {:?} pixel ({px}, {py}) is off the image", s.what)
+                    })?;
+                    Ok(cap.luminance(x, y))
+                })
+                .collect::<anyhow::Result<Vec<f64>>>()?;
+            let measured = mean(&lums) / pre;
             let expected = luminance(s.expected_cd_m2);
             Ok(SampleResult {
                 what: s.what.clone(),
@@ -617,6 +676,7 @@ pub fn samples(cap: &HdrCapture) -> anyhow::Result<Vec<SampleResult>> {
                 measured_cd_m2: measured,
                 expected_cd_m2: expected,
                 rel_err: measured / expected - 1.0,
+                pixels: lums.len(),
             })
         })
         .collect()
@@ -631,11 +691,12 @@ pub fn check_samples(cap: &HdrCapture, tol: f64) -> anyhow::Result<Verdict> {
         let ok = r.rel_err.abs() <= tol;
         within += usize::from(ok);
         lines.push(format!(
-            "  {} ({}, {}): {:.5e} cd/m² vs {:.5e} cd/m² ({:+.2} %) {}",
+            "  {} ({}, {}): {:.5e} cd/m² (mean of {} px) vs {:.5e} cd/m² ({:+.2} %) {}",
             r.what,
             r.x,
             r.y,
             r.measured_cd_m2,
+            r.pixels,
             r.expected_cd_m2,
             100.0 * r.rel_err,
             if ok { "ok" } else { "FAIL" }
@@ -848,7 +909,8 @@ pub fn flux(cap: &HdrCapture, name: &str) -> anyhow::Result<FluxResult> {
     })
 }
 
-/// `flux`: E within the relative tolerance `tol` of the entry's `expected_lux`.
+/// `flux`: E within the relative tolerance `tol` of the entry's expected total, `expected_lux`
+/// + `neighbour_lux`.
 pub fn check_flux(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verdict> {
     let f = flux(cap, name)?;
     let e = cap
@@ -856,15 +918,19 @@ pub fn check_flux(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verd
         .iter()
         .find(|e| e.name == name)
         .with_context(|| format!("no flux entry {name:?} in the capture JSON"))?;
-    let rel = f.lux / e.expected_lux - 1.0;
+    let expected = e.expected_total_lux();
+    let rel = f.lux / expected - 1.0;
     let pass = rel.abs() <= tol;
     let pre = cap.header.pre[1];
     Ok(Verdict {
         lines: vec![
             format!(
-                "flux {name}: E {:.5e} lx, expected {:.5e} lx ({:+.2} %); {} px inside R = {} px",
+                "flux {name}: E {:.5e} lx, expected {:.5e} lx = own {:.5e} + neighbours {:.5e} \
+                 ({:+.2} %); {} px inside R = {} px",
                 f.lux,
+                expected,
                 e.expected_lux,
+                e.neighbour_lux,
                 100.0 * rel,
                 f.pixels,
                 e.radius_px
@@ -879,6 +945,104 @@ pub fn check_flux(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verd
                 100.0 * f.bg_share
             ),
             format!("flux within ±{} % {}", 100.0 * tol, pass_word(pass)),
+        ],
+        pass,
+    })
+}
+
+/// A limb's integrated world light and the terms behind it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LimbResult {
+    /// E = Σ (Y_i − Y_sky·t_i)·Ω_i ÷ pre[0] [lx].
+    pub lux: f64,
+    /// The twin's Σ L_i·Ω_i [lx].
+    pub expected_lux: f64,
+    /// The sky's median, pre-exposed.
+    pub y_sky: f64,
+    /// The sky light subtracted, Σ Y_sky·t_i·Ω_i ÷ pre[0] [lx].
+    pub sky_lux: f64,
+    pub pixels: usize,
+    pub sky_pixels: usize,
+}
+
+/// Solid angle [sr] of the pixel centred at (x, y): Ω_c·cos³θ, as `flux` uses.
+fn pixel_omega(h: &HdrHeader, x: f64, y: f64) -> f64 {
+    let s = 2.0 * (h.fov_y_rad / 2.0).tan() / f64::from(h.height);
+    let d = (x - f64::from(h.width) / 2.0).hypot(y - f64::from(h.height) / 2.0);
+    let cos_theta = 1.0 / (1.0 + (s * d).powi(2)).sqrt();
+    s * s * cos_theta.powi(3)
+}
+
+pub fn limb_flux(cap: &HdrCapture, name: &str) -> anyhow::Result<LimbResult> {
+    let e = cap
+        .limbs
+        .iter()
+        .find(|e| e.name == name)
+        .with_context(|| format!("no limbs entry {name:?} in the capture JSON"))?;
+    if e.strip.is_empty() {
+        bail!("limbs entry {name:?} has no strip pixels");
+    }
+    let mut sky = e
+        .sky
+        .iter()
+        .map(|&[x, y]| {
+            let (i, j) = cap
+                .pixel_at(x, y)
+                .with_context(|| format!("limbs {name:?} sky pixel ({x}, {y}) is off the image"))?;
+            Ok(cap.luminance(i, j))
+        })
+        .collect::<anyhow::Result<Vec<f64>>>()?;
+    if sky.is_empty() {
+        bail!("limbs entry {name:?} has no sky pixels");
+    }
+    let y_sky = median(&mut sky);
+    let pre = cap.header.pre[0];
+    let (mut lux, mut expected_lux, mut sky_lux) = (0.0, 0.0, 0.0);
+    for &[x, y, expected, t] in &e.strip {
+        let (i, j) = cap
+            .pixel_at(x, y)
+            .with_context(|| format!("limbs {name:?} strip pixel ({x}, {y}) is off the image"))?;
+        let omega = pixel_omega(&cap.header, x, y);
+        lux += (cap.luminance(i, j) - y_sky * t) * omega / pre;
+        sky_lux += y_sky * t * omega / pre;
+        expected_lux += expected * omega;
+    }
+    if !(expected_lux > 0.0) {
+        bail!("limbs entry {name:?}: the twin expects no light ({expected_lux} lx)");
+    }
+    Ok(LimbResult {
+        lux,
+        expected_lux,
+        y_sky,
+        sky_lux,
+        pixels: e.strip.len(),
+        sky_pixels: sky.len(),
+    })
+}
+
+/// `limb`: the integrated light within the relative tolerance `tol` of the twin's.
+pub fn check_limb(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verdict> {
+    let r = limb_flux(cap, name)?;
+    let rel = r.lux / r.expected_lux - 1.0;
+    let pass = rel.abs() <= tol;
+    Ok(Verdict {
+        lines: vec![
+            format!(
+                "limb {name}: E {:.5e} lx vs the twin's {:.5e} lx ({:+.2} %) over {} px",
+                r.lux,
+                r.expected_lux,
+                100.0 * rel,
+                r.pixels
+            ),
+            format!(
+                "  sky median {:.5e} pre-exposed (of {} px); sky light subtracted {:.5e} lx \
+                 ({:.1} % of the measured sum)",
+                r.y_sky,
+                r.sky_pixels,
+                r.sky_lux,
+                100.0 * r.sky_lux / (r.lux + r.sky_lux)
+            ),
+            format!("limb within ±{} % {}", 100.0 * tol, pass_word(pass)),
         ],
         pass,
     })
@@ -913,6 +1077,7 @@ pub(crate) mod tests {
             samples: Vec::new(),
             features: BTreeMap::new(),
             flux: Vec::new(),
+            limbs: Vec::new(),
         }
     }
 
@@ -1309,6 +1474,7 @@ pub(crate) mod tests {
             y,
             radius_px: f64::from(radius),
             expected_lux: RIGEL_LUX,
+            neighbour_lux: 0.0,
             mask: Vec::new(),
         });
         let f = flux(&cap, "Rigel").expect("flux");
@@ -1364,6 +1530,7 @@ pub(crate) mod tests {
                 y,
                 radius_px: radius,
                 expected_lux: RIGEL_LUX,
+                neighbour_lux: 0.0,
                 mask: vec![[nx, ny, n_radius]],
             };
             cap.flux.push(entry.clone());
@@ -1385,5 +1552,299 @@ pub(crate) mod tests {
                 close(wrong / RIGEL_LUX, 1.0379, 0.003, "Ω_c without cos³θ");
             }
         }
+    }
+
+    /// `captures/b9-dev/sky-orion-3d.json` (B9's capture at 6cd81e9): Rigel's own illuminance,
+    /// the light of the other sources centred inside R, R, and its pixel.
+    const B9_RIGEL_LUX: f64 = 2.270_823_967_084_235_5e-6;
+    const B9_NEIGHBOUR_LUX: f64 = 4.148_540_357_670_285e-7;
+    const B9_RIGEL_R_PX: f64 = 47.702_751_159_667_97;
+    const B9_RIGEL_XY: (f64, f64) = (1_044.315_375_018_001_8, 655.415_269_513_219_8);
+    /// B9's measured Rigel flux at the gate, against its own illuminance alone (report §6).
+    const B9_MEASURED_OVER_OWN: f64 = 1.177;
+
+    /// Lead ruling "row 15 flux": the expectation is the star's own illuminance plus
+    /// `neighbour_lux`. A synthetic frame with B9's numbers (Rigel's own light, 18.3 % more from
+    /// twelve neighbours centred inside its 47.7-px R, on a uniform sky): the old expectation
+    /// reads +18 % and fails ±5 %, the new one passes. B9's measured +17.7 % becomes −0.5 %.
+    /// When the b9-dev capture is present (git-ignored), its entry parses with these numbers.
+    #[test]
+    fn hdr_flux_counts_neighbours_inside_r() {
+        let json =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/b9-dev/sky-orion-3d.json");
+        match fs::read_to_string(&json) {
+            Ok(text) => {
+                let c: CaptureJson = serde_json::from_str(&text).expect("b9-dev capture parses");
+                let e = c.flux.iter().find(|e| e.name == "Rigel").expect("Rigel");
+                assert_eq!(e.expected_lux, B9_RIGEL_LUX);
+                assert_eq!(e.neighbour_lux, B9_NEIGHBOUR_LUX);
+                assert_eq!(e.radius_px, B9_RIGEL_R_PX);
+                assert_eq!((e.x, e.y), B9_RIGEL_XY);
+                assert!(!e.mask.is_empty());
+            }
+            Err(_) => eprintln!("{} absent: synthetic part only", json.display()),
+        }
+        let rel = B9_MEASURED_OVER_OWN * B9_RIGEL_LUX / (B9_RIGEL_LUX + B9_NEIGHBOUR_LUX) - 1.0;
+        close(
+            rel,
+            -0.0048,
+            0.0005,
+            "B9's measurement against own + neighbours",
+        );
+
+        let mut cap = blank(1920, 1080, 60f64.to_radians(), [1e-4, STAR_PRE]);
+        for p in &mut cap.pixels {
+            *p = [2.0e-3, 2.0e-3, 2.0e-3, 1.0];
+        }
+        let (x, y) = B9_RIGEL_XY;
+        let r_rigel = f64::from(splat(&mut cap, x, y, B9_RIGEL_LUX, star_colour()));
+        let n = 12;
+        for k in 0..n {
+            let a = std::f64::consts::TAU * f64::from(k) / f64::from(n);
+            let d = 20.0 + 1.5 * f64::from(k);
+            let (nx, ny) = (x + d * a.cos(), y + d * a.sin());
+            let r = f64::from(splat(
+                &mut cap,
+                nx,
+                ny,
+                B9_NEIGHBOUR_LUX / f64::from(n),
+                star_colour(),
+            ));
+            assert!(d + r < B9_RIGEL_R_PX, "neighbour {k} reaches outside R");
+        }
+        assert!(r_rigel < B9_RIGEL_R_PX);
+        let mut entry = FluxEntry {
+            name: "Rigel".into(),
+            x,
+            y,
+            radius_px: B9_RIGEL_R_PX,
+            expected_lux: B9_RIGEL_LUX,
+            neighbour_lux: 0.0,
+            mask: Vec::new(),
+        };
+        cap.flux.push(entry.clone());
+        let f = flux(&cap, "Rigel").expect("flux");
+        close(f.lux / B9_RIGEL_LUX, 1.183, 0.01, "measured over own");
+        assert!(
+            !check_flux(&cap, "Rigel", 0.05).expect("check").pass,
+            "own only"
+        );
+        entry.neighbour_lux = B9_NEIGHBOUR_LUX;
+        cap.flux = vec![entry];
+        close(
+            f.lux / (B9_RIGEL_LUX + B9_NEIGHBOUR_LUX),
+            1.0,
+            0.01,
+            "own + neighbours",
+        );
+        let v = check_flux(&cap, "Rigel", 0.05).expect("check");
+        assert!(v.pass, "{v:?}");
+        assert!(v.lines[0].contains("+ neighbours 4.14854e-7"), "{v:?}");
+        // A capture JSON without the key reads 0.
+        let old: FluxEntry = serde_json::from_str(
+            r#"{"name": "Sun", "x": 1, "y": 2, "radius_px": 3, "expected_lux": 4}"#,
+        )
+        .expect("old entry");
+        assert_eq!(old.neighbour_lux, 0.0);
+        assert_eq!(old.expected_total_lux(), 4.0);
+    }
+
+    /// Lead ruling "row 5 Mars samples": with a footprint, `samples` reads the GPU's mean over
+    /// the pixels that see the 2k twin's 3 × 3 texel patch, not one pixel. The samples are
+    /// `captures/b9-dev/mars-reference-angle.json`'s (B9's capture at 6cd81e9, written before
+    /// footprints existed; when the git-ignored file is absent, its two disk-centre samples
+    /// below), each given the 3 × 3 px footprint that Mars's 2k texels (≈ 1.3 px at 425 px
+    /// radius) cover. In the synthetic HDR every footprint averages to the expectation, but the
+    /// two disk-centre pixels read +13 %, as B9 measured them: the single-pixel check fails, the
+    /// footprint check passes.
+    #[test]
+    fn hdr_samples_average_the_texel_footprint() {
+        let json = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../captures/b9-dev/mars-reference-angle.json");
+        let (pre, mut samples) = match fs::read_to_string(&json) {
+            Ok(text) => {
+                let c: CaptureJson = serde_json::from_str(&text).expect("b9-dev capture parses");
+                let pre = c.hdr.expect("hdr header").pre;
+                assert_eq!(c.samples.len(), 16);
+                (pre, c.samples)
+            }
+            Err(_) => {
+                eprintln!("{} absent: two embedded samples", json.display());
+                let sample = |x, y, e| Sample {
+                    x,
+                    y,
+                    expected_cd_m2: e,
+                    what: "Mars".into(),
+                    footprint: Vec::new(),
+                };
+                (
+                    [5.939_643e-5, 75.424_72],
+                    vec![
+                        sample(900.5, 588.5, [2945.3857, 915.43335, 506.91324]),
+                        sample(876.5, 588.5, [2990.1443, 949.09564, 524.1765]),
+                    ],
+                )
+            }
+        };
+        let mut cap = blank(1920, 1080, 60f64.to_radians(), pre);
+        // The disk-centre samples (lat ≈ 10°, the two B9 saw at +13 %).
+        let bright = |s: &Sample| s.y == 588.5 && (s.x == 900.5 || s.x == 876.5);
+        for s in &samples {
+            let k = if bright(s) { 1.13 } else { 1.0 };
+            // The other 8 pixels make the footprint's mean the expectation.
+            let rest = (9.0 - k) / 8.0;
+            for dy in -1..=1_i64 {
+                for dx in -1..=1_i64 {
+                    let f = if dx == 0 && dy == 0 { k } else { rest };
+                    let rgb = s.expected_cd_m2.map(|c| (c * f * pre[0]) as f32);
+                    put(
+                        &mut cap,
+                        (s.x.floor() as i64 + dx) as u32,
+                        (s.y.floor() as i64 + dy) as u32,
+                        rgb,
+                    );
+                }
+            }
+        }
+        cap.samples = samples.clone();
+        let single = check_samples(&cap, 0.05).expect("samples");
+        assert!(!single.pass, "{single:?}");
+        let failed = samples_failing(&single);
+        assert_eq!(failed, 2, "{single:?}");
+        for s in &mut samples {
+            let (x, y) = (s.x, s.y);
+            s.footprint = (-1..=1)
+                .flat_map(|dy| (-1..=1).map(move |dx| [x + f64::from(dx), y + f64::from(dy)]))
+                .collect();
+        }
+        cap.samples = samples;
+        let mean = check_samples(&cap, 0.05).expect("samples");
+        assert!(mean.pass, "{mean:?}");
+        assert!(mean.lines[0].contains("(mean of 9 px)"), "{mean:?}");
+        for r in super::samples(&cap).expect("results") {
+            close(r.rel_err, 0.0, 1e-5, &r.what);
+        }
+    }
+
+    /// Sample lines of a verdict that end in FAIL.
+    fn samples_failing(v: &Verdict) -> usize {
+        v.lines
+            .iter()
+            .filter(|l| l.starts_with("  ") && l.ends_with("FAIL"))
+            .count()
+    }
+
+    /// Lead ruling "row 13 Venus haze": `limb` integrates the world light across the limb against
+    /// the twin and subtracts the sky × its share. The frame is `venus-crescent`'s
+    /// (`captures/b9-dev/venus-crescent.json`, B9's capture at 6cd81e9: fov 20°, pre = (5.35e-6,
+    /// 75.4), EV 17.25 / −6.5; its numbers are embedded when the git-ignored file is absent):
+    /// Venus's deck limb at 125.1 px, the shell's top 1.2 px beyond, a haze band 0.4 px deep on
+    /// the night half, lit toward the cusps, and B9's sky behind it (its `night_limb_haze`
+    /// region measured 1.28e-3 pre-exposed: the band, not haze). The haze alone moves that
+    /// region's mean by under 1 %, so the old threshold check could not see it; the integral
+    /// does: right → PASS; missing, 20 % too bright, or with the sky left in → FAIL. (The GPU
+    /// and the twin sample the same pixel centres; a GPU that resampled the band, e.g. a
+    /// half-resolution march, would add sampling noise over the ~70 px of lit cusp arc.)
+    #[test]
+    fn hdr_limb_integrates_the_haze_across_the_limb() {
+        let json =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/b9-dev/venus-crescent.json");
+        let (fov, pre) = match fs::read_to_string(&json) {
+            Ok(text) => {
+                let c: CaptureJson = serde_json::from_str(&text).expect("b9-dev capture parses");
+                let h = c.hdr.expect("hdr header");
+                (h.fov_y_rad, h.pre)
+            }
+            Err(_) => {
+                eprintln!("{} absent: embedded header", json.display());
+                (20f64.to_radians(), [5.354_771e-6, 75.424_72])
+            }
+        };
+        const SKY_PRE: f64 = 1.28e-3;
+        let (cx, cy, r_deck, r_top) = (960.0, 540.0, 125.1, 126.3);
+        // Haze luminance [cd/m²] at radius ρ and image angle ψ from the Sun's direction (+y
+        // down here): the twin's pattern (task B9g), lit toward the cusps (ψ near 90°), fading
+        // to nothing 15° past them, dark at the anti-solar limb.
+        let haze = |rho: f64, psi: f64| -> f64 {
+            let h = rho - r_deck;
+            let past_cusp = psi - std::f64::consts::FRAC_PI_2;
+            if !(0.0..=r_top - r_deck).contains(&h) || past_cusp > 15f64.to_radians() {
+                return 0.0;
+            }
+            2.0e3 * (1.0 - past_cusp.max(0.0) / 15f64.to_radians()) * (-h / 0.4).exp()
+        };
+        // Sky share: opaque at the deck's limb, clear above ~0.3 px.
+        let sky_t = |rho: f64| ((rho - r_deck) / 0.3).clamp(0.0, 1.0);
+        let build = |gpu_haze: f64| {
+            let mut cap = blank(1920, 1080, fov, pre);
+            let mut entry = LimbEntry {
+                name: "venus_night_limb".into(),
+                strip: Vec::new(),
+                sky: Vec::new(),
+            };
+            for j in 380..700 {
+                for i in 800..1120 {
+                    let (x, y) = (f64::from(i) + 0.5, f64::from(j) + 0.5);
+                    let (dx, dy) = (x - cx, y - cy);
+                    let rho = dx.hypot(dy);
+                    // The night half: away from the Sun, which is toward +y (image down).
+                    if dy > 0.0 {
+                        continue;
+                    }
+                    let psi = dx.atan2(dy).abs();
+                    let twin = haze(rho, psi);
+                    let t = if rho < r_deck { 0.0 } else { sky_t(rho) };
+                    let y_pre = gpu_haze * haze(rho, psi) * pre[0] + SKY_PRE * t;
+                    put(&mut cap, i, j, [y_pre as f32; 3]);
+                    if rho >= r_deck - 2.0 && rho <= r_top + 2.0 {
+                        entry.strip.push([x, y, twin, t]);
+                    } else if rho >= r_top + 4.0 && rho <= r_top + 10.0 {
+                        entry.sky.push([x, y]);
+                    }
+                }
+            }
+            cap.limbs.push(entry);
+            cap
+        };
+        let right = build(1.0);
+        let r = limb_flux(&right, "venus_night_limb").expect("limb");
+        eprintln!("limb: {r:?}");
+        close(r.lux / r.expected_lux, 1.0, 1e-6, "the twin's own frame");
+        close(r.y_sky, SKY_PRE, 1e-6, "sky median");
+        assert!(
+            check_limb(&right, "venus_night_limb", 0.1)
+                .expect("check")
+                .pass
+        );
+        // On the plan's region (the anti-solar third of the limb, ψ > 120°, above the deck) the
+        // haze adds nothing to the sky: a mean there measures the band.
+        let old_region: Vec<f64> = right.limbs[0]
+            .strip
+            .iter()
+            .filter(|p| p[3] > 0.0 && (p[0] - cx).atan2(p[1] - cy).abs() > 120f64.to_radians())
+            .map(|p| p[2] * pre[0] / SKY_PRE)
+            .collect();
+        assert!(!old_region.is_empty() && mean(&old_region) < 0.01);
+        // Missing haze, and the sky not subtracted (a twin of zero sky share).
+        assert!(
+            !check_limb(&build(0.0), "venus_night_limb", 0.1)
+                .expect("check")
+                .pass
+        );
+        let mut unsubtracted = build(1.0);
+        for p in &mut unsubtracted.limbs[0].strip {
+            p[3] = 0.0;
+        }
+        assert!(
+            !check_limb(&unsubtracted, "venus_night_limb", 0.1)
+                .expect("check")
+                .pass
+        );
+        // A haze 20 % too bright fails ±10 %.
+        assert!(
+            !check_limb(&build(1.2), "venus_night_limb", 0.1)
+                .expect("check")
+                .pass
+        );
     }
 }

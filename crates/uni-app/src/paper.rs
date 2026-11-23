@@ -6,10 +6,21 @@
 //! Mallama & Hilton phase correction per pixel (clamped at 10, as B1 does); the Sun is its mean
 //! disk luminance I/(πR²) × B2's limb darkening at 550 nm; Saturn's rings are B2's I/F twin
 //! (`uni_planet::rings::ring_i_over_f`) over the committed ring profile, in the planet's shadow
-//! (`planet_shadow_on_ring`) where it falls. Atmospheres are left out, except Earth's (ruling
-//! W-B1/B3 I4): its ground and clouds are the maps' disk composite ρ = 0.302 (A8), scaled by B3's
-//! disk reflectance with the atmosphere over the bare Lambert disk at the same phase
-//! (`uni_atmo::feature::disk_reflectance`), so the sky's contribution is spread over the disk.
+//! (`planet_shadow_on_ring`) where it falls. Atmospheres are left out, except Earth's and
+//! Venus's:
+//! - Earth (ruling W-B1/B3 I4): its ground and clouds are the maps' disk composite ρ = 0.302
+//!   (A8), scaled by B3's disk reflectance with the atmosphere over the bare Lambert disk at the
+//!   same phase (`uni_atmo::feature::disk_reflectance`), so the sky's contribution is spread
+//!   over the disk.
+//! - Venus (lead ruling "row 13 Venus haze", task B9g), pixel by pixel as the bodies and
+//!   atmosphere passes draw it ([`VenusAtmo`]): the cloud deck at the map's ρ̄ 0.95 under A3's C,
+//!   lit through B3's haze (`ground_lighting`: sun transmittance and skylight), seen through it
+//!   (`segment_radiance`: view transmittance), plus the haze's in-scatter, also above the limb
+//!   and past the terminator. Without it the paper put `venus-crescent` at EV 18.93 against the
+//!   capture's 17.25: at phase 155° the deck is seen and lit at grazing angles through τ ≈ 0.36
+//!   of haze, and the haze's dim twilight glow beyond the hard crescent (≥ 10⁻³ cd/m², lit to
+//!   the meter) fills the 50th–95th percentile band the meter averages.
+//!
 //! Points (unresolved bodies) are sky light at star exposure and are not metered.
 //!
 //! The luminances go through B6's CPU meter (`Histogram::from_luminances(...).meter`,
@@ -33,6 +44,16 @@ use crate::world::World;
 const STRIDE: u32 = 1;
 /// Earth's map composite ρ, ground and clouds (ruling W-B1: A8's physical calibration).
 pub const EARTH_COMPOSITE_RHO: f64 = 0.302;
+/// Venus's cloud deck reflectance as the bodies pass draws it: the map's disk average as stored
+/// (`data/baked/maps/index.ron`, `venus_cloud_tops`: "disk average as stored 0.9500"; ruling
+/// W-B3 keeps it), here uniform and grey (the map's pattern has a 1.9 % disk rms, stored
+/// neutral).
+pub const VENUS_DECK_RHO: f64 = 0.95;
+/// First μ_s of [`VenusAtmo`]'s skylight table: below it the haze above the deck is in the
+/// planet's shadow (sunlight grazes the shell top at μ_s = −√(1 − (r_b/r_t)²) = −0.139).
+const SKY_MU_MIN: f64 = -0.25;
+/// Step of the skylight table in μ_s (the GPU's irradiance LUT has 64 columns over [−1, 1]).
+const SKY_MU_STEP: f64 = 1.0 / 32.0;
 /// NAIF ids.
 const EARTH: i32 = 399;
 const VENUS: i32 = 299;
@@ -52,12 +73,125 @@ pub struct Paper {
     pub p5_pre: f32,
 }
 
-/// The luminance [cd/m²] of world light along unit `dir` from the camera (0 for sky).
+/// B3's atmosphere over Venus's cloud deck, for the paper (module docs): the preset and the
+/// deck's skylight per lux of sunlight, tabulated in μ_s from [`SKY_MU_MIN`] to 1 (the CPU
+/// twin `uni_atmo::sky_irradiance`, 256 view marches each).
+pub struct VenusAtmo {
+    params: uni_atmo::AtmosphereParams,
+    sky: Vec<DVec3>,
+}
+
+impl VenusAtmo {
+    /// The shared table, built on first use (about 40 × 256 marches).
+    pub fn get() -> Option<&'static VenusAtmo> {
+        static ATMO: std::sync::OnceLock<Option<VenusAtmo>> = std::sync::OnceLock::new();
+        ATMO.get_or_init(|| {
+            let params = uni_atmo::preset_for(VENUS)?;
+            let r = params.bottom_radius_m;
+            let n = ((1.0 - SKY_MU_MIN) / SKY_MU_STEP).round() as usize + 1;
+            let sky = (0..n)
+                .map(|k| {
+                    let mu = SKY_MU_MIN + k as f64 * SKY_MU_STEP;
+                    uni_atmo::sky_irradiance(&params, r, mu).as_dvec3()
+                })
+                .collect();
+            Some(VenusAtmo { params, sky })
+        })
+        .as_ref()
+    }
+
+    /// The deck's (the preset's bottom) and the haze shell's top radius [m].
+    pub fn radii_m(&self) -> (f64, f64) {
+        (self.params.bottom_radius_m, self.params.top_radius_m)
+    }
+
+    /// Skylight on the deck per lux of sunlight at μ_s, linear in the table; 0 below it.
+    fn sky_at(&self, mu_s: f64) -> DVec3 {
+        let x = (mu_s - SKY_MU_MIN) / SKY_MU_STEP;
+        if !(x >= 0.0) {
+            return DVec3::ZERO;
+        }
+        let last = self.sky.len() - 1;
+        let k = (x.floor() as usize).min(last);
+        let f = (x - k as f64).min(1.0);
+        let next = self.sky[(k + 1).min(last)];
+        self.sky[k] * (1.0 - f) + next * f
+    }
+
+    /// The luminance [cd/m²] along unit `dir` from the camera through Venus's haze (body `b`,
+    /// drawn at the deck, the preset's bottom radius) and the distance to what it reaches (the
+    /// deck, else the shell's nearest point), or `None` where the ray misses the shell. As the
+    /// passes draw it: the deck ρ·E·C·(μ₀·T_sun + skylight)/π (body.wgsl, A3's C, B3's ground
+    /// lighting at r = the deck, μ_s about the normal) times the view transmittance, plus the
+    /// in-scatter × E (atmosphere_common.wgsl: no C), each with the Sun's colour.
+    pub fn luminance(&self, b: &BodyView, dir: DVec3) -> Option<(f64, f64)> {
+        self.ray(b, dir).map(|r| (r.luminance, r.dist_m))
+    }
+
+    /// [`VenusAtmo::luminance`] with the sky's share: what the band and stars behind the ray
+    /// keep, the view transmittance's Rec. 709 luminance (the passes multiply sky light by
+    /// 1 − g, g = 1 − luminance(T)), 0 where the ray meets the deck (nothing is drawn behind a
+    /// body).
+    pub fn ray(&self, b: &BodyView, dir: DVec3) -> Option<HazeRay> {
+        let p = &self.params;
+        let ro = -b.rel_pos_m;
+        let top = hit_ellipsoid(ro, dir, DQuat::IDENTITY, DVec3::splat(p.top_radius_m))?;
+        let deck = hit_ellipsoid(ro, dir, DQuat::IDENTITY, DVec3::splat(p.bottom_radius_m));
+        let sun = b.sun_rel_m.normalize();
+        let (insc, trans) =
+            uni_atmo::segment_radiance(p, ro, dir, deck.unwrap_or(f64::INFINITY), sun);
+        let colour = {
+            let c = uni_core::blackbody_linear_srgb(uni_core::TEFF_SUN_K).as_dvec3();
+            c / f64::from(crate::scene::luminance(c.as_vec3()))
+        };
+        let e = b.sun_illuminance_lux;
+        let mut l = insc.as_dvec3() * colour * e;
+        if let Some(t) = deck {
+            let x = ro + dir * t;
+            let n = x.normalize();
+            let mu0 = n.dot((b.sun_rel_m - x).normalize());
+            let sun_t = uni_atmo::transmittance(p, p.bottom_radius_m, mu0).as_dvec3();
+            let corr = planet_phase_correction(VENUS, b.brdf, crate::measure::phase_rad(b))
+                .min(uni_sim::snapshot::MAX_PHASE_CORRECTION);
+            let refl = reflectance(b.brdf, mu0, (-n.dot(dir)).max(1.0e-4));
+            let ground = colour
+                * (VENUS_DECK_RHO * e * corr / std::f64::consts::PI)
+                * (sun_t * refl + self.sky_at(mu0));
+            l += trans.as_dvec3() * ground;
+        }
+        let lum = |c: DVec3| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+        Some(HazeRay {
+            luminance: lum(l),
+            dist_m: deck.unwrap_or(top),
+            sky_t: if deck.is_some() {
+                0.0
+            } else {
+                lum(trans.as_dvec3())
+            },
+        })
+    }
+}
+
+/// One ray through Venus's haze ([`VenusAtmo::ray`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HazeRay {
+    /// World light along the ray [cd/m²] (Rec. 709 luminance).
+    pub luminance: f64,
+    /// Distance to the deck, or to the shell where the ray misses the deck [m].
+    pub dist_m: f64,
+    /// The fraction of the sky behind that the passes keep (0 on the deck).
+    pub sky_t: f64,
+}
+
+/// The luminance [cd/m²] of world light along unit `dir` from the camera (0 for sky). With
+/// `venus`, Venus is drawn with B3's haze ([`VenusAtmo::luminance`]); without, as a bare
+/// Lambert deck with ρ from p_V (the plan's row).
 pub fn world_luminance(
     snap: &Snapshot,
     dir: DVec3,
     rings: Option<&uni_data::RingProfile>,
     earth_k: f64,
+    venus: Option<&VenusAtmo>,
 ) -> f64 {
     // The nearest resolved body or star surface along the ray.
     let mut best: Option<(f64, f64)> = None; // (distance, luminance)
@@ -77,6 +211,14 @@ pub fn world_luminance(
         }
     }
     for b in &snap.bodies {
+        if b.naif == Some(VENUS)
+            && let Some(atmo) = venus
+        {
+            if let Some((l, t)) = atmo.luminance(b, dir) {
+                offer(t, l);
+            }
+            continue;
+        }
         let drawn = drawn(b);
         if let Some(t) = hit_body(&drawn, dir) {
             offer(t, body_luminance(&drawn, dir, t, earth_k));
@@ -170,7 +312,24 @@ pub fn on_paper(
     size: UVec2,
     rings: Option<&uni_data::RingProfile>,
 ) -> Paper {
+    on_paper_with(world, view, size, rings, true)
+}
+
+/// [`on_paper`], with Venus's haze (`venus_haze`, the model the passes draw) or as the plan's
+/// bare Lambert deck (for comparison: the "row 13 Venus" finding).
+pub fn on_paper_with(
+    world: &World,
+    view: &CameraView,
+    size: UVec2,
+    rings: Option<&uni_data::RingProfile>,
+    venus_haze: bool,
+) -> Paper {
     let snap = world.sim.snapshot(view, size);
+    let venus = if venus_haze && snap.bodies.iter().any(|b| b.naif == Some(VENUS)) {
+        VenusAtmo::get()
+    } else {
+        None
+    };
     let cam = Cam::new(view, size);
     let earth_k = snap
         .bodies
@@ -184,7 +343,7 @@ pub fn on_paper(
     for y in (0..size.y).step_by(STRIDE as usize) {
         for x in (0..size.x).step_by(STRIDE as usize) {
             let p = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
-            let l = world_luminance(&snap, cam.ray(p), rings, earth_k);
+            let l = world_luminance(&snap, cam.ray(p), rings, earth_k, venus);
             if l > 0.0 {
                 for _ in 0..w {
                     lums.push(l as f32);
@@ -193,11 +352,10 @@ pub fn on_paper(
         }
     }
     let total = size.x * size.y;
-    let meter = Histogram::from_luminances(lums.iter().copied()).meter(total);
-    let target = uni_post::target_ev(meter, 0.0);
-    let pre = uni_gfx::exposure_scale(target);
+    let (meter, target, pre) = settled_meter(&lums, total);
     let mut lit: Vec<f32> = lums
         .into_iter()
+        .map(|l| through_f16(l, pre))
         .filter(|l| *l >= uni_post::METER_MIN_CD_M2)
         .collect();
     lit.sort_by(f32::total_cmp);
@@ -210,6 +368,52 @@ pub fn on_paper(
         brightest_pre: lit.last().copied().unwrap_or(0.0) * pre,
         p5_pre: p5 * pre,
     }
+}
+
+/// f16's smallest subnormal, 2⁻²⁴, and smallest normal, 2⁻¹⁴ (IEEE 754-2008 binary16).
+const F16_MIN_SUBNORMAL: f64 = 5.960_464_477_539_063e-8;
+const F16_MIN_NORMAL: f64 = 6.103_515_625e-5;
+/// Most fixed-point steps of [`settled_meter`] (it settles in 2–3).
+const SETTLE_STEPS: usize = 8;
+
+/// Luminance `l` [cd/m²] as the meter reads it back from the `hdr` target (Rgba16Float), which
+/// stores l·`pre`: below 2⁻¹⁴ a stored value is a multiple of 2⁻²⁴ (under half of that it is 0).
+/// At EV 17 the meter therefore sees nothing below 0.011 cd/m², eleven times its own 10⁻³ lit
+/// threshold, which is why Venus's dimmest haze pixels drop out of the capture's meter (task
+/// B9g). The normal range's 2⁻¹¹ relative rounding is left out (it moves a pixel by 0.0007 EV).
+pub fn through_f16(l: f32, pre: f32) -> f32 {
+    let x = f64::from(l) * f64::from(pre);
+    let q = if x < F16_MIN_NORMAL {
+        (x / F16_MIN_SUBNORMAL).round() * F16_MIN_SUBNORMAL
+    } else {
+        x
+    };
+    (q / f64::from(pre)) as f32
+}
+
+/// The meter's reading once auto exposure has settled: the frame is stored at the pre-exposure
+/// of the EV it meters ([`through_f16`]), so the EV is the fixed point of meter → EV → storage,
+/// found by iteration from the unquantised reading (what the capture's settle loop does on the
+/// GPU). Returns the meter, its target [EV100] and that target's pre-exposure.
+fn settled_meter(lums: &[f32], total: u32) -> (Option<uni_post::histogram::Meter>, f32, f32) {
+    let mut meter = Histogram::from_luminances(lums.iter().copied()).meter(total);
+    let mut ev = uni_post::target_ev(meter, 0.0);
+    let dimmest = lums.iter().copied().fold(f32::INFINITY, f32::min);
+    for _ in 0..SETTLE_STEPS {
+        let pre = uni_gfx::exposure_scale(ev);
+        if f64::from(dimmest) * f64::from(pre) >= F16_MIN_NORMAL {
+            // Every pixel is stored as a normal f16: nothing to quantise.
+            break;
+        }
+        meter = Histogram::from_luminances(lums.iter().map(|&l| through_f16(l, pre))).meter(total);
+        let next = uni_post::target_ev(meter, 0.0);
+        let settled = (next - ev).abs() < 1.0e-3;
+        ev = next;
+        if settled {
+            break;
+        }
+    }
+    (meter, ev, uni_gfx::exposure_scale(ev))
 }
 
 /// The p_V point flux [lx] of body `b` (A4's point path: ρ·w·E·(R/d)²·Φ(α)·C(α)).
@@ -267,7 +471,7 @@ mod tests {
         let cam = Cam::new(&view, size);
         let mut lux = 0.0;
         for p in cam.pixels() {
-            lux += world_luminance(&snap, cam.ray(p), None, 1.0) * cam.pixel_solid_angle(p);
+            lux += world_luminance(&snap, cam.ray(p), None, 1.0, None) * cam.pixel_solid_angle(p);
         }
         let point = point_lux(b);
         assert!((lux / point - 1.0).abs() < 0.02, "{lux} vs {point}");

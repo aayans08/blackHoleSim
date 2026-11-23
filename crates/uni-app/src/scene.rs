@@ -426,10 +426,10 @@ impl Scene {
                 RingRenderer::new(gpu, &mut lib, camera_bgl, profile, body.clone())
                     .context("creating the ring pass")?,
             ),
-            None => {
-                notices.push("Saturn's ring profile missing: rings not drawn".to_owned());
-                None
-            }
+            // `world::load` already put "Saturn's ring profile missing" in `Assets::warnings`,
+            // which the HUD and the capture notes show beside `notices` (review B9 r0 minor 3:
+            // the line appeared twice).
+            None => None,
         };
         let albedo_rgb = {
             let b = bodies_pass.borrow();
@@ -464,8 +464,10 @@ impl Scene {
             .context("creating the bloom pass")?;
         let tonemap = uni_post::TonemapFeature::new(gpu, &mut lib, camera_bgl, output_format)
             .context("creating the tonemap pass")?;
-        let (world_tap, world_tap_pass) = HdrTap::new("hdr tap (world)");
-        let (hdr_tap, hdr_tap_pass) = HdrTap::new("hdr tap (pre-bloom)");
+        let (world_tap, world_tap_pass) =
+            HdrTap::new(gpu, crate::tap::TAP_WORLD).context("creating the world HDR tap")?;
+        let (hdr_tap, hdr_tap_pass) =
+            HdrTap::new(gpu, crate::tap::TAP_PREBLOOM).context("creating the pre-bloom HDR tap")?;
 
         renderer.push(Box::new(resolve));
         renderer.push(Box::new(band_cube));
@@ -1008,6 +1010,21 @@ pub fn pass_durations(stamps: &[(&'static str, Option<f32>)]) -> Vec<(&'static s
         .collect()
 }
 
+/// A `notes` line for every timer label that appears more than once in one frame's `timings`
+/// (their `gpu_ms` entries would collide); empty when every label is unique.
+pub fn duplicate_pass_names(timings: &[(&'static str, Option<f32>)]) -> Vec<String> {
+    let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+    for (name, _) in timings {
+        *seen.entry(name).or_default() += 1;
+    }
+    seen.into_iter()
+        .filter(|&(_, n)| n > 1)
+        .map(|(name, n)| {
+            format!("GPU pass label {name:?} timed {n} times in one frame: its gpu_ms entry is ambiguous")
+        })
+        .collect()
+}
+
 /// Frame timings for the HUD.
 pub struct Perf {
     pub fps: f32,
@@ -1219,9 +1236,9 @@ mod tests {
 
     /// B9 Step 1's app tests. The meter's night EV and uni-sky's star EV are both M0's −4 (the
     /// pair B6 and B4 were built against; the debug-grid bookmark keeps it); the app's
-    /// eye-adapted default is −6.5 (lead ruling "B4L exposure"), 2.5 stops darker than the night
-    /// scene EV, so a dark-adapted sky never runs brighter than the night scene. The resolve's
-    /// clamp is the app's.
+    /// eye-adapted default is −6.5 (lead ruling "B4L exposure"): a lower EV is more exposure, so
+    /// the stars get 2.5 stops more exposure than at the night scene EV (`exposure_scale(−6.5)`
+    /// is 2^2.5 = 5.7 × `exposure_scale(−4)`), never less. The resolve's clamp is the app's.
     #[test]
     fn auto_exposure_constants_match_the_app() {
         assert_eq!(uni_post::NIGHT_EV100, uni_sky::DEFAULT_STAR_EV100);
@@ -1375,6 +1392,77 @@ mod tests {
             }
         }
         assert!(pass_durations(&[]).is_empty());
+    }
+
+    /// The timer labels of the M1 stack in encode order (the frame contract's pass order, with the
+    /// sub-passes some features time on their own and the two capture taps), for the uniqueness
+    /// test below: `gpu_ms` in the capture JSON is keyed by label, so two passes with one label
+    /// would share one entry. A tap times its copy only on the frames it is armed for (captures).
+    /// The live check is `duplicate_pass_names` on the timer's own list, run on every capture.
+    const TIMED_PASSES: [&str; 18] = [
+        "exposure",
+        "band-update",
+        "background",
+        "sun",
+        "bodies",
+        "rings",
+        "atmosphere",
+        "atmosphere mask",
+        "histogram",
+        crate::tap::TAP_WORLD,
+        "lens",
+        "band",
+        "stars",
+        "points",
+        crate::tap::TAP_PREBLOOM,
+        "bloom",
+        "bloom composite",
+        "tonemap",
+    ];
+
+    /// Review B9 r0 Important 1: each armed tap is its own timed span, named "tap-world" and
+    /// "tap-prebloom", right after the meter and right before bloom, and every timer label of
+    /// the stack is unique (so `gpu_ms` has one entry per pass). With the tap's span in the
+    /// frame, the pass after it is charged its own time only, not the copy's.
+    #[test]
+    fn tap_spans_exist_and_pass_names_stay_unique() {
+        let at = |name: &str| TIMED_PASSES.iter().position(|p| *p == name).unwrap();
+        assert_eq!(at(crate::tap::TAP_WORLD), at("histogram") + 1);
+        assert_eq!(at(crate::tap::TAP_WORLD) + 1, at("lens"));
+        assert_eq!(at(crate::tap::TAP_PREBLOOM) + 1, at("bloom"));
+        assert_eq!(at(crate::tap::TAP_PREBLOOM), at("points") + 1);
+        assert_eq!(crate::tap::TAP_WORLD, "tap-world");
+        assert_eq!(crate::tap::TAP_PREBLOOM, "tap-prebloom");
+        let all: Vec<(&'static str, Option<f32>)> =
+            TIMED_PASSES.iter().map(|p| (*p, Some(1.0))).collect();
+        assert!(duplicate_pass_names(&all).is_empty());
+        let mut twice = all.clone();
+        twice.push(("band", None));
+        let notes = duplicate_pass_names(&twice);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("\"band\""), "{notes:?}");
+
+        // A 0.3 ms copy after the meter: charged to the tap, not to the lens or band pass.
+        let stamps = [
+            ("histogram", Some(3.0)),
+            (crate::tap::TAP_WORLD, Some(3.3)),
+            ("band", Some(4.3)),
+            ("points", Some(4.5)),
+            (crate::tap::TAP_PREBLOOM, Some(4.8)),
+            ("bloom", Some(5.8)),
+        ];
+        let d: std::collections::BTreeMap<&str, f32> = pass_durations(&stamps)
+            .into_iter()
+            .map(|(n, ms)| (n, ms.unwrap()))
+            .collect();
+        for (name, want) in [
+            (crate::tap::TAP_WORLD, 0.3),
+            ("band", 1.0),
+            (crate::tap::TAP_PREBLOOM, 0.3),
+            ("bloom", 1.0),
+        ] {
+            assert!((d[name] - want).abs() < 1e-5, "{name}: {}", d[name]);
+        }
     }
 
     #[test]

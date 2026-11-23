@@ -17,8 +17,8 @@
 //! - `bench --json <bench.json> --max-gpu-ms <ms> --max-cpu-ms <ms> --max-interval-ms <ms>
 //!   [--window last10s|first10s|all] [--budgets]` checks bench p95 timings (see `bench`).
 //! - HDR checks on the `--hdr` capture sidecar (see `hdr`): `ratio`, `stats`, `samples`,
-//!   `profile`, `angle`, `flux`, each with `--hdr-json <capture.json>`. They may also be written
-//!   `hdr <check> …`.
+//!   `profile`, `angle`, `flux`, `limb`, each with `--hdr-json <capture.json>`. They may also
+//!   be written `hdr <check> …`.
 //!
 //! Every check prints its numbers and a last line ending in PASS or FAIL. Exit codes: 0 on
 //! success or PASS, 1 on FAIL, 2 on a bad command line or an I/O or decode error (the error goes
@@ -59,6 +59,7 @@ const USAGE: &str = "usage:
   uni-verify profile --hdr-json <capture.json> --feature <name> --tol <slope>
   uni-verify angle --hdr-json <capture.json> --feature <name> --tol-deg <deg>
   uni-verify flux --hdr-json <capture.json> --name <star> --tol <rel>
+  uni-verify limb --hdr-json <capture.json> --name <limb> --tol <rel>
   (the HDR checks may also be written `uni-verify hdr <check> ...`)";
 
 /// Exit code when a check fails.
@@ -137,6 +138,11 @@ enum Command {
         tol_deg: f64,
     },
     Flux {
+        hdr_json: PathBuf,
+        name: String,
+        tol: f64,
+    },
+    Limb {
         hdr_json: PathBuf,
         name: String,
         tol: f64,
@@ -293,9 +299,11 @@ fn parse_args(args: &[OsString]) -> anyhow::Result<Command> {
         let Some((check, options)) = options.split_first() else {
             bail!("hdr needs a check name\n{USAGE}");
         };
-        let is_hdr_check = ["ratio", "stats", "samples", "profile", "angle", "flux"]
-            .iter()
-            .any(|name| check == *name);
+        let is_hdr_check = [
+            "ratio", "stats", "samples", "profile", "angle", "flux", "limb",
+        ]
+        .iter()
+        .any(|name| check == *name);
         if !is_hdr_check {
             bail!("unknown HDR check {check:?}\n{USAGE}");
         }
@@ -507,6 +515,14 @@ fn parse_command(command: &OsString, options: &[OsString]) -> anyhow::Result<Com
                 tol: o.number("--tol", Range::NonNegative)?,
             })
         }
+        "limb" => {
+            let o = parse_options(options, &["--hdr-json", "--name", "--tol"], &[])?;
+            Ok(Command::Limb {
+                hdr_json: o.path("--hdr-json")?,
+                name: o.text("--name")?,
+                tol: o.number("--tol", Range::NonNegative)?,
+            })
+        }
         _ => bail!("unknown command {command:?}\n{USAGE}"),
     }
 }
@@ -662,6 +678,14 @@ fn run(command: Command) -> anyhow::Result<ExitCode> {
         } => {
             let capture = hdr::HdrCapture::load(&hdr_json)?;
             Ok(finish(hdr::check_flux(&capture, &name, tol)?))
+        }
+        Command::Limb {
+            hdr_json,
+            name,
+            tol,
+        } => {
+            let capture = hdr::HdrCapture::load(&hdr_json)?;
+            Ok(finish(hdr::check_limb(&capture, &name, tol)?))
         }
     }
 }
@@ -924,6 +948,22 @@ mod tests {
                 hdr_json: PathBuf::from("c.json"),
                 name: "Rigel".into(),
                 tol: 0.05,
+            }
+        );
+        assert_eq!(
+            parse(&[
+                "limb",
+                "--hdr-json",
+                "c.json",
+                "--name",
+                "venus_night_limb",
+                "--tol",
+                "0.1",
+            ]),
+            Command::Limb {
+                hdr_json: PathBuf::from("c.json"),
+                name: "venus_night_limb".into(),
+                tol: 0.1,
             }
         );
         assert_eq!(

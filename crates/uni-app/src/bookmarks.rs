@@ -834,7 +834,8 @@ fn generate(world: &mut World) -> Vec<Mark> {
         marks.push(Mark {
             comment: "#19 30 M from TestBH-1 on the side away from the Galactic Centre, looking \
                       through the hole toward it (the Sun 86.9° off-axis), north up, the band \
-                      lensed, auto exposure."
+                      lensed, auto exposure. Checks: visual and seam only; no numeric shadow \
+                      check (lead ruling \"row 19 shadow\": #18 covers the geometry)."
                 .to_owned(),
             b,
         });
@@ -1435,10 +1436,75 @@ fn intent_13_venus_crescent() {
         125.1,
         0.01,
     );
-    // Re-derived row: B1 applies A3's phase correction per pixel, clamped at 10 at 155°, which
-    // the plan's 16.7 left out: 18.93, 1 844 lit px (the plan's 2 280 assumed a camera at
-    // infinity; from 24.5 radii the visible crescent is narrower).
-    assert_paper(world, assets.rings.as_ref(), &c, 18.93, Some(1_844.0));
+    // Re-derived row (task B9g, lead ruling "row 13 Venus haze"): 17.00 EV, 5 436 lit px. The
+    // plan's 16.7 left out A3's C (clamped at 10 at 155°); B9's 18.93 / 1 844 px added C to a
+    // bare Lambert deck but left out B3's haze, which the passes draw: through τ ≈ 0.36 at
+    // grazing angles the deck is dimmed and the haze's twilight glow lights pixels far past the
+    // hard crescent, and the meter's 50th–95th percentile band takes them in (the capture at
+    // 6cd81e9: 17.25 EV, 5 180 px). With the haze twin alone the paper reads 16.74 / 5 698 px;
+    // the `hdr` target's f16 floor (the meter cannot see l·pre < 2⁻²⁴) removes the faintest
+    // glow: 17.00 / 5 436.
+    assert_paper(world, assets.rings.as_ref(), &c, 17.0, Some(5_436.0));
+    let bare = crate::paper::on_paper_with(world, &c.view, SIZE, assets.rings.as_ref(), false);
+    near(
+        "bare-deck paper EV (B9's row)",
+        f64::from(bare.target_ev),
+        18.93,
+        0.001,
+    );
+}
+
+/// Task B9g: the rendered Venus (the passes' model, `paper::VenusAtmo`) sends at 155° nearly the
+/// light of the real planet, its p_V point flux with Mallama & Hilton's C (clamped at 10, A3):
+/// 0.89 of it, 0.13 mag fainter, inside ruling W-B1's 0.3 mag. So the 1.7 EV gap of row 13 was
+/// the paper's (a bare Lambert deck), not a renderer defect. (A bare deck with ρ(p_V) reads
+/// 0.74 of the point flux: the camera at 24.5 radii sees a narrower crescent than the point
+/// formula's observer at infinity.) And the plan's `night_limb_haze` region measured the sky:
+/// there, past ~25° beyond the terminator, the haze shell is in Venus's shadow.
+#[test]
+fn venus_disk_flux_and_night_limb_twin() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    let c = Case::new(world, "venus-crescent");
+    let v = c.body(world, "Venus");
+    let cam = crate::measure::Cam::new(&c.view, SIZE);
+    let atmo = crate::paper::VenusAtmo::get().expect("Venus preset");
+    let mut lux = 0.0;
+    for p in cam.pixels() {
+        if let Some((l, _)) = atmo.luminance(v, cam.ray(p)) {
+            lux += l * cam.pixel_solid_angle(p);
+        }
+    }
+    let point = crate::paper::point_lux(v);
+    let gap = -2.5 * (lux / point).log10();
+    println!("Venus at 155°: rendered {lux:.4e} lx, point {point:.4e} lx, gap {gap:+.3} mag");
+    assert!((0.0..0.3).contains(&gap), "{gap}");
+    // B9's capture JSON (git-ignored; skipped when absent): its night_limb_haze pixels hold
+    // twin light below 1e-4 of the 1.28e-3 pre-exposed B9 measured there.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../captures/b9-dev/venus-crescent.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        println!("{} absent: region part skipped", path.display());
+        return;
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).expect("b9-dev capture parses");
+    let pre = json["hdr"]["pre"][0].as_f64().expect("pre");
+    let region = json["regions"]["night_limb_haze"]
+        .as_array()
+        .expect("B9's night_limb_haze region");
+    let mut worst: f64 = 0.0;
+    for p in region {
+        let (x, y) = (p[0].as_f64().unwrap(), p[1].as_f64().unwrap());
+        let l = atmo
+            .luminance(v, cam.ray(glam::DVec2::new(x, y)))
+            .map_or(0.0, |r| r.0);
+        worst = worst.max(l * pre);
+    }
+    println!(
+        "night_limb_haze: {} px, brightest twin pixel {worst:.3e} pre-exposed",
+        region.len()
+    );
+    assert!(worst < 1.28e-3 * 1e-4, "{worst}");
 }
 
 #[test]
@@ -1583,7 +1649,7 @@ fn intent_15_16_sky_views() {
 #[test]
 fn intent_15_rigel_flux_radius() {
     let mut g = full_world();
-    let (world, _) = &mut *g;
+    let (world, assets) = &mut *g;
     let c = Case::new(world, "sky-orion-3d");
     let mut shares = Vec::new();
     for ev in [-4.0_f32, crate::scene::DEFAULT_STAR_EV100] {
@@ -1594,6 +1660,66 @@ fn intent_15_rigel_flux_radius() {
     println!("Rigel flux radius and neighbour share: {shares:?}");
     // The footprint grows with the star EV; the share with it.
     assert!(shares[1].1 > shares[0].1 && shares[1].2 >= shares[0].2);
+    // Lead ruling "row 15 flux": the capture JSON's `neighbour_lux` (what B8's check adds to
+    // Rigel's own illuminance) is this sum over the stars the star pass draws (its visibility
+    // cut at the default star EV); review B9 r0 minor 13.
+    let ev = crate::scene::DEFAULT_STAR_EV100;
+    let (x, y, r, lux, i) = star_footprint(world, &c, "Rigel", ev);
+    let drawn = drawn_neighbours_lux(world, &c, x, y, r, Some(i), ev);
+    let m = measured(world, assets, "sky-orion-3d");
+    let f = &m.flux[0];
+    near("Rigel expected_lux", f.expected_lux, lux, 1e-9);
+    near("Rigel R", f.radius_px, r, 1e-6);
+    near("neighbour_lux", f.neighbour_lux, drawn, 1e-9);
+    println!(
+        "Rigel neighbour_lux {:.4e} lx = {:.1} % of its own {:.4e} lx",
+        f.neighbour_lux,
+        100.0 * f.neighbour_lux / f.expected_lux,
+        f.expected_lux
+    );
+}
+
+/// [`neighbours_lux`] over the stars the star pass draws at star EV `ev`
+/// (`uni_sky::stars3d::star_is_visible`) and in front of the camera, as `measure` counts them.
+fn drawn_neighbours_lux(
+    world: &World,
+    c: &Case,
+    x: f64,
+    y: f64,
+    radius_px: f64,
+    skip: Option<u32>,
+    ev: f32,
+) -> f64 {
+    let years = world.epoch().seconds_since(Epoch::J2000) / crate::scene::JULIAN_YEAR_S;
+    let cam_pc = crate::scene::camera_icrs_pc(&c.view.pos);
+    let mut sum = 0.0;
+    for (i, s) in world.sim.star_data().iter().enumerate() {
+        if Some(i as u32) == skip || c.snap.suppressed_stars.contains(&(i as u32)) {
+            continue;
+        }
+        let rel = crate::measure::star_pos_pc(s, years) - cam_pc;
+        if rel.normalize_or_zero().dot(c.fwd()) < 0.1 {
+            continue;
+        }
+        let Some((sx, sy)) = c.px(rel) else { continue };
+        if (sx - x).hypot(sy - y) >= radius_px {
+            continue;
+        }
+        let lux = uni_core::star_illuminance_lux(
+            f64::from(s.abs_mag_v) + 5.0 * (rel.length() / 10.0).log10(),
+        );
+        let e = uni_sky::stars::star_display_energy_off_axis(
+            lux as f32,
+            c.view.fov_y_rad as f32,
+            H as f32,
+            ev,
+            rel.normalize().dot(c.fwd()) as f32,
+        );
+        if uni_sky::stars3d::star_is_visible(e, uni_sky::stars3d::STARS3D_HALO_FRACTION) {
+            sum += lux;
+        }
+    }
+    sum
 }
 
 #[test]
@@ -1779,7 +1905,6 @@ fn capture_measurements_cover_the_plan_checks() {
         ),
         ("sun-closeup", &["mu_0p5", "disk_centre"]),
         ("sun-granulation", &["granulation_patch"]),
-        ("venus-crescent", &["night_limb_haze"]),
         ("titan-backlit", &["haze_ring"]),
         ("sky-galactic-center", &["band_plane", "band_high_lat"]),
     ] {
@@ -1801,4 +1926,28 @@ fn capture_measurements_cover_the_plan_checks() {
     let m = measured(world, assets, "alpha-cen-sun");
     assert_eq!(m.flux.len(), 1);
     assert_eq!(m.flux[0].name, "Sun");
+    // Row 13 (lead ruling "row 13 Venus haze"): the night limb across the haze, for B8's `limb`.
+    let m = measured(world, assets, "venus-crescent");
+    let limb = m
+        .limbs
+        .iter()
+        .find(|l| l.name == "venus_night_limb")
+        .expect("venus_night_limb");
+    assert!(
+        limb.strip.len() > 500 && limb.sky.len() > 500,
+        "{} {}",
+        limb.strip.len(),
+        limb.sky.len()
+    );
+    let lit = limb.strip.iter().filter(|p| p[2] >= 1.0).count();
+    assert!(
+        lit > 20 && limb.strip.iter().all(|p| (0.0..=1.0).contains(&p[3])),
+        "{lit}"
+    );
+    assert!(!m.regions.contains_key("night_limb_haze"));
+    // Row 19 (lead ruling "row 19 shadow"): visual and seam checks only, so the JSON carries no
+    // regions, samples or flux for it (the `lens_rect_*_edge` regions cannot exist either: at
+    // 30 M the traced rectangle is the whole frame).
+    let m = measured(world, assets, "bh-lens-band");
+    assert!(m.regions.is_empty() && m.samples.is_empty() && m.flux.is_empty());
 }

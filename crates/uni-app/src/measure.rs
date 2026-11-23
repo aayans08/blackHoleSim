@@ -14,7 +14,8 @@
 //!   path at this phase, the Mallama & Hilton 2018 phase law; recorded, no pass/fail) and
 //!   `paper` (the view's "Exposure on paper" with the CPU twins, `crate::paper`).
 //! - `regions`, `samples`, `features`, `flux`: per bookmark, as the plan's table "M1 capture
-//!   bookmarks" names them (see [`measure`]).
+//!   bookmarks" names them (see [`measure`]); `limbs` (lead ruling "row 13 Venus haze"): the
+//!   light across a limb, pixel by pixel with its CPU twin, for B8's `limb` check.
 //!
 //! Pixel coordinates are framebuffer pixels (x right, y down, pixel k spanning [k, k + 1]),
 //! the convention of `uni_sim::snapshot` and B8.
@@ -50,6 +51,12 @@ pub struct Sample {
     pub y: f64,
     pub expected_cd_m2: [f64; 3],
     pub what: String,
+    /// The pixels (centres) whose ray meets the body inside the 3 × 3 texels of the 2k map copy
+    /// that `expected_cd_m2` averages, at most [`MAX_REGION_SAMPLES`] (evenly thinned): B8's
+    /// `samples` averages the GPU over them, because the GPU samples the finer BC7 mips, which
+    /// resolve detail the 2k twin's patch averages away (lead ruling "row 5 Mars samples").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub footprint: Vec<[f64; 2]>,
 }
 
 /// One `features` entry (comet checks, Wave C).
@@ -74,10 +81,27 @@ pub struct FluxEntry {
     pub radius_px: f64,
     pub expected_lux: f64,
     pub mask: Vec<[f64; 3]>,
-    /// Illuminance of every other catalogue star and point sprite whose centre lies inside R
-    /// [lx]: light B8's `flux` sums with the star's own (B4L's halo widened the footprints, so
-    /// this is no longer under the plan's 1 %; the gate reads it beside the check).
+    /// Illuminance of every other drawn catalogue star and point sprite whose centre lies inside
+    /// R [lx], as drawn (a reflected point with the frame's exposure factor): B8's `flux` expects
+    /// the star's own `expected_lux` plus this (lead ruling "row 15 flux"; B4L's halo widened the
+    /// footprints, so it is no longer under the plan's 1 %: 18 % of Rigel's at `sky-orion-3d`).
     pub neighbour_lux: f64,
+}
+
+/// One `limbs` entry (lead ruling "row 13 Venus haze", task B9g): the pixels across a limb with
+/// the CPU twin's world light, for an integrated-flux check (B8's `limb`) instead of a region's
+/// mean, which a sub-pixel haze band and the sky behind it decide.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct LimbFlux {
+    pub name: String,
+    /// Every pixel across the limb, none thinned (the check integrates them): [x, y, the twin's
+    /// world light [cd/m²], the sky's share (the band and stars behind the pixel are drawn ×
+    /// this: the view transmittance's luminance, 0 where the ray meets the body)]. Pixels
+    /// inside a drawn star's or point's footprint are left out.
+    pub strip: Vec<[f64; 4]>,
+    /// Sky pixels just beyond the limb on the same side, outside every star footprint: B8
+    /// subtracts their median × the sky's share from the strip.
+    pub sky: Vec<[f64; 2]>,
 }
 
 /// `metrics.earth_flux`: Earth's rendered flux against its point flux (ruling B3 I4).
@@ -118,6 +142,7 @@ pub struct Measurements {
     pub samples: Vec<Sample>,
     pub features: BTreeMap<String, Feature>,
     pub flux: Vec<FluxEntry>,
+    pub limbs: Vec<LimbFlux>,
 }
 
 /// What [`measure`] reads.
@@ -323,18 +348,6 @@ pub fn measure(input: &Input<'_>) -> Measurements {
                 add("limb_haze", haze_band(&cam, b, 10.0e3, 40.0e3, true));
             }
         }
-        "venus-crescent" => {
-            if let Some(b) = body(world, snap, "Venus") {
-                // The drawn Venus is its cloud deck, 70 km above the solid radius (B1, B3):
-                // the haze above the deck's night limb.
-                let mut deck = b.clone();
-                deck.radii_m += DVec3::splat(uni_atmo::VENUS_CLOUD_TOP_M);
-                add(
-                    "night_limb_haze",
-                    haze_band(&cam, &deck, 2.0e3, 30.0e3, false),
-                );
-            }
-        }
         "titan-backlit" => {
             if let Some(b) = body(world, snap, "Titan") {
                 add("haze_ring", haze_band(&cam, b, 100.0e3, 500.0e3, false));
@@ -387,7 +400,84 @@ pub fn measure(input: &Input<'_>) -> Measurements {
         "alpha-cen-sun" => flux_entries(input, &cam, &["Sun"]),
         _ => Vec::new(),
     };
+    if input.name == "venus-crescent"
+        && let Some(b) = body(world, snap, "Venus")
+        && let Some(atmo) = crate::paper::VenusAtmo::get()
+    {
+        m.limbs
+            .push(venus_night_limb(&cam, b, atmo, &drawn_sources(input, &cam)));
+    }
     m
+}
+
+/// Venus's night limb across its haze (lead ruling "row 13 Venus haze"): the night half of the
+/// image around Venus (the side away from the Sun's projected direction), every pixel from
+/// 2 px inside the cloud deck's limb to 2 px beyond the haze shell's top (60 km above the deck,
+/// 1.2 px at `venus-crescent`), with the twin's light ([`crate::paper::VenusAtmo`]); sky pixels
+/// from 4 to 10 px beyond the shell on the same side. B3's haze there is lit only toward the
+/// cusps: past ~25° from the terminator the shell is in Venus's shadow (sunlit only above
+/// ~140 km), which is why the plan's `night_limb_haze` region (the anti-solar third of the
+/// limb) measured the Milky Way behind it, not haze (task B9g).
+fn venus_night_limb(
+    cam: &Cam,
+    b: &BodyView,
+    atmo: &crate::paper::VenusAtmo,
+    sources: &[(DVec2, f64, Option<u32>, f64)],
+) -> LimbFlux {
+    let mut out = LimbFlux {
+        name: "venus_night_limb".to_owned(),
+        strip: Vec::new(),
+        sky: Vec::new(),
+    };
+    let Some(c) = cam.project(b.rel_pos_m) else {
+        return out;
+    };
+    let d = b.rel_pos_m.length();
+    let (deck, top) = atmo.radii_m();
+    let r_deck = cam.radius_px(deck, d);
+    let r_top = cam.radius_px(top, d);
+    let sun_img = cam
+        .project(b.rel_pos_m + b.sun_rel_m.normalize() * b.radii_m.x)
+        .map_or(DVec2::X, |s| (s - c).normalize_or_zero());
+    let reach = r_top + 10.0;
+    // Only the footprints that reach the strip or the sky ring.
+    let near: Vec<(DVec2, f64)> = sources
+        .iter()
+        .filter(|(q, r, _, _)| (*q - c).length() < reach + r)
+        .map(|&(q, r, _, _)| (q, r))
+        .collect();
+    let in_star = |p: DVec2| near.iter().any(|(q, r)| (*q - p).length() < *r);
+    let (x0, x1) = (
+        (c.x - reach).floor().max(0.0),
+        (c.x + reach).ceil().min(cam.size.x),
+    );
+    let (y0, y1) = (
+        (c.y - reach).floor().max(0.0),
+        (c.y + reach).ceil().min(cam.size.y),
+    );
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            let p = DVec2::new(x + 0.5, y + 0.5);
+            x += 1.0;
+            let rho = (p - c).length();
+            let strip = rho >= r_deck - 2.0 && rho <= r_top + 2.0;
+            let ring = rho >= r_top + 4.0 && rho <= r_top + 10.0;
+            if !(strip || ring) || (p - c).normalize_or_zero().dot(sun_img) > 0.0 || in_star(p) {
+                continue;
+            }
+            if strip {
+                let ray = atmo.ray(b, cam.ray(p));
+                let (l, t) = ray.map_or((0.0, 1.0), |r| (r.luminance, r.sky_t));
+                out.strip.push([p.x, p.y, l, t]);
+            } else {
+                out.sky.push([p.x, p.y]);
+            }
+        }
+        y += 1.0;
+    }
+    out
 }
 
 /// Every pick item on screen with a radius: a resolved body's or star surface's projected
@@ -936,6 +1026,77 @@ impl CpuMap {
     }
 }
 
+impl CpuMap {
+    /// Texel coordinates of `uv` in the 2k copy (fractional; the texel is their floor).
+    fn texel_f(&self, uv: glam::Vec2) -> DVec2 {
+        DVec2::new(
+            f64::from(uv.x) * f64::from(self.tex.width),
+            f64::from(uv.y) * f64::from(self.tex.height),
+        )
+    }
+}
+
+/// The texel coordinates in `map` of the surface point of body `b` that pixel `p` sees, or
+/// `None` where the ray misses it (the same lon/lat/uv as the samples' twin).
+fn texel_at(cam: &Cam, b: &BodyView, map: &CpuMap, p: DVec2) -> Option<DVec2> {
+    let dir = cam.ray(p);
+    let t = hit_body(b, dir)?;
+    let pb = b.orient.conjugate() * (dir * t - b.rel_pos_m);
+    let lon = pb.y.atan2(pb.x) as f32;
+    let lat = pb.z.atan2(pb.truncate().length()) as f32;
+    Some(map.texel_f(uni_planet::equirect_uv(lon, lat, map.info.lon0_deg as f32)))
+}
+
+/// Largest half-width [px] of a sample's footprint search window (Earth's close-up, one 2k
+/// texel ≈ 26 px, needs ≈ 53).
+const FOOTPRINT_MAX_HALF_PX: f64 = 96.0;
+
+/// The pixels around `p` whose ray meets body `b` inside the 3 × 3 texels of `map` around the
+/// texel `p` sees (longitude wraps), thinned to at most [`MAX_REGION_SAMPLES`]: the screen
+/// footprint of the patch whose mean is the sample's expectation (lead ruling "row 5 Mars
+/// samples"). The search window's half-width is 2 texels at the scale measured at `p`.
+fn texel_footprint(cam: &Cam, b: &BodyView, map: &CpuMap, p: DVec2) -> Vec<[f64; 2]> {
+    let Some(c) = texel_at(cam, b, map, p) else {
+        return Vec::new();
+    };
+    let w = f64::from(map.tex.width);
+    let wrap = |dx: f64| dx - w * (dx / w).round();
+    let centre = c.floor();
+    // Texels per pixel at p: the larger step of the two pixel axes.
+    let per_px = [DVec2::X, DVec2::Y]
+        .iter()
+        .filter_map(|&d| texel_at(cam, b, map, p + d))
+        .map(|q| DVec2::new(wrap(q.x - c.x), q.y - c.y).length())
+        .fold(0.0_f64, f64::max);
+    let half = if per_px > 0.0 {
+        (2.0 / per_px).ceil().clamp(2.0, FOOTPRINT_MAX_HALF_PX) + 1.0
+    } else {
+        2.0
+    };
+    let mut out = Vec::new();
+    let mut dy = -half;
+    while dy <= half {
+        let mut dx = -half;
+        while dx <= half {
+            let q = p + DVec2::new(dx, dy);
+            if q.x > 0.0
+                && q.y > 0.0
+                && q.x < cam.size.x
+                && q.y < cam.size.y
+                && let Some(t) = texel_at(cam, b, map, q)
+            {
+                let d = t.floor() - centre;
+                if wrap(d.x).abs() <= 1.0 && d.y.abs() <= 1.0 {
+                    out.push(q);
+                }
+            }
+            dx += 1.0;
+        }
+        dy += 1.0;
+    }
+    thin(out)
+}
+
 /// sRGB code value → linear (IEC 61966-2-1 §5.2).
 fn srgb(code: u8) -> f32 {
     let c = f64::from(code) / 255.0;
@@ -1038,44 +1199,57 @@ fn map_samples(input: &Input<'_>, cam: &Cam, name: &str) -> Vec<Sample> {
                         lat.to_degrees(),
                         100.0 * spread
                     ),
+                    footprint: Vec::new(),
                 },
             ));
         }
         y += step;
     }
-    // The flattest 16 (the plan's "low-gradient map areas").
+    // The flattest 16 (the plan's "low-gradient map areas"), each with the screen footprint of
+    // its 3 × 3 texel patch.
     found.sort_by(|a, b| a.0.total_cmp(&b.0));
     found
         .into_iter()
         .take(MAP_SAMPLES)
-        .map(|(_, s)| s)
+        .map(|(_, mut s)| {
+            s.footprint = texel_footprint(cam, b, &albedo, DVec2::new(s.x, s.y));
+            s
+        })
         .collect()
 }
 
-/// `flux` entries for the named sources (re-review r2 NPA): a catalogue star (its position at
-/// the epoch, its V from the camera) or the Sun as a point sprite. `radius_px` is the footprint
-/// the shader used (`stars3d::footprint_radius_px` of its off-axis display energy, the 2-px
-/// minimum included, B4L's halo share); `mask` lists every other catalogue star or point whose
-/// footprint reaches the annulus R ≤ ρ < 1.5 R.
-fn flux_entries(input: &Input<'_>, cam: &Cam, names: &[&str]) -> Vec<FluxEntry> {
-    let world = input.world;
-    let frame = input.frame;
+/// The pixel and footprint radius [px] of a point source of illuminance `lux` at `rel` as the
+/// star pass draws it (`stars3d::footprint_radius_px` of its off-axis display energy at the
+/// captured star EV, B4L's halo share), or `None` off screen or below the pass's visibility cut.
+fn source_footprint<'a>(
+    input: &'a Input<'_>,
+    cam: &'a Cam,
+) -> impl Fn(DVec3, f64) -> Option<(DVec2, f64)> + 'a {
     let star_ev = input.ev100[1];
     let fov = cam.fov_y_rad as f32;
     let h = cam.size.y as f32;
     let halo = uni_sky::stars3d::STARS3D_HALO_FRACTION;
-    let years = frame.ctx.epoch.seconds_since(uni_core::Epoch::J2000) / crate::scene::JULIAN_YEAR_S;
-    let cam_pc = crate::scene::camera_icrs_pc(&cam.pos);
     let fwd = cam.forward();
-    // (pixel, footprint radius, lux, catalogue index) of every catalogue star in or near frame.
-    let footprint = |rel: DVec3, lux: f64| -> Option<(DVec2, f64)> {
+    move |rel: DVec3, lux: f64| {
         let p = cam.project(rel)?;
         let cos = rel.normalize().dot(fwd) as f32;
         let e = uni_sky::stars::star_display_energy_off_axis(lux as f32, fov, h, star_ev, cos);
         uni_sky::stars3d::star_is_visible(e, halo)
             .then(|| (p, f64::from(uni_sky::stars3d::footprint_radius_px(e, halo))))
-    };
-    let mut others: Vec<(DVec2, f64, Option<u32>, f64)> = Vec::new();
+    }
+}
+
+/// Every drawn catalogue star in front of the camera and every point sprite, as (pixel,
+/// footprint radius [px], catalogue index, illuminance as drawn [lx]): a reflected point with
+/// the frame's exposure factor (review B9 r0 minor 5).
+fn drawn_sources(input: &Input<'_>, cam: &Cam) -> Vec<(DVec2, f64, Option<u32>, f64)> {
+    let world = input.world;
+    let frame = input.frame;
+    let years = frame.ctx.epoch.seconds_since(uni_core::Epoch::J2000) / crate::scene::JULIAN_YEAR_S;
+    let cam_pc = crate::scene::camera_icrs_pc(&cam.pos);
+    let fwd = cam.forward();
+    let footprint = source_footprint(input, cam);
+    let mut others = Vec::new();
     for (i, s) in world.sim.star_data().iter().enumerate() {
         if frame.snapshot.suppressed_stars.contains(&(i as u32)) {
             continue;
@@ -1103,9 +1277,24 @@ fn flux_entries(input: &Input<'_>, cam: &Cam, names: &[&str]) -> Vec<FluxEntry> 
                 1.0
             };
         if let Some((p, r)) = footprint(pt.rel_pos_m, lux) {
-            others.push((p, r, None, pt.illuminance_lux));
+            others.push((p, r, None, lux));
         }
     }
+    others
+}
+
+/// `flux` entries for the named sources (re-review r2 NPA): a catalogue star (its position at
+/// the epoch, its V from the camera) or the Sun as a point sprite. `radius_px` is the footprint
+/// the shader used (`stars3d::footprint_radius_px` of its off-axis display energy, the 2-px
+/// minimum included, B4L's halo share); `mask` lists every other catalogue star or point whose
+/// footprint reaches the annulus R ≤ ρ < 1.5 R.
+fn flux_entries(input: &Input<'_>, cam: &Cam, names: &[&str]) -> Vec<FluxEntry> {
+    let world = input.world;
+    let frame = input.frame;
+    let years = frame.ctx.epoch.seconds_since(uni_core::Epoch::J2000) / crate::scene::JULIAN_YEAR_S;
+    let cam_pc = crate::scene::camera_icrs_pc(&cam.pos);
+    let footprint = source_footprint(input, cam);
+    let others = drawn_sources(input, cam);
     let mut out = Vec::new();
     for &name in names {
         let Some(id) = world.sim.find(name) else {
