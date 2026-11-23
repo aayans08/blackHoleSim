@@ -183,3 +183,8 @@ block-compression reference (bake-side test decoder); lunar-Lambert photometric 
 
 None implemented yet. Each published model or algorithm is credited here when its code lands, in addition to the
 source comment required next to the code.
+
+<!-- M1 Wave B section (pre-split by Task B0, review I8): Task B3 writes only between its own markers, and only if
+it adapts any of Hillaire's sample code (MIT): then the MIT notice goes here (M1 global constraints, review m24). -->
+<!-- B3 -->
+<!-- /B3 -->

@@ -3465,6 +3465,34 @@ mod tests {
         }
     }
 
+    /// B0 ruling A.1: a resolved body carries the BRDF, p_V and mean radius the point path uses,
+    /// so the bodies pass (B1) can match the point flux at the handover.
+    #[test]
+    fn body_view_carries_point_path_photometry() {
+        let facts = real_facts();
+        let mut data = empty_data();
+        data.facts = facts.clone();
+        let world = World::new(data, date("2026-11-20T00:00:00Z"));
+        for (name, brdf) in [
+            ("Mars", Brdf::Lambert),
+            ("Moon", Brdf::LunarLambert { l: 0.9 }),
+        ] {
+            let id = id_of(&world, name);
+            let centre = world.position(id);
+            let view = looking_at(centre.offset(DVec3::new(0.0, 0.0, 2.0e7)), centre, 60.0);
+            let snap = world.snapshot(&view, VIEWPORT);
+            let body = snap.bodies.iter().find(|b| b.id == id).expect(name);
+            let info = &world.objects()[id as usize];
+            let fact = facts.iter().find(|f| Some(f.naif) == info.naif).unwrap();
+            let r = info.radii_m;
+            assert_eq!(body.brdf, brdf, "{name}");
+            assert_eq!(Some(body.geometric_albedo), fact.geometric_albedo, "{name}");
+            let mean = (r.x * r.y * r.z).cbrt();
+            assert!((body.mean_radius_m / mean - 1.0).abs() < 1e-12, "{name}");
+        }
+        assert_eq!(crate::snapshot::MAX_PHASE_CORRECTION, 10.0);
+    }
+
     /// A Moon between the Earth and the Sun shadows the Earth; behind the Earth it is
     /// shadowed by it.
     #[test]

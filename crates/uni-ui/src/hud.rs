@@ -54,6 +54,12 @@ const HONESTY_LABELS: [&str; 2] = [
 /// anti-goal 2): the "Eye-adapted stars" dual exposure is not what a camera would record.
 pub const EYE_ADAPTED_STARS_LABEL: &str = "Eye-adapted stars (dual exposure, non-physical)";
 
+/// Shown in amber while the "Vivid star colours" option is on (owner feedback, 2026-11-22; on by
+/// default): star colours are saturated beyond their Planck chromaticity, keeping their
+/// luminance (`uni_sky::vivid_color`), which a camera would not record. C0 moves this and
+/// [`EYE_ADAPTED_STARS_LABEL`] into `uni_ui::theme`.
+pub const VIVID_STAR_COLOURS_LABEL: &str = "Vivid star colours · non-physical";
+
 /// The app's own hotkeys in uni-nav's key map (Task 6): Tab hides the HUD, F1 shows the
 /// controls list, F12 saves the view as a bookmark. Matched by physical key, as uni-nav does.
 const APP_HOTKEYS: [KeyCode; 3] = [KeyCode::Tab, KeyCode::F1, KeyCode::F12];

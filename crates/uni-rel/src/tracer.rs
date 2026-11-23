@@ -27,11 +27,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use anyhow::Context as _;
 use glam::{DVec3, Mat4, UVec2};
 use uni_gfx::{
-    FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT, LensView,
-    PassTimer, RenderFeature, ShaderLib,
+    EnvMap, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, LENS_MASK_FORMAT,
+    LensView, PassTimer, RenderFeature, ShaderLib, SharedInput,
 };
 
-use crate::binet;
+use crate::{LensEnv, binet};
 
 /// Most RK4 steps per GPU ray (the brief's budget).
 const GPU_MAX_STEPS: u32 = 2000;
@@ -434,6 +434,11 @@ pub struct LensTracer {
     params_buffer: wgpu::Buffer,
     params: LensParams,
     resolution_scale: LensScale,
+    /// The environment cubemap escaped rays sample with [`LensEnv::Band`] (B7). Kept but not
+    /// read yet: B0 changed the constructor only, and M0's behaviour is the `DebugGrid` one.
+    _env: Arc<EnvMap>,
+    /// The lens environment the app selects each frame (B7 reads it in `prepare`).
+    _mode: SharedInput<LensEnv>,
     /// Size-dependent resources; `prepare` rebuilds them after a resize or a scale change.
     frame: Option<FrameResources>,
 }
@@ -451,13 +456,17 @@ struct FrameResources {
 impl LensTracer {
     /// Registers the uni-rel shaders in `lib`, compiles the lens pass and creates its
     /// pipelines and uniforms. `camera_bgl` is `Renderer::camera_bind_group_layout()`; `scale`
-    /// is the resolution-scale handle the app steers. Shader or pipeline validation errors are
-    /// returned, not raised on the device.
+    /// is the resolution-scale handle the app steers; `env` is the environment cubemap
+    /// (`uni_sky::BandCubemap::env_map`) and `mode` the lens environment the app sets each frame
+    /// (B0 added both; B7 uses them, and until then the pass draws the M0 debug grid). Shader or
+    /// pipeline validation errors are returned, not raised on the device.
     pub fn new(
         gpu: &GpuContext,
         lib: &mut ShaderLib,
         camera_bgl: &wgpu::BindGroupLayout,
         scale: LensScale,
+        env: Arc<EnvMap>,
+        mode: SharedInput<LensEnv>,
     ) -> anyhow::Result<Self> {
         crate::register_shaders(lib);
         let device = &gpu.device;
@@ -507,6 +516,8 @@ impl LensTracer {
             params_buffer,
             params: bytemuck::Zeroable::zeroed(),
             resolution_scale: scale,
+            _env: env,
+            _mode: mode,
             frame: None,
         })
     }

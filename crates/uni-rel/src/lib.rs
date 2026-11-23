@@ -1,15 +1,33 @@
 //! uni-rel: gravitational lensing. M0: brute-force Schwarzschild (Binet RK4) ground-truth tracer,
-//! and the debug-grid background it lenses.
+//! and the debug-grid background it lenses. M1 (Task B7): the lens environment is the Milky Way
+//! band's cubemap ([`LensEnv::Band`]), with the M0 debug grid kept as an opt-in environment
+//! ([`LensEnv::DebugGrid`], ruling 14) for the shadow regression bookmark.
+//!
+//! Task B0 changed the constructors and `debug_background_draws` to take the environment and
+//! added the [`probes`] stub; B7 owns this crate's files.
 
 pub mod background;
 pub mod binet;
+pub mod probes;
 pub mod tracer;
 
-pub use background::{DebugSkyBackground, debug_background_draws};
+pub use background::{DebugSkyBackground, debug_background_draws, lens_labels};
+pub use probes::gpu_probes;
 pub use tracer::{
     BEYOND_REACH_WARNING, DEFAULT_RESOLUTION_SCALE, LensCoverage, LensScale, LensTracer,
     TRACE_REACH, inside_horizon, lens_coverage,
 };
+
+/// What the lens pass shows through its escaped rays, and what the background draws around it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LensEnv {
+    /// The environment cubemap (the Milky Way band, `uni_sky::BandCubemap::env_map`): physical
+    /// sky light at star exposure.
+    Band,
+    /// The M0 debug grid (ruling 14): display-referred, so the app runs Manual exposure while it
+    /// is selected, and the HUD shows "Lens background: M0 debug grid".
+    DebugGrid,
+}
 
 /// `ShaderLib` path of the Binet integrator (`binet_trace`, `static_observer_ray`).
 pub const BINET_WGSL: &str = "rel/binet.wgsl";

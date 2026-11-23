@@ -28,11 +28,15 @@
 //!   disk-averaged ρ below 1 and the largest contrast that stays ≤ 1. p_V 0.689 exceeds a Lambert
 //!   sphere's 2/3, so matching it would leave only a uniform white map.
 //!
-//! **Earth's clouds** (`Clouds`, one channel c ∈ [0, 1], stored linear) are a cloud layer of
-//! albedo c × the cloud entry's `albedo_scale` s_c, composited over the ground as
-//! ρ = (1 − c) · ρ_ground + c · s_c, with ρ_ground = the ground entry's `albedo_scale` × its
-//! decoded texel. Water clouds barely absorb in the visible, so a layer that reflects c transmits
-//! 1 − c; s_c is 1 for the baked map, and at most 1 for any map.
+//! **Earth's clouds** (`Clouds`, one channel c ∈ [0, 1], stored linear: the source's DN/255 as
+//! is) are read as the **areal coverage of opaque white clouds**, c = cover fraction × cloud
+//! albedo, and composited over the ground as ρ = (1 − c) · ρ_ground + c · s_c, with
+//! ρ_ground = the ground entry's `albedo_scale` × its decoded texel and s_c the cloud entry's
+//! `albedo_scale` (1 for the baked map, so ρ = (1 − c) · ρ_ground + c; constraints §4a, ruling
+//! W-B2). This is a coverage-weighted mix, not a transmitting layer: a conservative layer of
+//! albedo c over a Lambert ground would give c + (1 − c)²ρ/(1 − cρ), because light reflected by
+//! the ground crosses it twice (A8 review R2-2); on the baked maps the two differ by about 4 % in
+//! Earth's disk composite (0.302 here against 0.290).
 
 use std::path::Path;
 
@@ -78,8 +82,16 @@ pub struct MapInfo {
     pub height: u32,
     /// Planetocentric east longitude at u = 0 (left edge) [deg].
     pub lon0_deg: f64,
-    /// Multiplies decoded linear albedo so the map's disk-averaged reflectance gives the body's
-    /// V geometric albedo (review I4).
+    /// Multiplies decoded linear albedo to give the reflectance (review I4). For most maps the
+    /// bake solves it so the map's disk-averaged reflectance gives the body's V geometric albedo;
+    /// it is 1 where the solved scale would push texels above 1 (the file then stores the capped
+    /// reflectance), and for these maps, which are not normalised to p_V (module docs; `source`
+    /// says how each was calibrated):
+    /// - Earth's ground (`Albedo`): calibrated on the ocean at the sea surface's measured
+    ///   reflectance; the atmosphere (B3) supplies the rest of Earth's p_V (ruling W-B1);
+    /// - Earth's clouds (`Clouds`): 1, the cloud coverage c used as is (ruling W-B2);
+    /// - Venus's cloud tops (`CloudTops`): a neutral grey pattern with a disk-averaged ρ below 1
+    ///   (p_V 0.689 exceeds a Lambert sphere's 2/3; ruling W-B3 keeps the baked 0.95).
     pub albedo_scale: f32,
     pub source: String,
 }

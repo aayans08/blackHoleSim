@@ -33,8 +33,9 @@ const POINT_MARGIN_PX: f64 = 64.0;
 /// At most this many named stars are pickable per frame, the brightest on screen (plan A4).
 const MAX_STAR_PICKS: usize = 2000;
 /// Upper clamp on Mallama & Hilton's phase correction, in the point path as in the disk path
-/// (lead ruling after A3, so brightness stays continuous where a body resolves).
-const MAX_PHASE_CORRECTION: f64 = 10.0;
+/// (lead ruling after A3, so brightness stays continuous where a body resolves). Public so the
+/// bodies pass (B1) clamps its per-pixel C with the same constant (B0 ruling A.1).
+pub const MAX_PHASE_CORRECTION: f64 = 10.0;
 /// Siblings and moons that may eclipse a body, after its parent (plan A4: up to 3).
 const MAX_OTHER_OCCLUDERS: usize = 3;
 
@@ -94,6 +95,16 @@ pub struct BodyView {
     pub occluders: Vec<Occluder>,
     pub ring: Option<RingView>,
     pub has_atmosphere: bool,
+    /// Reflectance model the body's albedo was solved for (Lambert for the atmosphere bodies
+    /// and the giants, lunar-Lambert L = 0.9 for the airless ones; A8's map calibration). The
+    /// same model the point path ([`reflected_lux`]) uses, so the point ↔ disk handover is
+    /// continuous (B0 ruling A.1).
+    pub brdf: Brdf,
+    /// V geometric albedo p_V: the fact sheet's, or the registry's assumed default for a body
+    /// without one (`uni_sim::{DEFAULT_MOON_ALBEDO, COMET_ALBEDO, ASSUMED_ASTEROID_ALBEDO}`).
+    pub geometric_albedo: f64,
+    /// Volumetric mean radius (a·b·c)^⅓ [m], the radius behind the point path's flux.
+    pub mean_radius_m: f64,
 }
 
 /// A star drawn as a resolved surface (the Sun, or a catalogue star nearer than 0.1 pc).
@@ -381,6 +392,7 @@ fn body_view(
     sun_cd: f64,
 ) -> BodyView {
     let info = &world.objects[id as usize];
+    let physical = &world.physical[id as usize];
     let orient = world.orientation(id);
     let r_sun = sun_rel.length();
     let ring = (info.naif == Some(SATURN)).then(|| RingView {
@@ -399,7 +411,10 @@ fn body_view(
         sun_illuminance_lux: if r_sun > 0.0 { sun_cd / (r_sun * r_sun) } else { 0.0 },
         occluders: occluders(world, id, sun_rel, cam),
         ring,
-        has_atmosphere: world.physical[id as usize].has_atmosphere,
+        has_atmosphere: physical.has_atmosphere,
+        brdf: physical.brdf,
+        geometric_albedo: physical.geometric_albedo,
+        mean_radius_m: physical.mean_radius_m,
     }
 }
 

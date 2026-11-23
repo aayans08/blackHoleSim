@@ -1,7 +1,8 @@
 //! The M0 background while a lens is traced: the unlensed debug grid over the whole frame.
 //!
 //! [`DebugSkyBackground`] runs first in the pass order (uni-gfx `targets` pass contract). While
-//! the lens is traced ([`LensCoverage::Traced`]) it writes the debug grid
+//! the lens environment is [`LensEnv::DebugGrid`] and the lens is traced
+//! ([`LensCoverage::Traced`]) it writes the debug grid
 //! (`shaders/debug_sky.wgsl`) into every `hdr` pixel; the lens pass then overwrites only its
 //! traced rectangle with the same grid seen through the lens. Everywhere else (no lens on
 //! screen, a lens beyond the trace reach, or inside a horizon) it writes nothing, so the cleared
@@ -14,9 +15,10 @@
 use anyhow::Context as _;
 use uni_gfx::{
     FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer, RenderFeature,
-    ShaderLib,
+    ShaderLib, SharedInput,
 };
 
+use crate::LensEnv;
 use crate::tracer::{LensCoverage, LensScale, lens_coverage};
 
 /// Feature name, also the GPU timing label.
@@ -33,10 +35,21 @@ struct BackgroundParams {
     scale: [f32; 4],
 }
 
-/// Whether the debug grid background draws for a frame with this lens coverage: only while
-/// the lens is traced, so the grid is never shown where no lens bends it.
-pub fn debug_background_draws(coverage: LensCoverage) -> bool {
-    coverage == LensCoverage::Traced
+/// Whether the debug grid background draws for a frame with this lens coverage and lens
+/// environment: only with [`LensEnv::DebugGrid`] and while the lens is traced, so the grid is
+/// never shown where no lens bends it (m0.1 took the coverage only; with `DebugGrid` the result
+/// is m0.1's).
+pub fn debug_background_draws(coverage: LensCoverage, env: LensEnv) -> bool {
+    env == LensEnv::DebugGrid && coverage == LensCoverage::Traced
+}
+
+/// Which lens honesty labels the HUD shows for this coverage and environment: (the debug-grid
+/// label "Lens background: M0 debug grid", the unlensed-stars label "Stars near the hole are not
+/// yet lensed (M3)"). The debug label only while the grid draws ([`debug_background_draws`]);
+/// the unlensed-stars label whenever the lens is traced (Task B7).
+pub fn lens_labels(coverage: LensCoverage, env: LensEnv) -> (bool, bool) {
+    let _ = (coverage, env);
+    todo!("B7")
 }
 
 /// Group 1 of `cs_background`: the params uniform and the hdr storage texture.
@@ -71,6 +84,8 @@ pub struct DebugSkyBackground {
     bgl: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     scale: LensScale,
+    /// The lens environment the app selects; the grid draws only with `DebugGrid`.
+    mode: SharedInput<LensEnv>,
     /// Decided in `prepare` for this frame's `encode`.
     draws: bool,
     /// Group 1 over the current `hdr` view; `None` until first used and after a resize.
@@ -80,12 +95,14 @@ pub struct DebugSkyBackground {
 impl DebugSkyBackground {
     /// Registers the uni-rel shaders in `lib` and builds the pass. `camera_bgl` is
     /// `Renderer::camera_bind_group_layout()`; `scale` is the lens tracer's resolution-scale
-    /// handle, so the unlensed lines are as wide as the traced ones.
+    /// handle, so the unlensed lines are as wide as the traced ones; `mode` is the lens
+    /// environment the app sets each frame (the pass draws only with `DebugGrid` and `Traced`).
     pub fn new(
         gpu: &GpuContext,
         lib: &mut ShaderLib,
         camera_bgl: &wgpu::BindGroupLayout,
         scale: LensScale,
+        mode: SharedInput<LensEnv>,
     ) -> anyhow::Result<Self> {
         crate::register_shaders(lib);
         let device = &gpu.device;
@@ -124,6 +141,7 @@ impl DebugSkyBackground {
             bgl,
             params_buffer,
             scale,
+            mode,
             draws: false,
             binding: None,
         })
@@ -136,7 +154,7 @@ impl RenderFeature for DebugSkyBackground {
     }
 
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
-        self.draws = debug_background_draws(lens_coverage(ctx));
+        self.draws = debug_background_draws(lens_coverage(ctx), self.mode.get());
         if !self.draws {
             return;
         }
@@ -286,16 +304,23 @@ mod tests {
     }
 
     /// Review I3: the grid is the lens's environment, so it is drawn exactly when the lens is
-    /// traced, never in sky views or beyond the trace reach.
+    /// traced, never in sky views or beyond the trace reach; and only while the debug grid is
+    /// the selected environment (B0 signature, M1).
     #[test]
     fn grid_background_only_while_the_lens_is_traced() {
-        assert!(debug_background_draws(LensCoverage::Traced));
+        assert!(debug_background_draws(
+            LensCoverage::Traced,
+            LensEnv::DebugGrid
+        ));
+        assert!(!debug_background_draws(LensCoverage::Traced, LensEnv::Band));
         for c in [
             LensCoverage::Unlensed,
             LensCoverage::BeyondReach,
             LensCoverage::InsideHorizon,
         ] {
-            assert!(!debug_background_draws(c), "{c:?}");
+            for env in [LensEnv::DebugGrid, LensEnv::Band] {
+                assert!(!debug_background_draws(c, env), "{c:?} {env:?}");
+            }
         }
     }
 }

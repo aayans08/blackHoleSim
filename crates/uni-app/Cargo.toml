@@ -15,6 +15,12 @@ uni-post.workspace = true
 uni-data.workspace = true
 uni-nav.workspace = true
 uni-ui.workspace = true
+# Wave B integration (B9), added by Task B0 (ruling B.8) so no wave agent edits this manifest.
+uni-sim.workspace = true
+uni-planet.workspace = true
+uni-atmo.workspace = true
+uni-procgen.workspace = true
+uni-physics.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 glam.workspace = true

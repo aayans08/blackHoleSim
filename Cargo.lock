@@ -2639,12 +2639,17 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "uni-atmo",
  "uni-core",
  "uni-data",
  "uni-gfx",
  "uni-nav",
+ "uni-physics",
+ "uni-planet",
  "uni-post",
+ "uni-procgen",
  "uni-rel",
+ "uni-sim",
  "uni-sky",
  "uni-ui",
  "wgpu",
@@ -2654,6 +2659,15 @@ dependencies = [
 [[package]]
 name = "uni-atmo"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "pollster",
+ "uni-core",
+ "uni-gfx",
+ "wgpu",
+]
 
 [[package]]
 name = "uni-bake"
@@ -2739,6 +2753,19 @@ dependencies = [
 [[package]]
 name = "uni-planet"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "pollster",
+ "uni-atmo",
+ "uni-core",
+ "uni-data",
+ "uni-gfx",
+ "uni-physics",
+ "uni-sim",
+ "wgpu",
+]
 
 [[package]]
 name = "uni-post"
@@ -2800,6 +2827,9 @@ dependencies = [
  "uni-core",
  "uni-data",
  "uni-gfx",
+ "uni-physics",
+ "uni-procgen",
+ "uni-sim",
  "wgpu",
 ]
 

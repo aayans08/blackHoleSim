@@ -13,12 +13,22 @@ use anyhow::Context as _;
 use glam::{DMat4, UVec2, Vec2};
 use uni_core::{CameraView, Epoch};
 use uni_data::CatalogStar;
-use uni_gfx::{Exposure, FrameCtx, GpuContext, Renderer, ShaderLib, reversed_z_infinite_proj};
+use uni_gfx::{
+    Exposure, FrameCtx, GpuContext, Renderer, ShaderLib, SharedInput, reversed_z_infinite_proj,
+};
 use uni_nav::Bookmark;
-use uni_rel::{DebugSkyBackground, LensCoverage, LensScale, LensTracer};
+use uni_rel::{DebugSkyBackground, LensCoverage, LensEnv, LensScale, LensTracer};
 use uni_ui::{HudControls, HudData};
 
 use crate::world::World;
+
+// Task B0 adds B9's Wave B dependencies (ruling B.8), so no wave agent edits the manifest. These
+// lines keep `cargo::unused_dependencies` quiet until B9 wires each crate in; B9 deletes each one
+// then. (uni-procgen is already used below: the band cubemap the lens pass is given.)
+use uni_atmo as _;
+use uni_physics as _;
+use uni_planet as _;
+use uni_sim as _;
 
 /// Near plane of the reversed-Z infinite projection [m]. M0 draws nothing closer than
 /// infinity, so this only fixes the depth scale for later geometry.
@@ -62,10 +72,34 @@ impl Scene {
         let mut lib = ShaderLib::with_common();
         let camera_bgl = renderer.camera_bind_group_layout();
         let lens_scale = LensScale::new(lens_scale);
-        let background = DebugSkyBackground::new(gpu, &mut lib, camera_bgl, lens_scale.clone())
-            .context("creating the debug background pass")?;
-        let tracer = LensTracer::new(gpu, &mut lib, camera_bgl, lens_scale.clone())
-            .context("creating the lens pass")?;
+        // M1 constructors (B0 rulings A.4, A.5): the lens pass is given the band's environment
+        // cubemap and the lens environment. This M0 stack keeps the debug grid, and the band
+        // passes are not pushed yet (B9 does both), so the cubemap stays black and unused.
+        let band = uni_sky::BandCubemap::new(
+            gpu,
+            &mut lib,
+            &uni_procgen::galaxy::GalaxyModel::milky_way(),
+            SharedInput::new(uni_sky::BandInput::default()),
+        )
+        .context("creating the environment cubemap")?;
+        let lens_env = SharedInput::new(LensEnv::DebugGrid);
+        let background = DebugSkyBackground::new(
+            gpu,
+            &mut lib,
+            camera_bgl,
+            lens_scale.clone(),
+            lens_env.clone(),
+        )
+        .context("creating the debug background pass")?;
+        let tracer = LensTracer::new(
+            gpu,
+            &mut lib,
+            camera_bgl,
+            lens_scale.clone(),
+            band.env_map(),
+            lens_env,
+        )
+        .context("creating the lens pass")?;
         let star_field = uni_sky::StarField::new(gpu, &mut lib, camera_bgl, stars)
             .context("creating the star pass")?;
         let tonemap = uni_post::TonemapFeature::new(gpu, &mut lib, camera_bgl, output_format)
@@ -299,8 +333,9 @@ pub fn hud_data(
         // the hole are not yet lensed (M0)") only when the debug grid is actually visible: the
         // lens pass traced this frame (and the debug background drew; the same condition,
         // `uni_rel::debug_background_draws`). From inside the horizon the frame is all black, so
-        // no grid is shown and the labels would be false (lead ruling, M0 gate, Task 10b).
-        lens_on_screen: uni_rel::debug_background_draws(coverage),
+        // no grid is shown and the labels would be false (lead ruling, M0 gate, Task 10b). The M0
+        // stack always runs the debug grid (B0 ruling A.5); B9 passes the selected environment.
+        lens_on_screen: uni_rel::debug_background_draws(coverage, LensEnv::DebugGrid),
         // uni-ui's amber "Eye-adapted stars (dual exposure, non-physical)" while the stars'
         // exposure differs from the scene's (review I4, design §2 and §7.4).
         eye_adapted_stars: ctx.exposure.eye_adapted_stars(),
@@ -463,9 +498,10 @@ mod tests {
     fn near_the_hole_the_lens_runs_and_the_hud_shows_the_m0_labels() {
         let (world, ctx) = ctx_near_hole(30.0);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::Traced);
-        assert!(uni_rel::debug_background_draws(uni_rel::lens_coverage(
-            &ctx
-        )));
+        assert!(uni_rel::debug_background_draws(
+            uni_rel::lens_coverage(&ctx),
+            LensEnv::DebugGrid
+        ));
         let perf = Perf {
             fps: 60.0,
             cpu_ms: 1.0,
@@ -493,9 +529,10 @@ mod tests {
     fn beyond_the_trace_reach_the_hud_warns_and_the_lens_does_not_run() {
         let (_, ctx) = ctx_near_hole(1e5);
         assert_eq!(uni_rel::lens_coverage(&ctx), LensCoverage::BeyondReach);
-        assert!(!uni_rel::debug_background_draws(uni_rel::lens_coverage(
-            &ctx
-        )));
+        assert!(!uni_rel::debug_background_draws(
+            uni_rel::lens_coverage(&ctx),
+            LensEnv::DebugGrid
+        ));
         assert_eq!(lens_warnings(&ctx), [uni_rel::BEYOND_REACH_WARNING]);
     }
 
