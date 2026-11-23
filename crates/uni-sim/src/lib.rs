@@ -1,7 +1,7 @@
 //! uni-sim: world state and time controller from M1; streaming/LOD scheduler and job system as
 //! the universe grows (M2+).
 //!
-//! M1 Task A4 (A0b stubs; bodies `todo!("A4")` until it lands): [`time`] (warp and pause),
+//! M1 Task A4: [`time`] (warp and pause),
 //! [`registry`] (every named object), [`world`] (frames, cached states, data loading),
 //! [`snapshot`] (what the renderer draws this frame), [`honesty`] (world-state labels) and
 //! [`starindex`] (nearest catalogue stars).
@@ -18,4 +18,3 @@ pub mod world;
 // one once its crate is used.
 use ron as _;
 use serde as _;
-use uni_physics as _;
