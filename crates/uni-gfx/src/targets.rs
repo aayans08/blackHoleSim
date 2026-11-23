@@ -25,9 +25,12 @@
 //! - A resolved body whose projected radius is between `POINT_LOD_PX` (1.5 px) and
 //!   `BLEND_LOD_PX` (4 px) blends its exposure factor from `star_pre` to `scene_pre` (CPU twin
 //!   `uni_planet::lod_exposure_mix`, B0), so the point → disk handover never pops. The blend is
-//!   labelled as part of "Eye-adapted stars".
+//!   labelled as part of "Eye-adapted stars". Its rings and its atmosphere use the body's own
+//!   weight, and every such writer stores its star share in `lens_mask.a` (below).
 //! - Auto-exposure meters world light only: the meter (pass 9) runs before any sky light or
-//!   point source is written.
+//!   point source is written. It reads each pixel at the pre it was written with,
+//!   mix(scene_pre, star_pre, `lens_mask.a`), so a body in the LOD band is metered at its true
+//!   luminance (lead ruling B6 I1).
 //! - Star brightness against the band depends on the field of view, deliberately (review m26):
 //!   stars are written as E/Ω_pixel and the band as a surface brightness, so at fov 20° a star's
 //!   pixels are (tan 30°/tan 10°)² = 10.7× (+3.42 EV) brighter relative to the band than at
@@ -43,7 +46,19 @@
 //!   coverage, rings their opacity, atmospheres 1 − luminance(T). The lens pass writes `g = 0` on
 //!   the traced pixels it repaints.
 //! - `b`: 1 where the lens pass wrote the lensed environment.
-//! - `a`: reserved for M3's star magnification.
+//! - `a`: the **star share** s = 1 − w of the world writers in the LOD band (lead ruling B6 I1),
+//!   w being the exposure weight of `pre = mix(star_pre, scene_pre, w)`: bodies, rings and star
+//!   surfaces (uni-planet) and a body's atmosphere (uni-atmo, with its body's w) write
+//!   `select(0, 1 − w, coverage > 0)` (an atmosphere: on every fragment its march does not
+//!   discard), composited with `BlendOperation::Max` like `g`. It is 0 everywhere else: the
+//!   clear value 0 means scene exposure, and plain world light (w = 1, or eye-adapted stars not
+//!   in effect) stores 0. w is snapped to 1 when 1 − w < 2⁻¹⁴, f16's smallest normal, because
+//!   Metal may flush f16 subnormals on store and a flushed share would be metered at scene
+//!   exposure. The meter (pass 9) divides each pixel by mix(scene_pre, star_pre, s), which is
+//!   the writer's pre; with Max compositing no reading grows with the scene EV, so the exposure
+//!   loop cannot run away (uni-post `histogram.rs`). The lens pass, after the meter, writes
+//!   `a = 0` on the pixels it repaints. M3's star magnification will use a new channel or
+//!   target, not `a`.
 //!
 //! Sky features multiply what they add by (1 − r)(1 − g); the band also by (1 − b). Point
 //! sprites and asteroids multiply by (1 − r) only: they are depth-tested against bodies, so a
@@ -66,12 +81,12 @@
 //! | 1 | `exposure` (auto-exposure resolve; own bind group: imports `common/exposure.wgsl`, never group 0) | uni-post | exposure buffer (storage) | — |
 //! | 2 | `band-update` (one environment cube face per frame, when needed) | uni-sky | environment cubemap | — |
 //! | 3 | `background` (the M0 debug grid; only with `LensEnv::DebugGrid` and a traced lens; display-referred, so the app runs Manual exposure whenever `DebugGrid` is selected) | uni-rel | hdr | — |
-//! | 4 | `sun` (star surfaces) | uni-planet | hdr (world), g | write, `Greater` |
-//! | 5 | `bodies` | uni-planet | hdr (world), g | write, `Greater` |
-//! | 6 | `rings` | uni-planet | hdr (world), g | test only |
+//! | 4 | `sun` (star surfaces) | uni-planet | hdr (world), g, a | write, `Greater` |
+//! | 5 | `bodies` | uni-planet | hdr (world), g, a | write, `Greater` |
+//! | 6 | `rings` | uni-planet | hdr (world), g, a | test only |
 //! | 7 | `comets` (Wave C) | uni-planet | hdr (world), g (nucleus) | nucleus write; coma and tails test only |
-//! | 8 | `atmosphere` (reads `depth`; dual-source variant: two pipelines, grey-transmittance variant: one) | uni-atmo | hdr, g | none attached |
-//! | 9 | `histogram` (the exposure meter) | uni-post | meter state | — |
+//! | 8 | `atmosphere` (reads `depth`; dual-source variant: two pipelines, grey-transmittance variant: one) | uni-atmo | hdr, g, a | none attached |
+//! | 9 | `histogram` (the exposure meter; reads `hdr` and `lens_mask.a`) | uni-post | meter state | — |
 //! | 10 | `lens` (reads `depth`; skips pixels with depth ≠ 0) | uni-rel | hdr (sky, star exposure), r, g = 0, b | — |
 //! | 11 | `band` | uni-sky | hdr (sky) × (1 − r)(1 − g)(1 − b) | test `GreaterEqual` at depth 0 (ruling 4) |
 //! | 12 | `stars` | uni-sky | hdr (sky) × (1 − r)(1 − g) | test `GreaterEqual` at depth 0 |
@@ -95,9 +110,10 @@ pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Reversed-Z depth (near = 1, far = 0; compare `Greater`, or `GreaterEqual` for things drawn
 /// exactly on the far plane, such as stars).
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-/// Lens mask: `r` captured fraction, `g` sky occlusion, `b` lensed environment written, `a`
-/// reserved for M3 (see "lens_mask channels" above). Cleared to 0 every frame. Read with
-/// `textureLoad` at integer pixels; blendable, so `g` can use `BlendOperation::Max`.
+/// Lens mask: `r` captured fraction, `g` sky occlusion, `b` lensed environment written, `a` the
+/// world writers' star share 1 − w (see "lens_mask channels" above). Cleared to 0 every frame.
+/// Read with `textureLoad` at integer pixels; blendable, so `g` and `a` can use
+/// `BlendOperation::Max`.
 pub const LENS_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Largest value any feature writes into `hdr` (below f16's largest finite value, 65504).
