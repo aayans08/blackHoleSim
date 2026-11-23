@@ -1043,10 +1043,10 @@ pub fn duplicate_pass_names(timings: &[(&'static str, Option<f32>)]) -> Vec<Stri
 }
 
 /// The timer values [`pass_durations`] takes from a frame's timings: each pass's end time on the
-/// frame's origin once uni-gfx reports it (`&t.pass_end_ms`); today the spans, `&t.passes`
-/// (see [`pass_durations`]). The one place the HUD, the capture JSON and the bench read them.
+/// frame's origin (`&t.pass_end_ms`, uni-gfx B9t), so durations are differences of end times
+/// and sum to the frame. The one place the HUD, the capture JSON and the bench read them.
 pub fn pass_times(t: &uni_gfx::GpuTimings) -> &[(&'static str, Option<f32>)] {
-    &t.passes
+    &t.pass_end_ms
 }
 
 /// The latest frame's per-pass GPU durations ([`pass_durations`] of [`pass_times`]); empty

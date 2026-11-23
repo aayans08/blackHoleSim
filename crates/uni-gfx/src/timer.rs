@@ -84,6 +84,12 @@ pub struct GpuTimings {
     /// (pass label, ms) in encode order; `None` where the device returned no valid
     /// measurement for that pass.
     pub passes: Vec<(&'static str, Option<f32>)>,
+    /// (pass label, ms) in encode order: each pass's END tick minus the opening frame bracket's
+    /// begin tick; `None` where either tick is unwritten or the end is not after the frame's
+    /// begin. Per-pass durations are differences of these (B9t). The spans in `passes` do not
+    /// difference cleanly on Metal: a render pass's begin tick is sampled early (vertex stage),
+    /// a compute pass's exactly, so overlapping spans made compute passes read 0.
+    pub pass_end_ms: Vec<(&'static str, Option<f32>)>,
     /// Whole-frame GPU time between the frame brackets; `None` if unavailable or invalid.
     pub frame_ms: Option<f32>,
 }
@@ -512,6 +518,14 @@ impl PassTimer {
             .map_or_else(Vec::new, |t| t.passes.clone())
     }
 
+    /// The most recent (label, end time on the frame's origin [ms]) pairs
+    /// ([`GpuTimings::pass_end_ms`]); empty when disabled or before the first read-back.
+    pub fn last_end_ms(&self) -> Vec<(&'static str, Option<f32>)> {
+        self.last
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.pass_end_ms.clone())
+    }
+
     /// The most recent whole-frame GPU time [ms], if measured and valid.
     pub fn last_frame_ms(&self) -> Option<f32> {
         self.last.as_ref().and_then(|t| t.frame_ms)
@@ -635,6 +649,12 @@ fn timings_from_ticks(
         (Some(b), Some(e)) => span_ms(b, e, period_ns),
         _ => None,
     };
+    let pass_end_ms = labels
+        .iter()
+        .zip(ticks.chunks_exact(2))
+        .filter(|(l, _)| !matches!(**l, FRAME_BEGIN | FRAME_END))
+        .map(|(&label, t)| (label, frame_begin.and_then(|b| span_ms(b, t[1], period_ns))))
+        .collect();
     if log::log_enabled!(log::Level::Debug) {
         let pairs: Vec<String> = labels
             .iter()
@@ -646,6 +666,7 @@ fn timings_from_ticks(
     GpuTimings {
         seq,
         passes,
+        pass_end_ms,
         frame_ms,
     }
 }
@@ -684,6 +705,32 @@ mod tests {
         // A non-unit period scales the result.
         let t = timings_from_ticks(0, &["a"], &[1, 1_001], 41.666_668);
         assert!((t.passes[0].1.unwrap() - 0.041_666_668).abs() < 1e-7);
+    }
+
+    /// B9t: each pass's end time on the frame origin, so that a compute pass that starts before
+    /// the previous render pass's (early-sampled) end is not floored to 0 when durations are
+    /// taken as differences. Ticks laid out as Metal samples them.
+    #[test]
+    fn pass_end_times_are_on_the_frame_origin() {
+        let labels = [FRAME_BEGIN, "x", "y", FRAME_END];
+        let ticks = [
+            1_000, 1_010, // frame begin
+            1_100, 900_000, // x (render)
+            900_500, 2_900_000, // y (compute)
+            2_900_100, 2_900_200, // frame end
+        ];
+        let t = timings_from_ticks(0, &labels, &ticks, 1.0);
+        assert_eq!(t.pass_end_ms.len(), 2, "brackets are not passes");
+        assert_eq!(t.pass_end_ms[0].0, "x");
+        assert!((t.pass_end_ms[0].1.unwrap() - 0.899).abs() < 1e-6);
+        assert_eq!(t.pass_end_ms[1].0, "y");
+        assert!((t.pass_end_ms[1].1.unwrap() - 2.899).abs() < 1e-6);
+        // Differences of the end times sum to the frame (to the end bracket's few ticks).
+        let sum = t.pass_end_ms[1].1.unwrap();
+        assert!((sum - t.frame_ms.unwrap()).abs() < 1e-3);
+        // Without the opening bracket there is no origin: every end is None, never 0.
+        let t = timings_from_ticks(0, &["x", "y"], &ticks[2..6], 1.0);
+        assert!(t.pass_end_ms.iter().all(|(_, ms)| ms.is_none()));
     }
 
     /// Review I5: backwards or unwritten timestamps are not a measurement of 0 ms.
