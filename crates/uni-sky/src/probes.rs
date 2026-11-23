@@ -466,8 +466,50 @@ fn halo_inputs() -> Vec<[f32; 4]> {
     out
 }
 
-fn check_halo(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+/// The CPU twins' answer for one halo input: [`stars3d_moffat`](crate::stars3d::stars3d_moffat)
+/// (r), `stars3d_halo_energy`(R), `stars3d_halo_weight`(r, R, 1/E(R)), 0 — the probe's output
+/// layout.
+fn halo_expected(c: &[f32; 4]) -> [f32; 4] {
     use crate::stars3d::{stars3d_halo_energy, stars3d_halo_weight, stars3d_moffat};
+    let (r, radius) = (c[0], c[1]);
+    let e = stars3d_halo_energy(radius);
+    [
+        stars3d_moffat(r),
+        e,
+        stars3d_halo_weight(r, radius, 1.0 / e),
+        0.0,
+    ]
+}
+
+/// Worst GPU − CPU differences of the halo probe, each relative to its scale: [moffat (over its
+/// peak), halo energy (it is ≤ 1), windowed weight (over the footprint's central weight)]. NaN
+/// anywhere, or a read-back of the wrong length, gives NaN (so the check fails).
+fn halo_worst(inputs: &[[f32; 4]], out: &[[f32; 4]]) -> [f32; 3] {
+    use crate::stars3d::{stars3d_halo_weight, stars3d_moffat};
+    if out.len() != inputs.len() {
+        return [f32::NAN; 3];
+    }
+    let mut worst = [0.0_f32; 3];
+    for (c, g) in inputs.iter().zip(out) {
+        let cpu = halo_expected(c);
+        let scale = [
+            stars3d_moffat(0.0),
+            1.0,
+            stars3d_halo_weight(0.0, c[1], 1.0 / cpu[1]),
+        ];
+        for k in 0..3 {
+            worst[k] = nan_max(worst[k], (g[k] - cpu[k]).abs() / scale[k]);
+        }
+    }
+    worst
+}
+
+/// Whether the halo probe's worst differences are within [`HALO_TOLERANCE`] (NaN fails).
+fn halo_pass(worst: &[f32; 3]) -> bool {
+    worst.iter().all(|w| *w <= HALO_TOLERANCE)
+}
+
+fn check_halo(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
     let inputs = halo_inputs();
     let src = lib.compose(HALO_PROBE)?;
     let n = u32::try_from(inputs.len()).context("too many probe inputs")?;
@@ -476,32 +518,13 @@ fn check_halo(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String
         &src,
         "cs_main",
         bytemuck::cast_slice(&inputs),
-        (inputs.len() * 16) as u64,
+        (inputs.len() * std::mem::size_of::<[f32; 4]>()) as u64,
         [n.div_ceil(64), 1, 1],
     )?;
     let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
-    anyhow::ensure!(out.len() == inputs.len(), "stars3d_halo: short read-back");
-    let mut worst = [0.0_f32; 3];
-    for (c, g) in inputs.iter().zip(&out) {
-        let (r, radius) = (c[0], c[1]);
-        let e = stars3d_halo_energy(radius);
-        let cpu = [
-            stars3d_moffat(r),
-            e,
-            stars3d_halo_weight(r, radius, 1.0 / e),
-        ];
-        let scale = [
-            stars3d_moffat(0.0),
-            1.0,
-            stars3d_halo_weight(0.0, radius, 1.0 / e),
-        ];
-        for k in 0..3 {
-            worst[k] = nan_max(worst[k], (g[k] - cpu[k]).abs() / scale[k]);
-        }
-    }
-    let pass = worst.iter().all(|w| *w <= HALO_TOLERANCE);
+    let worst = halo_worst(&inputs, &out);
     Ok((
-        pass,
+        halo_pass(&worst),
         format!(
             "{n} (r, R) pairs, R 2–64 px: moffat {:.1e}, halo energy {:.1e}, windowed weight \
              {:.1e} (relative to scale; tolerance {HALO_TOLERANCE:.0e})",
@@ -549,12 +572,23 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// Relative |GPU − CPU| of the band radiance (B5 brief: ±1 %).
 const DETAIL_TOLERANCE: f64 = 1e-2;
 
+/// One ray of the galaxy-detail probe: twin of `DetailRay` in its WGSL (32 bytes, two vec4s;
+/// `detail_probe_layout_matches_wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct DetailRay {
+    /// xyz: camera, galactocentric [pc]; w: v_lim [V mag].
+    cam_v_lim: [f32; 4],
+    /// xyz: unit direction, galactic axes; w: footprint [rad].
+    dir: [f32; 4],
+}
+
 /// 60 rays from the Sun at V = 10: toward the named dark clouds and the dusty band (Galactic l,
 /// b [deg]: Taurus 172/−15, Ophiuchus ρ Oph 353/17, the Pipe 0/5, the Coalsack 301/−1, the
 /// Cygnus Rift 80/0, the Aquila Rift 30/3, Orion 209/−19, Baade's window 1/−3.9, Chamaeleon
 /// 300/−16, Lupus 339/16, Perseus 160/−20, Corona Australis 0/−18), each with footprints 0,
 /// one 512² texel, 0.01, 0.05 and 0.2 rad.
-fn detail_rays(model: &uni_procgen::galaxy::GalaxyModel) -> Vec<[[f32; 4]; 2]> {
+fn detail_rays(model: &uni_procgen::galaxy::GalaxyModel) -> Vec<DetailRay> {
     let sun = model.sun_galactocentric_pc();
     let targets = [
         (172.0, -15.0),
@@ -576,51 +610,81 @@ fn detail_rays(model: &uni_procgen::galaxy::GalaxyModel) -> Vec<[[f32; 4]; 2]> {
         let (l, b): (f64, f64) = (f64::to_radians(l), f64::to_radians(b));
         let d = DVec3::new(b.cos() * l.cos(), b.cos() * l.sin(), b.sin());
         for fp in footprints {
-            out.push([
-                [sun.x as f32, sun.y as f32, sun.z as f32, 10.0],
-                [d.x as f32, d.y as f32, d.z as f32, fp],
-            ]);
+            out.push(DetailRay {
+                cam_v_lim: [sun.x as f32, sun.y as f32, sun.z as f32, 10.0],
+                dir: [d.x as f32, d.y as f32, d.z as f32, fp],
+            });
         }
     }
     out
+}
+
+/// The galaxy-detail probe's input buffer: the model's `GalaxyGpu`, then the rays, packed as
+/// `DetailIn` in the WGSL (the rays start at `size_of::<GalaxyGpu>()`;
+/// `detail_probe_layout_matches_wgsl`).
+fn detail_input(model: &uni_procgen::galaxy::GalaxyModel, rays: &[DetailRay]) -> Vec<u8> {
+    let mut input = bytemuck::bytes_of(&model.gpu()).to_vec();
+    input.extend_from_slice(bytemuck::cast_slice(rays));
+    input
+}
+
+/// The CPU twin's band radiance for each ray [cd/m²] (`GalaxyModel::band_radiance`).
+fn detail_expected(model: &uni_procgen::galaxy::GalaxyModel, rays: &[DetailRay]) -> Vec<DVec3> {
+    rays.iter()
+        .map(|r| {
+            model.band_radiance(
+                Vec3::from_slice(&r.cam_v_lim[..3]).as_dvec3(),
+                Vec3::from_slice(&r.dir[..3]).as_dvec3(),
+                f64::from(r.cam_v_lim[3]),
+                f64::from(r.dir[3]),
+            )
+        })
+        .collect()
+}
+
+/// Worst relative GPU − CPU difference of the galaxy-detail probe (each ray's largest channel
+/// difference over its brightest CPU channel). NaN anywhere, or a read-back of the wrong length,
+/// gives NaN (so the check fails).
+fn detail_worst(expected: &[DVec3], out: &[[f32; 4]]) -> f64 {
+    if out.len() != expected.len() {
+        return f64::NAN;
+    }
+    expected.iter().zip(out).fold(0.0, |w, (cpu, g)| {
+        let gpu_v = Vec3::from_slice(&g[..3]).as_dvec3();
+        // glam's max_element skips NaN (f64::max), so a NaN channel is caught here.
+        if !gpu_v.is_finite() {
+            return f64::NAN;
+        }
+        nan_max(w, (gpu_v - *cpu).abs().max_element() / cpu.max_element())
+    })
 }
 
 fn check_galaxy_detail(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
     let model = uni_procgen::galaxy::GalaxyModel::milky_way();
     let rays = detail_rays(&model);
     let n = u32::try_from(rays.len()).context("too many probe rays")?;
-    let mut input = bytemuck::bytes_of(&model.gpu()).to_vec();
-    input.extend_from_slice(bytemuck::cast_slice(&rays));
     let src = lib.compose(DETAIL_PROBE)?;
     let bytes = run_compute(
         gpu,
         &src,
         "cs_main",
-        &input,
-        u64::from(n) * 16,
+        &detail_input(&model, &rays),
+        (rays.len() * std::mem::size_of::<[f32; 4]>()) as u64,
         [n.div_ceil(64), 1, 1],
     )?;
     let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
-    anyhow::ensure!(out.len() == rays.len(), "galaxy_detail: short read-back");
-    let mut worst = 0.0_f64;
-    let mut spread = (f64::INFINITY, 0.0_f64);
-    for (r, g) in rays.iter().zip(&out) {
-        let cpu = model.band_radiance(
-            Vec3::from_slice(&r[0][..3]).as_dvec3(),
-            Vec3::from_slice(&r[1][..3]).as_dvec3(),
-            f64::from(r[0][3]),
-            f64::from(r[1][3]),
-        );
-        let gpu_v = Vec3::from_slice(&g[..3]).as_dvec3();
-        worst = nan_max(worst, (gpu_v - cpu).abs().max_element() / cpu.max_element());
-        spread = (spread.0.min(cpu.y), spread.1.max(cpu.y));
-    }
+    let expected = detail_expected(&model, &rays);
+    let worst = detail_worst(&expected, &out);
+    let (lo, hi) = expected
+        .iter()
+        .fold((f64::INFINITY, 0.0_f64), |(lo, hi), c| {
+            (lo.min(c.y), hi.max(c.y))
+        });
     Ok((
         worst <= DETAIL_TOLERANCE,
         format!(
-            "{n} rays (12 dusty directions × 5 footprints 0–0.2 rad), band G {:.2e}–{:.2e} \
-             cd/m², max relative |GPU − CPU| {worst:.1e} (tolerance {DETAIL_TOLERANCE:.0e})",
-            spread.0, spread.1
+            "{n} rays (12 dusty directions × 5 footprints 0–0.2 rad), band G {lo:.2e}–{hi:.2e} \
+             cd/m², max relative |GPU − CPU| {worst:.1e} (tolerance {DETAIL_TOLERANCE:.0e})"
         ),
     ))
 }
@@ -723,5 +787,175 @@ mod tests {
         assert!(psf_worst(&inputs, &wrong)[0].is_nan());
         wrong[5].b[1] = f32::NAN;
         assert!(psf_worst(&inputs, &wrong)[3].is_nan());
+    }
+
+    /// The two B9 probes compose and validate with naga (CLAUDE.md §3), bind only binding 0 and
+    /// 1 of one group (what `run_compute` binds), and call the functions they claim to test.
+    #[test]
+    fn b9_probe_shaders_validate() {
+        for (path, src, group, called) in [
+            (
+                HALO_PROBE,
+                HALO_PROBE_WGSL,
+                2,
+                &[
+                    "stars3d_moffat",
+                    "stars3d_halo_energy",
+                    "stars3d_halo_weight",
+                ][..],
+            ),
+            (
+                DETAIL_PROBE,
+                DETAIL_PROBE_WGSL,
+                0,
+                &["gal_band_radiance"][..],
+            ),
+        ] {
+            let m = probe_module(path, src);
+            let ep = m.entry_points.iter().find(|e| e.name == "cs_main").unwrap();
+            assert_eq!(ep.workgroup_size, [64, 1, 1], "{path}");
+            let cs = entry(&m, "cs_main");
+            for f in called {
+                assert!(calls(&cs.body, func(&m, f)), "{path}: no call to {f}");
+            }
+            let mut bindings: Vec<(u32, u32)> = m
+                .global_variables
+                .iter()
+                .filter_map(|(_, v)| v.binding.as_ref().map(|b| (b.group, b.binding)))
+                .filter(|(g, _)| *g == group)
+                .collect();
+            bindings.sort_unstable();
+            assert_eq!(bindings, [(group, 0), (group, 1)], "{path}");
+        }
+    }
+
+    /// Review (B9 r0 I2): the galaxy-detail probe's packed input is `GalaxyGpu` followed by the
+    /// ray array, so in the WGSL `DetailIn.rays` starts at `size_of::<GalaxyGpu>()` and each
+    /// `DetailRay` is the Rust struct's 32 bytes with the same member offsets.
+    #[test]
+    fn detail_probe_layout_matches_wgsl() {
+        use core::mem::offset_of;
+        use uni_procgen::galaxy::GalaxyGpu;
+        let m = probe_module(DETAIL_PROBE, DETAIL_PROBE_WGSL);
+        let (size, members, vec4_only) = wgsl_struct(&m, "DetailRay");
+        assert_eq!(size, size_of::<DetailRay>());
+        assert!(vec4_only);
+        assert_eq!(
+            members,
+            [
+                ("cam_v_lim".to_owned(), offset_of!(DetailRay, cam_v_lim)),
+                ("dir".to_owned(), offset_of!(DetailRay, dir)),
+            ]
+        );
+        let (galaxy_size, _, _) = wgsl_struct(&m, "GalaxyGpu");
+        assert_eq!(galaxy_size, size_of::<GalaxyGpu>());
+        let (_, members, _) = wgsl_struct(&m, "DetailIn");
+        assert_eq!(
+            members,
+            [
+                ("galaxy".to_owned(), 0),
+                ("rays".to_owned(), size_of::<GalaxyGpu>()),
+            ]
+        );
+        // The buffer the probe uploads is exactly that: the model, then the rays.
+        let model = uni_procgen::galaxy::GalaxyModel::milky_way();
+        let rays = detail_rays(&model);
+        let input = detail_input(&model, &rays);
+        assert_eq!(
+            input.len(),
+            size_of::<GalaxyGpu>() + rays.len() * size_of::<DetailRay>()
+        );
+        assert_eq!(
+            &input[size_of::<GalaxyGpu>()..size_of::<GalaxyGpu>() + size_of::<DetailRay>()],
+            bytemuck::bytes_of(&rays[0])
+        );
+        // The halo probe's buffers are plain vec4 arrays: 16 bytes a slot.
+        assert_eq!(size_of::<[f32; 4]>(), 16);
+    }
+
+    /// The halo probe: inputs span the footprints and radii it claims; a perfect GPU (the CPU's
+    /// own answers) passes, and a wrong, NaN or short read-back fails.
+    #[test]
+    fn halo_probe_expectations() {
+        let inputs = halo_inputs();
+        assert_eq!(inputs.len(), 64);
+        let radii: Vec<f32> = inputs.iter().map(|c| c[1]).collect();
+        assert_eq!(radii.iter().cloned().fold(f32::MAX, f32::min), 2.0);
+        assert_eq!(radii.iter().cloned().fold(f32::MIN, f32::max), 64.0);
+        assert!(radii.contains(&42.5)); // Sirius at EV −4 (B4L)
+        // r from the centre to past the footprint's edge, where the weight is 0.
+        assert!(inputs.iter().any(|c| c[0] < 0.1));
+        assert!(inputs.iter().any(|c| c[0] > c[1]));
+        let perfect: Vec<[f32; 4]> = inputs.iter().map(halo_expected).collect();
+        assert!(perfect.iter().flatten().all(|x| x.is_finite()));
+        assert!(perfect.iter().any(|o| o[2] == 0.0) && perfect.iter().any(|o| o[2] > 0.0));
+        // The windowed energy tends to 1 for a wide footprint.
+        assert!(perfect.iter().all(|o| o[1] > 0.0 && o[1] < 1.0));
+        let w = halo_worst(&inputs, &perfect);
+        assert_eq!(w, [0.0; 3]);
+        assert!(halo_pass(&w));
+        // A wrong GPU fails, channel by channel.
+        for k in 0..3 {
+            let mut wrong = perfect.clone();
+            wrong[10][k] *= 1.01;
+            wrong[10][k] += 1e-3;
+            let w = halo_worst(&inputs, &wrong);
+            assert!(
+                w[k] > HALO_TOLERANCE && !halo_pass(&w),
+                "channel {k}: {w:?}"
+            );
+        }
+        let mut wrong = perfect.clone();
+        wrong[3][2] = f32::NAN;
+        assert!(halo_worst(&inputs, &wrong)[2].is_nan());
+        assert!(!halo_pass(&halo_worst(&inputs, &wrong)));
+        assert!(
+            halo_worst(&inputs, &perfect[..63])
+                .iter()
+                .all(|x| x.is_nan())
+        );
+        assert!(!halo_pass(&halo_worst(&inputs, &perfect[..63])));
+    }
+
+    /// The galaxy-detail probe: 12 directions × 5 footprints, all finite and lit; a perfect GPU
+    /// passes, and a wrong, NaN or short read-back fails.
+    #[test]
+    fn galaxy_detail_probe_expectations() {
+        let model = uni_procgen::galaxy::GalaxyModel::milky_way();
+        let rays = detail_rays(&model);
+        assert_eq!(rays.len(), 60);
+        let footprints: std::collections::BTreeSet<u32> =
+            rays.iter().map(|r| r.dir[3].to_bits()).collect();
+        assert_eq!(footprints.len(), 5);
+        assert!(rays.iter().any(|r| r.dir[3] == 0.0) && rays.iter().any(|r| r.dir[3] == 0.2));
+        assert!(
+            rays.iter()
+                .all(|r| (Vec3::from_slice(&r.dir[..3]).length() - 1.0).abs() < 1e-6)
+        );
+        let expected = detail_expected(&model, &rays);
+        assert!(
+            expected
+                .iter()
+                .all(|c| c.is_finite() && c.max_element() > 0.0)
+        );
+        // The footprint matters: the detail's octaves fade, so a direction's radiance changes
+        // between footprint 0 and 0.2 rad somewhere among the 12.
+        assert!(
+            expected
+                .chunks(5)
+                .any(|c| (c[0].y - c[4].y).abs() > 1e-3 * c[0].y)
+        );
+        let perfect: Vec<[f32; 4]> = expected
+            .iter()
+            .map(|c| [c.x as f32, c.y as f32, c.z as f32, 0.0])
+            .collect();
+        let w = detail_worst(&expected, &perfect);
+        assert!(w < 1e-6, "{w}");
+        let mut wrong = perfect.clone();
+        wrong[7][1] *= 1.05;
+        assert!(detail_worst(&expected, &wrong) > DETAIL_TOLERANCE);
+        wrong[7][1] = f32::NAN;
+        assert!(detail_worst(&expected, &wrong).is_nan());
+        assert!(detail_worst(&expected, &perfect[..59]).is_nan());
     }
 }
