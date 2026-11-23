@@ -2,9 +2,10 @@
 //!
 //! Pass 9 of the M1 frame contract: after the atmospheres, before any sky light or point source
 //! is written, so it meters world light only. One compute pass with two dispatches:
-//! 1. `cs_histogram`: each pixel's world luminance, Rec. 709 Y of `hdr` ÷ `scene_pre()` [cd/m²]
-//!    ([`meter_luminance`]; a pixel clamped at `HDR_MAX` counts as at least
-//!    `HDR_MAX / scene_pre`), skipped below [`METER_MIN_CD_M2`] (not lit), binned into
+//! 1. `cs_histogram`: each pixel's world luminance, Rec. 709 Y of `hdr` ÷ the pre-exposure the
+//!    pixel was written with [cd/m²] ([`meter_pixel`]: `scene_pre()` for plain world light; a
+//!    pixel clamped at `HDR_MAX` counts as at least `HDR_MAX / pre`), skipped below
+//!    [`METER_MIN_CD_M2`] (not lit), binned into
 //!    [`METER_BINS`] log₂ bins over [[`METER_LOG2_MIN`], [`METER_LOG2_MAX`]] (values outside go
 //!    to the end bins) with workgroup-shared atomics flushed once per workgroup (bruop 2019,
 //!    "Automatic Exposure Using a Luminance Histogram", <https://bruop.github.io/exposure/>).
@@ -18,6 +19,29 @@
 //! pixels' mean log₂ L instead of its centre (the GPU packs count and step sum into one shared
 //! atomic). [`Histogram`] is the exact CPU twin; [`meter_histogram`] (counts only, bin centres)
 //! differs from it by at most half a bin.
+//!
+//! ## Star share in `hdr` alpha (fix round 1, review r0 Important 1; needs the lead's ruling)
+//!
+//! The plan's rule divides every pixel by `scene_pre`. A body whose projected radius is in the
+//! 1.5–4 px LOD band is written at pre = mix(star_pre, scene_pre, w) (`uni_planet::
+//! lod_exposure_mix`; body.wgsl, rings.wgsl, star_surface.wgsl), so ÷ `scene_pre` reads it
+//! (1 − w)·2^(EV_scene − EV_star) + w times too bright. That reading grows with the scene EV, a
+//! positive feedback: an Earth at 12 px with the Moon at 3.2 px ran the exposure to EV 40
+//! (`earth_moon_band_pair_settles`). The meter therefore reads the pixel's **star share**
+//! s = 1 − w from `hdr` alpha and divides by [`meter_pre`] = mix(scene_pre, star_pre, s):
+//! - s = 0 is the clear value (`Renderer` clears `hdr` to 0) and what every pass leaves while
+//!   its colour target masks alpha out (all of them at fix round 1). Such pixels read exactly
+//!   as the plan's rule, so nothing changes until a writer stores s.
+//! - The encoding is 1 − w, not w, for two reasons. Zero (the clear value) then means scene
+//!   exposure. And f16's relative precision lands where the feedback is sensitive (w → 1):
+//!   a stored s is off by ≤ 2⁻¹¹ relative, and so is the pre the meter recovers.
+//! - Mixed pixels: if the writers composite s exactly like their premultiplied colour
+//!   (s_out = coverage·s + (1 − coverage)·s_dst), the meter reads the pre-weighted mean of the
+//!   luminances in the pixel, within their range at every EV, so no feedback
+//!   (`mixed_band_pixel_reads_within_its_luminances`).
+//! - Not built here: the writers (B1 body, B2 rings and star surfaces) must store s, and the
+//!   frame contract (uni-gfx `targets.rs`) must state it. Until they do, a band body next to a
+//!   metered one still runs the loop away. The fix round 1 report gives the exact change.
 
 use anyhow::Context as _;
 use uni_gfx::{
@@ -92,19 +116,43 @@ pub(crate) struct MeterBinsGpu {
     pub(crate) steps: [u32; METER_BINS],
 }
 
-/// The world luminance [cd/m²] the meter reads from a pre-exposed `hdr` pixel `pre_rgb` at scene
-/// pre-exposure `scene_pre`: Rec. 709 Y ÷ `scene_pre`, each channel clamped to [0, `HDR_MAX`]
-/// first; a pixel with a channel at `HDR_MAX` (clamped by its writer) counts as at least
-/// `HDR_MAX / scene_pre`, the lower bound of its true value (plan B6). Twin of
-/// `meter_luminance` in `histogram.wgsl`.
-pub fn meter_luminance(pre_rgb: [f32; 3], scene_pre: f32) -> f32 {
+/// The world luminance [cd/m²] the meter reads from a pre-exposed `hdr` pixel `pre_rgb` written
+/// at pre-exposure `pre` ([`meter_pre`]; `scene_pre` for plain world light): Rec. 709 Y ÷ `pre`,
+/// each channel clamped to [0, `HDR_MAX`] first. A pixel with any channel at `HDR_MAX` (clamped
+/// by its writer) counts as at least `HDR_MAX / pre` (plan B6). That is a lower bound of its true
+/// value only when all three channels clipped; a pixel clipped in one channel can read up to
+/// log₂(1/0.0722) = 3.8 EV high (blue alone). The loop still converges: the next frame, exposed
+/// for the high reading, no longer clips. Twin of `meter_luminance` in `histogram.wgsl`.
+pub fn meter_luminance(pre_rgb: [f32; 3], pre: f32) -> f32 {
     let c = pre_rgb.map(|v| v.clamp(0.0, HDR_MAX));
-    let l = (REC709_Y[0] * c[0] + REC709_Y[1] * c[1] + REC709_Y[2] * c[2]) / scene_pre;
+    let l = (REC709_Y[0] * c[0] + REC709_Y[1] * c[1] + REC709_Y[2] * c[2]) / pre;
     if c[0].max(c[1]).max(c[2]) >= HDR_MAX {
-        l.max(HDR_MAX / scene_pre)
+        l.max(HDR_MAX / pre)
     } else {
         l
     }
+}
+
+/// The pre-exposure the light in an `hdr` pixel was written with, from the pixel's star share
+/// `star_share` (its alpha at the meter, see the module docs): mix(`scene_pre`, `star_pre`, s) =
+/// `scene_pre`·(1 − s) + `star_pre`·s (WGSL `mix`, same order), with s clamped to [0, 1]. s = 0
+/// gives `scene_pre` exactly. A NaN share gives NaN (the pixel is not metered). Twin of
+/// `meter_pre` in `histogram.wgsl`.
+pub fn meter_pre(scene_pre: f32, star_pre: f32, star_share: f32) -> f32 {
+    // f32::clamp keeps NaN, so a NaN share stays NaN here.
+    let s = star_share.clamp(0.0, 1.0);
+    scene_pre * (1.0 - s) + star_pre * s
+}
+
+/// What `cs_histogram` reads from one pre-exposed `hdr` texel `rgba`: its world luminance
+/// [cd/m²], [`meter_luminance`] at [`meter_pre`]`(scene_pre, star_pre, rgba[3])`. A NaN alpha
+/// returns NaN, which [`meter_bin`] treats as not lit (the GPU skips the pixel on its bits).
+pub fn meter_pixel(rgba: [f32; 4], scene_pre: f32, star_pre: f32) -> f32 {
+    let [r, g, b, s] = rgba;
+    if s.is_nan() {
+        return f32::NAN;
+    }
+    meter_luminance([r, g, b], meter_pre(scene_pre, star_pre, s))
 }
 
 /// The bin and sub-bin step (0..[`METER_BIN_STEPS`]) of world luminance `l_cd_m2`, or `None`
@@ -409,7 +457,7 @@ impl RenderFeature for ExposureMeter {
         NAME
     }
 
-    /// Nothing to upload: the meter reads `scene_pre()` from group 0 and `hdr`.
+    /// Nothing to upload: the meter reads `scene_pre()` and `star_pre()` from group 0 and `hdr`.
     fn prepare(&mut self, _gpu: &GpuContext, _ctx: &FrameCtx, _targets: &FrameTargets) {}
 
     /// One compute pass: `cs_histogram` over every pixel, then `cs_reduce` in one workgroup.
@@ -523,16 +571,52 @@ mod tests {
     /// Scene EV frame by frame from `ev0`, with the resolve's settle step (the meter reads the
     /// previous frame): `[ev0, ev1, …, ev_frames]`.
     fn settle(lums: &[f32], total_px: u32, ev0: f32, frames: usize) -> Vec<f32> {
+        settle_with(|ev| meter_at(lums, total_px, ev), ev0, frames)
+    }
+
+    /// [`settle`] with any meter: `read(ev)` is the reading of the frame rendered at scene EV `ev`.
+    fn settle_with(read: impl Fn(f32) -> Option<Meter>, ev0: f32, frames: usize) -> Vec<f32> {
         let s = settle_settings();
         let mut evs = vec![ev0];
         for _ in 0..frames {
             let ev = *evs.last().unwrap();
-            let next =
-                next_adapted_ev(&s, Some(meter_at(lums, total_px, ev)), Some(ev), 1.0 / 60.0)
-                    .expect("Auto with a reading adapts");
+            let next = next_adapted_ev(&s, Some(read(ev)), Some(ev), 1.0 / 60.0)
+                .expect("Auto with a reading adapts");
             evs.push(next);
         }
         evs
+    }
+
+    /// `uni_planet::lod_exposure_mix` (B0), copied because uni-post does not depend on
+    /// uni-planet: 0 at and below 1.5 px, 1 at and above 4 px, smoothstep in ln(radius) between.
+    fn lod_mix(r_px: f32) -> f32 {
+        let t = ((r_px / 1.5).ln() / (4.0f32 / 1.5).ln()).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// An f32 stored in and read back from an f16 channel of `hdr` (Rgba16Float).
+    fn f16(x: f32) -> f32 {
+        crate::probes::f16_value(crate::probes::f16_bits(x))
+    }
+
+    /// One grey world-light pixel of luminance `l` [cd/m²] as the frame contract writes it: at
+    /// pre = mix(star_pre, scene_pre, w) (body.wgsl, rings.wgsl, star_surface.wgsl; w =
+    /// `lod_exposure_mix`, 1 for a body of 4 px or more), clamped at `HDR_MAX`, with its star
+    /// share 1 − w in alpha, stored as f16.
+    fn hdr_pixel(l: f32, w: f32, scene_pre: f32, star_pre: f32) -> [f32; 4] {
+        let pre = star_pre * (1.0 - w) + scene_pre * w;
+        let v = f16((l * pre).min(HDR_MAX));
+        [v, v, v, f16(1.0 - w)]
+    }
+
+    /// The meter's reading of world-light pixels `(l, w)` ([`hdr_pixel`]) rendered at scene EV
+    /// `ev` and star EV `star_ev`; the rest of the `total_px` frame is black.
+    fn meter_frame(px: &[(f32, f32)], total_px: u32, ev: f32, star_ev: f32) -> Option<Meter> {
+        let (scene_pre, star_pre) = (exposure_scale(ev), exposure_scale(star_ev));
+        Histogram::from_luminances(px.iter().map(|&(l, w)| {
+            meter_pixel(hdr_pixel(l, w, scene_pre, star_pre), scene_pre, star_pre)
+        }))
+        .meter(total_px)
     }
 
     #[test]
@@ -722,5 +806,146 @@ mod tests {
             Some((255, METER_BIN_STEPS - 1))
         );
         assert_eq!(meter_bin(f32::INFINITY), Some((255, METER_BIN_STEPS - 1)));
+    }
+
+    #[test]
+    fn meter_pixel_divides_by_its_own_pre() {
+        // Fix round 1 (review r0 Important 1): hdr alpha is the pixel's star share s, and the
+        // meter divides by mix(scene_pre, star_pre, s).
+        let (scene, star) = (exposure_scale(15.0), exposure_scale(NIGHT_EV100));
+        let rgbs = [
+            [0.3, 0.5, 0.9],
+            [1e-6, 2.0, 7.5],
+            [0.0, 0.0, HDR_MAX],
+            [HDR_MAX; 3],
+        ];
+        for [r, g, b] in rgbs {
+            // s = 0 (the clear value, and every writer that leaves alpha alone) is the brief's
+            // rule exactly: Y ÷ scene_pre.
+            let zero = meter_pixel([r, g, b, 0.0], scene, star);
+            assert_eq!(zero.to_bits(), meter_luminance([r, g, b], scene).to_bits());
+            assert_eq!(meter_pixel([r, g, b, -1.0], scene, star), zero);
+            // s = 1: star exposure; s = 2 and +∞ clamp to it.
+            let one = meter_luminance([r, g, b], star);
+            assert_eq!(meter_pixel([r, g, b, 1.0], scene, star), one);
+            assert_eq!(meter_pixel([r, g, b, 2.0], scene, star), one);
+            assert_eq!(meter_pixel([r, g, b, f32::INFINITY], scene, star), one);
+            // Between: the writer's mix(star_pre, scene_pre, w) with w = 1 − s.
+            let quarter = meter_luminance([r, g, b], scene * 0.75 + star * 0.25);
+            assert_eq!(meter_pixel([r, g, b, 0.25], scene, star), quarter);
+            // A NaN share: the pixel's pre is unknown, so it is not metered.
+            assert_eq!(meter_bin(meter_pixel([r, g, b, f32::NAN], scene, star)), None);
+        }
+        // The HDR_MAX bound is taken at the pixel's own pre.
+        let half = scene * 0.5 + star * 0.5;
+        assert_eq!(
+            meter_pixel([0.0, 0.0, HDR_MAX, 0.5], scene, star),
+            HDR_MAX / half
+        );
+        assert_eq!(meter_pre(scene, star, 0.0), scene);
+        assert_eq!(meter_pre(scene, star, 1.0), star);
+    }
+
+    #[test]
+    fn earth_moon_band_pair_settles() {
+        // Review r0 Important 1, its worked case: a full-phase Earth at r = 12 px (metered) with
+        // the Moon at r = 3.2 px (w = 0.87) or 3.8 px (w = 0.99), inside the 1.5–4 px LOD band,
+        // so drawn at mix(star_pre, scene_pre, w); eye-adapted stars at EV −4; settle (τ = 0).
+        // Read ÷ scene_pre, the Moon's pixels grow by 2^(EV − EV_star) with the scene EV and the
+        // loop runs to EV100_MAX (review: −4 → 15.1 → 26.1 → 37.2 → 40, a black frame). Read ÷
+        // their own pre (star share in alpha), they read their true luminance and it settles.
+        //
+        // Lambert stand-ins at 1 AU (E = 1.259e5 lux, star_illuminance_lux(−26.74)), for the
+        // loop's stability rather than an absolute EV: Earth's disk composite ρ = 0.302 (ruling
+        // W-B1, ground and clouds without the atmosphere); the Moon ρ = 1.5·p_V = 0.18 (p_V
+        // 0.12, NSSDCA Moon fact sheet, data/baked/body_facts.ron; a Lambert sphere has
+        // p = 2ρ/3).
+        let e = 1.259e5f32;
+        let earth = lambert_sphere(12.0, 0.0, 0.302 * e / PI);
+        let earth_px: Vec<(f32, f32)> = earth.iter().map(|&l| (l, 1.0)).collect();
+        let alone = settle_with(
+            |ev| meter_frame(&earth_px, FRAME_PX, ev, NIGHT_EV100),
+            NIGHT_EV100,
+            8,
+        );
+        assert!(earth.len() >= 400, "Earth is fully metered: {}", earth.len());
+        assert!((alone[8] - alone[3]).abs() < 1e-3, "{alone:?}");
+        for (moon_r, w_expected) in [(3.2f32, 0.87f32), (3.8, 0.99)] {
+            let w = lod_mix(moon_r);
+            assert!((w - w_expected).abs() < 0.005, "{moon_r} px: w {w}");
+            let moon = lambert_sphere(moon_r, 0.0, 0.18 * e / PI);
+            let px: Vec<(f32, f32)> = earth_px
+                .iter()
+                .copied()
+                .chain(moon.iter().map(|&l| (l, w)))
+                .collect();
+            let evs = settle_with(
+                |ev| meter_frame(&px, FRAME_PX, ev, NIGHT_EV100),
+                NIGHT_EV100,
+                8,
+            );
+            let ev = evs[8];
+            // Settled from frame 3 on (frame 1 reads Earth clamped at HDR_MAX).
+            assert!(
+                evs[3..].iter().all(|e| (e - ev).abs() < 1e-3),
+                "Moon at {moon_r} px: not settled {evs:?}"
+            );
+            // The true-luminance meter of the same pixels, and Earth alone (the dimmer Moon
+            // barely moves it).
+            let truth = target_ev(
+                Histogram::from_luminances(earth.iter().chain(&moon).copied()).meter(FRAME_PX),
+                0.0,
+            );
+            assert!(
+                (ev - truth).abs() < 0.05,
+                "Moon at {moon_r} px: {ev} vs true {truth}; {evs:?}"
+            );
+            assert!(
+                (ev - alone[8]).abs() < 0.25,
+                "Moon at {moon_r} px: {ev} vs Earth alone {}",
+                alone[8]
+            );
+            assert!(ev < 20.0, "Moon at {moon_r} px: ran away {evs:?}");
+        }
+    }
+
+    #[test]
+    fn mixed_band_pixel_reads_within_its_luminances() {
+        // Fix round 1: a pixel part-covered (coverage c) by a body in the LOD band (luminance
+        // lb, star share sb = 1 − w) over world light at scene exposure (ld, share 0), with the
+        // share composited like the colour ("over", premultiplied alpha): colour
+        // c·lb·pre(sb) + (1 − c)·ld·pre(0), share c·sb. pre(s) = mix(scene_pre, star_pre, s) is
+        // affine in s, so pre(c·sb) = c·pre(sb) + (1 − c)·pre(0) and the meter reads the
+        // pre-weighted mean of lb and ld: within [min, max] at every scene EV, so it cannot feed
+        // back. Swept over the whole EV range, with f16 storage.
+        let star = exposure_scale(NIGHT_EV100);
+        let mut checked = 0;
+        for ev in (-30..=40).map(|e| e as f32) {
+            let scene = exposure_scale(ev);
+            for c in [0.1f32, 0.5, 0.9, 1.0] {
+                for w in [0.0f32, 0.5, 0.87, 0.99] {
+                    for (lb, ld) in [(5000.0f32, 100.0f32), (100.0, 5000.0), (2.0, 3.0e4)] {
+                        let pre_b = star * (1.0 - w) + scene * w;
+                        let raw = c * lb * pre_b + (1.0 - c) * ld * scene;
+                        let v = f16(raw.min(HDR_MAX));
+                        let l = meter_pixel([v, v, v, f16(c * (1.0 - w))], scene, star);
+                        let (lo, hi) = (lb.min(ld), lb.max(ld));
+                        assert!(
+                            l <= hi * 1.002,
+                            "EV {ev}, c {c}, w {w}, ({lb}, {ld}): read {l} > {hi}"
+                        );
+                        // Unclipped, the reading is also not below the dimmer one.
+                        if raw < HDR_MAX && v >= 6.2e-5 {
+                            assert!(
+                                l >= lo * 0.998,
+                                "EV {ev}, c {c}, w {w}, ({lb}, {ld}): read {l} < {lo}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 71 * 4 * 4 * 3);
     }
 }

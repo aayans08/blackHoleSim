@@ -3,8 +3,9 @@
 //! Each runs the real feature (its pipelines, bind groups and dispatches) on a synthetic frame
 //! and compares what the GPU wrote with the CPU twin:
 //! - `meter_histogram`: the meter and the resolve on a 512² frame (a quarter black, an 8 × 8
-//!   block clamped at `HDR_MAX`, the rest log-normal luminance) vs [`Histogram::meter`] and
-//!   [`target_ev`]: lit_px ±0.1 %, ev_avg, ev_hi and the target ±0.05 EV.
+//!   block clamped at `HDR_MAX`, a 32 × 32 block written at a blended pre-exposure with its star
+//!   share in alpha, the rest log-normal luminance) vs [`meter_pixel`], [`Histogram::meter`]
+//!   and [`target_ev`]: lit_px ±0.1 %, ev_avg, ev_hi and the target ±0.05 EV.
 //! - `exposure_resolve`: the resolve for 16 settings and states vs [`next_adapted_ev`] and
 //!   [`resolve_exposure`] (±1e-6 relative), and the read-back ring against the last of them.
 //! - `bloom_impulse`: the whole bloom on impulses (one above `BLOOM_INPUT_MAX`) at strength 1
@@ -13,7 +14,7 @@
 //! M0's `agx` check stays in the app's selftest.
 
 use anyhow::Context as _;
-use glam::{DQuat, DVec3, Mat4, UVec2, Vec2, Vec3};
+use glam::{DQuat, DVec3, Mat4, UVec2, Vec2, Vec3, Vec4};
 use uni_core::{CameraView, Epoch, UniversePos, splitmix64};
 use uni_gfx::probe::ProbeResult;
 use uni_gfx::{
@@ -27,7 +28,7 @@ use crate::exposure::{
     DEFAULT_ADAPT_TAU_S, ExposureMode, ExposureSettings, ExposureStateGpu, NIGHT_EV100,
     auto_exposure, next_adapted_ev, resolve_exposure,
 };
-use crate::histogram::{Histogram, Meter, meter_luminance, target_ev};
+use crate::histogram::{Histogram, Meter, meter_pixel, target_ev};
 
 /// Every uni-post probe, registering its shaders in `lib`.
 pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
@@ -59,15 +60,20 @@ const BLOOM_TOLERANCE: f32 = 0.01;
 
 fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, String)> {
     let size = UVec2::new(512, 512);
-    let scene_ev = 10.0;
-    let pre = exposure_scale(scene_ev);
-    let frame = lognormal_frame(size, pre);
+    // Star EV ≠ scene EV, so the band block's star share changes what the meter reads.
+    let (scene_ev, star_ev) = (10.0, NIGHT_EV100);
+    let (scene_pre, star_pre) = (exposure_scale(scene_ev), exposure_scale(star_ev));
+    let frame = lognormal_frame(size, scene_pre, star_pre);
 
     // CPU: the same f16 values, through the twins.
     let total = size.x * size.y;
-    let cpu = Histogram::from_luminances(frame.iter().map(|c| meter_luminance(c.to_array(), pre)))
-        .meter(total)
-        .context("the synthetic frame has lit pixels")?;
+    let cpu = Histogram::from_luminances(
+        frame
+            .iter()
+            .map(|c| meter_pixel(c.to_array(), scene_pre, star_pre)),
+    )
+    .meter(total)
+    .context("the synthetic frame has lit pixels")?;
     let cpu_target = target_ev(Some(cpu), 0.0);
 
     // GPU: the meter, then the resolve (Auto, settle) reading it in the same submission.
@@ -89,7 +95,7 @@ fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
         0,
         bytemuck::bytes_of(&ExposureUniform::from_exposure(Exposure {
             scene_ev100: scene_ev,
-            star_ev100: scene_ev,
+            star_ev100: star_ev,
         })),
     );
     let targets = probe_targets(&gpu.device, size);
@@ -135,9 +141,9 @@ fn check_meter(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
     Ok((
         pass,
         format!(
-            "512² log-normal frame: lit_px GPU {lit:.0} / CPU {:.0}; ev_avg {ev_avg:.4} / {:.4}; \
-             ev_hi {ev_hi:.4} / {:.4}; target {gpu_target:.4} / {cpu_target:.4} (tolerance \
-             {METER_EV_TOLERANCE} EV)",
+            "512² log-normal frame with a band block: lit_px GPU {lit:.0} / CPU {:.0}; ev_avg \
+             {ev_avg:.4} / {:.4}; ev_hi {ev_hi:.4} / {:.4}; target {gpu_target:.4} / \
+             {cpu_target:.4} (tolerance {METER_EV_TOLERANCE} EV)",
             cpu.lit_px, cpu.ev_avg, cpu.ev_hi
         ),
     ))
@@ -239,6 +245,7 @@ fn check_bloom(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
         frame[(y * size.x + x) as usize] = v;
     }
     let cpu = bloom_reference(&frame, size, true);
+    let rgba: Vec<Vec4> = frame.iter().map(|c| c.extend(0.0)).collect();
 
     let mut renderer = Renderer::new(gpu, size);
     // Strength 1: hdr = bloom, so the read-back is the chain's output.
@@ -250,7 +257,7 @@ fn check_bloom(gpu: &GpuContext, lib: &mut ShaderLib) -> anyhow::Result<(bool, S
     )?;
     let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let targets = probe_targets(&gpu.device, size);
-    upload_hdr(gpu, &targets, &frame);
+    upload_hdr(gpu, &targets, &rgba);
     let ctx = probe_ctx(size, 1.0 / 60.0);
     // One empty renderer frame uploads the camera uniform (the composite reads its viewport).
     let upload = renderer.render(gpu, &ctx, &targets.hdr_view);
@@ -490,11 +497,11 @@ fn probe_targets(device: &wgpu::Device, size: UVec2) -> FrameTargets {
     }
 }
 
-/// Writes `rgb` (row-major, alpha 0) into `targets.hdr` as f16.
-fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgb: &[Vec3]) {
-    let bytes: Vec<u8> = rgb
+/// Writes `rgba` (row-major) into `targets.hdr` as f16.
+fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgba: &[Vec4]) {
+    let bytes: Vec<u8> = rgba
         .iter()
-        .flat_map(|c| [c.x, c.y, c.z, 0.0])
+        .flat_map(|c| c.to_array())
         .flat_map(|v| f16_bits(v).to_le_bytes())
         .collect();
     gpu.queue.write_texture(
@@ -518,43 +525,58 @@ fn upload_hdr(gpu: &GpuContext, targets: &FrameTargets, rgb: &[Vec3]) {
     );
 }
 
-/// The meter probe's frame at scene pre-exposure `pre`, already rounded to f16: the left
-/// quarter black (not lit), an 8 × 8 block at `HDR_MAX` in the top-right corner (clamped), the
-/// rest a log-normal luminance (median 300 cd/m², σ = 1.5 EV; Box–Muller on `splitmix64`) in a
-/// warm tint.
-fn lognormal_frame(size: UVec2, pre: f32) -> Vec<Vec3> {
+/// The meter probe's frame at scene pre-exposure `scene_pre` and star pre-exposure `star_pre`,
+/// already rounded to f16: the left quarter black (not lit), an 8 × 8 block at `HDR_MAX` in the
+/// top-right corner (clamped), and everywhere else a log-normal luminance (median 300 cd/m²,
+/// σ = 1.5 EV; Box–Muller on `splitmix64`) in a warm tint. That light is at scene exposure (star
+/// share 0 in alpha) except in a 32 × 32 block ([`BAND_BLOCK`]), written like a body in the
+/// 1.5–4 px LOD band at mix(star_pre, scene_pre, w), w = 1 − [`BAND_SHARE`], with its star share
+/// in alpha. The block is 0.5 % of the lit pixels, so read ÷ scene_pre it would set ev_hi.
+fn lognormal_frame(size: UVec2, scene_pre: f32, star_pre: f32) -> Vec<Vec4> {
     let tint = Vec3::new(1.1, 1.0, 0.8);
     let tint = tint / tint.dot(Vec3::new(0.2126, 0.7152, 0.0722));
     let unit = |h: u64| ((h >> 40) as f32 + 1.0) / (1u64 << 24) as f32; // (0, 1]
+    let band_pre = scene_pre * (1.0 - BAND_SHARE) + star_pre * BAND_SHARE;
     (0..size.y)
         .flat_map(|y| (0..size.x).map(move |x| (x, y)))
         .map(|(x, y)| {
             if x < size.x / 4 {
-                return Vec3::ZERO;
+                return Vec4::ZERO;
             }
             if x >= size.x - 8 && y < 8 {
-                return Vec3::splat(HDR_MAX);
+                return Vec4::new(HDR_MAX, HDR_MAX, HDR_MAX, 0.0);
             }
             let h1 = splitmix64(u64::from(y * size.x + x));
             let h2 = splitmix64(h1);
             let z = (-2.0 * unit(h1).ln()).sqrt() * (std::f32::consts::TAU * unit(h2)).cos();
             let l = 300.0 * (1.5 * z).exp2();
+            let [x0, y0, edge] = BAND_BLOCK;
+            let (pre, share) = if (x0..x0 + edge).contains(&x) && (y0..y0 + edge).contains(&y) {
+                (band_pre, BAND_SHARE)
+            } else {
+                (scene_pre, 0.0)
+            };
             // Inside the normal f16 range, where `f16_bits` is exact.
-            (tint * l * pre)
+            let rgb = (tint * l * pre)
                 .clamp(Vec3::splat(F16_MIN_NORMAL), Vec3::splat(HDR_MAX))
                 .to_array()
-                .map(|v| f16_value(f16_bits(v)))
-                .into()
+                .map(|v| f16_value(f16_bits(v)));
+            Vec4::new(rgb[0], rgb[1], rgb[2], share)
         })
         .collect()
 }
+
+/// The meter probe's band block: its corner (x, y) and edge [px].
+const BAND_BLOCK: [u32; 3] = [256, 256, 32];
+/// The band block's star share 1 − w (exact in f16): w = 0.875, about the Moon's at 3.2 px.
+const BAND_SHARE: f32 = 0.125;
 
 /// Smallest normal f16, 2^−14.
 const F16_MIN_NORMAL: f32 = 6.103_515_6e-5;
 
 /// IEEE 754 binary16 bits of `x`, rounded to nearest even, for 0 and every finite |x| in the
 /// normal f16 range [2^−14, 65504], which is all the probes write. Smaller values flush to 0.
-fn f16_bits(x: f32) -> u16 {
+pub(crate) fn f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let abs = bits & 0x7fff_ffff;
@@ -574,7 +596,7 @@ fn f16_bits(x: f32) -> u16 {
 }
 
 /// The f32 value of f16 bits `h` (normal, subnormal or zero).
-fn f16_value(h: u16) -> f32 {
+pub(crate) fn f16_value(h: u16) -> f32 {
     let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exponent = i32::from((h >> 10) & 0x1f);
     let mantissa = f32::from(h & 0x3ff);
@@ -653,18 +675,32 @@ mod tests {
     fn probe_inputs_are_meaningful() {
         // The meter frame: three quarters lit, its target from the log-normal part (not NIGHT).
         let size = UVec2::new(512, 512);
-        let pre = exposure_scale(10.0);
-        let frame = lognormal_frame(size, pre);
-        let m =
-            Histogram::from_luminances(frame.iter().map(|c| meter_luminance(c.to_array(), pre)))
-                .meter(size.x * size.y)
-                .unwrap();
+        let (scene_pre, star_pre) = (exposure_scale(10.0), exposure_scale(NIGHT_EV100));
+        let frame = lognormal_frame(size, scene_pre, star_pre);
+        let read = |star_for_band: f32| {
+            Histogram::from_luminances(
+                frame
+                    .iter()
+                    .map(|c| meter_pixel(c.to_array(), scene_pre, star_for_band)),
+            )
+            .meter(size.x * size.y)
+            .unwrap()
+        };
+        let m = read(star_pre);
         assert!((m.lit_px / 2_073_600.0 - 0.75).abs() < 0.01, "{m:?}");
         // Median 300 cd/m², σ 1.5 EV: the 50–95th percentile mean is above the median.
         assert!(
             m.ev_avg > (300.0f32 * 8.0).log2() && m.ev_avg < 16.0,
             "{m:?}"
         );
+        // The band block matters: read as if at scene exposure (star_pre = scene_pre, the rule
+        // before fix round 1), it sets ev_hi more than 5 EV higher.
+        let band = frame.iter().filter(|c| c.w == BAND_SHARE).count();
+        assert_eq!(band, 32 * 32);
+        let lit = frame.iter().filter(|c| c.x > 0.0).count() as f32;
+        assert!(band as f32 / lit > 0.005, "{band} of {lit}");
+        let ignored = read(scene_pre);
+        assert!(ignored.ev_hi > m.ev_hi + 5.0, "{m:?} vs {ignored:?}");
         // The resolve cases: 16, each with finite expectations.
         let cases = resolve_cases();
         assert_eq!(cases.len(), 16);

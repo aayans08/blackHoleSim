@@ -2,7 +2,8 @@
 // contract: after the atmospheres, before any sky light or point source is written, so it meters
 // world light only.
 //
-// - cs_histogram: each pixel's world luminance, Rec. 709 Y of hdr / scene_pre() [cd/m²], into
+// - cs_histogram: each pixel's world luminance, Rec. 709 Y of hdr / the pre-exposure it was
+//   written with [cd/m²] (meter_pre: scene_pre() for plain world light, see "Star share"), into
 //   256 log2 bins over [-10, 32] with workgroup-shared atomics, flushed to the global bins once
 //   per workgroup (bruop 2019, "Automatic Exposure Using a Luminance Histogram",
 //   https://bruop.github.io/exposure/).
@@ -15,11 +16,20 @@
 // one atomic per bin holds both: count << 16 | step sum (a workgroup has at most 256 pixels per
 // bin: count ≤ 256, step sum ≤ 3840 < 2^16).
 //
-// CPU twins (crates/uni-post/src/histogram.rs): meter_luminance, meter_bin, Histogram::meter
-// (meter_reduce here, same order of operations). The constants are checked against Rust by
+// Star share (B6 fix round 1, review r0 Important 1; the lead's ruling is pending): hdr alpha at
+// this pass is the pixel's star share s = 1 - w, where w = lod_exposure_mix is the weight its
+// writer used in pre = mix(star_pre(), scene_pre(), w). The meter divides by
+// mix(scene_pre(), star_pre(), s). s = 0, the clear value and what every writer leaves while it
+// masks alpha out, is the plan's rule (÷ scene_pre) exactly. A body in the 1.5-4 px band read
+// ÷ scene_pre grows 2^(EV_scene - EV_star) with the scene EV, which runs the loop away
+// (crates/uni-post/src/histogram.rs module docs).
+//
+// CPU twins (crates/uni-post/src/histogram.rs): meter_pre, meter_luminance, meter_pixel (the
+// per-pixel step of cs_histogram), meter_bin, Histogram::meter (meter_reduce here, same order
+// of operations). The constants are checked against Rust by
 // `post_shaders_validate`; MeterBins and ExposureState by `post_layouts_match_wgsl`.
 //
-// Bindings: group 0 = the renderer's (scene_pre); group 1: 0 meter_hdr, 1 meter_bins,
+// Bindings: group 0 = the renderer's (scene_pre, star_pre); group 1: 0 meter_hdr, 1 meter_bins,
 // 2 meter_state.
 
 #import "common/camera.wgsl"
@@ -80,9 +90,10 @@ fn is_nan(x: f32) -> bool {
     return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
 }
 
-// The world luminance [cd/m²] of pre-exposed pixel `rgb` at scene pre-exposure `pre`: Rec. 709 Y
-// / pre, channels clamped to [0, HDR_MAX] first; a pixel with a channel at HDR_MAX (clamped by
-// its writer) counts as at least HDR_MAX / pre, its true value's lower bound (plan B6).
+// The world luminance [cd/m²] of pre-exposed pixel `rgb` written at pre-exposure `pre`: Rec. 709
+// Y / pre, channels clamped to [0, HDR_MAX] first; a pixel with a channel at HDR_MAX (clamped by
+// its writer) counts as at least HDR_MAX / pre (plan B6): a lower bound when all three channels
+// clipped, up to 3.8 EV high for one frame when only one did (it no longer clips the next).
 fn meter_luminance(rgb: vec3<f32>, pre: f32) -> f32 {
     let c = clamp(rgb, vec3<f32>(0.0), vec3<f32>(HDR_MAX));
     let l = luminance(c) / pre;
@@ -90,6 +101,12 @@ fn meter_luminance(rgb: vec3<f32>, pre: f32) -> f32 {
         return max(l, HDR_MAX / pre);
     }
     return l;
+}
+
+// The pre-exposure a pixel was written with, from its star share s (hdr alpha, not NaN):
+// mix(scene_pre, star_pre, s), s clamped to [0, 1]; s = 0 gives scene_pre() exactly.
+fn meter_pre(s: f32) -> f32 {
+    return mix(scene_pre(), star_pre(), clamp(s, 0.0, 1.0));
 }
 
 // Bin (x) and sub-bin step (y) of lit luminance l ≥ METER_MIN_CD_M2; values beyond the range go
@@ -114,10 +131,14 @@ fn cs_histogram(
     workgroupBarrier();
     let dims = textureDimensions(meter_hdr);
     if (gid.x < dims.x && gid.y < dims.y) {
-        let l = meter_luminance(textureLoad(meter_hdr, vec2<i32>(gid.xy), 0).rgb, scene_pre());
-        if (l >= METER_MIN_CD_M2 && !is_nan(l)) {
-            let b = meter_bin(l);
-            atomicAdd(&wg_packed[b.x], (1u << 16u) | b.y);
+        let px = textureLoad(meter_hdr, vec2<i32>(gid.xy), 0);
+        // A NaN star share: the pixel's pre is unknown, so it is not metered.
+        if (!is_nan(px.a)) {
+            let l = meter_luminance(px.rgb, meter_pre(px.a));
+            if (l >= METER_MIN_CD_M2 && !is_nan(l)) {
+                let b = meter_bin(l);
+                atomicAdd(&wg_packed[b.x], (1u << 16u) | b.y);
+            }
         }
     }
     workgroupBarrier();
