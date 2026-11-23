@@ -220,9 +220,13 @@ impl RenderFeature for StarSurfaceRenderer {
     }
 
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, _targets: &FrameTargets) {
-        let frame = self
+        let mut frame = self
             .input
             .with(|scene| plan_stars(scene, ctx.camera.fov_y_rad, f64::from(ctx.viewport.y)));
+        // A cap wholly outside the view draws nothing; with none left the pass is not encoded
+        // (task B9p: the empty pass still loaded and stored hdr, lens_mask and depth).
+        let view_proj = ctx.proj * ctx.view_rot;
+        frame.draws.retain(|d| cap_in_view(&d.vertices, view_proj));
         self.warnings = frame.warnings;
         self.count = frame.draws.len() as u32;
         if frame.draws.is_empty() {
@@ -731,6 +735,22 @@ pub(crate) struct StarGpu {
 pub(crate) struct StarDraw {
     pub gpu: StarGpu,
     pub vertices: Vec<[f32; 3]>,
+}
+
+/// False when every vertex of a cap (camera-relative, root axes) lies outside the same plane of
+/// the view volume of `view_proj` (x < −w, x > w, y < −w, y > w, or behind the eye, w ≤ 0):
+/// then the cap's convex hull, and so the cap, is outside too and draws nothing. Conservative:
+/// a cap that is outside every plane only in part is kept.
+pub(crate) fn cap_in_view(vertices: &[[f32; 3]], view_proj: glam::Mat4) -> bool {
+    let mut outside = [true; 5];
+    for v in vertices {
+        let c = view_proj * glam::Vec4::new(v[0], v[1], v[2], 1.0);
+        let planes = [c.x < -c.w, c.x > c.w, c.y < -c.w, c.y > c.w, c.w <= 0.0];
+        for (o, p) in outside.iter_mut().zip(planes) {
+            *o &= p;
+        }
+    }
+    !vertices.is_empty() && !outside.iter().any(|&o| o)
 }
 
 /// What the pass draws this frame, and its HUD warnings.
@@ -1440,6 +1460,34 @@ mod tests {
         assert_eq!(star_share(w[0], 1.0), 1.0 - w[0]);
         scene.eye_adapted = false;
         assert_eq!(weights(&scene), vec![1.0, 1.0]);
+    }
+
+    /// The pass skips caps wholly outside the view (task B9p): behind the camera, or off one side;
+    /// a cap in front or straddling an edge is kept.
+    #[test]
+    fn caps_outside_the_view_are_skipped() {
+        let proj = uni_gfx::proj::reversed_z_infinite_proj(1.0, 16.0 / 9.0, 1.0);
+        let cap = |rel: DVec3| {
+            let scene = BodyScene {
+                stars: vec![star_view(rel, R_SUN_M, TEFF_SUN_K, M_V_SUN)],
+                names: vec![(0, "Sun".to_owned())],
+                ..Default::default()
+            };
+            plan_stars(&scene, 1.0, 1080.0).draws.remove(0).vertices
+        };
+        let ahead = cap(DVec3::new(0.0, 0.0, -10.0 * R_SUN_M));
+        let behind = cap(DVec3::new(0.0, 0.0, 10.0 * R_SUN_M));
+        let left = cap(DVec3::new(-30.0 * R_SUN_M, 0.0, -10.0 * R_SUN_M));
+        let edge = cap(DVec3::new(-5.8 * R_SUN_M, 0.0, -10.0 * R_SUN_M));
+        let identity = glam::Mat4::IDENTITY;
+        assert!(cap_in_view(&ahead, proj * identity));
+        assert!(!cap_in_view(&behind, proj * identity));
+        assert!(!cap_in_view(&left, proj * identity));
+        assert!(cap_in_view(&edge, proj * identity));
+        // Turning the camera round brings the one behind into view.
+        let turned = glam::Mat4::from_rotation_y(std::f32::consts::PI);
+        assert!(cap_in_view(&behind, proj * turned));
+        assert!(!cap_in_view(&[], proj));
     }
 
     /// Review Focus 2, review C2: a camera inside a photosphere draws nothing and warns.
