@@ -19,8 +19,8 @@ use uni_gfx::{GpuContext, ShaderLib};
 
 use crate::psf::{self, HALO_ENERGY_FRACTION};
 use crate::stars3d::{
-    StarGpu, TWINKLE_SIGMA_MAX, footprint_radius_px, pack_stars, star_apparent_mag,
-    star_is_visible, star_lux, star_rel_pos_pc, twinkle_factor, vivid_color,
+    StarGpu, footprint_radius_px, pack_stars, scintillation_index, star_apparent_mag,
+    star_is_visible, star_lux, star_rel_pos_pc, twinkle_factor, twinkle_log_sigma, vivid_color,
 };
 
 /// Shader path of the magnitude-and-direction probe.
@@ -64,11 +64,12 @@ struct PsfProbeIn {
     // x: edge [px] for psf_erf and pixel_coverage; y: r [px] and z: radius [px] for halo_weight;
     // w: display energy for footprint_radius_px and star_is_visible.
     a: vec4<f32>,
-    // x: halo fraction; y: slot, z: frame (exact integers) and w: sigma for twinkle_factor.
+    // x: halo fraction; y: slot, z: twinkle step (exact integers) and w: sigma for
+    // twinkle_factor.
     b: vec4<f32>,
     // rgb: colour for vivid_color; w: V magnitude for star_lux.
     c: vec4<f32>,
-    // x: binary16 bits (an exact integer) for f16_bits_to_f32; yzw: 0.
+    // x: binary16 bits (an exact integer) for f16_bits_to_f32; y: twinkle phase; zw: 0.
     d: vec4<f32>,
 }
 
@@ -76,7 +77,7 @@ struct PsfProbeIn {
 struct PsfProbeOut {
     // psf_erf(a.x), pixel_coverage(a.x), halo_weight(a.y, a.z), footprint_radius_px(a.w, b.x).
     a: vec4<f32>,
-    // rgb: vivid_color(c.rgb); w: twinkle_factor(b.y, b.z, b.w).
+    // rgb: vivid_color(c.rgb); w: twinkle_factor(b.y, b.z, d.y, b.w).
     b: vec4<f32>,
     // x: star_lux(c.w); y: 1 when star_is_visible(a.w, b.x), else 0; z: f16_bits_to_f32(d.x);
     // w: 0.
@@ -95,7 +96,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var out: PsfProbeOut;
     out.a = vec4<f32>(psf_erf(c.a.x), pixel_coverage(c.a.x), halo_weight(c.a.y, c.a.z),
         footprint_radius_px(c.a.w, c.b.x));
-    out.b = vec4<f32>(vivid_color(c.c.rgb), twinkle_factor(u32(c.b.y), u32(c.b.z), c.b.w));
+    out.b = vec4<f32>(vivid_color(c.c.rgb),
+        twinkle_factor(u32(c.b.y), u32(c.b.z), c.d.y, c.b.w));
     out.c = vec4<f32>(star_lux(c.c.w), select(0.0, 1.0, star_is_visible(c.a.w, c.b.x)),
         f16_bits_to_f32(u32(c.d.x)), 0.0);
     probe_out[gid.x] = out;
@@ -228,6 +230,13 @@ fn check_mag_dir(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, Str
         [n.div_ceil(64), 1, 1],
     )?;
     let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+    // A short read-back must not pass on fewer stars (review r0 M4).
+    if out.len() != inputs.len() {
+        return Ok((
+            false,
+            format!("read back {} results for {n} stars", out.len()),
+        ));
+    }
     let (mut worst_dir, mut worst_mag) = (0.0f64, 0.0f32);
     for (c, g) in inputs.iter().zip(&out) {
         let want = mag_dir_expected(c);
@@ -250,9 +259,11 @@ fn check_mag_dir(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, Str
 
 /// PSF probe inputs: edges across a footprint, halo radii up to each footprint radius, display
 /// energies from below the visibility cutoff to the radius cap with and without the halo,
-/// Planck colours from 2000 to 40 000 K, twinkle slots and frames, V from −27 to 15, and
-/// binary16 bit patterns: ±0, subnormals, normals and the largest finite value.
+/// Planck colours from 2000 to 40 000 K, twinkle slots, steps and phases (0 to 1) at Young's
+/// sea-level zenith amplitude, V from −27 to 15, and binary16 bit patterns: ±0, subnormals,
+/// normals and the largest finite value.
 fn psf_inputs() -> Vec<PsfProbeIn> {
+    let twinkle_sigma = twinkle_log_sigma(scintillation_index(1.0, 1.0));
     let mut inputs = Vec::new();
     let radii = [2.0, 3.0, 8.0, 20.0, 64.0];
     for i in 0..64u32 {
@@ -269,7 +280,8 @@ fn psf_inputs() -> Vec<PsfProbeIn> {
         let kelvin = 2000.0 * 20f64.powf(f64::from(t));
         let c = uni_core::blackbody_linear_srgb(kelvin);
         let c = c / c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
-        let sigma = if i % 5 == 0 { 0.0 } else { TWINKLE_SIGMA_MAX };
+        let sigma = if i % 5 == 0 { 0.0 } else { twinkle_sigma };
+        let phase = (i % 9) as f32 / 8.0;
         let v_mag = -27.0 + 42.0 * t;
         let f16_bits = F16_PATTERNS
             .get(i as usize)
@@ -279,7 +291,7 @@ fn psf_inputs() -> Vec<PsfProbeIn> {
             a: [edge, r, radius, energy],
             b: [halo, (i * 977) as f32, (i * 31 + 5) as f32, sigma],
             c: c.extend(v_mag).to_array(),
-            d: [f16_bits as f32, 0.0, 0.0, 0.0],
+            d: [f16_bits as f32, phase, 0.0, 0.0],
         });
     }
     inputs
@@ -288,7 +300,7 @@ fn psf_inputs() -> Vec<PsfProbeIn> {
 /// The CPU twins' answer for one PSF input.
 fn psf_expected(c: &PsfProbeIn) -> PsfProbeOut {
     let [edge, r, radius, energy] = c.a;
-    let [halo, slot, frame, sigma] = c.b;
+    let [halo, slot, step, sigma] = c.b;
     PsfProbeOut {
         a: [
             psf::erf(edge),
@@ -297,7 +309,7 @@ fn psf_expected(c: &PsfProbeIn) -> PsfProbeOut {
             footprint_radius_px(energy, halo),
         ],
         b: vivid_color(Vec3::from_slice(&c.c[..3]))
-            .extend(twinkle_factor(slot as u32, frame as u32, sigma))
+            .extend(twinkle_factor(slot as u32, step as u32, c.d[1], sigma))
             .to_array(),
         c: [
             star_lux(c.c[3]),
@@ -472,6 +484,15 @@ mod tests {
         assert!(visible > 0 && visible < inputs.len());
         assert!(perfect.iter().any(|o| o.a[3] == 2.0));
         assert!(perfect.iter().any(|o| o.a[3] == psf::MAX_RADIUS_PX));
+        // The twinkle at both ends of a draw's phase, twinkling and steady.
+        let twinkling = |phase: f32| {
+            inputs
+                .iter()
+                .zip(&perfect)
+                .any(|(c, o)| c.d[1] == phase && c.b[3] > 0.0 && o.b[3] != 1.0)
+        };
+        assert!(twinkling(0.0) && twinkling(1.0));
+        assert!(inputs.iter().any(|c| c.b[3] == 0.0));
         // A wrong GPU fails.
         let mut wrong = perfect.clone();
         wrong[3].a[3] += 0.01;

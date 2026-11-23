@@ -8,15 +8,17 @@
 //! 2. places the star: p = (sector centre − camera) + offset + v·t, in f32 (below);
 //! 3. takes d = |p|, m = M_V + 5 log₁₀ d − 5 ([`star_apparent_mag`]) and
 //!    E = 10^(−0.4 (m + 13.99)) lx (`uni_core::star_illuminance_lux`, as [`star_lux`]);
-//! 4. multiplies E by the twinkle factor (only under an atmosphere, [`StarInput::scintillation`]);
-//! 5. reads the colour from B−V through a 128-entry Planck table (`uni_core::bv_to_teff`, then
-//!    `uni_core::blackbody_linear_srgb`, luminance 1), boosted by [`vivid_color`] while
-//!    [`StarInput::vivid_colours`] is on;
-//! 6. splats it with M0's energy-normalised PSF (`crate::psf`: erf-integrated Gaussian core,
-//!    Moffat halo above 1e-6 lx) at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as M0
-//!    (`crate::stars`), culls it when no pixel would rise above `psf::VISIBILITY_CUTOFF`
+//! 4. scales E by the twinkle factor (only under an atmosphere, [`StarInput::scintillation`]):
+//!    log-normal, with Young's (1967) naked-eye scintillation index at the zenith, on a TDB
+//!    clock ([`scintillation_index`], [`twinkle_clock`]; approximate, see there);
+//! 5. splats it with M0's energy-normalised PSF (`crate::psf`: erf-integrated Gaussian core,
+//!    Moffat halo above 1e-6 lx of steady light) at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as
+//!    M0 (`crate::stars`), culls it when no pixel would rise above `psf::VISIBILITY_CUTOFF`
 //!    ([`star_is_visible`]), and sizes its quad with [`footprint_radius_px`]: M0's rule with a
-//!    2-px minimum ([`STARS3D_MIN_RADIUS_PX`], review m16).
+//!    2-px minimum ([`STARS3D_MIN_RADIUS_PX`], review m16);
+//! 6. for a drawn star only, reads the colour from B−V through a 128-entry Planck table
+//!    (`uni_core::bv_to_teff`, then `uni_core::blackbody_linear_srgb`, luminance 1), boosted by
+//!    [`vivid_color`] while [`StarInput::vivid_colours`] is on.
 //!
 //! The fragment stage writes radiance × PSF weight × (1 − r)(1 − g) of `lens_mask` (the frame
 //! contract's sky-light rule), clamped to `HDR_MAX`.
@@ -43,7 +45,7 @@ use std::sync::OnceLock;
 use anyhow::Context as _;
 use bytemuck::Zeroable as _;
 use glam::{DVec3, IVec3, UVec3, Vec3};
-use uni_core::{blackbody_linear_srgb, bv_to_teff, pcg3d};
+use uni_core::{Epoch, blackbody_linear_srgb, bv_to_teff, pcg3d};
 use uni_data::{FLAG_NO_VELOCITY, Star3, f16_to_f32, f32_to_f16};
 use uni_gfx::{
     DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer,
@@ -86,19 +88,35 @@ pub(crate) const INVISIBLE_ABS_MAG: f32 = 1.0e30;
 /// Saturation factor of the vivid colours about the luminance axis: 1.6, the owner-approved look
 /// preview's value (`.superpowers/look-preview/v2/parts/78-frame.js`, `uSat`).
 pub(crate) const VIVID_SATURATION: f32 = 1.6;
-/// Twinkle log-amplitude σ at full scintillation strength: I/⟨I⟩ = exp(σn − σ²/2) with n of unit
-/// variance, so the scintillation index σ_I² = e^(σ²) − 1 = 0.094 at strength 1 (measured over
-/// 10⁵ frames: 0.092). A chosen value, not fitted to a cited measurement (approximate): enough to
-/// see by eye. B3's `scintillation_strength` carries the dependence on the atmosphere; the
-/// dependence on each star's elevation is not modelled (`StarInput` has no zenith).
-pub(crate) const TWINKLE_SIGMA_MAX: f32 = 0.3;
-/// Frames between independent twinkle values (smoothly interpolated in between): 15 Hz at 60 fps.
-pub(crate) const TWINKLE_FRAMES: u32 = 4;
+/// Young's (1967) scintillation coefficient [cm^(2/3) s^(1/2)]: a star's relative rms intensity
+/// through an aperture D [cm] at air mass X from altitude h, averaged over t [s], is
+/// σ_I = 0.09·D^(−2/3)·X^1.75·e^(−h/8000 m)·(2t)^(−1/2) (Young 1967, AJ 72, 747, in the form
+/// Stefansson et al. 2017, arXiv:1710.01790, quote; in SI units, with σ_I² ∝ (cos γ)^(−3), it is
+/// Osborn et al. 2015, MNRAS 452, 1707, eq. 2, who find it ~1.5× below measured medians at large
+/// telescopes). It is fitted to telescope apertures above the Fresnel scale (a few cm to tens of
+/// cm, Osborn et al. 2015 §2); a 7 mm pupil is below it, so the naked-eye value is an
+/// extrapolation (approximate; the HUD shows "Twinkling: approximate model").
+pub(crate) const YOUNG_SCINTILLATION_COEFF: f64 = 0.09;
+/// The naked eye's aperture D [cm]: a dark-adapted pupil of about 7 mm (lead's r0 ruling; the
+/// pupil spans roughly 2 to 8 mm from bright to dark). A modelling choice.
+pub(crate) const EYE_PUPIL_CM: f64 = 0.7;
+/// The eye's integration time t [s] in Young's (2t)^(−1/2), and the interval between independent
+/// twinkle draws (what the eye sees decorrelates over its own averaging time): Bloch's law of
+/// complete temporal summation, about 0.1 s in dim light (Barlow 1958, J. Physiol. 141, 337; the
+/// commonly quoted order of magnitude, not checked against the paper here). A modelling choice.
+pub(crate) const TWINKLE_EYE_S: f64 = 0.1;
+/// Twinkle draws per day: 86 400 s / [`TWINKLE_EYE_S`], a whole number, so the clock counts whole
+/// days first and its f64 fraction stays exact at any epoch.
+pub(crate) const TWINKLE_STEPS_PER_DAY: i64 = 864_000;
 /// Third `pcg3d` lane of the twinkle hash, so it never repeats another hash of (slot, step).
 pub(crate) const TWINKLE_SEED: u32 = 0x7F4A_7C15;
 /// The star pass re-uploads the sector centres when the camera is further than this [pc] from
-/// the anchor they were uploaded against. The f32 camera − anchor offset then errs by at most
-/// 3e-8 pc per axis (half an ulp below 1 pc), 6e-7 rad for a star 0.05 pc away.
+/// the anchor they were uploaded against. The f32 path's direction error is then dominated not
+/// by camera − anchor (≤ 3e-8 pc per axis, half an ulp below 1 pc) but by the sector centre −
+/// anchor and the star's offset (each rounded to f32 at 8–16 pc: 5e-7 to 1e-6 pc) and their f32
+/// difference: about 2e-6 pc in all, 2e-5 rad (0.02 px at 1080 lines, 60°) for a star at the
+/// 0.1-pc radius inside which uni-sim suppresses stars. `sector_offsets_precision_at_1kpc`
+/// measures 8.1e-7 rad over its cases (review r0 M2).
 pub(crate) const REANCHOR_PC: f64 = 1.0;
 /// Relative luminance weights of linear Rec. 709: ITU-R BT.709-6 (2015), item 3.2.
 const REC709_Y: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
@@ -135,8 +153,12 @@ pub struct StarInput {
     /// ([`vivid_color`]). The HUD shows `uni_ui::VIVID_STAR_COLOURS_LABEL` while it is on.
     pub vivid_colours: bool,
     /// Scintillation (twinkle) strength in [0, 1]: `uni_atmo::scintillation_strength` for the
-    /// camera, 0 in space. B4 drives the twinkle deterministically from `pcg3d` of the star's
-    /// instance slot and the frame index, so captures repeat. Clamped to [0, 1]; NaN is 0.
+    /// camera, 0 in space. The star pass takes it as Young's (1967) altitude factor at the
+    /// zenith ([`scintillation_index`]) and drives the twinkle deterministically from `pcg3d`
+    /// of the star's instance slot and the frame's TDB seconds ([`twinkle_clock`]), so captures
+    /// at a fixed epoch repeat. Non-zero exactly inside an atmosphere shell, so the point pass
+    /// also reads it as "the camera is inside an atmosphere" ([`crate::PointSprites`]). Clamped
+    /// to [0, 1]; NaN is 0.
     pub scintillation: f32,
 }
 
@@ -174,8 +196,11 @@ pub struct StarGpu {
 pub(crate) struct StarsParams {
     /// xyz: camera − anchor [pc] (f64 difference, then f32); w: years since the catalogue epoch.
     pub camera_years: [f32; 4],
-    /// x: twinkle log-amplitude σ (0 = steady); y: 1 with vivid colours, else 0; zw: 0.
+    /// x: twinkle log-amplitude σ (0 = steady); y: 1 with vivid colours, else 0; z: the
+    /// twinkle phase ([`TwinkleClock::phase`]); w: 0.
     pub look: [f32; 4],
+    /// x: the twinkle draw ([`TwinkleClock::step`]); yzw: 0.
+    pub twinkle_step: [u32; 4],
     /// Instance slots of the suppressed stars, [`NO_STAR`] where unused.
     pub suppressed: [[u32; 4]; 2],
 }
@@ -263,9 +288,14 @@ pub(crate) fn star_rel_pos_pc(star: &StarGpu, sector_rel: Vec3, years: f32) -> V
     (sector_rel + Vec3::from_slice(&star.offset_absmag[..3])) + v * years
 }
 
-/// The star pass's uniform for `input`, with the sector centres uploaded relative to
-/// `anchor_pc` and `slots` mapping star indices to instance slots.
-pub(crate) fn stars_params(input: &StarInput, anchor_pc: DVec3, slots: &[u32]) -> StarsParams {
+/// The star pass's uniform for `input` at twinkle time `clock`, with the sector centres uploaded
+/// relative to `anchor_pc` and `slots` mapping star indices to instance slots.
+pub(crate) fn stars_params(
+    input: &StarInput,
+    clock: &TwinkleClock,
+    anchor_pc: DVec3,
+    slots: &[u32],
+) -> StarsParams {
     let mut suppressed = [NO_STAR; 8];
     let kept = input
         .suppressed
@@ -274,21 +304,17 @@ pub(crate) fn stars_params(input: &StarInput, anchor_pc: DVec3, slots: &[u32]) -
     for (entry, slot) in suppressed.iter_mut().zip(kept) {
         *entry = slot;
     }
-    // NaN and negative strengths are 0, and strengths above 1 are 1.
-    let strength = if input.scintillation > 0.0 {
-        input.scintillation.min(1.0)
-    } else {
-        0.0
-    };
+    let sigma = twinkle_log_sigma(scintillation_index(input.scintillation, clock.time_rate));
     let camera = (input.camera_pc - anchor_pc).as_vec3();
     StarsParams {
         camera_years: camera.extend(input.years_since_epoch as f32).to_array(),
         look: [
-            TWINKLE_SIGMA_MAX * strength,
+            sigma,
             if input.vivid_colours { 1.0 } else { 0.0 },
-            0.0,
+            clock.phase,
             0.0,
         ],
+        twinkle_step: [clock.step, 0, 0, 0],
         suppressed: [
             [suppressed[0], suppressed[1], suppressed[2], suppressed[3]],
             [suppressed[4], suppressed[5], suppressed[6], suppressed[7]],
@@ -482,7 +508,12 @@ impl StarField3 {
             centres.len(),
             sector_bytes.len()
         );
-        let params = stars_params(&input.get(), anchor_pc, &packed.slots);
+        let params = stars_params(
+            &input.get(),
+            &TwinkleClock::default(),
+            anchor_pc,
+            &packed.slots,
+        );
 
         crate::register_shaders(lib);
         let module = lib.module(device, STARS3D_WGSL)?;
@@ -597,9 +628,9 @@ impl RenderFeature for StarField3 {
     }
 
     /// Reads this frame's [`StarInput`], re-uploads the sector centres when the camera has left
-    /// the anchor's 1-pc neighbourhood, and writes the per-frame uniform. A non-finite camera
-    /// position keeps the previous frame's uniform.
-    fn prepare(&mut self, gpu: &GpuContext, _ctx: &FrameCtx, targets: &FrameTargets) {
+    /// the anchor's 1-pc neighbourhood, and writes the per-frame uniform with the twinkle clock
+    /// of `ctx`'s epoch. A non-finite camera position keeps the previous frame's uniform.
+    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
         if self.bind_group.is_none() {
             self.bind_targets(gpu, targets);
         }
@@ -616,7 +647,8 @@ impl RenderFeature for StarField3 {
                     .write_buffer(&self.sector_buffer, 0, bytemuck::cast_slice(&centres));
             }
         }
-        let params = stars_params(&input, self.anchor_pc, &self.slots);
+        let clock = twinkle_clock(ctx.epoch, ctx.sim_dt_s, ctx.dt_real_s);
+        let params = stars_params(&input, &clock, self.anchor_pc, &self.slots);
         gpu.queue
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
     }
@@ -705,8 +737,11 @@ pub fn star_is_visible(energy: f32, halo_fraction: f32) -> bool {
 /// at the catalogue epoch (the lead's star-EV sweep, ruling 9).
 ///
 /// Each star is taken on the optical axis (Ω = Ω_c), where its pixels are dimmest, so this is
-/// the count the whole frame would draw if every star were at its centre: the GPU's rule
-/// ([`star_is_visible`] of E·`exposure_scale(EV)`/Ω_c) in the GPU's f32 arithmetic.
+/// the count the whole frame would draw if every star were at its centre: the vertex stage's
+/// rule ([`star_is_visible`] of E·`exposure_scale(EV)`/Ω_c, no twinkle) in f32, with its culls
+/// of a star at zero distance or without light, and `pack_stars`'s of a non-finite position or
+/// magnitude. The distance is taken from the catalogue position, not through the sector
+/// offsets, so a star within f32 rounding of the cutoff may count differently (review r0 M3).
 pub fn visible_star_count(
     stars: &[Star3],
     eye_star_ev100: f32,
@@ -718,12 +753,18 @@ pub fn visible_star_count(
     let n = stars
         .iter()
         .filter(|s| {
-            let d = Vec3::from(s.pos_pc).length();
+            let pos = Vec3::from(s.pos_pc);
+            if !pos.is_finite() || !s.abs_mag_v.is_finite() {
+                return false;
+            }
+            let d = pos.length();
             let lux = star_lux(star_apparent_mag(s.abs_mag_v, d));
-            star_is_visible(
-                (lux * pre / omega).min(MAX_SPLAT_ENERGY),
-                halo_fraction(lux),
-            )
+            d > 0.0
+                && lux > 0.0
+                && star_is_visible(
+                    (lux * pre / omega).min(MAX_SPLAT_ENERGY),
+                    halo_fraction(lux),
+                )
         })
         .count();
     u32::try_from(n).unwrap_or(u32::MAX)
@@ -796,18 +837,119 @@ fn twinkle_noise(slot: u32, step: u32) -> f32 {
     (u.x + u.y + u.z - 1.5) * 2.0
 }
 
-/// The twinkle factor I/⟨I⟩ of slot `slot` on frame `frame` for log-amplitude `sigma`:
-/// exp(σn − σ²/2), whose mean over frames is 1, so the photometry stays the catalogue's on
-/// average. n moves smoothly between independent draws every [`TWINKLE_FRAMES`] frames
-/// (smoothstep, renormalised to unit variance), driven only by the slot and the frame index, so
-/// captures repeat. `sigma` ≤ 0 or NaN gives exactly 1 (no twinkle in space). Twin of
-/// `twinkle_factor` in `stars3d.wgsl`.
-pub(crate) fn twinkle_factor(slot: u32, frame: u32, sigma: f32) -> f32 {
+/// Where the twinkle is in time on one frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TwinkleClock {
+    /// The current draw: TDB seconds since J2000 / [`TWINKLE_EYE_S`], floored, modulo 2^32.
+    pub step: u32,
+    /// How far from draw `step` to the next, in [0, 1].
+    pub phase: f32,
+    /// Simulated seconds per real second on this frame, |sim dt / real dt|, at least 1.
+    pub time_rate: f64,
+}
+
+impl Default for TwinkleClock {
+    /// J2000.0 in real time (before the first frame).
+    fn default() -> Self {
+        Self {
+            step: 0,
+            phase: 0.0,
+            time_rate: 1.0,
+        }
+    }
+}
+
+/// The twinkle clock at `epoch` for a frame that advanced the epoch by `sim_dt_s` in `dt_real_s`
+/// real seconds (`FrameCtx`'s fields).
+///
+/// The draws follow the epoch's TDB seconds (lead's r0 ruling: sim seconds, never the frame
+/// index), so the twinkle's speed does not follow the frame rate and a capture at a fixed epoch
+/// repeats. It is the clock of `sim_time_s()`, computed here in f64 because the f32
+/// `sim_time_s()` steps by up to 0.25 s, more than a draw. Whole days are counted first
+/// ([`TWINKLE_STEPS_PER_DAY`]) so the fraction stays exact at any epoch; the step wraps modulo
+/// 2^32 on both CPU and GPU, so the draws stay continuous across the wrap. Under time warp the
+/// draws speed up with the simulation and [`scintillation_index`] lowers their amplitude by the
+/// warp factor's square root. A non-finite epoch gives step 0 and phase 0; an unknown or
+/// non-finite rate, a pause and slow motion give rate 1.
+pub(crate) fn twinkle_clock(epoch: Epoch, sim_dt_s: f64, dt_real_s: f64) -> TwinkleClock {
+    let rate = (sim_dt_s / dt_real_s).abs();
+    let time_rate = if dt_real_s > 0.0 && rate.is_finite() {
+        rate.max(1.0)
+    } else {
+        1.0
+    };
+    let draws = epoch.sec / TWINKLE_EYE_S;
+    if !draws.is_finite() {
+        return TwinkleClock {
+            time_rate,
+            ..TwinkleClock::default()
+        };
+    }
+    let whole = draws.floor();
+    // Modulo 2^32: the wrapping sum, truncated to its low 32 bits.
+    let step = epoch
+        .day
+        .wrapping_mul(TWINKLE_STEPS_PER_DAY)
+        .wrapping_add(whole as i64) as u32;
+    TwinkleClock {
+        step,
+        phase: ((draws - whole) as f32).min(1.0),
+        time_rate,
+    }
+}
+
+/// Scintillation index σ_I (relative rms intensity) of a star at the zenith seen by the naked
+/// eye, for B3's `strength` (`StarInput::scintillation`) and the clock's `time_rate`:
+/// Young's (1967) σ_I = 0.09·D^(−2/3)·X^1.75·S·(2t)^(−1/2) ([`YOUNG_SCINTILLATION_COEFF`]) with
+/// D = [`EYE_PUPIL_CM`], X = 1 and t = [`TWINKLE_EYE_S`] × `time_rate`; 0.255 at strength 1 in
+/// real time.
+///
+/// - S is B3's `scintillation_strength`, in the place of Young's e^(−h/8000 m): it falls with
+///   the camera's altitude as the air column above it and is 1 at Earth's sea level.
+/// - X = 1 for every star (approximate): `StarInput` carries no local up, so the growth with
+///   each star's air mass (X^1.75 in Young's form, X^1.5 in Osborn et al. 2015's) is not
+///   modelled, and stars near the horizon twinkle as little as at the zenith.
+/// - Under time warp W the eye's 0.1 s holds W·0.1 s of air, so t = W·0.1 s and the amplitude
+///   falls as 1/√W (Young's averaging law); slow motion and a pause keep the real-time value,
+///   since that law does not hold below the scintillation's own millisecond time scales.
+///
+/// Strength is clamped to [0, 1] (NaN is 0); a non-finite rate counts as 1.
+pub(crate) fn scintillation_index(strength: f32, time_rate: f64) -> f64 {
+    let s = if strength > 0.0 {
+        f64::from(strength.min(1.0))
+    } else {
+        0.0
+    };
+    let rate = if time_rate.is_finite() {
+        time_rate.max(1.0)
+    } else {
+        1.0
+    };
+    // At the zenith (see above).
+    let air_mass: f64 = 1.0;
+    YOUNG_SCINTILLATION_COEFF * EYE_PUPIL_CM.powf(-2.0 / 3.0) * air_mass.powf(1.75) * s
+        / (2.0 * TWINKLE_EYE_S * rate).sqrt()
+}
+
+/// Log-amplitude σ of the log-normal twinkle I/⟨I⟩ = exp(σn − σ²/2) whose scintillation index
+/// e^(σ²) − 1 is `sigma_i`²: σ = √ln(1 + σ_I²). Small-aperture scintillation is close to
+/// log-normal (Dravins et al. 1997, PASP 109, 173). 0.251 at σ_I = 0.255.
+pub(crate) fn twinkle_log_sigma(sigma_i: f64) -> f32 {
+    (sigma_i * sigma_i).ln_1p().sqrt() as f32
+}
+
+/// The twinkle factor I/⟨I⟩ of slot `slot` at twinkle draw `step` and `phase` (a
+/// [`TwinkleClock`]) for log-amplitude `sigma`: exp(σn − σ²/2), log-normal. n moves smoothly
+/// from draw `step` to draw `step + 1` (smoothstep of `phase`, renormalised to unit variance),
+/// driven only by the slot and the clock, so a capture at a fixed epoch repeats. The mean is 1
+/// to 1e-4, so the photometry stays the catalogue's on average: at a draw n is Irwin–Hall, whose
+/// exact mean factor is (sinh σ/σ)³·e^(−σ²/2), 0.99993 at σ = 0.25 (review r0 M10). `sigma` ≤ 0
+/// or NaN gives exactly 1 (no twinkle in space). Twin of `twinkle_factor` in `stars3d.wgsl`.
+pub(crate) fn twinkle_factor(slot: u32, step: u32, phase: f32, sigma: f32) -> f32 {
     if !(sigma > 0.0) {
         return 1.0;
     }
-    let step = frame / TWINKLE_FRAMES;
-    let f = (frame % TWINKLE_FRAMES) as f32 / TWINKLE_FRAMES as f32;
+    let f = phase.clamp(0.0, 1.0);
     let t = f * f * (3.0 - 2.0 * f);
     let n0 = twinkle_noise(slot, step);
     let n1 = twinkle_noise(slot, step.wrapping_add(1));
@@ -832,12 +974,11 @@ pub(crate) mod twin {
         pub size: Vec2,
         pub fov_y: f32,
         pub star_pre: f32,
-        pub frame: u32,
     }
 
     impl ViewTwin {
         /// A camera whose optical axis (camera −Z) points along `axis` [root axes], with
-        /// `fov_y_deg` and `size` px, at star exposure `star_ev100`, on frame 0.
+        /// `fov_y_deg` and `size` px, at star exposure `star_ev100`.
         pub fn looking(axis: Vec3, fov_y_deg: f32, size: Vec2, star_ev100: f32) -> Self {
             let cam_to_root = glam::Quat::from_rotation_arc(Vec3::NEG_Z, axis.normalize());
             let fov_y = fov_y_deg.to_radians();
@@ -847,7 +988,6 @@ pub(crate) mod twin {
                 size,
                 fov_y,
                 star_pre: uni_gfx::exposure_scale(star_ev100),
-                frame: 0,
             }
         }
     }
@@ -872,10 +1012,17 @@ pub(crate) mod twin {
         Vec2::new((vi & 1) as f32, (vi >> 1) as f32) * 2.0 - 1.0
     }
 
-    /// The splat of a source in unit direction `dir` (root axes) with illuminance `lux` and
-    /// colour `colour`, at NDC depth `depth`; `None` where the vertex stage culls it. Twin of
-    /// `splat_vertex`.
-    pub fn splat(view: &ViewTwin, dir: Vec3, lux: f32, colour: Vec3, depth: f32) -> Option<Splat> {
+    /// The splat of a source in unit direction `dir` (root axes) with steady illuminance `lux`
+    /// scaled by `twinkle`, and colour `colour`, at NDC depth `depth`; `None` where the vertex
+    /// stage culls it. Twin of `splat_vertex`.
+    pub fn splat(
+        view: &ViewTwin,
+        dir: Vec3,
+        lux: f32,
+        twinkle: f32,
+        colour: Vec3,
+        depth: f32,
+    ) -> Option<Splat> {
         let view_dir = (view.view_rot * dir.extend(0.0)).truncate();
         let clip = view.proj * view_dir.extend(0.0);
         if !(clip.w > MIN_CLIP_W) || !(lux > 0.0) {
@@ -886,7 +1033,8 @@ pub(crate) mod twin {
         let centre = Vec2::new(0.5 * (ndc.x + 1.0) * size.x, 0.5 * (1.0 - ndc.y) * size.y);
         let cos_theta = -view_dir.z / view_dir.length();
         let omega = pixel_solid_angle_off_axis(view.fov_y, size.y, cos_theta);
-        let energy = (lux * view.star_pre / omega).min(MAX_SPLAT_ENERGY);
+        let energy = (lux * twinkle * view.star_pre / omega).min(MAX_SPLAT_ENERGY);
+        // From the steady illuminance (review r0 M7).
         let h = halo_fraction(lux);
         if !star_is_visible(energy, h) {
             return None;
@@ -937,13 +1085,16 @@ pub(crate) mod twin {
         if !(d > 0.0) {
             return None;
         }
-        let lux = star_lux(star_apparent_mag(star.offset_absmag[3], d))
-            * twinkle_factor(slot, view.frame, params.look[0]);
+        let lux = star_lux(star_apparent_mag(star.offset_absmag[3], d));
+        let twinkle = twinkle_factor(slot, params.twinkle_step[0], params.look[2], params.look[0]);
+        // The colour only for a drawn splat, as `vs_stars`.
+        let mut s = splat(view, p / d, lux, twinkle, Vec3::ONE, 0.0)?;
         let mut colour = bv_colour(unpack_f16_pair(star.vel_bv_flags[1])[1]);
         if params.look[1] > 0.5 {
             colour = vivid_color(colour);
         }
-        splat(view, p / d, lux, colour, 0.0)
+        s.radiance *= colour;
+        Some(s)
     }
 
     /// The share of a sky source's light a star keeps under `lens_mask` value `mask`:
@@ -1133,7 +1284,7 @@ mod tests {
             suppressed: vec![1],
             ..StarInput::default()
         };
-        let params = stars_params(&input, DVec3::ZERO, &packed.slots);
+        let params = stars_params(&input, &TwinkleClock::default(), DVec3::ZERO, &packed.slots);
         let rel = packed.table.centres_rel(DVec3::ZERO);
         let view = ViewTwin::looking(Vec3::NEG_Z, 60.0, Vec2::new(1920.0, 1080.0), -4.0);
         // Twice the area of triangle (a, b, c) in NDC.
@@ -1174,11 +1325,11 @@ mod tests {
         // has a 2 px quad radius, and one 0.01 % fainter is culled.
         let view = ViewTwin::looking(Vec3::X, 60.0, Vec2::new(1920.0, 1080.0), DEFAULT_STAR_EV100);
         let lux = threshold * pixel_solid_angle(view.fov_y, view.size.y) / view.star_pre;
-        let s = splat(&view, Vec3::X, lux * 1.0001, Vec3::ONE, 0.0).expect("visible");
+        let s = splat(&view, Vec3::X, lux * 1.0001, 1.0, Vec3::ONE, 0.0).expect("visible");
         assert_eq!(s.radius_px, 2.0);
-        assert!(splat(&view, Vec3::X, lux * 0.9999, Vec3::ONE, 0.0).is_none());
+        assert!(splat(&view, Vec3::X, lux * 0.9999, 1.0, Vec3::ONE, 0.0).is_none());
         // Sirius (V = −1.46): M0's 18.31 px glare footprint.
-        let s = splat(&view, Vec3::X, star_lux(-1.46), Vec3::ONE, 0.0).expect("visible");
+        let s = splat(&view, Vec3::X, star_lux(-1.46), 1.0, Vec3::ONE, 0.0).expect("visible");
         assert!(s.radius_px > 2.0);
         assert!((s.radius_px - 18.31).abs() < 0.01, "{}", s.radius_px);
     }
@@ -1293,33 +1444,186 @@ mod tests {
         assert!(bv_colour(1.6).x > bv_colour(1.6).z);
     }
 
+    /// Lead's r0 ruling (review r0 I1): the twinkle's strength is Young's (1967) scintillation
+    /// index for the naked eye, σ_I = 0.09·D^(−2/3)·X^1.75·e^(−h/8 km)·(2t)^(−1/2) with D = 0.7 cm,
+    /// X = 1 (the zenith: `StarInput` carries no local up), t = 0.1 s (the eye's integration),
+    /// and B3's `scintillation_strength` in the place of e^(−h/8 km).
+    #[test]
+    fn twinkle_amplitude_follows_young_1967() {
+        let zenith = 0.09 * 0.7f64.powf(-2.0 / 3.0) * 0.2f64.powf(-0.5);
+        assert!((zenith - 0.2553).abs() < 1e-4, "{zenith}");
+        assert!((scintillation_index(1.0, 1.0) - zenith).abs() < 1e-12);
+        // Linear in B3's strength (Young's e^(−h/8 km)); clamped to [0, 1]; NaN is 0.
+        assert!((scintillation_index(0.25, 1.0) - 0.25 * zenith).abs() < 1e-12);
+        assert_eq!(scintillation_index(7.0, 1.0), scintillation_index(1.0, 1.0));
+        assert_eq!(scintillation_index(0.0, 1.0), 0.0);
+        assert_eq!(scintillation_index(-1.0, 1.0), 0.0);
+        assert_eq!(scintillation_index(f32::NAN, 1.0), 0.0);
+        // Time warp W: the eye's 0.1 s holds W·0.1 s of air, so Young's (2t)^(−1/2) gives σ/√W.
+        assert!((scintillation_index(1.0, 100.0) - zenith / 10.0).abs() < 1e-12);
+        // Slow motion and pause keep the real-time amplitude; a non-finite rate counts as 1.
+        assert_eq!(scintillation_index(1.0, 0.1), scintillation_index(1.0, 1.0));
+        assert_eq!(
+            scintillation_index(1.0, f64::NAN),
+            scintillation_index(1.0, 1.0)
+        );
+        // The log-normal amplitude whose scintillation index e^(σ²) − 1 is σ_I².
+        let s = twinkle_log_sigma(zenith);
+        assert!(((f64::from(s) * f64::from(s)).exp_m1() - zenith * zenith).abs() < 1e-6);
+        assert_eq!(twinkle_log_sigma(0.0), 0.0);
+        // The uniform carries it.
+        let input = StarInput {
+            scintillation: 1.0,
+            ..StarInput::default()
+        };
+        let p = stars_params(&input, &TwinkleClock::default(), DVec3::ZERO, &[]);
+        assert_eq!(p.look[0], s);
+        let steady = stars_params(
+            &StarInput::default(),
+            &TwinkleClock::default(),
+            DVec3::ZERO,
+            &[],
+        );
+        assert_eq!(steady.look[0], 0.0);
+    }
+
+    /// Lead's r0 ruling: the twinkle runs on TDB seconds (the epoch the frame shows), never the
+    /// frame index, so its speed does not follow the frame rate and a capture at a fixed epoch
+    /// repeats.
+    #[test]
+    fn twinkle_clock_runs_on_tdb_seconds() {
+        let at = |s: f64| twinkle_clock(Epoch::from_tdb_seconds(s), 1.0 / 60.0, 1.0 / 60.0);
+        let t0 = 851_234_567.25; // 2026-12-22, TDB seconds since J2000
+        let c = at(t0);
+        // Any frame rate: the same instant, the same clock.
+        let c30 = twinkle_clock(Epoch::from_tdb_seconds(t0), 1.0 / 30.0, 1.0 / 30.0);
+        assert_eq!((c.step, c.phase), (c30.step, c30.phase));
+        assert_eq!(c.time_rate, 1.0);
+        // Half a draw later: the same draw, half-way to the next; a draw later: the next one.
+        let half = at(t0 + 0.5 * TWINKLE_EYE_S);
+        assert_eq!(half.step, c.step);
+        assert!((half.phase - c.phase - 0.5).abs() < 1e-6, "{half:?} {c:?}");
+        assert_eq!(at(t0 + TWINKLE_EYE_S).step, c.step.wrapping_add(1));
+        // Across midnight the draws keep counting by one.
+        let day = Epoch {
+            day: 9_853,
+            sec: 0.0,
+        };
+        let before = twinkle_clock(day.add_seconds(-0.05), 0.0, 0.0);
+        let after = twinkle_clock(day, 0.0, 0.0);
+        assert_eq!(after.step, before.step.wrapping_add(1));
+        assert!((before.phase - 0.5).abs() < 1e-6 && after.phase == 0.0);
+        assert_eq!(
+            (TWINKLE_STEPS_PER_DAY as f64) * TWINKLE_EYE_S,
+            uni_core::DAY
+        );
+        // The factor is a function of the instant alone: sampled at 60 and at 30 fps over 2 s,
+        // the shared instants agree, and 2 s hold 20 draws at either rate.
+        let sigma = twinkle_log_sigma(scintillation_index(1.0, 1.0));
+        let factor = |c: TwinkleClock| twinkle_factor(5, c.step, c.phase, sigma);
+        for k in 0..60 {
+            let s60 = at(t0 + f64::from(2 * k) / 60.0);
+            let s30 = twinkle_clock(Epoch::from_tdb_seconds(t0 + f64::from(k) / 30.0), 1.0, 1.0);
+            assert_eq!(factor(s60), factor(s30), "frame {k}");
+        }
+        assert_eq!(at(t0 + 2.0).step.wrapping_sub(c.step), 20);
+        // Time rate: |sim dt / real dt|, at least 1; paused, unknown or non-finite is 1.
+        let rate = |sim: f64, real: f64| twinkle_clock(Epoch::J2000, sim, real).time_rate;
+        assert_eq!(rate(1.0 / 6.0, 1.0 / 60.0), 10.0);
+        assert_eq!(rate(-1.0 / 6.0, 1.0 / 60.0), 10.0);
+        assert_eq!(rate(0.0, 1.0 / 60.0), 1.0);
+        assert_eq!(rate(1.0 / 600.0, 1.0 / 60.0), 1.0);
+        assert_eq!(rate(1.0, 0.0), 1.0);
+        assert_eq!(rate(f64::NAN, 1.0 / 60.0), 1.0);
+        // A non-finite epoch gives the clock's start.
+        let bad = twinkle_clock(
+            Epoch {
+                day: 0,
+                sec: f64::NAN,
+            },
+            0.0,
+            0.0,
+        );
+        assert_eq!((bad.step, bad.phase), (0, 0.0));
+    }
+
+    /// The shader reads no frame index for the twinkle (review r0 I1).
+    #[test]
+    fn twinkle_ignores_the_frame_index() {
+        let src = include_str!("../shaders/stars3d.wgsl");
+        assert!(!src.contains("camera.time.x"));
+        let m = module(STARS3D_WGSL);
+        assert!(calls(
+            &entry(&m, "vs_stars").body,
+            func(&m, "twinkle_factor")
+        ));
+    }
+
     #[test]
     fn twinkle_is_deterministic_with_unit_mean() {
-        assert_eq!(twinkle_factor(7, 123, 0.0), 1.0);
-        assert_eq!(twinkle_factor(7, 123, f32::NAN), 1.0);
-        let sigma = TWINKLE_SIGMA_MAX;
-        assert_eq!(twinkle_factor(7, 123, sigma), twinkle_factor(7, 123, sigma));
-        assert_ne!(twinkle_factor(7, 123, sigma), twinkle_factor(8, 123, sigma));
-        let n = 20_000u32;
-        let mean = (0..n)
-            .map(|f| f64::from(twinkle_factor(42, f, sigma)))
-            .sum::<f64>()
-            / f64::from(n);
-        assert!((mean - 1.0).abs() < 0.02, "{mean}");
+        let sigma = twinkle_log_sigma(scintillation_index(1.0, 1.0));
+        assert_eq!(twinkle_factor(7, 123, 0.3, 0.0), 1.0);
+        assert_eq!(twinkle_factor(7, 123, 0.3, f32::NAN), 1.0);
+        assert_eq!(
+            twinkle_factor(7, 123, 0.3, sigma),
+            twinkle_factor(7, 123, 0.3, sigma)
+        );
+        assert_ne!(
+            twinkle_factor(7, 123, 0.3, sigma),
+            twinkle_factor(8, 123, 0.3, sigma)
+        );
+        // Continuous across draws, the u32 wrap included.
+        for step in [0, 99, u32::MAX] {
+            let end = twinkle_factor(42, step, 1.0, sigma);
+            let start = twinkle_factor(42, step.wrapping_add(1), 0.0, sigma);
+            assert!((end / start - 1.0).abs() < 1e-6, "{step}: {end} vs {start}");
+        }
+        // Over 20 000 draws, six frames per draw (60 fps): mean 1 and the scintillation index
+        // σ_I² of Young's formula. At a draw n is Irwin–Hall, so the exact mean there is
+        // (sinh σ/σ)³·e^(−σ²/2) = 0.99993, not 1; the blends between draws are closer to normal.
+        let (n, per) = (20_000u32, 6u32);
+        let samples: Vec<f64> = (0..n)
+            .flat_map(|step| {
+                (0..per)
+                    .map(move |k| f64::from(twinkle_factor(42, step, k as f32 / per as f32, sigma)))
+            })
+            .collect();
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let var = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+        let index = var / (mean * mean);
+        let want = scintillation_index(1.0, 1.0).powi(2);
+        assert!((mean - 1.0).abs() < 0.01, "mean {mean}");
+        assert!((index / want - 1.0).abs() < 0.1, "index {index} vs {want}");
         // Smooth in time: from one frame to the next it changes far less than independent
         // draws every frame would.
-        let mean_step = |f: &dyn Fn(u32) -> f32| {
-            (0..n - 1)
-                .map(|i| f64::from((f(i + 1) - f(i)).abs()))
+        let steps = |v: &[f64]| {
+            v.windows(2)
+                .map(|w| (w[1].ln() - w[0].ln()).abs())
                 .sum::<f64>()
-                / f64::from(n)
+                / v.len() as f64
         };
-        let smooth = mean_step(&|i| twinkle_factor(42, i, sigma).ln());
-        let jumpy = mean_step(&|i| sigma * twinkle_noise(42, i));
-        assert!(smooth < 0.5 * jumpy, "{smooth} vs {jumpy}");
-        for f in 0..1000 {
-            assert!(twinkle_factor(3, f, sigma) > 0.0);
-        }
+        let jumpy: Vec<f64> = (0..n * per)
+            .map(|i| f64::from(sigma * twinkle_noise(42, i)).exp())
+            .collect();
+        assert!(steps(&samples) < 0.5 * steps(&jumpy));
+        assert!(samples.iter().all(|&x| x > 0.0));
+    }
+
+    /// Review r0 M7: the halo share follows the steady illuminance, so a star near
+    /// `HALO_MIN_LUX` keeps (or lacks) its halo while it twinkles.
+    #[test]
+    fn halo_share_ignores_the_twinkle() {
+        let view = ViewTwin::looking(Vec3::X, 60.0, Vec2::new(1920.0, 1080.0), -4.0);
+        let above = HALO_MIN_LUX * 1.01;
+        let s = splat(&view, Vec3::X, above, 0.5, Vec3::ONE, 0.0).expect("visible");
+        assert_eq!(s.halo_fraction, HALO_ENERGY_FRACTION);
+        let below = HALO_MIN_LUX * 0.99;
+        let s = splat(&view, Vec3::X, below, 2.0, Vec3::ONE, 0.0).expect("visible");
+        assert_eq!(s.halo_fraction, 0.0);
+        // The twinkle scales the light itself.
+        let steady = splat(&view, Vec3::X, above, 1.0, Vec3::ONE, 0.0).unwrap();
+        let dim = splat(&view, Vec3::X, above, 0.5, Vec3::ONE, 0.0).unwrap();
+        assert!((dim.energy / steady.energy - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -1379,12 +1683,24 @@ mod tests {
             scintillation: 0.5,
         };
         let slots = [4, 3, 2, 1, 0, 5, 6, 7, 8];
-        let p = stars_params(&input, DVec3::new(1.0, 2.0, -2.0), &slots);
+        let clock = TwinkleClock {
+            step: 0xDEAD_BEEF,
+            phase: 0.25,
+            time_rate: 4.0,
+        };
+        let p = stars_params(&input, &clock, DVec3::new(1.0, 2.0, -2.0), &slots);
         assert_eq!(p.camera_years, [0.5, 0.0, -1.0, 26.9]);
-        assert_eq!(p.look, [0.5 * TWINKLE_SIGMA_MAX, 0.0, 0.0, 0.0]);
+        let sigma = twinkle_log_sigma(scintillation_index(0.5, 4.0));
+        assert_eq!(p.look, [sigma, 0.0, 0.25, 0.0]);
+        assert_eq!(p.twinkle_step, [0xDEAD_BEEF, 0, 0, 0]);
         // Index 99 is out of range and skipped; at most 8 slots are kept.
         assert_eq!(p.suppressed, [[2, 4, 3, 1], [0, 5, 6, 7]]);
-        let p = stars_params(&StarInput::default(), DVec3::ZERO, &slots);
+        let p = stars_params(
+            &StarInput::default(),
+            &TwinkleClock::default(),
+            DVec3::ZERO,
+            &slots,
+        );
         assert_eq!(p.suppressed, [[NO_STAR; 4]; 2]);
         assert_eq!(p.look[1], 1.0);
         // Scintillation is clamped to [0, 1].
@@ -1393,8 +1709,8 @@ mod tests {
             ..StarInput::default()
         };
         assert_eq!(
-            stars_params(&loud, DVec3::ZERO, &slots).look[0],
-            TWINKLE_SIGMA_MAX
+            stars_params(&loud, &TwinkleClock::default(), DVec3::ZERO, &slots).look[0],
+            twinkle_log_sigma(scintillation_index(1.0, 1.0))
         );
     }
 
@@ -1444,6 +1760,10 @@ mod tests {
                     offset_of!(StarsParams, camera_years)
                 ),
                 ("look".to_owned(), offset_of!(StarsParams, look)),
+                (
+                    "twinkle_step".to_owned(),
+                    offset_of!(StarsParams, twinkle_step)
+                ),
                 ("suppressed".to_owned(), offset_of!(StarsParams, suppressed)),
             ]
         );
@@ -1469,9 +1789,19 @@ mod tests {
                 ),
             ]
         );
+        let (size, offsets, vec4_only) = wgsl_struct(&m, "PointsParams");
+        assert_eq!(size, size_of::<crate::points::PointsParams>());
+        assert!(vec4_only);
+        assert_eq!(
+            offsets,
+            vec![(
+                "sky".to_owned(),
+                offset_of!(crate::points::PointsParams, sky)
+            )]
+        );
 
-        // Group 1 bindings: the star pass's 0–4 and the point pass's own buffer at 5, sharing
-        // the lens mask at 4.
+        // Group 1 bindings: the star pass's 0–4 and the point pass's own buffers at 5 and 6,
+        // sharing the lens mask at 4.
         let binding = |m: &naga::Module, name: &str| {
             m.global_variables
                 .iter()
@@ -1487,6 +1817,7 @@ mod tests {
             ("bv_lut", 3),
             ("lens_mask", 4),
             ("points", 5),
+            ("points_params", 6),
         ] {
             assert_eq!(binding(&m, name), rb(b), "{name}");
         }
@@ -1531,7 +1862,6 @@ mod tests {
         }
         for (name, cpu) in [
             ("BV_LUT_LEN", BV_LUT_LEN as u32),
-            ("TWINKLE_FRAMES", TWINKLE_FRAMES),
             ("TWINKLE_SEED", TWINKLE_SEED),
             ("NO_STAR", NO_STAR),
         ] {

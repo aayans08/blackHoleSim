@@ -9,9 +9,12 @@
 //        p = (sector centre − camera) + offset + v·t,
 //      where the sector centre comes relative to an anchor near the camera and the uniform
 //      carries camera − anchor (both f64 differences on the CPU, then f32; design §5.2);
-//   3. m = M_V + 5 log10 d − 5, E = 10^(−0.4 (m + 13.99)) lx (Allen 1973), × the twinkle;
-//   4. colour from B−V through the Planck table, boosted by vivid_color when the option is on;
-//   5. splat_vertex: M0's PSF sizing at E/Ω(θ) × star_pre(), culled below VISIBILITY_CUTOFF.
+//   3. m = M_V + 5 log10 d − 5, E = 10^(−0.4 (m + 13.99)) lx (Allen 1973);
+//   4. splat_vertex: M0's PSF sizing at E × twinkle / Ω(θ) × star_pre(), culled below
+//      VISIBILITY_CUTOFF (the twinkle is 1 in space; under an atmosphere it follows Young's 1967
+//      scintillation index on a TDB clock, see twinkle_factor);
+//   5. for a drawn splat only, the colour from B−V through the Planck table, boosted by
+//      vivid_color when the option is on.
 // The fragment stage integrates the PSF over its pixel (erf differences, so the footprint sums
 // to the star's energy at any sub-pixel position) and writes it × (1 − r)(1 − g) of lens_mask.
 //
@@ -39,8 +42,12 @@ struct StarGpu {
 struct StarsParams {
     // xyz: camera − anchor [pc]; w: years since the catalogue epoch (J2000.0).
     camera_years: vec4<f32>,
-    // x: twinkle log-amplitude sigma (0 = steady); y: 1 with vivid colours, else 0; zw: 0.
+    // x: twinkle log-amplitude sigma (0 = steady); y: 1 with vivid colours, else 0; z: twinkle
+    // phase in [0, 1] from draw twinkle_step.x to the next; w: 0.
     look: vec4<f32>,
+    // x: the twinkle draw: TDB seconds since J2000 / 0.1 s, floored, modulo 2^32 (computed in
+    // f64 on the CPU: sim_time_s() is f32 and steps by up to 0.25 s); yzw: 0.
+    twinkle_step: vec4<u32>,
     // Instance slots of the suppressed stars; NO_STAR where unused.
     suppressed: array<vec4<u32>, 2>,
 }
@@ -90,11 +97,16 @@ const BV_LUT_MIN: f32 = -0.4;
 const BV_LUT_MAX: f32 = 2.0;
 // Saturation factor of "Vivid star colours · non-physical" (the owner-approved preview's 1.6).
 const VIVID_SATURATION: f32 = 1.6;
-// Frames between independent twinkle draws, and the hash's third lane.
-const TWINKLE_FRAMES: u32 = 4u;
+// The twinkle hash's third lane.
 const TWINKLE_SEED: u32 = 0x7f4a7c15u;
 // An unused entry of StarsParams.suppressed.
 const NO_STAR: u32 = 0xffffffffu;
+
+// psf_erf, pixel_coverage, moffat, halo_weight, pixel_solid_angle_off_axis and (but for its 2-px
+// minimum) footprint_radius_px repeat M0's stars.wgsl, which declares its own bindings and so
+// cannot be imported; shader_constants_match_cpu and the stars3d_psf probe hold them to M0's
+// CPU twins. Review r0 I3, lead's decision: M2 moves them into a binding-free sky/psf.wgsl that
+// both passes import.
 
 // erf(x), Abramowitz & Stegun 1964, eq. 7.1.26 (after Hastings 1955), |error| ≤ 1.5e-7. Twin of
 // `uni_sky::psf::erf` (M0's `psf_erf` in stars.wgsl).
@@ -244,15 +256,17 @@ fn twinkle_noise(slot: u32, step: u32) -> f32 {
     return (u.x + u.y + u.z - 1.5) * 2.0;
 }
 
-// I/<I> = exp(σn − σ²/2) (mean 1), n blended smoothly between draws every TWINKLE_FRAMES frames
-// and renormalised to unit variance; exactly 1 for σ ≤ 0. Twin of
+// I/<I> = exp(σn − σ²/2), log-normal (Dravins et al. 1997, PASP 109, 173), with σ from Young's
+// (1967) scintillation index (computed on the CPU, `uni_sky::stars3d::scintillation_index`).
+// n is draw `step`'s value blended smoothly (smoothstep of `phase`) into draw step + 1's and
+// renormalised to unit variance. The mean is 1 to 1e-4: at a draw n is Irwin–Hall, whose exact
+// mean factor is (sinh σ/σ)³·e^(−σ²/2) = 0.99993 at σ = 0.25. Exactly 1 for σ ≤ 0. Twin of
 // `uni_sky::stars3d::twinkle_factor`.
-fn twinkle_factor(slot: u32, frame: u32, sigma: f32) -> f32 {
+fn twinkle_factor(slot: u32, step: u32, phase: f32, sigma: f32) -> f32 {
     if (!(sigma > 0.0)) {
         return 1.0;
     }
-    let step = frame / TWINKLE_FRAMES;
-    let f = f32(frame % TWINKLE_FRAMES) / f32(TWINKLE_FRAMES);
+    let f = clamp(phase, 0.0, 1.0);
     let t = f * f * (3.0 - 2.0 * f);
     let n0 = twinkle_noise(slot, step);
     let n1 = twinkle_noise(slot, step + 1u);
@@ -285,11 +299,14 @@ fn culled_splat() -> SplatOut {
     return out;
 }
 
-// Vertex vi of the splat of a source in unit direction `dir` (root axes) with illuminance `lux`
-// [lx] and colour `colour` (luminance 1), at NDC depth `depth` (0 for stars at the far plane).
-// Culled behind the camera, without light, below VISIBILITY_CUTOFF or off screen by more than
-// its footprint. Twin of `uni_sky::stars3d::twin::splat` and `vertex`.
-fn splat_vertex(vi: u32, dir: vec3<f32>, lux: f32, colour: vec3<f32>, depth: f32) -> SplatOut {
+// Vertex vi of the splat of a source in unit direction `dir` (root axes) with steady illuminance
+// `lux` [lx] scaled by `twinkle` (1 for a steady source) and colour `colour` (luminance 1), at
+// NDC depth `depth` (0 for stars at the far plane). Culled behind the camera, without light,
+// below VISIBILITY_CUTOFF or off screen by more than its footprint. Twin of
+// `uni_sky::stars3d::twin::splat` and `vertex`.
+fn splat_vertex(
+    vi: u32, dir: vec3<f32>, lux: f32, twinkle: f32, colour: vec3<f32>, depth: f32,
+) -> SplatOut {
     let out_culled = culled_splat();
     // Directions go in with w = 0: the reversed-Z infinite projection maps view (x, y, z, 0) to
     // clip (f·x/aspect, f·y, 0, −z), and clip.w = −z is positive only in front of the camera.
@@ -305,7 +322,9 @@ fn splat_vertex(vi: u32, dir: vec3<f32>, lux: f32, colour: vec3<f32>, depth: f32
     let cos_theta = -view_dir.z / length(view_dir);
     let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
     // Display-normalised energy: the footprint's sum of pre-exposed hdr values.
-    let energy = min(lux * star_pre() / omega, MAX_SPLAT_ENERGY);
+    let energy = min(lux * twinkle * star_pre() / omega, MAX_SPLAT_ENERGY);
+    // The halo share follows the steady illuminance, so it does not switch on and off at the
+    // twinkle rate (review r0 M7).
     let h = select(0.0, HALO_ENERGY_FRACTION, lux > HALO_MIN_LUX);
     if (!star_is_visible(energy, h)) {
         return out_culled;
@@ -358,14 +377,19 @@ fn vs_stars(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) 
     if (!(d > 0.0)) {
         return culled_splat();
     }
-    let frame = u32(camera.time.x);
-    let lux = star_lux(star_apparent_mag(star.offset_absmag.w, d))
-        * twinkle_factor(slot, frame, stars_params.look.x);
-    var colour = bv_colour(unpack_f16_pair(star.vel_bv_flags.y).y);
-    if (stars_params.look.y > 0.5) {
-        colour = vivid_color(colour);
+    let lux = star_lux(star_apparent_mag(star.offset_absmag.w, d));
+    let twinkle = twinkle_factor(
+        slot, stars_params.twinkle_step.x, stars_params.look.z, stars_params.look.x);
+    var out = splat_vertex(vi, p / d, lux, twinkle, vec3<f32>(1.0), 0.0);
+    // The colour only for a drawn splat (review r0 M8); a culled one has radius 0.
+    if (out.halo.y > 0.0) {
+        var colour = bv_colour(unpack_f16_pair(star.vel_bv_flags.y).y);
+        if (stars_params.look.y > 0.5) {
+            colour = vivid_color(colour);
+        }
+        out.radiance = colour * out.radiance;
     }
-    return splat_vertex(vi, p / d, lux, colour, 0.0);
+    return out;
 }
 
 @fragment

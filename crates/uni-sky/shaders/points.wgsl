@@ -1,11 +1,13 @@
 // sky/points.wgsl: the point-sprite pass "points" (Task B4): unresolved bodies, the Sun and near
-// stars as PSF splats, × star_pre() × (1 − r) of lens_mask (review m6), with vertex depth from
-// the true distance and compare Greater, so bodies in front hide them.
+// stars as PSF splats, × star_pre() × (1 − r) of lens_mask (review m6), and × (1 − g) as well
+// while the camera is inside an atmosphere shell (lead's r0 ruling), with vertex depth from the
+// true distance and compare Greater, so bodies in front hide them.
 //
 // The splat itself (projection, E/Ω(θ) × star_pre(), M0's PSF, the 2-px minimum footprint, the
 // cull) is `splat_vertex` and `psf_weight` from sky/stars3d.wgsl, imported here, so a point and
 // a star of equal illuminance and direction leave the same energy. This pass binds only group 1's
-// `lens_mask` (binding 4, declared in stars3d.wgsl) and its own instances (binding 5).
+// `lens_mask` (binding 4, declared in stars3d.wgsl), its own instances (binding 5) and its
+// uniform (binding 6).
 //
 // CPU twins: crates/uni-sky/src/points.rs (`twin::point_splat`, `twin::point_sky_factor`).
 
@@ -19,13 +21,24 @@ struct PointGpu {
     color_lux: vec4<f32>,
 }
 
-@group(1) @binding(5) var<storage, read> points: array<PointGpu>;
+// Twin of `uni_sky::points::PointsParams`: 16 bytes, written once per frame.
+struct PointsParams {
+    // x: 1 while the camera is inside an atmosphere shell (uni_sky::StarInput::scintillation
+    // > 0, B3), else 0; yzw: 0.
+    sky: vec4<f32>,
+}
 
-// The share of a point's light kept under lens-mask value `mask`: 1 − r (review m6). Points are
-// depth-tested against bodies instead of using g. Twin of
+@group(1) @binding(5) var<storage, read> points: array<PointGpu>;
+@group(1) @binding(6) var<uniform> points_params: PointsParams;
+
+// The share of a point's light kept under lens-mask value `mask`. From space 1 − r (review m6):
+// points are depth-tested against bodies instead of using g, so a moon's point in front of a
+// planet's limb is not dimmed by the limb's g. With the camera inside an atmosphere every point
+// is seen through the air: (1 − r)(1 − g), the star pass's factor (lead's r0 ruling). Twin of
 // `uni_sky::points::twin::point_sky_factor`.
-fn point_sky_factor(mask: vec4<f32>) -> f32 {
-    return 1.0 - clamp(mask.r, 0.0, 1.0);
+fn point_sky_factor(mask: vec4<f32>, inside_atmosphere: bool) -> f32 {
+    let kept = 1.0 - clamp(mask.r, 0.0, 1.0);
+    return select(kept, kept * (1.0 - clamp(mask.g, 0.0, 1.0)), inside_atmosphere);
 }
 
 @vertex
@@ -41,13 +54,16 @@ fn vs_points(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
     if (!(depth > 0.0 && depth <= 1.0)) {
         return culled_splat();
     }
-    return splat_vertex(vi, point.dir_dist.xyz, point.color_lux.w, point.color_lux.rgb, depth);
+    return splat_vertex(
+        vi, point.dir_dist.xyz, point.color_lux.w, 1.0, point.color_lux.rgb, depth);
 }
 
 @fragment
 fn fs_points(in: SplatOut) -> @location(0) vec4<f32> {
     let pix = floor(in.pos.xy);
     let mask = textureLoad(lens_mask, vec2<i32>(pix), 0);
-    let rgb = in.radiance * (psf_weight(pix, in.centre_px, in.halo) * point_sky_factor(mask));
+    let inside = points_params.sky.x > 0.5;
+    let rgb = in.radiance
+        * (psf_weight(pix, in.centre_px, in.halo) * point_sky_factor(mask, inside));
     return vec4<f32>(min(rgb, vec3<f32>(HDR_MAX)), 0.0);
 }

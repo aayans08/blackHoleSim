@@ -8,9 +8,17 @@
 //! leave the same display energy and footprint (`point_sprite_energy_matches_star_path`), so a
 //! near star handed from the star pass to this one does not pop.
 //!
-//! Points are not dimmed by `lens_mask.g` (sky occlusion): a point behind an atmosphere is not
-//! dimmed by it in M1, the frame contract's accepted approximation. The app pre-tints star
-//! colours through [`crate::vivid_color`]; this pass applies no colour change of its own.
+//! Sky occlusion (`lens_mask.g`, lead's r0 ruling): with the camera in space points ignore it,
+//! so a moon's point in front of a planet's limb is not dimmed by the limb's g (the depth test
+//! handles bodies). With the camera inside an atmosphere shell every point is seen through the
+//! air, so points are multiplied by (1 − g) as well, like stars. The pass learns where the camera
+//! is from the star pass's [`StarInput`] ([`PointSprites::with_star_input`]):
+//! `StarInput::scintillation` (B3's `scintillation_strength`) is non-zero exactly inside a shell.
+//! Cost if that signal is wrong: a point just behind a limb seen from space is not dimmed
+//! (sub-pixel, rare). Without a star input the pass keeps the space rule.
+//!
+//! The app pre-tints star colours through [`crate::vivid_color`]; this pass applies no colour
+//! change of its own.
 
 use glam::{DVec3, Vec3};
 use uni_gfx::{
@@ -20,7 +28,7 @@ use uni_gfx::{
 
 use crate::POINTS_WGSL;
 use crate::stars3d::{
-    QUAD_INDICES, begin_splat_pass, lens_mask_entry, quad_index_buffer, splat_pipeline,
+    QUAD_INDICES, StarInput, begin_splat_pass, lens_mask_entry, quad_index_buffer, splat_pipeline,
     vertex_buffer_entry,
 };
 
@@ -48,6 +56,26 @@ pub struct PointGpu {
     pub color_lux: [f32; 4],
 }
 
+/// The point pass's per-frame uniform: the twin of `struct PointsParams` in `points.wgsl` (16
+/// bytes, one vec4).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct PointsParams {
+    /// x: 1 while the camera is inside an atmosphere shell (points also × (1 − g)), else 0;
+    /// yzw: 0.
+    pub sky: [f32; 4],
+}
+
+/// The point pass's uniform for the star pass's input `stars` (`None`: the camera is taken to
+/// be in space). Inside an atmosphere shell exactly when `stars.scintillation > 0` (B3; lead's r0
+/// ruling); NaN is outside.
+pub(crate) fn points_params(stars: Option<&StarInput>) -> PointsParams {
+    let inside = stars.is_some_and(|s| s.scintillation > 0.0);
+    PointsParams {
+        sky: [if inside { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+    }
+}
+
 /// Packs `p` for the GPU, or `None` when it cannot be drawn (no light, a zero or non-finite
 /// distance, a non-finite colour). The direction is normalised in f64 before the cast, and an
 /// illuminance beyond f32's range becomes `f32::MAX`. Negative colour channels are clamped to 0.
@@ -70,12 +98,16 @@ const INITIAL_CAPACITY: usize = 256;
 /// The point-sprite pass (`RenderFeature` named "points").
 ///
 /// Group 0 is the renderer's. Group 1: binding 4 the lens mask (the declaration it shares with
-/// `stars3d.wgsl`), binding 5 the instances. The bind group is rebuilt when the instance buffer
-/// grows and in `resize`.
+/// `stars3d.wgsl`), binding 5 the instances, binding 6 the [`PointsParams`] uniform. The bind
+/// group is rebuilt when the instance buffer grows and in `resize`.
 pub struct PointSprites {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     instance_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    /// The star pass's input, read for "the camera is inside an atmosphere"; `None` until
+    /// [`PointSprites::with_star_input`] (the camera is then taken to be in space).
+    stars: Option<SharedInput<StarInput>>,
     /// Instances `instance_buffer` holds.
     capacity: usize,
     index_buffer: wgpu::Buffer,
@@ -112,6 +144,12 @@ impl PointSprites {
         // Validation errors in the objects below come back as an Err, not a device panic.
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let instance_buffer = instance_buffer(device, INITIAL_CAPACITY);
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("points params"),
+            size: size_of::<PointsParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let index_buffer = quad_index_buffer(device);
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("points bgl"),
@@ -122,6 +160,16 @@ impl PointSprites {
                     wgpu::BufferBindingType::Storage { read_only: true },
                     size_of::<PointGpu>(),
                 ),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(size_of::<PointsParams>() as u64),
+                    },
+                    count: None,
+                },
             ],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -146,6 +194,8 @@ impl PointSprites {
             pipeline,
             bgl,
             instance_buffer,
+            params_buffer,
+            stars: None,
             capacity: INITIAL_CAPACITY,
             index_buffer,
             bind_group: None,
@@ -153,6 +203,17 @@ impl PointSprites {
             scratch: Vec::new(),
             count: 0,
         })
+    }
+
+    /// Gives the pass the star pass's input (the same [`SharedInput`] the app hands
+    /// [`crate::StarField3::new`]), whose `scintillation` > 0 tells it the camera is inside an
+    /// atmosphere shell, so points are also multiplied by (1 − g) of `lens_mask` (lead's r0
+    /// ruling). Without it the pass keeps the space rule, (1 − r) only. Additive to B0's
+    /// [`PointSprites::new`], whose signature is unchanged: the app calls
+    /// `PointSprites::new(..)?.with_star_input(star_input.clone())`.
+    pub fn with_star_input(mut self, stars: SharedInput<StarInput>) -> Self {
+        self.stars = Some(stars);
+        self
     }
 
     /// (Re)creates group 1 against `targets` and the current instance buffer.
@@ -169,6 +230,10 @@ impl PointSprites {
                     binding: 5,
                     resource: self.instance_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -180,8 +245,14 @@ impl RenderFeature for PointSprites {
     }
 
     /// Packs this frame's sprites (skipping undrawable ones), grows the instance buffer when
-    /// needed and uploads them.
+    /// needed and uploads them, and writes the uniform from the star input.
     fn prepare(&mut self, gpu: &GpuContext, _ctx: &FrameCtx, targets: &FrameTargets) {
+        let params = match &self.stars {
+            Some(stars) => stars.with(|s| points_params(Some(s))),
+            None => points_params(None),
+        };
+        gpu.queue
+            .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         self.input
@@ -251,19 +322,27 @@ pub(crate) mod twin {
         if !(depth > 0.0 && depth <= 1.0) {
             return None;
         }
+        // Points do not twinkle in M1 (a steady factor of 1).
         splat(
             view,
             dir,
             p.color_lux[3],
+            1.0,
             Vec3::from_slice(&p.color_lux[..3]),
             depth,
         )
     }
 
-    /// The share of a point's light kept under `lens_mask` value `mask`: 1 − r (review m6).
+    /// The share of a point's light kept under `lens_mask` value `mask`: 1 − r from space
+    /// (review m6), (1 − r)(1 − g) with the camera inside an atmosphere (lead's r0 ruling).
     /// Twin of `point_sky_factor`.
-    pub fn point_sky_factor(mask: Vec4) -> f32 {
-        1.0 - mask.x.clamp(0.0, 1.0)
+    pub fn point_sky_factor(mask: Vec4, inside_atmosphere: bool) -> f32 {
+        let kept = 1.0 - mask.x.clamp(0.0, 1.0);
+        if inside_atmosphere {
+            kept * (1.0 - mask.y.clamp(0.0, 1.0))
+        } else {
+            kept
+        }
     }
 }
 
@@ -273,8 +352,8 @@ mod tests {
     use super::*;
     use crate::POINTS_WGSL;
     use crate::stars3d::tests_support::{calls, entry, func, module};
-    use crate::stars3d::twin::{ViewTwin, splat, star_splat};
-    use crate::stars3d::{StarInput, pack_stars, stars_params};
+    use crate::stars3d::twin::{ViewTwin, splat, star_sky_factor, star_splat};
+    use crate::stars3d::{TwinkleClock, pack_stars, stars_params};
     use glam::{Vec2, Vec4};
     use uni_core::PC;
     use uni_data::Star3;
@@ -293,7 +372,12 @@ mod tests {
         let pos = (dir * 264.0).to_array();
         let star = Star3::new(pos, -7.0, [0.0; 3], -0.03, 1, 0);
         let packed = pack_stars(&[star]);
-        let params = stars_params(&StarInput::default(), DVec3::ZERO, &packed.slots);
+        let params = stars_params(
+            &StarInput::default(),
+            &TwinkleClock::default(),
+            DVec3::ZERO,
+            &packed.slots,
+        );
         let rel = packed.table.centres_rel(DVec3::ZERO);
         let s = star_splat(&view, &packed, &rel, &params, 0).expect("star on screen");
         // The star path's illuminance agrees with uni_core's f64 formula.
@@ -338,25 +422,77 @@ mod tests {
         assert!(p.depth > 0.0);
     }
 
-    /// Review m6: points honour the black hole's capture (r) but not sky occlusion (g); they are
-    /// depth-tested against bodies instead.
+    /// Review m6 and the lead's r0 ruling: from space, points honour the black hole's capture (r)
+    /// but not sky occlusion (g), since a moon's point in front of a limb must not be dimmed by
+    /// the limb's g. They are depth-tested against bodies instead. With the camera inside an
+    /// atmosphere shell every point is seen through the air, so they also take (1 − g).
     #[test]
     fn points_respect_capture_mask() {
-        assert_eq!(point_sky_factor(Vec4::new(1.0, 0.0, 0.0, 0.0)), 0.0);
-        assert_eq!(point_sky_factor(Vec4::new(0.25, 0.0, 0.0, 0.0)), 0.75);
-        assert_eq!(point_sky_factor(Vec4::new(0.0, 1.0, 1.0, 1.0)), 1.0);
-        assert_eq!(point_sky_factor(Vec4::ZERO), 1.0);
-        // The CPU model of fs_points: radiance × PSF weight × (1 − r).
+        // In space: 1 − r.
+        assert_eq!(point_sky_factor(Vec4::new(1.0, 0.0, 0.0, 0.0), false), 0.0);
+        assert_eq!(
+            point_sky_factor(Vec4::new(0.25, 0.0, 0.0, 0.0), false),
+            0.75
+        );
+        assert_eq!(point_sky_factor(Vec4::new(0.0, 1.0, 1.0, 1.0), false), 1.0);
+        assert_eq!(point_sky_factor(Vec4::ZERO, false), 1.0);
+        // Inside an atmosphere: (1 − r)(1 − g), the star pass's factor.
+        assert_eq!(point_sky_factor(Vec4::new(0.0, 1.0, 1.0, 1.0), true), 0.0);
+        assert_eq!(point_sky_factor(Vec4::new(0.0, 0.5, 0.0, 0.0), true), 0.5);
+        assert_eq!(point_sky_factor(Vec4::ZERO, true), 1.0);
+        // The CPU model of fs_points: radiance × PSF weight × the factor.
         let energy = 3.0;
-        for (r, want) in [(1.0, 0.0), (0.25, 0.75 * energy), (0.0, energy)] {
-            let mask = Vec4::new(r, 0.6, 0.0, 0.0);
-            assert_eq!(energy * point_sky_factor(mask), want);
+        for (r, g, inside, want) in [
+            (1.0, 0.6, false, 0.0),
+            (0.25, 0.6, false, 0.75 * energy),
+            (0.0, 0.6, false, energy),
+            (0.25, 0.6, true, 0.75 * 0.4 * energy),
+            (0.0, 0.0, true, energy),
+        ] {
+            let mask = Vec4::new(r, g, 0.0, 0.0);
+            let got = energy * point_sky_factor(mask, inside);
+            assert!((got - want).abs() < 1e-6, "r {r} g {g} {inside}: {got}");
+            if inside {
+                assert_eq!(point_sky_factor(mask, true), star_sky_factor(mask));
+            }
         }
-        // The shader's fragment stage uses that factor, not the star pass's (1 − r)(1 − g).
+        // The signal: B3's scintillation is non-zero exactly inside a shell (ruling). Without
+        // a star input the pass keeps the space rule.
+        assert_eq!(points_params(None).sky, [0.0; 4]);
+        for (s, inside) in [
+            (0.3, 1.0),
+            (1e-9, 1.0),
+            (0.0, 0.0),
+            (-1.0, 0.0),
+            (f32::NAN, 0.0),
+        ] {
+            let input = StarInput {
+                scintillation: s,
+                ..StarInput::default()
+            };
+            assert_eq!(
+                points_params(Some(&input)).sky,
+                [inside, 0.0, 0.0, 0.0],
+                "{s}"
+            );
+        }
+        // The shader's fragment stage uses that factor with the uniform's flag, not the star
+        // pass's factor.
         let m = module(POINTS_WGSL);
         let fs = entry(&m, "fs_points");
         assert!(calls(&fs.body, func(&m, "point_sky_factor")));
         assert!(!calls(&fs.body, func(&m, "star_sky_factor")));
+        assert!(reads_global(&m, fs, "points_params"));
+    }
+
+    /// Whether `f` reads the global variable `name`.
+    fn reads_global(m: &wgpu::naga::Module, f: &wgpu::naga::Function, name: &str) -> bool {
+        f.expressions.iter().any(|(_, e)| match e {
+            wgpu::naga::Expression::GlobalVariable(g) => {
+                m.global_variables[*g].name.as_deref() == Some(name)
+            }
+            _ => false,
+        })
     }
 
     /// Vertex depth comes from the true distance: nearer points have larger reversed-Z depth, the
@@ -393,7 +529,7 @@ mod tests {
             color: Vec3::ONE,
         })
         .unwrap();
-        let s = splat(&view, Vec3::Y, 1e-3, Vec3::ONE, near).unwrap();
+        let s = splat(&view, Vec3::Y, 1e-3, 1.0, Vec3::ONE, near).unwrap();
         assert_eq!(point_splat(&view, &p), Some(s));
     }
 
