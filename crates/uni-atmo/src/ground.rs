@@ -10,15 +10,16 @@
 //! [`crate::AtmosphereSet::new`] adds one group per atmosphere over its real transmittance and
 //! irradiance LUTs.
 //!
-//! **r_m for a surface point** is its radius in the atmosphere's frame
-//! ([`crate::feature::atmosphere_frame`]): the atmosphere's bottom radius (`atmo_ground.radii.x`)
-//! plus the point's height above the body's reference ellipsoid, not its distance from the
-//! centre. The atmosphere follows the ellipsoid, so a point on the ground of an oblate Earth is
-//! at the bottom whatever its latitude. mu_s is the cosine of the Sun's zenith angle about the
-//! surface normal.
+//! **The contract** (lead ruling "B3/B1 ground lighting r", 2026-11-23): r_m for a surface point
+//! is the atmosphere's bottom radius (`atmo_ground.radii.x`; Venus: its cloud deck) plus the
+//! point's height above the body's reference ellipsoid, which is 0 for every ground point in M1
+//! (no terrain), and mu_s is the cosine of the Sun's zenith angle about the surface normal. That
+//! is the point's radius in the atmosphere's frame ([`crate::feature::atmosphere_frame`]): the
+//! shell follows the ellipsoid, so a point on the ground of an oblate Earth is at the bottom
+//! whatever its latitude. The bodies pass passes r_m = `atmo_ground.radii.x` and mu_s = the
+//! normal's cosine (uni-planet `body.wgsl`, B1 `18e6ae7`).
 //!
-//! B0's stub described r_m only as a "radius". This reading is B3's and needs the lead's ruling
-//! (B3 review I2). A caller that passes `length(p_body)` instead lights Earth's equatorial
+//! The point's distance from the body's centre is not r_m: it would light Earth's equatorial
 //! ground as if 7.1 km up and Mars's as if 6.7 km up. The B3 report quotes the effect from
 //! `report_numbers`.
 
