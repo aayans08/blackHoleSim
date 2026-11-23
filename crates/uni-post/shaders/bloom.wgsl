@@ -3,16 +3,22 @@
 // Jimenez 2014 (SIGGRAPH Advances in Real-Time Rendering, "Next Generation Post Processing in
 // Call of Duty: Advanced Warfare"):
 // - cs_down_first: level 1 from hdr, the 13-tap downsample with every source texel clamped to
-//   BLOOM_INPUT_MAX first and the partial Karis average (per block of four taps);
+//   BLOOM_INPUT_MAX first and the partial Karis average (per block of four taps); bilinear taps
+//   wherever that clamp changes nothing, texel by texel where it does (down_first);
 // - cs_down: level k from level k − 1, the 13-tap downsample of bilinear taps;
 // - cs_up: u_k = d_k + tent(u_{k+1}), a 3 × 3 tent of bilinear taps one lower-level texel apart
-//   (u_L = d_L);
+//   (u_L = d_L), evaluated as 2 × 2 bilinear taps with the same weights (tent);
 // - vs_composite / fs_composite: bloom = tent(u_1) / L at full resolution; the pipeline's blend
 //   (constant, 1 - constant) with the constant = strength makes hdr = mix(hdr, bloom, strength).
 // No threshold. Every step is normalised, so the chain conserves energy away from the edges.
 //
-// CPU twin: uni_post::bloom::bloom_reference (crates/uni-post/src/bloom.rs), same taps, blocks and
-// order of operations; `universe --selftest` compares the two on an impulse.
+// Task B9p (performance, no change to the result beyond rounding): the first downsample read each
+// window's 36 texels one by one (4.4 ms at 1920 x 1080; now 0.26 ms), and the tents took 9 taps
+// (u_1 0.20 -> 0.08 ms, composite 0.76 -> 0.38 ms).
+//
+// CPU twin: uni_post::bloom::bloom_reference (crates/uni-post/src/bloom.rs), the same texels and
+// weights (the GPU groups some sums differently: bilinear taps, the 2 x 2-tap tent);
+// `universe --selftest` compares the two on an impulse (1 %).
 //
 // Bindings: group 0 = the renderer's (the composite reads camera.viewport, the internal size =
 // hdr's); group 1: 0 bloom_src (the level read), 1 bloom_dst (the level written, storage),
@@ -72,44 +78,101 @@ fn bloom_combine(
     return sum / (wc + w.x + w.y + w.z + w.w);
 }
 
+// One 2 x 2 tap of level 1's 13-tap pattern, exactly: the mean of the four source texels around
+// the corner `p` (texel units, texel t spans [t, t + 1]), each clamped to the edges and to
+// BLOOM_INPUT_MAX first.
+fn first_tap_exact(p: vec2<f32>, last: vec2<i32>) -> vec3<f32> {
+    let i = vec2<i32>(p);
+    let a = bloom_input(textureLoad(bloom_src, clamp(i - vec2<i32>(1, 1), vec2<i32>(0), last), 0).rgb);
+    let b = bloom_input(textureLoad(bloom_src, clamp(i - vec2<i32>(0, 1), vec2<i32>(0), last), 0).rgb);
+    let c = bloom_input(textureLoad(bloom_src, clamp(i - vec2<i32>(1, 0), vec2<i32>(0), last), 0).rgb);
+    let d = bloom_input(textureLoad(bloom_src, clamp(i, vec2<i32>(0), last), 0).rgb);
+    return ((a + b) + (c + d)) * 0.25;
+}
+
+// Level-1 texel `dst` from hdr: the 6 x 6 source texels 2·dst - 2 ..= 2·dst + 3 as the 13 taps of
+// cs_down: the five blocks (the centre, taps j k l m at ±1; the corners, taps a..i at {-2, 0} or
+// {0, 2}) are each the mean of four taps = the mean of their 4 x 4 texels, combined with the
+// Karis average. Task B9p: the 13 taps are bilinear (4.4 ms when every thread read its 36 texels
+// one by one into a private array; 0.26 ms at 1920 x 1080 now), which equals clamping each texel
+// first whenever no tap's mean has a channel above BLOOM_INPUT_MAX / 4 (then no texel is above
+// BLOOM_INPUT_MAX) or below 0 (pre-exposed light is not negative). Otherwise, decided once after
+// all 13 taps are issued (a test per tap serialised the fetches: +0.3 to 0.6 ms), every tap is
+// redone texel by texel with the clamp (first_tap_exact).
+fn down_first(dst: vec2<u32>) -> vec3<f32> {
+    let last = vec2<i32>(textureDimensions(bloom_src)) - vec2<i32>(1);
+    let texel = 1.0 / vec2<f32>(textureDimensions(bloom_src));
+    let p = 2.0 * vec2<f32>(dst) + 1.0;
+    var a = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(-2.0, -2.0)) * texel, 0.0).rgb;
+    var b = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(0.0, -2.0)) * texel, 0.0).rgb;
+    var c = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(2.0, -2.0)) * texel, 0.0).rgb;
+    var d = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(-2.0, 0.0)) * texel, 0.0).rgb;
+    var e = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(0.0, 0.0)) * texel, 0.0).rgb;
+    var f = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(2.0, 0.0)) * texel, 0.0).rgb;
+    var g = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(-2.0, 2.0)) * texel, 0.0).rgb;
+    var h = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(0.0, 2.0)) * texel, 0.0).rgb;
+    var i = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(2.0, 2.0)) * texel, 0.0).rgb;
+    var j = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(-1.0, -1.0)) * texel, 0.0).rgb;
+    var k = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(1.0, -1.0)) * texel, 0.0).rgb;
+    var l = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(-1.0, 1.0)) * texel, 0.0).rgb;
+    var m = textureSampleLevel(bloom_src, bloom_sampler, (p + vec2<f32>(1.0, 1.0)) * texel, 0.0).rgb;
+    var hi = 0.0;
+    var lo = 0.0;
+    hi = max(hi, max(a.r, max(a.g, a.b)));
+    hi = max(hi, max(b.r, max(b.g, b.b)));
+    hi = max(hi, max(c.r, max(c.g, c.b)));
+    hi = max(hi, max(d.r, max(d.g, d.b)));
+    hi = max(hi, max(e.r, max(e.g, e.b)));
+    hi = max(hi, max(f.r, max(f.g, f.b)));
+    hi = max(hi, max(g.r, max(g.g, g.b)));
+    hi = max(hi, max(h.r, max(h.g, h.b)));
+    hi = max(hi, max(i.r, max(i.g, i.b)));
+    hi = max(hi, max(j.r, max(j.g, j.b)));
+    hi = max(hi, max(k.r, max(k.g, k.b)));
+    hi = max(hi, max(l.r, max(l.g, l.b)));
+    hi = max(hi, max(m.r, max(m.g, m.b)));
+    lo = min(lo, min(a.r, min(a.g, a.b)));
+    lo = min(lo, min(b.r, min(b.g, b.b)));
+    lo = min(lo, min(c.r, min(c.g, c.b)));
+    lo = min(lo, min(d.r, min(d.g, d.b)));
+    lo = min(lo, min(e.r, min(e.g, e.b)));
+    lo = min(lo, min(f.r, min(f.g, f.b)));
+    lo = min(lo, min(g.r, min(g.g, g.b)));
+    lo = min(lo, min(h.r, min(h.g, h.b)));
+    lo = min(lo, min(i.r, min(i.g, i.b)));
+    lo = min(lo, min(j.r, min(j.g, j.b)));
+    lo = min(lo, min(k.r, min(k.g, k.b)));
+    lo = min(lo, min(l.r, min(l.g, l.b)));
+    lo = min(lo, min(m.r, min(m.g, m.b)));
+    if (hi > 0.25 * BLOOM_INPUT_MAX || lo < 0.0) {
+        a = first_tap_exact(p + vec2<f32>(-2.0, -2.0), last);
+        b = first_tap_exact(p + vec2<f32>(0.0, -2.0), last);
+        c = first_tap_exact(p + vec2<f32>(2.0, -2.0), last);
+        d = first_tap_exact(p + vec2<f32>(-2.0, 0.0), last);
+        e = first_tap_exact(p + vec2<f32>(0.0, 0.0), last);
+        f = first_tap_exact(p + vec2<f32>(2.0, 0.0), last);
+        g = first_tap_exact(p + vec2<f32>(-2.0, 2.0), last);
+        h = first_tap_exact(p + vec2<f32>(0.0, 2.0), last);
+        i = first_tap_exact(p + vec2<f32>(2.0, 2.0), last);
+        j = first_tap_exact(p + vec2<f32>(-1.0, -1.0), last);
+        k = first_tap_exact(p + vec2<f32>(1.0, -1.0), last);
+        l = first_tap_exact(p + vec2<f32>(-1.0, 1.0), last);
+        m = first_tap_exact(p + vec2<f32>(1.0, 1.0), last);
+    }
+    let centre = (j + k + l + m) * 0.25;
+    let tl = (a + b + d + e) * 0.25;
+    let tr = (b + c + e + f) * 0.25;
+    let bl = (d + e + g + h) * 0.25;
+    let br = (e + f + h + i) * 0.25;
+    return bloom_combine(centre, tl, tr, bl, br, true);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_down_first(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (any(gid.xy >= textureDimensions(bloom_dst))) {
         return;
     }
-    // The 6 × 6 source texels 2·dst - 2 ..= 2·dst + 3, clamped to the edges and to
-    // BLOOM_INPUT_MAX one by one (a bilinear tap would average a hot texel before clamping it).
-    let last = vec2<i32>(textureDimensions(bloom_src)) - vec2<i32>(1);
-    let base = 2 * vec2<i32>(gid.xy) - vec2<i32>(2);
-    var t: array<array<vec3<f32>, 6>, 6>;
-    for (var y = 0; y < 6; y++) {
-        for (var x = 0; x < 6; x++) {
-            let p = clamp(base + vec2<i32>(x, y), vec2<i32>(0), last);
-            t[y][x] = bloom_input(textureLoad(bloom_src, p, 0).rgb);
-        }
-    }
-    // The five blocks, each the mean of its 4 × 4 texels (= its four 2 × 2 taps): the centre
-    // (taps at ±1) at origin (1, 1), the corners (taps at {-2, 0} or {0, 2}) at (0, 0), (2, 0),
-    // (0, 2), (2, 2).
-    var origins = array<vec2<i32>, 5>(
-        vec2<i32>(1, 1),
-        vec2<i32>(0, 0),
-        vec2<i32>(2, 0),
-        vec2<i32>(0, 2),
-        vec2<i32>(2, 2),
-    );
-    var blocks: array<vec3<f32>, 5>;
-    for (var b = 0; b < 5; b++) {
-        var s = vec3<f32>(0.0);
-        for (var y = 0; y < 4; y++) {
-            for (var x = 0; x < 4; x++) {
-                s += t[origins[b].y + y][origins[b].x + x];
-            }
-        }
-        blocks[b] = s / 16.0;
-    }
-    let c = bloom_combine(blocks[0], blocks[1], blocks[2], blocks[3], blocks[4], true);
-    textureStore(bloom_dst, gid.xy, vec4<f32>(c, 1.0));
+    textureStore(bloom_dst, gid.xy, vec4<f32>(down_first(gid.xy), 1.0));
 }
 
 // Bilinear tap of bloom_src at source position `p` (texel units, texel t spans [t, t + 1]).
@@ -147,18 +210,27 @@ fn cs_down(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // The 3 × 3 tent ([1 2 1] ⊗ [1 2 1] / 16) of bilinear taps of bloom_src one texel apart, around
-// `uv`.
+// `uv`, as 2 × 2 bilinear taps (task B9p; 9 taps before). Per axis, with p = uv·size − ½ = i + f,
+// the three taps weigh texels i − 1 ..= i + 2 by (1 − f)/4, f/4 + (1 − f)/2, f/2 + (1 − f)/4, f/4;
+// one bilinear tap between texels i − 1 and i carries the first two ((3 − 2f)/4 at i − 1 + (2 − f)/
+// (3 − 2f)), one between i + 1 and i + 2 the last two ((1 + 2f)/4 at i + 1 + f/(1 + 2f)). The same
+// texels and weights as the nine taps (the CPU twin's form), up to the sampler's sub-texel
+// precision; clamp to edge picks the same edge texels.
 fn tent(uv: vec2<f32>) -> vec3<f32> {
-    let texel = 1.0 / vec2<f32>(textureDimensions(bloom_src));
-    var sum = vec3<f32>(0.0);
-    for (var oy = -1; oy <= 1; oy++) {
-        for (var ox = -1; ox <= 1; ox++) {
-            let w = f32(2 - abs(ox)) * f32(2 - abs(oy));
-            let o = vec2<f32>(f32(ox), f32(oy));
-            sum += w * textureSampleLevel(bloom_src, bloom_sampler, uv + o * texel, 0.0).rgb;
-        }
-    }
-    return sum / 16.0;
+    let size = vec2<f32>(textureDimensions(bloom_src));
+    let p = uv * size - 0.5;
+    let i = floor(p);
+    let f = p - i;
+    let wa = (3.0 - 2.0 * f) * 0.25;
+    let wb = (1.0 + 2.0 * f) * 0.25;
+    // Texel-centre coordinates of the two taps per axis, then + ½ and / size for uv.
+    let pa = (i - 1.0 + (2.0 - f) / (3.0 - 2.0 * f) + 0.5) / size;
+    let pb = (i + 1.0 + f / (1.0 + 2.0 * f) + 0.5) / size;
+    let s00 = textureSampleLevel(bloom_src, bloom_sampler, vec2<f32>(pa.x, pa.y), 0.0).rgb;
+    let s10 = textureSampleLevel(bloom_src, bloom_sampler, vec2<f32>(pb.x, pa.y), 0.0).rgb;
+    let s01 = textureSampleLevel(bloom_src, bloom_sampler, vec2<f32>(pa.x, pb.y), 0.0).rgb;
+    let s11 = textureSampleLevel(bloom_src, bloom_sampler, vec2<f32>(pb.x, pb.y), 0.0).rgb;
+    return wa.y * (wa.x * s00 + wb.x * s10) + wb.y * (wa.x * s01 + wb.x * s11);
 }
 
 @compute @workgroup_size(8, 8, 1)

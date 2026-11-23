@@ -17,6 +17,11 @@
 //! - bloom = tent(u₁) / L at full resolution, mixed by the composite render pass with blend
 //!   factors (constant, 1 − constant), the constant = strength.
 //!
+//! The GPU (`bloom.wgsl`, task B9p) computes the same texels and weights with fewer fetches:
+//! level 1 from 13 bilinear taps wherever the input clamp changes nothing in a window (no tap's
+//! mean above [`BLOOM_INPUT_MAX`]/4 or below 0), texel by texel where it does; each 3 × 3 tent as
+//! 2 × 2 bilinear taps. The twin below keeps the texel-by-texel form.
+//!
 //! Each step is normalised, so away from the frame's edges every level carries the input's
 //! energy, and averaging the L levels conserves it (`bloom_impulse_energy_conserved`): bloom
 //! moves light, it does not add any. Above the clamp, mix() takes strength × (hdr −
