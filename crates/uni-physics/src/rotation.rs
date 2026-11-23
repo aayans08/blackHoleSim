@@ -7,15 +7,27 @@
 //! T in Julian centuries and d in days (TDB) from J2000, θᵢ = θᵢ,₀ + θ̇ᵢ·T (+ θ̈ᵢ·T²) the
 //! report's phase angles (E1–E13, M1–M10, Ja–Je, S1–S6, U1–U16, N–N7).
 //!
-//! Transcription source: NAIF `pck00011.tpc` (N. Bachman, 2022-12-27; read 2026-11-22 at
-//! https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/pck00011.tpc), whose orientation
-//! data are the 2015 report's [1], the Phobos prime meridian from its 2019 correction [2], and
-//! the Earth and Moon from the 2009 report (the 2015 report gives none for them). The tables
-//! below copy its `BODYnnn_POLE_RA`, `_POLE_DEC`, `_PM` and `_NUT_PREC_*` values, with the
-//! phase angles' rates in degrees per Julian century as the kernel scales them (the report's
-//! per-day rates × 36 525) and each periodic term listed as (1-based angle index, coefficient).
-//! The report claims 0.1° accuracy in general; NAIF notes the Earth model's prime meridian is
-//! off by ≥ 150″.
+//! Sources, by table (the report is CMDA 130, article 22, 2018; DOI 10.1007/s10569-017-9805-5):
+//! - the Sun, Mercury … Neptune and their phase angles (Mars 11–26, Jupiter Ja–Je, Neptune N):
+//!   the 2015 report's Table 1 (Sun and planets);
+//! - Phobos, Deimos (M1–M10), the Galileans (J1–J8), Mimas … Iapetus (S1–S6), the Uranian
+//!   moons (U1–U16), Triton (N1–N7) and Charon: its Table 2 (satellites), with Phobos's prime
+//!   meridian from the 2019 correction (CMDA 131, 61; DOI 10.1007/s10569-019-9925-1), which
+//!   amends that Table 2 entry;
+//! - Pluto: the report's dwarf-planet entry;
+//! - the Earth and the Moon (E1–E13): the 2009 report (Archinal et al. 2011, CMDA 109, 101–135),
+//!   its Tables 1 and 2, which the 2015 report does not replace.
+//!
+//! Page numbers within the article could not be given: the publisher's copy was not
+//! reachable (2026-11-23), so the values were transcribed from NAIF `pck00011.tpc` (N. Bachman,
+//! 2022-12-27; read 2026-11-22 at
+//! https://naif.jpl.nasa.gov/pub/naif/generic_kernels/pck/pck00011.tpc), which carries those
+//! tables (its references [1]–[3]) and was checked entry by entry against them in the A2
+//! review. The tables below copy its `BODYnnn_POLE_RA`, `_POLE_DEC`, `_PM` and `_NUT_PREC_*`
+//! values, with the phase angles' rates in degrees per Julian century as the kernel scales them
+//! (the report's per-day rates × 36 525) and each periodic term listed as (1-based angle index,
+//! coefficient). The report claims 0.1° accuracy in general; NAIF notes the Earth model's
+//! prime meridian is off by ≥ 150″.
 //!
 //! Body-fixed → ICRS is R = R_z(α₀ + 90°)·R_x(90° − δ₀)·R_z(W) (the inverse of the report's
 //! ICRF → body-fixed rotation): body +z is the pole, body +x the prime meridian.
@@ -107,7 +119,8 @@ const fn plain(naif: NaifId, ra: [f64; 2], dec: [f64; 2], pm: [f64; 3]) -> Model
     periodic_model(naif, &[], ra, dec, pm, NO_TERMS, NO_TERMS, NO_TERMS)
 }
 
-/// Mercury's M1–M5 (`BODY1_NUT_PREC_ANGLES`; the report's 4.092335°/d … × 36 525).
+/// Mercury's M1–M5 (WGCCRE 2015 Table 1; `BODY1_NUT_PREC_ANGLES`; the report's 4.092335°/d …
+/// × 36 525).
 #[rustfmt::skip]
 static MERCURY_ANGLES: [Angle; 5] = [
     ang(174.791_085_7, 149_472.535_875_000_03),
@@ -117,7 +130,8 @@ static MERCURY_ANGLES: [Angle; 5] = [
     ang(153.955_428_6, 747_362.679_374_999_95),
 ];
 
-/// The Earth–Moon E1–E13 (`BODY3_NUT_PREC_ANGLES`; the report's per-day rates × 36 525).
+/// The Earth–Moon E1–E13 (WGCCRE 2009 Table 2; `BODY3_NUT_PREC_ANGLES`; the report's per-day
+/// rates × 36 525).
 #[rustfmt::skip]
 static EARTH_MOON_ANGLES: [Angle; 13] = [
     ang(125.045, -1_935.536_452_5),
@@ -135,8 +149,9 @@ static EARTH_MOON_ANGLES: [Angle; 13] = [
     ang(25.053, 473_327.796_42),
 ];
 
-/// Mars M1–M10 (Phobos and Deimos) and the Mars terms 11–26 (`BODY4_NUT_PREC_ANGLES`, with
-/// the quadratic coefficient of Phobos's M5; `BODY4_MAX_PHASE_DEGREE = 2`).
+/// Mars M1–M10 (Phobos and Deimos; WGCCRE 2015 Table 2) and the Mars terms 11–26 (Table 1)
+/// (`BODY4_NUT_PREC_ANGLES`, with the quadratic coefficient of Phobos's M5;
+/// `BODY4_MAX_PHASE_DEGREE = 2`).
 #[rustfmt::skip]
 static MARS_ANGLES: [Angle; 26] = [
     ang(190.726_466_43, 15_917.108_186_95),
@@ -167,7 +182,8 @@ static MARS_ANGLES: [Angle; 26] = [
     ang(95.391_654, 0.504_261_5),
 ];
 
-/// Jupiter J1–J10 and Ja–Je (`BODY5_NUT_PREC_ANGLES`; 9 and 10 are 2·J1 and 2·J2).
+/// Jupiter J1–J10 (WGCCRE 2015 Table 2) and Ja–Je (Table 1) (`BODY5_NUT_PREC_ANGLES`; 9 and
+/// 10 are 2·J1 and 2·J2).
 #[rustfmt::skip]
 static JUPITER_ANGLES: [Angle; 15] = [
     ang(73.32, 91_472.9),
@@ -187,7 +203,7 @@ static JUPITER_ANGLES: [Angle; 15] = [
     ang(49.511_251, 64.300_0),
 ];
 
-/// Saturn S1–S6, 2·S1, 2·S2 (`BODY6_NUT_PREC_ANGLES`).
+/// Saturn S1–S6, 2·S1, 2·S2 (WGCCRE 2015 Table 2; `BODY6_NUT_PREC_ANGLES`).
 #[rustfmt::skip]
 static SATURN_ANGLES: [Angle; 8] = [
     ang(353.32, 75_706.7),
@@ -200,7 +216,7 @@ static SATURN_ANGLES: [Angle; 8] = [
     ang(57.44, 151_413.4),
 ];
 
-/// Uranus U1–U16, 2·U11, 2·U12 (`BODY7_NUT_PREC_ANGLES`).
+/// Uranus U1–U16, 2·U11, 2·U12 (WGCCRE 2015 Table 2; `BODY7_NUT_PREC_ANGLES`).
 #[rustfmt::skip]
 static URANUS_ANGLES: [Angle; 18] = [
     ang(115.75, 54_991.87),
@@ -223,7 +239,8 @@ static URANUS_ANGLES: [Angle; 18] = [
     ang(632.82, 5_727.92),
 ];
 
-/// Neptune N, N1–N7, 2·N1, 2·N7 … 9·N7 (`BODY8_NUT_PREC_ANGLES`).
+/// Neptune N (WGCCRE 2015 Table 1), N1–N7, 2·N1, 2·N7 … 9·N7 (Table 2)
+/// (`BODY8_NUT_PREC_ANGLES`).
 #[rustfmt::skip]
 static NEPTUNE_ANGLES: [Angle; 17] = [
     ang(357.85, 52.316),
@@ -252,8 +269,10 @@ const SAT_DEC: [f64; 2] = [83.52, -0.004];
 const URA_RA: [f64; 2] = [257.43, 0.0];
 const URA_DEC: [f64; 2] = [-15.10, 0.0];
 
-/// Every body with a model: the Sun, the planets, Pluto and the moons the M1 ephemeris places
-/// by name (Hyperion has none: its rotation is chaotic).
+/// Every body with a model: the Sun and the planets (WGCCRE 2015 Table 1; the Earth from the
+/// 2009 report's Table 1), Pluto (the 2015 dwarf-planet entry) and the moons the M1 ephemeris
+/// places by name (2015 Table 2; the Moon from the 2009 report's Table 2; Phobos's W from the
+/// 2019 correction). Hyperion has none: its rotation is chaotic.
 #[rustfmt::skip]
 static MODELS: [Model; 31] = [
     plain(10, [286.13, 0.0], [63.87, 0.0], [84.176, 14.184_40, 0.0]),
@@ -399,6 +418,13 @@ pub fn body_to_icrs(naif: NaifId, t: Epoch) -> Option<DQuat> {
             * DQuat::from_rotation_x((90.0 - dec).to_radians())
             * DQuat::from_rotation_z(w.to_radians()),
     )
+}
+
+/// The linear prime-meridian rate Ẇ [°/day] of a body's model (negative for retrograde
+/// rotation), `None` without a model. [`crate::sat_elements`] takes a synchronous moon's |Ẇ|
+/// as its sidereal rate where JPL's tabulated period is too coarse.
+pub(crate) fn linear_w_rate_deg_per_day(naif: NaifId) -> Option<f64> {
+    model(naif).map(|m| m.pm[1])
 }
 
 /// Prime-meridian angle W [deg], in [0, 360).

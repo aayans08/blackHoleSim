@@ -7,7 +7,8 @@
 //! from the equinox along the ecliptic to the node Ω of Jupiter's orbit, along the orbit to the
 //! ascending node ψ of the equator on the orbit, then along the equator (his rotation steps
 //! 1–4, p. 312: R_z(Ω)·R_x(i)·R_z(ψ − Ω)·R_x(I), with Ω and i of Jupiter's mean orbit of date,
-//! Meeus Table 31.A, and L, ψ both advanced by the precession P from B1950). The geometric
+//! Meeus Table 31.A, p. 213, and L, ψ both advanced by the precession P from B1950, p. 311). The
+//! geometric
 //! position (no light time: Meeus's τ = 0) is u = L − ψ from that node, B and R, placed in a
 //! frame whose pole is Jupiter's WGCCRE 2015 pole ([`crate::rotation`]) and whose x axis is
 //! E5's node direction (steps 2–4 applied to x̂, ecliptic of date → ICRS) projected onto that
@@ -18,11 +19,14 @@
 //! normal, and it drifts 0.03–0.09° from E5's over 1950–2050. Measured against Horizons, the
 //! rebuilt node's worst error was 3 513 km (RMS 1 311 km) against 1 906 km (RMS 768 km) here.
 //!
-//! Units: the radii are multiplied by 71 398 km, the Jupiter radius conventionally used with
-//! E5's mean distances. Lieske 1998 (which would state it) was not accessible to check. Measured
-//! against DE441/jup365 every moon's distance is 0.99972 of the truth at all sixteen spots
-//! (−108 to −576 km), the same ratio for all four moons, which points at a unit near
-//! 71 418 km; the value is kept and the bias reported (A2 report).
+//! Units (A2 fix round 1, review I3/M1): the radii are multiplied by 71 418 km, the unit implied
+//! by JPL's mean semi-major axes (https://ssd.jpl.nasa.gov/sats/elem/, JUP365): a / E5's mean
+//! distance is 71 423 km (Io), 71 420 (Europa), 71 416 (Ganymede) and 71 415 (Callisto), each
+//! good to ±2–8 km because JPL rounds a to 100 km; their mean is 71 418 km. Neither Meeus nor
+//! Lieske 1998 was available to state the unit. The 71 398 km Jupiter radius used before left
+//! every moon at 0.99972 of the DE441/jup365 distance at all sixteen Horizons spots (the same
+//! ratio for all four moons, −108 to −576 km); 71 398 / 0.99972 = 71 418 km agrees with JPL's
+//! a, so the unit is independent of the Horizons goldens that test it.
 //!
 //! Validity: Lieske fitted E5 to observations 1891–1996; the arguments are linear in time,
 //! but outside ±3000 yr of J2000 ([`crate::ephemeris::MOON_THEORY_WINDOW_CY`]) this module
@@ -45,11 +49,21 @@ pub enum Galilean {
     Callisto,
 }
 
-/// The length unit of E5's radii [m] (module doc).
-const E5_UNIT_M: f64 = 71_398.0e3;
+/// The length unit of E5's radii [m]: JPL's mean a over [`MEAN_DISTANCE`] (module doc).
+const E5_UNIT_M: f64 = 71_418.0e3;
 
-/// Mean distances a [Jupiter radii] (Meeus ch. 44).
+/// Mean distances a [Jupiter radii] (Meeus ch. 44, higher-accuracy method).
 const MEAN_DISTANCE: [f64; 4] = [5.90569, 9.39657, 14.98832, 26.36273];
+
+/// The mean longitudes' rates l̇₁ … l̇₄ [°/day] of E5 (Meeus ch. 44, higher-accuracy method, the
+/// arguments after Example 44.a, p. 303). They keep the Laplace relation l̇₁ − 3l̇₂ + 2l̇₃ = 0
+/// to 1e-9 °/d. [`crate::sat_elements`] uses them as the Galileans' sidereal rates.
+pub(crate) const E5_MEAN_LONGITUDE_RATES: [f64; 4] = [
+    203.488_955_790,
+    101.374_724_735,
+    50.317_609_207,
+    21.571_071_177,
+];
 
 /// The angles E5's series are written in (Meeus ch. 44), plus the moon's own true
 /// longitude L and its sum Σ (in the latitude terms).
@@ -95,11 +109,15 @@ const fn t(amp: f64, args: &'static [(A, f64)], phase_deg: f64) -> Term {
     }
 }
 
-// Term tables, Meeus ch. 44. Transcribed by script from soniakeys/meeus
-// `jupitermoons.go` (MIT) and compared term by term with the independent PyMeeus typing
-// (`JupiterMoons.py`, LGPL): all 219 terms agree except R₃'s cos(l₃ − π₄), 0.0007917 against
-// 0.0007919; the third typing in Project Pluto's `jsats.cpp` (B. Gray) has 0.0007919, used here
-// (0.2 km either way).
+// Term tables: Meeus, Astronomical Algorithms 2nd ed. (1998), ch. 44, the higher-accuracy
+// method, the periodic terms in the longitudes (Σ₁ … Σ₄), the latitudes (tan B) and the radius
+// vectors (R), printed between Example 44.a (p. 303) and the precession P (p. 311). The page
+// of each table within pp. 303–311 could not be pinned: the book was not available, and these
+// page numbers come from the soniakeys/meeus comments (Example 44.a p. 303; P p. 311; the
+// rotation steps p. 312). Transcribed by script from soniakeys/meeus `jupitermoons.go` (MIT)
+// and compared term by term with the independent PyMeeus typing (`JupiterMoons.py`, LGPL):
+// all 219 terms agree except R₃'s cos(l₃ − π₄), 0.0007917 against 0.0007919; the third typing
+// in Project Pluto's `jsats.cpp` (B. Gray) has 0.0007919, used here (0.2 km either way).
 
 /// Σ₁ [°] (sine terms).
 #[rustfmt::skip]
@@ -392,14 +410,15 @@ fn e5(moon: Galilean, t: Epoch) -> (f64, f64, f64) {
     // Meeus ch. 44: t in days from JDE 2443000.5 (light time τ = 0: geometric).
     let d = t.jd_tdb() - 2_443_000.5;
     let deg = |at: f64, rate: f64| (at + rate * d).rem_euclid(360.0).to_radians();
-    // Meeus ch. 44: mean longitudes, perijoves, nodes, Γ, Φ_λ, ψ, G, G′, Π [°].
+    // Meeus ch. 44 (pp. 303–311): mean longitudes, perijoves, nodes, Γ, Φ_λ, ψ, G, G′, Π [°].
     let gamma = 0.33033 * (163.679 + 0.001_051_2 * d).to_radians().sin()
         + 0.03439 * (34.486 - 0.016_173_1 * d).to_radians().sin();
     let mut ang = [0.0; N_ANGLES];
-    ang[L1 as usize] = deg(106.077_19, 203.488_955_790);
-    ang[L2 as usize] = deg(175.731_61, 101.374_724_735);
-    ang[L3 as usize] = deg(120.558_83, 50.317_609_207);
-    ang[L4 as usize] = deg(84.444_59, 21.571_071_177);
+    let rates = E5_MEAN_LONGITUDE_RATES;
+    ang[L1 as usize] = deg(106.077_19, rates[0]);
+    ang[L2 as usize] = deg(175.731_61, rates[1]);
+    ang[L3 as usize] = deg(120.558_83, rates[2]);
+    ang[L4 as usize] = deg(84.444_59, rates[3]);
     ang[Pi1 as usize] = deg(97.0881, 0.161_385_86);
     ang[Pi2 as usize] = deg(154.8663, 0.047_263_07);
     ang[Pi3 as usize] = deg(188.1840, 0.007_127_34);
@@ -449,7 +468,8 @@ fn jupiter_equator_frame(t: Epoch) -> [DVec3; 3] {
     let t0 = (jde - 2_433_282.423) / 36_525.0;
     let p = (1.396_662_6 + 0.000_308_8 * t0) * t0;
     let psi = 316.5182 - 0.000_002_08 * (jde - 2_443_000.5) + p;
-    // Meeus Table 31.A (mean equinox of date): Jupiter's node Ω and inclination i [°].
+    // Meeus Table 31.A, p. 213 (mean equinox of date; the page as PyMeeus and Project Pluto's
+    // `jsats.cpp` cite it): Jupiter's node Ω and inclination i [°].
     let tc = t.julian_centuries();
     let node = 100.464_407 + tc * (1.020_977_4 + tc * (0.000_403_15 + tc * 0.000_000_404));
     let inc = 1.303_267 + tc * (-0.005_496_5 + tc * (0.000_004_66 - tc * 0.000_000_002));
@@ -493,11 +513,12 @@ mod tests {
     ];
 
     /// Spots over the brief's 1 000 km ceiling, asserted at their measured error + 10 % and
-    /// listed in the A2 report for the lead (ruling 10): E5 as Meeus truncates it, 54 yr past the
-    /// end of Lieske's 1891–1996 fit, drifts along track (Ganymede +1 891 km, Callisto
-    /// −1 430 km). Self-checking: each must still exceed 1 000 km.
+    /// listed in the A2 report for the lead (ruling 10, still to rule): E5 as Meeus truncates it,
+    /// 54 yr past the end of Lieske's 1891–1996 fit, drifts along track (radial errors are
+    /// 46–65 km there). Measured with the 71 418 km unit: Ganymede 1 893 km, Callisto 1 432 km
+    /// (1 906 and 1 542 with 71 398 km). Self-checking: each must still exceed 1 000 km.
     const OVER_CEILING: [(i32, f64, f64); 2] =
-        [(503, 2_469_807.5, 2_100.0), (504, 2_469_807.5, 1_700.0)];
+        [(503, 2_469_807.5, 2_090.0), (504, 2_469_807.5, 1_580.0)];
 
     /// Horizons 501–504@599 (jup365) at 1950, 2000, 2026-11-20 and 2050: prints the measured
     /// worst error per moon in km and as a fraction of its distance; ceiling 1 000 km except

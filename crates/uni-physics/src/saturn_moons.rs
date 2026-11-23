@@ -15,11 +15,22 @@
 //! 225 constants agree except Hyperion's inclination term, 0.6434886 against AA+'s 0.643486
 //! cos χ; the latter is used (2.6 × 10⁻⁶ °, 0.07 km).
 //!
-//! Units: r is multiplied by 60 330 km, the Saturn reference radius that is "generally agreed"
-//! (NAIF Cassini PCK `cpck02Sep2010_Sci.tpc`, the 100 mbar sphere). Measured against
-//! DE441/sat441 the theory's distances are 0.9983–0.9994 of the truth (Titan −2 200 km,
-//! Iapetus −6 100 km at their mean distances); `saturn_moons_vs_horizons` prints the ratio per
-//! spot and the A2 report lists it. Meeus's book, which states the unit, was not available.
+//! Page citations: the constants and series below are Meeus ch. 46's, printed before its
+//! Example 46.a (p. 334, as the soniakeys/meeus and learnmeeus typings cite it); the page of
+//! each moon's block could not be pinned, because the book was not available.
+//!
+//! Units (A2 fix round 1, review I3): r is multiplied by 60 438 km, the unit implied by JPL's
+//! mean semi-major axes (https://ssd.jpl.nasa.gov/sats/elem/, SAT441) of the two outer regular
+//! moons, Titan (1 221 900 km / 20.216 193 = 60 442 km) and Iapetus (3 561 700 km /
+//! 58.935 028 = 60 434 km). Those two are used because JPL rounds a to 100 km (±2.5 and
+//! ±0.9 km in the unit) and J2 shifts their mean distance by under 5 × 10⁻⁵; the inner moons'
+//! ratios scatter more (Tethys 60 438, Dione 60 445, Rhea 60 417, Enceladus 60 489, Mimas
+//! 60 610 km) and Hyperion's (60 454 km) mean distance is ill-defined in its resonance with
+//! Titan. The 60 330 km Saturn reference radius used before (NAIF Cassini PCK
+//! `cpck02Sep2010_Sci.tpc`) left the distances at 0.9983–0.9994 of DE441/sat441's (Titan
+//! −2 200 km, Iapetus −6 100 km); 60 330 / 0.9982 = 60 439 km agrees with JPL's a, so the unit
+//! is independent of the Horizons goldens that test it. Meeus's book, which states the unit
+//! the theory uses, was not available.
 //!
 //! Validity: outside ±3000 yr of J2000 ([`crate::ephemeris::MOON_THEORY_WINDOW_CY`]) this
 //! module returns the value at the nearer window edge and the Ephemeris uses the moons' JPL
@@ -44,18 +55,20 @@ pub enum SaturnMoon {
     Iapetus,
 }
 
-/// The theory's unit of length [m] (module doc).
-const SATURN_UNIT_M: f64 = 60_330.0e3;
+/// The theory's unit of length [m]: JPL's mean a of Titan and Iapetus over the theory's
+/// (module doc).
+const SATURN_UNIT_M: f64 = 60_438.0e3;
 
 /// B1950.0 [JDE], the epoch of the theory's ecliptic and equinox.
 const B1950_JDE: f64 = 2_433_282.4235;
 
-/// Saturn's equator on the B1950 ecliptic: inclination and ascending node [°] (Meeus ch. 46).
+/// Saturn's equator on the B1950 ecliptic: inclination and ascending node [°] (Meeus ch. 46,
+/// before Example 46.a, p. 334).
 const EQUATOR_INCLINATION_DEG: f64 = 28.0817;
 const EQUATOR_NODE_DEG: f64 = 168.8112;
 
 /// The time arguments t₁ … t₁₁ (t₃ and t₅ enter only W₀, W₃, W₄) and angles W₀ … W₈ [rad]
-/// of Meeus ch. 46.
+/// of Meeus ch. 46 (before Example 46.a, p. 334).
 struct Args {
     t1: f64,
     t2: f64,
@@ -129,7 +142,7 @@ struct Orbit {
     node: f64,
 }
 
-/// Mimas (Meeus ch. 46).
+/// Mimas (Meeus ch. 46, before Example 46.a, p. 334).
 fn mimas(q: &Args) -> Orbit {
     let l = rad(127.64 + 381.994_497 * q.t1
         - 43.57 * q.w0.sin()
@@ -147,7 +160,7 @@ fn mimas(q: &Args) -> Orbit {
     }
 }
 
-/// Enceladus (Meeus ch. 46).
+/// Enceladus (Meeus ch. 46, before Example 46.a, p. 334).
 fn enceladus(q: &Args) -> Orbit {
     let l = rad(200.317 + 262.731_900_2 * q.t1 + 0.256_67 * q.w1.sin() + 0.208_83 * q.w2.sin());
     let p = rad(309.107 + 123.441_21 * q.t2);
@@ -161,7 +174,7 @@ fn enceladus(q: &Args) -> Orbit {
     }
 }
 
-/// Tethys (Meeus ch. 46).
+/// Tethys (Meeus ch. 46, before Example 46.a, p. 334).
 fn tethys(q: &Args) -> Orbit {
     Orbit {
         lambda: rad(285.306
@@ -175,7 +188,7 @@ fn tethys(q: &Args) -> Orbit {
     }
 }
 
-/// Dione (Meeus ch. 46).
+/// Dione (Meeus ch. 46, before Example 46.a, p. 334).
 fn dione(q: &Args) -> Orbit {
     let l = rad(254.712 + 131.534_931_93 * q.t1 - 0.0215 * q.w1.sin() - 0.017_33 * q.w2.sin());
     let p = rad(174.8 + 30.82 * q.t2);
@@ -189,7 +202,7 @@ fn dione(q: &Args) -> Orbit {
     }
 }
 
-/// Rhea (Meeus ch. 46), through the subroutine.
+/// Rhea (Meeus ch. 46, before Example 46.a, p. 334), through the subroutine.
 fn rhea(q: &Args) -> Orbit {
     let pp = rad(342.7 + 10.057 * q.t2);
     let a1 = 0.000_265 * pp.sin() + 0.001 * q.w4.sin();
@@ -201,7 +214,7 @@ fn rhea(q: &Args) -> Orbit {
     subroutine(lambda_dash, a1.atan2(a2), a1.hypot(a2), 8.725_924, node, i)
 }
 
-/// Titan (Meeus ch. 46), through the subroutine.
+/// Titan (Meeus ch. 46, before Example 46.a, p. 334), through the subroutine.
 fn titan(q: &Args) -> Orbit {
     let l = rad(261.1582 + 22.576_978_55 * q.t4 + 0.074_025 * q.w3.sin());
     let i_dash = (27.451_41 + 0.295_999 * q.w3.cos()).to_radians();
@@ -235,7 +248,7 @@ fn titan(q: &Args) -> Orbit {
     subroutine(lambda_dash, p, e, 20.216_193, node, i)
 }
 
-/// Hyperion (Meeus ch. 46), through the subroutine.
+/// Hyperion (Meeus ch. 46, before Example 46.a, p. 334), through the subroutine.
 fn hyperion(q: &Args) -> Orbit {
     let eta = rad(92.39 + 0.562_107_1 * q.t6);
     let zeta = rad(148.19 - 19.18 * q.t8);
@@ -286,7 +299,7 @@ fn hyperion(q: &Args) -> Orbit {
     subroutine(lambda_dash, p, e, a, node, i)
 }
 
-/// Iapetus (Meeus ch. 46), through the subroutine.
+/// Iapetus (Meeus ch. 46, before Example 46.a, p. 334), through the subroutine.
 fn iapetus(q: &Args) -> Orbit {
     let l = rad(261.1582 + 22.576_978_55 * q.t4);
     let varpi_dash = rad(91.796 + 0.562 * q.t7);
