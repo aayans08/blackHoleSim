@@ -185,7 +185,9 @@ pub const FREE_FLIGHT_LABEL: &str = "FREE FLIGHT · GRAVITY NOT SIMULATED";
 pub const CRUISE_LABEL: &str = "CRUISE · FTL · NON-PHYSICAL · GRAVITY IGNORED";
 /// While "Highlight asteroid belt" is on (round 2, review I12), amber.
 pub const BELT_HIGHLIGHT_LABEL: &str = "Asteroid belt brightness exaggerated (non-physical)";
-/// While the debug grid shows through a traced lens (ruling 14; m0.1's string), amber.
+/// While the debug grid shows through a traced lens (ruling 14; m0.1's string), amber. The app
+/// puts it in `HudData::notes` (the first flag of `uni_rel::lens_labels`, which knows the lens
+/// environment); `HudData::lens_on_screen` never adds it (review C4 r0 I1).
 pub const DEBUG_GRID_LABEL: &str = "Lens background: M0 debug grid";
 /// While a lens is traced: the stars over it are drawn unlensed until M3 (the plan's M1
 /// wording, replacing m0.1's "(M0)"), amber.

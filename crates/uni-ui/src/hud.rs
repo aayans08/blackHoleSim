@@ -39,12 +39,12 @@ use crate::cards::{CardAction, TargetCard, show_card};
 use crate::overlay::{Overlay, draw_overlay};
 use crate::panels::{self, GravityPanel, LocationPanel, NavLine, SpeedPanel, TimePanel, WarpPick};
 use crate::theme::{
-    self, BELT_HIGHLIGHT_LABEL, BELT_TOGGLE_LABEL, CARD_PADDING_Y, DEBUG_GRID_LABEL,
-    EYE_ADAPTED_STARS_LABEL, GRAVITY_WIDTH, HINT_CARD, HINT_COLLAPSED, INK_2, INK_3, INK_SOFT,
-    INSIDE_HORIZON_LABEL, KICKER_TRACKING_EM, LOCATION_WIDTH, LabelTone, MUTED, NON_PHYSICAL_SOFT,
-    NOTE_DOT, NOTES_LINE_MAX_WIDTH, NOTES_POPUP_TITLE, NOTES_POPUP_WIDTH, NOTES_SIZE,
-    SCREEN_MARGIN, SMALL_SIZE, SPEED_WIDTH, TIME_LINE_SIZE, UNLENSED_STARS_LABEL, Weight,
-    mono_font, short_label, text_font, tone_color,
+    self, BELT_HIGHLIGHT_LABEL, BELT_TOGGLE_LABEL, CARD_PADDING_Y, EYE_ADAPTED_STARS_LABEL,
+    GRAVITY_WIDTH, HINT_CARD, HINT_COLLAPSED, INK_2, INK_3, INK_SOFT, INSIDE_HORIZON_LABEL,
+    KICKER_TRACKING_EM, LOCATION_WIDTH, LabelTone, MUTED, NON_PHYSICAL_SOFT, NOTE_DOT,
+    NOTES_LINE_MAX_WIDTH, NOTES_POPUP_TITLE, NOTES_POPUP_WIDTH, NOTES_SIZE, SCREEN_MARGIN,
+    SMALL_SIZE, SPEED_WIDTH, TIME_LINE_SIZE, UNLENSED_STARS_LABEL, Weight, mono_font, short_label,
+    text_font, tone_color,
 };
 
 /// Slider range for both exposures, EV at ISO 100. A UI choice, not physics: it spans the
@@ -74,11 +74,6 @@ const CONTROLS: [(&str, &str); 15] = [
     ("Save view bookmark (captures/views/)", "F12"),
     ("Show / hide this list", "F1"),
 ];
-
-/// What is approximate wherever the lens pass draws (Global Constraints, Honesty): it bends a
-/// debug grid or the band, and the catalogue stars are drawn unlensed over it. Shown only while
-/// `HudData::lens_on_screen` (the M1 wording of [`crate::theme`]).
-const LENS_LABELS: [&str; 2] = [DEBUG_GRID_LABEL, UNLENSED_STARS_LABEL];
 
 /// The app's own hotkeys in uni-nav's key map (Task 6): Tab hides the HUD, F1 shows the
 /// controls list, F12 saves the view as a bookmark. Matched by physical key, as uni-nav does.
@@ -123,9 +118,12 @@ pub struct HudData {
     pub warnings: Vec<String>,
     /// Shows "Inside event horizon" in red, first in the notes.
     pub inside_horizon: bool,
-    /// True when the lens pass draws this frame: the notes then hold, in amber, "Lens
-    /// background: M0 debug grid" and "Stars near the hole are not yet lensed (M3)". Sky views
-    /// skip the pass, so neither line would be true there.
+    /// True when a lens is traced on screen this frame, in either lens environment (the second
+    /// flag of `uni_rel::lens_labels`): the notes then hold, in amber, "Stars near the hole are
+    /// not yet lensed (M3)". Sky views skip the pass, so the line would not be true there. The
+    /// flag never adds "Lens background: M0 debug grid": that label depends on the lens
+    /// environment (M1's default lenses the band), which only the app knows, so the app puts it
+    /// in `notes` (the first flag of `uni_rel::lens_labels`; review C4 r0 I1).
     pub lens_on_screen: bool,
     /// True while "Eye-adapted stars" is in effect (`ExposureSettings::eye_adapted_in_effect`,
     /// review m13): the notes then hold [`EYE_ADAPTED_STARS_LABEL`] in amber.
@@ -142,8 +140,12 @@ pub struct HudData {
     /// The target card of the selected object (or the goto target); `None` without one.
     pub target: Option<TargetCard>,
     /// The notes line: honesty labels and warnings with their tones (world labels from
-    /// `uni_sim::honesty`, UI labels from `theme::ui_labels`, renderer warnings). The HUD adds
-    /// the labels of its own flags above (each label is shown once).
+    /// `uni_sim::honesty`, UI labels from `theme::ui_labels`, the debug-grid label, renderer
+    /// warnings), in any order. The HUD shows "Inside event horizon" first, then the flight
+    /// label (the note equal to `speed.header`, added from the Speed panel if missing here), so
+    /// the collapsed line always holds it however narrow the window (ruling 6; review C4 r0
+    /// I2); then these notes in their order, then the labels of its own flags above (each
+    /// label is shown once).
     pub notes: Vec<(String, LabelTone)>,
     /// The collapsed HUD's place line.
     pub nav_line: NavLine,
@@ -727,9 +729,15 @@ fn haloed(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.painter().set(halo, theme::halo_shape(rect.expand(6.0)));
 }
 
-/// The notes in their order: "Inside event horizon" (red), the app's notes, then the labels of
-/// the HUD's own flags (the belt toggle, eye-adapted stars, the lens) and the renderer warnings
-/// (amber); each text once.
+/// The notes in their order: "Inside event horizon" (red), the flight label, the app's notes,
+/// then the labels of the HUD's own flags (the belt toggle, eye-adapted stars, the traced lens)
+/// and the renderer warnings (amber); each text once.
+///
+/// The flight label is the Speed panel's header (`FREE FLIGHT · GRAVITY NOT SIMULATED` or
+/// `CRUISE · …`), in the tone the app's matching note gives it, else the panel's. Collapsed,
+/// the Speed panel is hidden and the honesty line is the only place it shows; [`notes_line`]
+/// always keeps the line's first item and the first two always fit its least width, so the
+/// label stays on screen however many notes the app lists (ruling 6; review C4 r0 I2).
 fn hud_notes(data: &HudData, c: &HudControls) -> Vec<(String, LabelTone)> {
     fn push(notes: &mut Vec<(String, LabelTone)>, text: &str, tone: LabelTone) {
         if !notes.iter().any(|(t, _)| t == text) {
@@ -740,6 +748,15 @@ fn hud_notes(data: &HudData, c: &HudControls) -> Vec<(String, LabelTone)> {
     if data.inside_horizon {
         push(&mut notes, INSIDE_HORIZON_LABEL, LabelTone::Danger);
     }
+    let flight = data.speed.header.as_str();
+    if !flight.is_empty() {
+        let tone = data
+            .notes
+            .iter()
+            .find(|(t, _)| t == flight)
+            .map_or(data.speed.tone, |(_, tone)| *tone);
+        push(&mut notes, flight, tone);
+    }
     for (text, tone) in &data.notes {
         push(&mut notes, text, *tone);
     }
@@ -749,10 +766,10 @@ fn hud_notes(data: &HudData, c: &HudControls) -> Vec<(String, LabelTone)> {
     if data.eye_adapted_stars {
         push(&mut notes, EYE_ADAPTED_STARS_LABEL, LabelTone::NonPhysical);
     }
+    // A traced lens: the stars over it are unlensed until M3. The debug-grid label is the
+    // app's, in `data.notes` (it knows the lens environment; review C4 r0 I1).
     if data.lens_on_screen {
-        for label in LENS_LABELS {
-            push(&mut notes, label, LabelTone::NonPhysical);
-        }
+        push(&mut notes, UNLENSED_STARS_LABEL, LabelTone::NonPhysical);
     }
     for warning in &data.warnings {
         push(&mut notes, warning, LabelTone::NonPhysical);
@@ -1474,8 +1491,9 @@ mod tests {
         );
     }
 
-    /// Review m13: the eye-adapted label exactly while it is in effect; the M1 lens labels
-    /// exactly while the lens pass draws (M0 gate, the "(M3)" wording).
+    /// Review m13: the eye-adapted label exactly while it is in effect; the unlensed-stars label
+    /// exactly while a lens is traced (the "(M3)" wording). The debug-grid label is not the
+    /// flag's (`lens_flag_never_claims_the_debug_grid`).
     #[test]
     fn eye_adapted_and_lens_labels_follow_state() {
         let c = HudControls {
@@ -1487,11 +1505,7 @@ mod tests {
             d.eye_adapted_stars = on;
             d.lens_on_screen = on;
             let f = draw(&d, c);
-            for label in [
-                EYE_ADAPTED_STARS_LABEL,
-                DEBUG_GRID_LABEL,
-                UNLENSED_STARS_LABEL,
-            ] {
+            for label in [EYE_ADAPTED_STARS_LABEL, UNLENSED_STARS_LABEL] {
                 let in_tone = f
                     .texts
                     .iter()
@@ -1522,6 +1536,168 @@ mod tests {
             .filter(|p| p.text == "Eye-adapted stars")
             .count();
         assert_eq!(n, 1, "once on the line");
+    }
+
+    /// Review C4 r0 I1 (plan table "Honesty labels in M1"): `lens_on_screen` means a lens is
+    /// traced, in either lens environment. M1's default environment is the band, so the flag
+    /// alone must never claim "Lens background: M0 debug grid"; that label depends on the
+    /// environment, which only the app knows (`uni_rel::lens_labels`), and arrives in `notes`.
+    #[test]
+    fn lens_flag_never_claims_the_debug_grid() {
+        let c = HudControls {
+            notes_expanded: true,
+            ..controls()
+        };
+        // A band-lensed hole on screen: only the unlensed-stars label.
+        let mut d = data();
+        d.lens_on_screen = true;
+        let texts: Vec<String> = hud_notes(&d, &c).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == UNLENSED_STARS_LABEL), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == DEBUG_GRID_LABEL), "{texts:?}");
+        let f = draw(&d, c);
+        assert!(f.find(DEBUG_GRID_LABEL).is_none(), "{:?}", f.all_text());
+        assert!(
+            f.texts
+                .iter()
+                .any(|p| p.text == UNLENSED_STARS_LABEL && p.color == NON_PHYSICAL),
+            "{:?}",
+            f.all_text()
+        );
+        // The debug environment: the app lists the grid label, which the HUD shows in amber.
+        d.notes
+            .push((DEBUG_GRID_LABEL.into(), LabelTone::NonPhysical));
+        let f = draw(&d, c);
+        assert!(
+            f.texts
+                .iter()
+                .any(|p| p.text == DEBUG_GRID_LABEL && p.color == NON_PHYSICAL),
+            "{:?}",
+            f.all_text()
+        );
+        // Without a traced lens and without the app's note: neither label.
+        d.notes.retain(|(t, _)| t != DEBUG_GRID_LABEL);
+        d.lens_on_screen = false;
+        let f = draw(&d, c);
+        assert!(f.find(DEBUG_GRID_LABEL).is_none());
+        assert!(f.find(short_label(UNLENSED_STARS_LABEL)).is_none());
+    }
+
+    /// A settled draw of `d` on a fresh headless HUD at `size_px` and `ppp`.
+    fn draw_at(size_px: [u32; 2], ppp: f32, d: &HudData, mut c: HudControls) -> Frame {
+        let ctx = headless_context();
+        let (mut out, _hud, _runs) =
+            run_hud_settled(&ctx, size_px, ppp, 8192, d, &Overlay::default(), &mut c);
+        out.textures_delta.clear();
+        collect(&out)
+    }
+
+    /// Review C4 r0 I2 (ruling 6, the lead's collapsed-HUD ruling): collapsed, the honesty line
+    /// is the only place the flight label shows, so it leads the line (after the red "Inside
+    /// event horizon") however many world labels the app lists before it, and survives the "…"
+    /// cut on the owner's 1280–1470 pt wide window (the M3 at 2560 × 1664 px, 2 px per point,
+    /// and macOS's default 1470 × 956 pt) and at the line's least width (560 pt, an 800 pt
+    /// window), with the longer cruise label behind the red one. It leads even when the app's
+    /// notes lack it.
+    #[test]
+    fn flight_label_leads_a_narrow_notes_line() {
+        use crate::theme::{SATURN_MOONS_LABEL, VIVID_STAR_COLOURS_LABEL};
+        use uni_sim::honesty::{HonestyFlag, label};
+        // A typical M1 set of world labels, listed by the app before its UI labels.
+        let world: Vec<(String, LabelTone)> = [
+            (label(HonestyFlag::BandModel), LabelTone::Neutral),
+            (
+                label(HonestyFlag::MilkyWayDetailProcedural),
+                LabelTone::Neutral,
+            ),
+            (VIVID_STAR_COLOURS_LABEL, LabelTone::NonPhysical),
+            (label(HonestyFlag::ProceduralBelt), LabelTone::Neutral),
+            (SATURN_MOONS_LABEL, LabelTone::Neutral),
+            (
+                label(HonestyFlag::PlanetsExtrapolated),
+                LabelTone::NonPhysical,
+            ),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_owned(), t))
+        .collect();
+        let band = short_label(label(HonestyFlag::BandModel));
+        for (flight, header) in [
+            (FlightLabel::Free, FREE_FLIGHT_LABEL),
+            (FlightLabel::Cruise, CRUISE_LABEL),
+        ] {
+            for (horizon, with_ui_labels) in [(false, true), (true, true), (false, false)] {
+                let mut d = data();
+                d.speed.header = header.into();
+                d.inside_horizon = horizon;
+                d.notes = world.clone();
+                if with_ui_labels {
+                    d.notes.extend(
+                        ui_labels(flight, true, true)
+                            .into_iter()
+                            .map(|(s, t)| (s.to_owned(), t)),
+                    );
+                }
+                let case = format!("{header:?}, horizon {horizon}, ui_labels {with_ui_labels}");
+                // The order: red horizon, the flight label, then the app's notes in order.
+                let notes = hud_notes(&d, &controls());
+                let lead = usize::from(horizon);
+                if horizon {
+                    assert_eq!(
+                        notes[0],
+                        (INSIDE_HORIZON_LABEL.to_owned(), LabelTone::Danger),
+                        "{case}"
+                    );
+                }
+                assert_eq!(
+                    notes[lead],
+                    (header.to_owned(), LabelTone::NonPhysical),
+                    "{case}: {notes:?}"
+                );
+                assert_eq!(notes[lead + 1..lead + 1 + world.len()], world[..], "{case}");
+                assert_eq!(
+                    notes.iter().filter(|(t, _)| t == header).count(),
+                    1,
+                    "{case}"
+                );
+                for (w, h) in [(800_u32, 600_u32), (1280, 832), (1470, 956)] {
+                    // 800 pt: the line is at its least width, `NOTES_LINE_MAX_WIDTH` (560 pt;
+                    // 800 − 2 × 24 − 320 = 432 is less).
+                    let f = draw_at([2 * w, 2 * h], 2.0, &d, controls());
+                    let case = format!("{case}, {w} × {h} pt");
+                    // The line really is cut here, so the test exercises the "…".
+                    let more = f
+                        .texts
+                        .iter()
+                        .find(|p| p.text == " …")
+                        .unwrap_or_else(|| panic!("{case}: no cut in {:?}", f.all_text()));
+                    let shown = f
+                        .texts
+                        .iter()
+                        .find(|p| p.text == header)
+                        .unwrap_or_else(|| panic!("{case}: no flight label in {:?}", f.all_text()));
+                    assert!(shown.pos.y > h as f32 - 60.0, "{case}: {shown:?}");
+                    assert!(
+                        shown.pos.x + shown.size.x <= more.pos.x,
+                        "{case}: {shown:?}"
+                    );
+                    if horizon {
+                        let red = f.get(INSIDE_HORIZON_LABEL);
+                        assert!(red.pos.x < shown.pos.x, "{case}: {red:?} {shown:?}");
+                    } else {
+                        // First on the line: just after its amber dot.
+                        assert!(
+                            shown.pos.x <= SCREEN_MARGIN + NOTE_DOT + 6.0 + 1.0,
+                            "{case}: {shown:?}"
+                        );
+                    }
+                    // The app's notes follow, in its order (the first one may be cut at 560 pt).
+                    match f.find(band) {
+                        Some(p) => assert!(p.pos.x > shown.pos.x, "{case}: {p:?}"),
+                        None => assert_eq!(w, 800, "{case}: {:?}", f.all_text()),
+                    }
+                }
+            }
+        }
     }
 
     /// Expanded, the notes stack sits under the Location panel, in tone, 12 pt.
