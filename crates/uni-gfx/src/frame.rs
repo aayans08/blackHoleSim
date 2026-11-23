@@ -252,6 +252,37 @@ pub fn exposure_scale(ev100: f32) -> f32 {
     1.0 / (1.2 * ev100.exp2())
 }
 
+/// The pre-exposure a fraction `t` of the way from pre-exposure `a` to `b`, blended in log space
+/// (in stops): exp2(mix(log₂ a, log₂ b, t)) = a^(1 − t)·b^t (task B11, lead ruling on B10 minor
+/// 1). Twin of `pre_mix` in `shaders/common/exposure.wgsl`.
+///
+/// The LOD-band writers draw at `pre_mix(star_pre, scene_pre, w)` and the meter reads a pixel
+/// back at `pre_mix(scene_pre, star_pre, s)` with s = 1 − w (M1 frame contract). An exposure
+/// factor is a multiplier, so a blend that moves it by equal stops per step of `t` is the one
+/// that changes brightness evenly; the linear mix(a, b, t) stays within one stop of the larger
+/// factor until t = ½ and leaves the rest of a 19-stop star/scene gap to the end of the blend.
+///
+/// - t ≤ 0 returns `a` and t ≥ 1 returns `b` unchanged: exp2(log₂ a) need not round back to `a`,
+///   and s = 0 must read `scene_pre` exactly. A NaN `t` gives NaN.
+/// - A non-positive (or NaN) `a` or `b`, where log₂ is undefined, falls back to the linear
+///   mix(a, b, t). The renderer's factors are always positive (`exposure_scale`).
+/// - Between, log₂ is blended as x + (y − x)·t, the form the Metal Shading Language
+///   Specification gives for its `mix` (its common functions; WGSL's own definition,
+///   x·(1 − t) + y·t, differs only by rounding), which keeps the result monotonic in `t`.
+pub fn pre_mix(a: f32, b: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    if !(a > 0.0 && b > 0.0) {
+        return a + (b - a) * t;
+    }
+    let (la, lb) = (a.log2(), b.log2());
+    (la + (lb - la) * t).exp2()
+}
+
 /// Twin of `struct ExposureUniform` in `shaders/common/exposure.wgsl`, bound as `exposure` at
 /// group(0) binding(1) by `shaders/common/camera.wgsl`.
 ///
@@ -675,6 +706,116 @@ mod tests {
                 star_ev100: 1.5
             }
             .eye_adapted_stars()
+        );
+    }
+
+    /// Task B11: [`pre_mix`] blends two pre-exposures in log space.
+    /// - Exact at both ends (bit for bit), and t outside [0, 1] gives the nearer end, so a star
+    ///   share of 0 reads `scene_pre` exactly and a body at w = 1 is written at `scene_pre`.
+    /// - Monotonic in t from a to b, never outside [min, max] (both to f32 rounding: exp2(log2 a)
+    ///   may differ from a by an ulp, which is why the ends are returned as they are).
+    /// - Equal steps in stops: log₂ of the result is linear in t, so the midpoint is the
+    ///   geometric mean and at a 19-stop gap every 0.1 of t moves 1.9 stops.
+    /// - Symmetric: pre_mix(a, b, t) = pre_mix(b, a, 1 − t), so a writer's
+    ///   pre_mix(star, scene, w) is what the meter's pre_mix(scene, star, 1 − w) reads back.
+    /// - A non-positive input falls back to the linear mix (log₂ is undefined there); a NaN t is
+    ///   NaN.
+    #[test]
+    fn pre_mix_endpoints_exact_monotonic_log_linear() {
+        // Exposure values seen in M1: night stars −4, scene −10…40 (EV100 range of the meter).
+        let evs = [-10.0, -4.0, 0.0, 10.0, 15.0, 40.0];
+        let ulps = 4.0 * f32::EPSILON;
+        for &ea in &evs {
+            for &eb in &evs {
+                let (a, b) = (exposure_scale(ea), exposure_scale(eb));
+                let at = format!("EV {ea} → {eb}");
+                assert_eq!(pre_mix(a, b, 0.0).to_bits(), a.to_bits(), "{at}");
+                assert_eq!(pre_mix(a, b, 1.0).to_bits(), b.to_bits(), "{at}");
+                for t in [-0.5, -1.0e-30, f32::NEG_INFINITY] {
+                    assert_eq!(pre_mix(a, b, t).to_bits(), a.to_bits(), "{at}, t {t}");
+                }
+                for t in [1.0 + f32::EPSILON, 2.0, f32::INFINITY] {
+                    assert_eq!(pre_mix(a, b, t).to_bits(), b.to_bits(), "{at}, t {t}");
+                }
+                assert!(pre_mix(a, b, f32::NAN).is_nan(), "{at}");
+                let (lo, hi) = (a.min(b), a.max(b));
+                let stops = (b / a).log2();
+                let mut prev = a;
+                for i in 0..=20_000 {
+                    let t = i as f32 / 20_000.0;
+                    let p = pre_mix(a, b, t);
+                    let at = format!("{at}, t {t}: {p}");
+                    assert!(p >= lo * (1.0 - ulps) && p <= hi * (1.0 + ulps), "{at}");
+                    if b >= a {
+                        assert!(p >= prev * (1.0 - ulps), "{at} < {prev}");
+                    } else {
+                        assert!(p <= prev * (1.0 + ulps), "{at} > {prev}");
+                    }
+                    // log₂ p = log₂ a + t·log₂(b/a), to f32 rounding of the log (|log₂| ≤ 52).
+                    let off = (p / a).log2() - t * stops;
+                    assert!(off.abs() < 2.0e-5, "{at}: {off} stops off the line");
+                    let back = pre_mix(b, a, 1.0 - t);
+                    assert!((back / p - 1.0).abs() < 2.0e-5, "{at}: reversed {back}");
+                    prev = p;
+                }
+                let mid = pre_mix(a, b, 0.5);
+                assert!(
+                    (f64::from(mid) / (f64::from(a) * f64::from(b)).sqrt() - 1.0).abs() < 1e-5,
+                    "{at}: midpoint {mid}"
+                );
+            }
+        }
+        // The LOD band's case (star EV −4, scene EV 15): equal 1.9-stop steps per 0.1 of t,
+        // where the linear mix stays within 0.16 stop of star_pre until t = 0.1 and within
+        // 1 stop until t = 0.5, then drops the remaining 18 stops over the last half.
+        let (star, scene) = (exposure_scale(-4.0), exposure_scale(15.0));
+        for i in 0..10 {
+            let t0 = i as f32 / 10.0;
+            let step = (pre_mix(star, scene, t0) / pre_mix(star, scene, t0 + 0.1)).log2();
+            assert!((step - 1.9).abs() < 1e-4, "t {t0}: {step} stops");
+        }
+        let linear = |t: f32| star * (1.0 - t) + scene * t;
+        assert!((star / linear(0.5)).log2() < 1.0 + 1e-4);
+        assert!((star / pre_mix(star, scene, 0.5)).log2() > 9.49);
+        // Guard: a non-positive pre-exposure (never written by the renderer) is mixed linearly.
+        assert_eq!(pre_mix(0.0, 2.0, 0.25), 0.5);
+        assert_eq!(pre_mix(-1.0, 1.0, 0.5), 0.0);
+        assert_eq!(pre_mix(2.0, 0.0, 0.75), 0.5);
+        assert!(pre_mix(f32::NAN, 1.0, 0.5).is_nan());
+    }
+
+    /// `common/exposure.wgsl` defines `pre_mix(a, b, t)` as its CPU twin [`pre_mix`] does: the
+    /// ends returned as they are, the linear guard for a non-positive input, and
+    /// exp2(mix(log2 a, log2 b, t)) between (the GPU check is a probe; `cargo test` has no GPU).
+    #[test]
+    fn pre_mix_wgsl_is_the_twin() {
+        let lib = ShaderLib::with_common();
+        let src = lib.compose("common/exposure.wgsl").unwrap();
+        let module = validate_wgsl(&src).unwrap();
+        let f = module
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("pre_mix"))
+            .map(|(_, f)| f)
+            .expect("fn pre_mix in common/exposure.wgsl");
+        assert_eq!(f.arguments.len(), 3);
+        let names: Vec<_> = f.arguments.iter().map(|a| a.name.as_deref()).collect();
+        assert_eq!(names, [Some("a"), Some("b"), Some("t")]);
+        for line in [
+            "if (t <= 0.0) {\n        return a;",
+            "if (t >= 1.0) {\n        return b;",
+            "if (!(a > 0.0 && b > 0.0)) {\n        return mix(a, b, t);",
+            "return exp2(mix(log2(a), log2(b), t));",
+        ] {
+            assert_eq!(src.matches(line).count(), 1, "{line}\n{src}");
+        }
+        // camera.wgsl, which every render feature imports, brings it in.
+        let camera = validate_wgsl(&lib.compose("common/camera.wgsl").unwrap()).unwrap();
+        assert!(
+            camera
+                .functions
+                .iter()
+                .any(|(_, f)| f.name.as_deref() == Some("pre_mix"))
         );
     }
 
