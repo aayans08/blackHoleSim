@@ -1445,6 +1445,25 @@ fn intent_13_venus_crescent() {
     // the `hdr` target's f16 floor (the meter cannot see l·pre < 2⁻²⁴) removes the faintest
     // glow: 17.00 / 5 436.
     assert_paper(world, assets.rings.as_ref(), &c, 17.0, Some(5_436.0));
+    // B9g fix round 1 (review minor 1): with the `hdr` target's f16 subnormals flushed the
+    // paper reads 18.32 EV / 3 568 px, 1.07 EV above the capture and with 1 600 lit pixels
+    // fewer than the capture's meter saw; kept (the model, `paper::Subnormals`), 17.00 / 5 436.
+    let flushed = crate::paper::on_paper_model(
+        world,
+        &c.view,
+        SIZE,
+        assets.rings.as_ref(),
+        true,
+        crate::paper::Subnormals::Flush,
+    );
+    println!("venus-crescent paper with subnormals flushed: {flushed:?}");
+    near(
+        "flushed paper EV",
+        f64::from(flushed.target_ev),
+        18.32,
+        0.002,
+    );
+    near("flushed lit px", f64::from(flushed.lit_px), 3_568.0, 0.01);
     let bare = crate::paper::on_paper_with(world, &c.view, SIZE, assets.rings.as_ref(), false);
     near(
         "bare-deck paper EV (B9's row)",
@@ -1926,24 +1945,46 @@ fn capture_measurements_cover_the_plan_checks() {
     let m = measured(world, assets, "alpha-cen-sun");
     assert_eq!(m.flux.len(), 1);
     assert_eq!(m.flux[0].name, "Sun");
-    // Row 13 (lead ruling "row 13 Venus haze"): the night limb across the haze, for B8's `limb`.
+    // Row 13 (lead ruling "row 13 Venus haze"; fix round 1, review I1): the night limb across
+    // the haze, for B8's `limb`, in the lit azimuth bins only (the two cusp arcs), each with
+    // its own sky.
     let m = measured(world, assets, "venus-crescent");
     let limb = m
         .limbs
         .iter()
         .find(|l| l.name == "venus_night_limb")
         .expect("venus_night_limb");
-    assert!(
-        limb.strip.len() > 500 && limb.sky.len() > 500,
-        "{} {}",
-        limb.strip.len(),
-        limb.sky.len()
+    let cam = crate::measure::Cam::new(&applied(world, "venus-crescent").1.view, SIZE);
+    let omega = |q: &[f64; 4]| cam.pixel_solid_angle(glam::DVec2::new(q[0], q[1]));
+    let (mut twin, mut deck, mut sky_px, mut strip_px) = (0.0, 0.0, 0, 0);
+    for bin in &limb.bins {
+        let lux: f64 = bin.strip.iter().map(|q| q[2] * omega(q)).sum();
+        twin += lux;
+        deck += bin
+            .strip
+            .iter()
+            .filter(|q| q[3] == 0.0)
+            .map(|q| q[2] * omega(q))
+            .sum::<f64>();
+        sky_px += bin.sky.len();
+        strip_px += bin.strip.len();
+        // Every kept bin lies on the night half, near a cusp (|ψ| 90°–130°).
+        let mid = 0.5 * (bin.psi_deg[0] + bin.psi_deg[1]);
+        assert!((88.0..=130.0).contains(&mid.abs()), "{:?}", bin.psi_deg);
+        assert!(bin.strip.iter().all(|q| (0.0..=1.0).contains(&q[3])));
+    }
+    println!(
+        "venus_night_limb: {} bins, {strip_px} strip px, {sky_px} sky px, twin {twin:.4e} lx \
+         ({:.1} % on the deck)",
+        limb.bins.len(),
+        100.0 * deck / twin
     );
-    let lit = limb.strip.iter().filter(|p| p[2] >= 1.0).count();
     assert!(
-        lit > 20 && limb.strip.iter().all(|p| (0.0..=1.0).contains(&p[3])),
-        "{lit}"
+        limb.bins.len() >= 4 && limb.bins.len() <= 40,
+        "{}",
+        limb.bins.len()
     );
+    assert!(twin > 0.0 && sky_px > 100 && strip_px > 50);
     assert!(!m.regions.contains_key("night_limb_haze"));
     // Row 19 (lead ruling "row 19 shadow"): visual and seam checks only, so the JSON carries no
     // regions, samples or flux for it (the `lens_rect_*_edge` regions cannot exist either: at

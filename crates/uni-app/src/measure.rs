@@ -88,19 +88,31 @@ pub struct FluxEntry {
     pub neighbour_lux: f64,
 }
 
-/// One `limbs` entry (lead ruling "row 13 Venus haze", task B9g): the pixels across a limb with
-/// the CPU twin's world light, for an integrated-flux check (B8's `limb`) instead of a region's
-/// mean, which a sub-pixel haze band and the sky behind it decide.
+/// One `limbs` entry (lead ruling "row 13 Venus haze", task B9g; fix round 1, review I1): the
+/// pixels across a limb with the CPU twin's world light, in azimuth bins, for an integrated-flux
+/// check (B8's `limb`) instead of a region's mean, which a sub-pixel haze band and the sky
+/// behind it decide. Only the bins where the twin expects light are kept (the haze's two cusp
+/// arcs), each with its own sky, so the subtracted Milky Way is a small part of the sum and a
+/// patchy band is estimated where it lies.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct LimbFlux {
     pub name: String,
-    /// Every pixel across the limb, none thinned (the check integrates them): [x, y, the twin's
-    /// world light [cd/m²], the sky's share (the band and stars behind the pixel are drawn ×
-    /// this: the view transmittance's luminance, 0 where the ray meets the body)]. Pixels
-    /// inside a drawn star's or point's footprint are left out.
+    pub bins: Vec<LimbBin>,
+}
+
+/// One azimuth bin of a [`LimbFlux`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct LimbBin {
+    /// The bin's image angle from the Sun's projected direction [deg], signed (counter-clockwise
+    /// with the image's y up): [from, to).
+    pub psi_deg: [f64; 2],
+    /// Every pixel across the limb in the bin, none thinned (the check integrates them): [x, y,
+    /// the twin's world light [cd/m²], the sky's share (the band and stars behind the pixel are
+    /// drawn × this: the view transmittance's luminance, 0 where the ray meets the body)].
+    /// Pixels inside a drawn star's or point's footprint are left out.
     pub strip: Vec<[f64; 4]>,
-    /// Sky pixels just beyond the limb on the same side, outside every star footprint: B8
-    /// subtracts their median × the sky's share from the strip.
+    /// The bin's sky pixels just beyond the limb, outside every star footprint: B8 subtracts
+    /// their median × the sky's share from the bin's strip.
     pub sky: Vec<[f64; 2]>,
 }
 
@@ -410,14 +422,22 @@ pub fn measure(input: &Input<'_>) -> Measurements {
     m
 }
 
-/// Venus's night limb across its haze (lead ruling "row 13 Venus haze"): the night half of the
-/// image around Venus (the side away from the Sun's projected direction), every pixel from
-/// 2 px inside the cloud deck's limb to 2 px beyond the haze shell's top (60 km above the deck,
-/// 1.2 px at `venus-crescent`), with the twin's light ([`crate::paper::VenusAtmo`]); sky pixels
-/// from 4 to 10 px beyond the shell on the same side. B3's haze there is lit only toward the
-/// cusps: past ~25° from the terminator the shell is in Venus's shadow (sunlit only above
-/// ~140 km), which is why the plan's `night_limb_haze` region (the anti-solar third of the
-/// limb) measured the Milky Way behind it, not haze (task B9g).
+/// Azimuth bin width of the limb entry [deg] (review I1: 1–2°).
+const LIMB_BIN_DEG: f64 = 2.0;
+/// A bin is kept when the twin's light in it is at least this share of the brightest bin's.
+const LIMB_LIT_SHARE: f64 = 0.01;
+/// Bins kept on each side of a lit run (margin for the haze's fade).
+const LIMB_MARGIN_BINS: i64 = 1;
+
+/// Venus's night limb across its haze (lead ruling "row 13 Venus haze"; fix round 1, review I1).
+/// On the night half of the image around Venus (the side away from the Sun's projected
+/// direction), the pixels from 2 px inside the cloud deck's limb to 2 px beyond the haze shell's
+/// top (60 km above the deck, 1.2 px at `venus-crescent`) with the twin's light
+/// ([`crate::paper::VenusAtmo`]), and sky pixels 4–10 px beyond the shell, are binned by image
+/// angle in [`LIMB_BIN_DEG`] steps. Only the bins whose twin light reaches [`LIMB_LIT_SHARE`]
+/// of the brightest bin, plus [`LIMB_MARGIN_BINS`] on each side, are kept: B3's haze is lit only
+/// toward the cusps (past ~25° from the terminator the shell is in Venus's shadow, sunlit only
+/// above ~140 km, which is why the plan's `night_limb_haze` region measured the Milky Way).
 fn venus_night_limb(
     cam: &Cam,
     b: &BodyView,
@@ -426,8 +446,7 @@ fn venus_night_limb(
 ) -> LimbFlux {
     let mut out = LimbFlux {
         name: "venus_night_limb".to_owned(),
-        strip: Vec::new(),
-        sky: Vec::new(),
+        bins: Vec::new(),
     };
     let Some(c) = cam.project(b.rel_pos_m) else {
         return out;
@@ -447,6 +466,28 @@ fn venus_night_limb(
         .map(|&(q, r, _, _)| (q, r))
         .collect();
     let in_star = |p: DVec2| near.iter().any(|(q, r)| (*q - p).length() < *r);
+    // Bins by signed image angle ψ from the Sun's direction (image y down, so the angle is
+    // taken with y flipped: counter-clockwise on screen).
+    let n_bins = (360.0 / LIMB_BIN_DEG).round() as i64;
+    let bin_of = |p: DVec2| {
+        let v = p - c;
+        let psi = (sun_img.x * -v.y - -sun_img.y * v.x)
+            .atan2(sun_img.dot(v))
+            .to_degrees();
+        ((psi + 180.0) / LIMB_BIN_DEG)
+            .floor()
+            .clamp(0.0, (n_bins - 1) as f64) as i64
+    };
+    let mut bins: Vec<LimbBin> = (0..n_bins)
+        .map(|k| {
+            let lo = -180.0 + LIMB_BIN_DEG * k as f64;
+            LimbBin {
+                psi_deg: [lo, lo + LIMB_BIN_DEG],
+                strip: Vec::new(),
+                sky: Vec::new(),
+            }
+        })
+        .collect();
     let (x0, x1) = (
         (c.x - reach).floor().max(0.0),
         (c.x + reach).ceil().min(cam.size.x),
@@ -467,16 +508,44 @@ fn venus_night_limb(
             if !(strip || ring) || (p - c).normalize_or_zero().dot(sun_img) > 0.0 || in_star(p) {
                 continue;
             }
+            let bin = &mut bins[bin_of(p) as usize];
             if strip {
                 let ray = atmo.ray(b, cam.ray(p));
                 let (l, t) = ray.map_or((0.0, 1.0), |r| (r.luminance, r.sky_t));
-                out.strip.push([p.x, p.y, l, t]);
+                bin.strip.push([p.x, p.y, l, t]);
             } else {
-                out.sky.push([p.x, p.y]);
+                bin.sky.push([p.x, p.y]);
             }
         }
         y += 1.0;
     }
+    // Keep the lit bins and their margins.
+    let light: Vec<f64> = bins
+        .iter()
+        .map(|bin| {
+            bin.strip
+                .iter()
+                .map(|q| q[2] * cam.pixel_solid_angle(DVec2::new(q[0], q[1])))
+                .sum()
+        })
+        .collect();
+    let brightest = light.iter().copied().fold(0.0_f64, f64::max);
+    if !(brightest > 0.0) {
+        return out;
+    }
+    let lit: Vec<bool> = light
+        .iter()
+        .map(|&l| l >= LIMB_LIT_SHARE * brightest)
+        .collect();
+    let keep = |k: i64| {
+        (-LIMB_MARGIN_BINS..=LIMB_MARGIN_BINS).any(|m| lit[(k + m).rem_euclid(n_bins) as usize])
+    };
+    out.bins = bins
+        .into_iter()
+        .enumerate()
+        .filter(|(k, bin)| keep(*k as i64) && !bin.strip.is_empty())
+        .map(|(_, bin)| bin)
+        .collect();
     out
 }
 

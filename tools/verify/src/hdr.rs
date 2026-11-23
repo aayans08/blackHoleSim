@@ -8,7 +8,8 @@
 //! - `samples: [{x, y, expected_cd_m2: [r, g, b], what, footprint?: [[x, y], …]}]`;
 //! - `features: {name: {x, y, r_min, r_max, angle_deg?, expected_slope?}}`;
 //! - `flux: [{name, x, y, radius_px, expected_lux, neighbour_lux, mask: [[x, y, r], …]}]`;
-//! - `limbs: [{name, strip: [[x, y, expected_cd_m2, sky_t], …], sky: [[x, y], …]}]`.
+//! - `limbs: [{name, bins: [{psi_deg: [from, to], strip: [[x, y, expected_cd_m2, sky_t], …],
+//!   sky: [[x, y], …]}]}]`.
 //!
 //! Positions (x, y) of features and flux entries are framebuffer pixels: x right, y down, pixel
 //! k spans [k, k + 1], so a pixel's centre is k + 0.5. Luminance is Rec. 709,
@@ -43,13 +44,17 @@
 //!   illuminance of every other star or point whose footprint centre lies inside R, which B4L's
 //!   wider halo footprints put inside R (18 % of Rigel's light at `sky-orion-3d`). A capture JSON
 //!   without `neighbour_lux` reads 0.
-//! - `limb`: the world light integrated across a limb (lead ruling "row 13 Venus haze"):
-//!   E = Σ (Y_i − Y_sky·t_i)·Ω_i ÷ `pre[0]` over the entry's `strip` against the CPU twin's
-//!   Σ L_i·Ω_i, both in lux. Y_sky is the median of Y over the entry's `sky` pixels (the band and
-//!   stars beyond the limb, pre-exposed at the star exposure); t_i, the pixel's sky share, is what
+//! - `limb`: the world light integrated across a limb (lead ruling "row 13 Venus haze"; fix
+//!   round 1, review I1): E = Σ_bins Σ_strip (Y_i − Y_sky,bin·t_i)·Ω_i ÷ `pre[0]` against the CPU
+//!   twin's Σ L_i·Ω_i, both in lux. The entry holds only the azimuth bins where the twin expects
+//!   light (Venus: the haze's two cusp arcs), so the subtracted sky is a minor part of the sum.
+//!   Y_sky,bin is the median of Y over the bin's own `sky` pixels (the band and stars just
+//!   beyond the limb, pre-exposed at the star exposure; a bin without one takes the nearest
+//!   bin's), so a patchy band is estimated where it lies; t_i, the pixel's sky share, is what
 //!   the passes keep of the sky behind it (the view transmittance's luminance, 0 on the body).
-//!   Ω_i as for `flux`. Integrating over every pixel across the limb makes a haze band thinner
-//!   than a pixel count by its light, not by where its sub-pixel peak lands.
+//!   Ω_i as for `flux`. Integrating every pixel across the limb counts a haze band thinner than
+//!   a pixel by its light, not by where its sub-pixel peak lands. The output gives the sky's
+//!   share of the measured sum and the twin's share on the body (t = 0).
 
 use crate::{Verdict, pass_word};
 use anyhow::{Context, bail};
@@ -143,11 +148,20 @@ impl FluxEntry {
     }
 }
 
-/// One `limbs` entry: the pixels across a limb with the twin's world light and their sky
-/// share, and the sky pixels beyond it.
+/// One `limbs` entry: the azimuth bins of a limb where the twin expects light.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LimbEntry {
     pub name: String,
+    pub bins: Vec<LimbBin>,
+}
+
+/// One azimuth bin: the pixels across the limb with the twin's world light and their sky
+/// share, and the bin's sky pixels beyond it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LimbBin {
+    /// The bin's image angle range [deg] (reported only).
+    #[serde(default)]
+    pub psi_deg: Option<[f64; 2]>,
     /// [x, y, expected luminance [cd/m²] (world light), sky share t].
     pub strip: Vec<[f64; 4]>,
     #[serde(default)]
@@ -953,14 +967,19 @@ pub fn check_flux(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verd
 /// A limb's integrated world light and the terms behind it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LimbResult {
-    /// E = Σ (Y_i − Y_sky·t_i)·Ω_i ÷ pre[0] [lx].
+    /// E = Σ (Y_i − Y_sky,bin·t_i)·Ω_i ÷ pre[0] [lx].
     pub lux: f64,
     /// The twin's Σ L_i·Ω_i [lx].
     pub expected_lux: f64,
-    /// The sky's median, pre-exposed.
-    pub y_sky: f64,
-    /// The sky light subtracted, Σ Y_sky·t_i·Ω_i ÷ pre[0] [lx].
+    /// The twin's light on the body (pixels with t = 0) [lx].
+    pub expected_body_lux: f64,
+    /// The sky light subtracted, Σ Y_sky,bin·t_i·Ω_i ÷ pre[0] [lx].
     pub sky_lux: f64,
+    /// The smallest and largest bin sky median, pre-exposed.
+    pub y_sky_range: [f64; 2],
+    pub bins: usize,
+    /// Bins without sky pixels of their own (they took the nearest bin's).
+    pub borrowed_sky: usize,
     pub pixels: usize,
     pub sky_pixels: usize,
 }
@@ -979,45 +998,72 @@ pub fn limb_flux(cap: &HdrCapture, name: &str) -> anyhow::Result<LimbResult> {
         .iter()
         .find(|e| e.name == name)
         .with_context(|| format!("no limbs entry {name:?} in the capture JSON"))?;
-    if e.strip.is_empty() {
+    if e.bins.iter().all(|b| b.strip.is_empty()) {
         bail!("limbs entry {name:?} has no strip pixels");
     }
-    let mut sky = e
-        .sky
+    // Each bin's own sky median, pre-exposed (None without sky pixels).
+    let own: Vec<Option<f64>> = e
+        .bins
         .iter()
-        .map(|&[x, y]| {
-            let (i, j) = cap
-                .pixel_at(x, y)
-                .with_context(|| format!("limbs {name:?} sky pixel ({x}, {y}) is off the image"))?;
-            Ok(cap.luminance(i, j))
+        .map(|bin| {
+            let mut sky = bin
+                .sky
+                .iter()
+                .map(|&[x, y]| {
+                    let (i, j) = cap.pixel_at(x, y).with_context(|| {
+                        format!("limbs {name:?} sky pixel ({x}, {y}) is off the image")
+                    })?;
+                    Ok(cap.luminance(i, j))
+                })
+                .collect::<anyhow::Result<Vec<f64>>>()?;
+            Ok((!sky.is_empty()).then(|| median(&mut sky)))
         })
-        .collect::<anyhow::Result<Vec<f64>>>()?;
-    if sky.is_empty() {
-        bail!("limbs entry {name:?} has no sky pixels");
-    }
-    let y_sky = median(&mut sky);
+        .collect::<anyhow::Result<_>>()?;
+    let nearest = |k: usize| -> Option<f64> {
+        (0..e.bins.len()).find_map(|d| {
+            own.get(k + d)
+                .copied()
+                .flatten()
+                .or_else(|| k.checked_sub(d).and_then(|j| own[j]))
+        })
+    };
     let pre = cap.header.pre[0];
-    let (mut lux, mut expected_lux, mut sky_lux) = (0.0, 0.0, 0.0);
-    for &[x, y, expected, t] in &e.strip {
-        let (i, j) = cap
-            .pixel_at(x, y)
-            .with_context(|| format!("limbs {name:?} strip pixel ({x}, {y}) is off the image"))?;
-        let omega = pixel_omega(&cap.header, x, y);
-        lux += (cap.luminance(i, j) - y_sky * t) * omega / pre;
-        sky_lux += y_sky * t * omega / pre;
-        expected_lux += expected * omega;
+    let mut r = LimbResult {
+        lux: 0.0,
+        expected_lux: 0.0,
+        expected_body_lux: 0.0,
+        sky_lux: 0.0,
+        y_sky_range: [f64::INFINITY, 0.0],
+        bins: e.bins.len(),
+        borrowed_sky: own.iter().filter(|o| o.is_none()).count(),
+        pixels: 0,
+        sky_pixels: e.bins.iter().map(|b| b.sky.len()).sum(),
+    };
+    for (k, bin) in e.bins.iter().enumerate() {
+        let y_sky = nearest(k)
+            .with_context(|| format!("limbs entry {name:?} has no sky pixels in any bin"))?;
+        r.y_sky_range = [r.y_sky_range[0].min(y_sky), r.y_sky_range[1].max(y_sky)];
+        for &[x, y, expected, t] in &bin.strip {
+            let (i, j) = cap.pixel_at(x, y).with_context(|| {
+                format!("limbs {name:?} strip pixel ({x}, {y}) is off the image")
+            })?;
+            let omega = pixel_omega(&cap.header, x, y);
+            r.lux += (cap.luminance(i, j) - y_sky * t) * omega / pre;
+            r.sky_lux += y_sky * t * omega / pre;
+            r.expected_lux += expected * omega;
+            if t == 0.0 {
+                r.expected_body_lux += expected * omega;
+            }
+            r.pixels += 1;
+        }
     }
-    if !(expected_lux > 0.0) {
-        bail!("limbs entry {name:?}: the twin expects no light ({expected_lux} lx)");
+    if !(r.expected_lux > 0.0) {
+        bail!(
+            "limbs entry {name:?}: the twin expects no light ({} lx)",
+            r.expected_lux
+        );
     }
-    Ok(LimbResult {
-        lux,
-        expected_lux,
-        y_sky,
-        sky_lux,
-        pixels: e.strip.len(),
-        sky_pixels: sky.len(),
-    })
+    Ok(r)
 }
 
 /// `limb`: the integrated light within the relative tolerance `tol` of the twin's.
@@ -1028,17 +1074,22 @@ pub fn check_limb(cap: &HdrCapture, name: &str, tol: f64) -> anyhow::Result<Verd
     Ok(Verdict {
         lines: vec![
             format!(
-                "limb {name}: E {:.5e} lx vs the twin's {:.5e} lx ({:+.2} %) over {} px",
+                "limb {name}: E {:.5e} lx vs the twin's {:.5e} lx ({:+.2} %) over {} px in {} \
+                 lit bins; the twin's light on the body {:.1} %",
                 r.lux,
                 r.expected_lux,
                 100.0 * rel,
-                r.pixels
+                r.pixels,
+                r.bins,
+                100.0 * r.expected_body_lux / r.expected_lux
             ),
             format!(
-                "  sky median {:.5e} pre-exposed (of {} px); sky light subtracted {:.5e} lx \
-                 ({:.1} % of the measured sum)",
-                r.y_sky,
+                "  sky medians {:.5e}–{:.5e} pre-exposed (of {} px; {} bins borrowed a \
+                 neighbour's); sky light subtracted {:.5e} lx ({:.1} % of the measured sum)",
+                r.y_sky_range[0],
+                r.y_sky_range[1],
                 r.sky_pixels,
+                r.borrowed_sky,
                 r.sky_lux,
                 100.0 * r.sky_lux / (r.lux + r.sky_lux)
             ),
@@ -1734,17 +1785,17 @@ pub(crate) mod tests {
             .count()
     }
 
-    /// Lead ruling "row 13 Venus haze": `limb` integrates the world light across the limb against
-    /// the twin and subtracts the sky × its share. The frame is `venus-crescent`'s
-    /// (`captures/b9-dev/venus-crescent.json`, B9's capture at 6cd81e9: fov 20°, pre = (5.35e-6,
-    /// 75.4), EV 17.25 / −6.5; its numbers are embedded when the git-ignored file is absent):
-    /// Venus's deck limb at 125.1 px, the shell's top 1.2 px beyond, a haze band 0.4 px deep on
-    /// the night half, lit toward the cusps, and B9's sky behind it (its `night_limb_haze`
-    /// region measured 1.28e-3 pre-exposed: the band, not haze). The haze alone moves that
-    /// region's mean by under 1 %, so the old threshold check could not see it; the integral
-    /// does: right → PASS; missing, 20 % too bright, or with the sky left in → FAIL. (The GPU
-    /// and the twin sample the same pixel centres; a GPU that resampled the band, e.g. a
-    /// half-resolution march, would add sampling noise over the ~70 px of lit cusp arc.)
+    /// Lead ruling "row 13 Venus haze", fix round 1 (review I1): `limb` integrates the world
+    /// light across the limb in the lit azimuth bins only, each with its own sky. The frame is
+    /// `venus-crescent`'s (`captures/b9-dev/venus-crescent.json`, B9's capture at 6cd81e9: fov
+    /// 20°, pre = (5.35e-6, 75.4); embedded when the git-ignored file is absent): the deck's
+    /// limb at 125.1 px, the shell's top 1.2 px beyond, and the twin's haze on the night half:
+    /// a band 0.25 px deep, lit on the two cusp arcs (|ψ| 90°–105°) with the twin's total,
+    /// 1.27e-2 lx (uni-app's `capture_measurements_cover_the_plan_checks`). The sky behind it
+    /// is B9's level (its old `night_limb_haze` region read 1.28e-3 pre-exposed) with a
+    /// gradient across the frame, ±30 % patches 50–70 px across and stray stars in the sky
+    /// rings; the GPU's sky share is the twin's smeared over 2 px. With the haze right the
+    /// check stays within ±10 %; 20 % too bright, 20 % too dark or missing, it fails.
     #[test]
     fn hdr_limb_integrates_the_haze_across_the_limb() {
         let json =
@@ -1761,90 +1812,109 @@ pub(crate) mod tests {
             }
         };
         const SKY_PRE: f64 = 1.28e-3;
+        const BIN_DEG: f64 = 2.0;
         let (cx, cy, r_deck, r_top) = (960.0, 540.0, 125.1, 126.3);
-        // Haze luminance [cd/m²] at radius ρ and image angle ψ from the Sun's direction (+y
-        // down here): the twin's pattern (task B9g), lit toward the cusps (ψ near 90°), fading
-        // to nothing 15° past them, dark at the anti-solar limb.
+        // The Sun toward +y (image down): ψ is the angle from it, the night half |ψ| ≥ 90°.
+        let psi_of = |x: f64, y: f64| (-(x - cx)).atan2(y - cy).to_degrees();
+        // The twin's haze [cd/m²]: lit from each cusp (|ψ| = 90°) fading to nothing 15° past it.
         let haze = |rho: f64, psi: f64| -> f64 {
             let h = rho - r_deck;
-            let past_cusp = psi - std::f64::consts::FRAC_PI_2;
-            if !(0.0..=r_top - r_deck).contains(&h) || past_cusp > 15f64.to_radians() {
+            let past = psi.abs() - 90.0;
+            if !(0.0..=r_top - r_deck).contains(&h) || !(0.0..15.0).contains(&past) {
                 return 0.0;
             }
-            2.0e3 * (1.0 - past_cusp.max(0.0) / 15f64.to_radians()) * (-h / 0.4).exp()
+            1.5e4 * (1.0 - past / 15.0) * (-h / 0.25).exp()
         };
-        // Sky share: opaque at the deck's limb, clear above ~0.3 px.
-        let sky_t = |rho: f64| ((rho - r_deck) / 0.3).clamp(0.0, 1.0);
+        // The twin's sky share: opaque at the deck, clear 0.3 px above it; the GPU's, the same
+        // smeared over 2 px (a box in ρ, which keeps its integral across the edge).
+        let t_twin = |rho: f64| ((rho - r_deck) / 0.3).clamp(0.0, 1.0);
+        let t_gpu = |rho: f64| {
+            (0..20)
+                .map(|k| t_twin(rho - 1.0 + 0.1 * (f64::from(k) + 0.5)))
+                .sum::<f64>()
+                / 20.0
+        };
+        // A patchy band: a gradient across the frame and ±30 % patches 50–70 px across.
+        let sky = |x: f64, y: f64| {
+            SKY_PRE
+                * (1.0 + 0.5 * (x - cx) / 400.0)
+                * (1.0 + 0.3 * (x / 17.0).sin() * (y / 21.0).cos())
+        };
         let build = |gpu_haze: f64| {
             let mut cap = blank(1920, 1080, fov, pre);
-            let mut entry = LimbEntry {
-                name: "venus_night_limb".into(),
-                strip: Vec::new(),
-                sky: Vec::new(),
-            };
+            let mut bins: BTreeMap<i64, LimbBin> = BTreeMap::new();
             for j in 380..700 {
                 for i in 800..1120 {
                     let (x, y) = (f64::from(i) + 0.5, f64::from(j) + 0.5);
-                    let (dx, dy) = (x - cx, y - cy);
-                    let rho = dx.hypot(dy);
-                    // The night half: away from the Sun, which is toward +y (image down).
-                    if dy > 0.0 {
+                    let rho = (x - cx).hypot(y - cy);
+                    let psi = psi_of(x, y);
+                    let t = if rho < r_deck { 0.0 } else { t_gpu(rho) };
+                    // Stray stars in the sky rings, every 37th pixel.
+                    let star = if (i * 31 + j * 17) % 37 == 0 && rho > r_top + 3.0 {
+                        0.05
+                    } else {
+                        0.0
+                    };
+                    let y_pre = gpu_haze * haze(rho, psi) * pre[0] + sky(x, y) * t + star;
+                    put(&mut cap, i, j, [y_pre as f32; 3]);
+                    // The entry: lit bins and one margin bin each side (|ψ| 88°–107°).
+                    if !(88.0..107.0).contains(&psi.abs()) {
                         continue;
                     }
-                    let psi = dx.atan2(dy).abs();
-                    let twin = haze(rho, psi);
-                    let t = if rho < r_deck { 0.0 } else { sky_t(rho) };
-                    let y_pre = gpu_haze * haze(rho, psi) * pre[0] + SKY_PRE * t;
-                    put(&mut cap, i, j, [y_pre as f32; 3]);
+                    let k = (psi / BIN_DEG).floor() as i64;
+                    let bin = bins.entry(k).or_insert_with(|| LimbBin {
+                        psi_deg: Some([k as f64 * BIN_DEG, (k + 1) as f64 * BIN_DEG]),
+                        strip: Vec::new(),
+                        sky: Vec::new(),
+                    });
                     if rho >= r_deck - 2.0 && rho <= r_top + 2.0 {
-                        entry.strip.push([x, y, twin, t]);
+                        let tw = if rho < r_deck { 0.0 } else { t_twin(rho) };
+                        bin.strip.push([x, y, haze(rho, psi), tw]);
                     } else if rho >= r_top + 4.0 && rho <= r_top + 10.0 {
-                        entry.sky.push([x, y]);
+                        bin.sky.push([x, y]);
                     }
                 }
             }
-            cap.limbs.push(entry);
+            cap.limbs.push(LimbEntry {
+                name: "venus_night_limb".into(),
+                bins: bins.into_values().collect(),
+            });
             cap
         };
         let right = build(1.0);
         let r = limb_flux(&right, "venus_night_limb").expect("limb");
-        eprintln!("limb: {r:?}");
-        close(r.lux / r.expected_lux, 1.0, 1e-6, "the twin's own frame");
-        close(r.y_sky, SKY_PRE, 1e-6, "sky median");
-        assert!(
-            check_limb(&right, "venus_night_limb", 0.1)
-                .expect("check")
-                .pass
-        );
-        // On the plan's region (the anti-solar third of the limb, ψ > 120°, above the deck) the
-        // haze adds nothing to the sky: a mean there measures the band.
-        let old_region: Vec<f64> = right.limbs[0]
-            .strip
-            .iter()
-            .filter(|p| p[3] > 0.0 && (p[0] - cx).atan2(p[1] - cy).abs() > 120f64.to_radians())
-            .map(|p| p[2] * pre[0] / SKY_PRE)
-            .collect();
-        assert!(!old_region.is_empty() && mean(&old_region) < 0.01);
-        // Missing haze, and the sky not subtracted (a twin of zero sky share).
-        assert!(
-            !check_limb(&build(0.0), "venus_night_limb", 0.1)
-                .expect("check")
-                .pass
-        );
-        let mut unsubtracted = build(1.0);
-        for p in &mut unsubtracted.limbs[0].strip {
-            p[3] = 0.0;
+        eprintln!("limb: {r:?}, E/twin {:.4}", r.lux / r.expected_lux);
+        close(r.expected_lux, 1.27e-2, 0.1, "the twin's total");
+        assert!(r.sky_lux < r.lux, "the sky is the minor part: {r:?}");
+        assert_eq!(r.expected_body_lux, 0.0);
+        let v = check_limb(&right, "venus_night_limb", 0.1).expect("check");
+        assert!(v.pass, "{v:?}");
+        for (k, what) in [
+            (1.2, "20 % too bright"),
+            (0.8, "20 % too dark"),
+            (0.0, "missing"),
+        ] {
+            let v = check_limb(&build(k), "venus_night_limb", 0.1).expect("check");
+            assert!(!v.pass, "{what}: {v:?}");
         }
-        assert!(
-            !check_limb(&unsubtracted, "venus_night_limb", 0.1)
-                .expect("check")
-                .pass
+        // One sky median for all bins (the review's leverage): with the patches it misses.
+        let mut one = build(1.0);
+        let all_sky: Vec<[f64; 2]> = one.limbs[0]
+            .bins
+            .iter()
+            .flat_map(|b| b.sky.clone())
+            .collect();
+        let mut merged = one.limbs[0].bins.clone();
+        for b in &mut merged {
+            b.sky = all_sky.clone();
+        }
+        one.limbs[0].bins = merged;
+        let single = limb_flux(&one, "venus_night_limb").expect("limb");
+        let err = |x: &LimbResult| (x.lux / x.expected_lux - 1.0).abs();
+        eprintln!(
+            "one sky median: E/twin {:.4}",
+            single.lux / single.expected_lux
         );
-        // A haze 20 % too bright fails ±10 %.
-        assert!(
-            !check_limb(&build(1.2), "venus_night_limb", 0.1)
-                .expect("check")
-                .pass
-        );
+        assert!(err(&single) > 0.1 && err(&r) < 0.1, "{single:?}");
     }
 }

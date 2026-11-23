@@ -79,6 +79,8 @@ pub struct Paper {
 pub struct VenusAtmo {
     params: uni_atmo::AtmosphereParams,
     sky: Vec<DVec3>,
+    /// The Sun's colour, luminance 1 (a CIE integration: computed once, review minor 2).
+    colour: DVec3,
 }
 
 impl VenusAtmo {
@@ -95,7 +97,13 @@ impl VenusAtmo {
                     uni_atmo::sky_irradiance(&params, r, mu).as_dvec3()
                 })
                 .collect();
-            Some(VenusAtmo { params, sky })
+            let c = uni_core::blackbody_linear_srgb(uni_core::TEFF_SUN_K).as_dvec3();
+            let colour = c / f64::from(crate::scene::luminance(c.as_vec3()));
+            Some(VenusAtmo {
+                params,
+                sky,
+                colour,
+            })
         })
         .as_ref()
     }
@@ -140,10 +148,7 @@ impl VenusAtmo {
         let sun = b.sun_rel_m.normalize();
         let (insc, trans) =
             uni_atmo::segment_radiance(p, ro, dir, deck.unwrap_or(f64::INFINITY), sun);
-        let colour = {
-            let c = uni_core::blackbody_linear_srgb(uni_core::TEFF_SUN_K).as_dvec3();
-            c / f64::from(crate::scene::luminance(c.as_vec3()))
-        };
+        let colour = self.colour;
         let e = b.sun_illuminance_lux;
         let mut l = insc.as_dvec3() * colour * e;
         if let Some(t) = deck {
@@ -324,6 +329,19 @@ pub fn on_paper_with(
     rings: Option<&uni_data::RingProfile>,
     venus_haze: bool,
 ) -> Paper {
+    on_paper_model(world, view, size, rings, venus_haze, HDR_SUBNORMALS)
+}
+
+/// [`on_paper_with`] with the `hdr` target's f16 subnormals flushed or kept (for comparison:
+/// B9g fix round 1).
+pub fn on_paper_model(
+    world: &World,
+    view: &CameraView,
+    size: UVec2,
+    rings: Option<&uni_data::RingProfile>,
+    venus_haze: bool,
+    subnormals: Subnormals,
+) -> Paper {
     let snap = world.sim.snapshot(view, size);
     let venus = if venus_haze && snap.bodies.iter().any(|b| b.naif == Some(VENUS)) {
         VenusAtmo::get()
@@ -352,10 +370,10 @@ pub fn on_paper_with(
         }
     }
     let total = size.x * size.y;
-    let (meter, target, pre) = settled_meter(&lums, total);
+    let (meter, target, pre) = settled_meter(&lums, total, subnormals);
     let mut lit: Vec<f32> = lums
         .into_iter()
-        .map(|l| through_f16(l, pre))
+        .map(|l| through_f16(l, pre, subnormals))
         .filter(|l| *l >= uni_post::METER_MIN_CD_M2)
         .collect();
     lit.sort_by(f32::total_cmp);
@@ -376,17 +394,43 @@ const F16_MIN_NORMAL: f64 = 6.103_515_625e-5;
 /// Most fixed-point steps of [`settled_meter`] (it settles in 2–3).
 const SETTLE_STEPS: usize = 8;
 
-/// Luminance `l` [cd/m²] as the meter reads it back from the `hdr` target (Rgba16Float), which
-/// stores l·`pre`: below 2⁻¹⁴ a stored value is a multiple of 2⁻²⁴ (under half of that it is 0).
-/// At EV 17 the meter therefore sees nothing below 0.011 cd/m², eleven times its own 10⁻³ lit
-/// threshold, which is why Venus's dimmest haze pixels drop out of the capture's meter (task
-/// B9g). The normal range's 2⁻¹¹ relative rounding is left out (it moves a pixel by 0.0007 EV).
-pub fn through_f16(l: f32, pre: f32) -> f32 {
+/// How the `hdr` target (Rgba16Float) stores a value below f16's smallest normal, 2⁻¹⁴.
+///
+/// Metal does not promise to keep f16 subnormals when it stores a render target (the contract
+/// `uni_atmo::feature::STAR_SHARE_MIN` and uni-planet's twin are built on). B9g fix round 1
+/// (review minor 1) computed both at `venus-crescent`, whose dim haze glow lies in that range:
+/// - flushed: EV 18.32, 3 568 lit px;
+/// - kept: EV 17.00, 5 436 lit px;
+/// - the capture (6cd81e9, the meter on the GPU): EV 17.25, 5 180 lit px.
+///
+/// The capture's meter saw 1 600 lit pixels more than a flushing target could hold (every
+/// pixel between 0.011 and 11 cd/m² at EV 17.25 is an f16 subnormal), so on the M3 the `hdr`
+/// target keeps them: the paper models [`Subnormals::Keep`]. The other contract (never rely on
+/// a stored subnormal, `STAR_SHARE_MIN`) stays right for code that must work on any GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subnormals {
+    /// Stored as 0 (the comparison in `intent_13_venus_crescent`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Flush,
+    /// Kept as multiples of 2⁻²⁴ (round to nearest), the IEEE 754 binary16 behaviour.
+    Keep,
+}
+
+/// The paper's model of the `hdr` target (see [`Subnormals`]).
+pub const HDR_SUBNORMALS: Subnormals = Subnormals::Keep;
+
+/// Luminance `l` [cd/m²] as the meter reads it back from the `hdr` target, which stores
+/// l·`pre` in f16: below 2⁻¹⁴ a value is flushed to 0 ([`Subnormals::Flush`]) or kept as a
+/// multiple of 2⁻²⁴ ([`Subnormals::Keep`]). At EV 17 the meter then sees nothing below
+/// 11 cd/m² (flushed) or 0.011 cd/m² (kept), against its own 10⁻³ lit threshold, which is why
+/// Venus's dimmest haze pixels drop out of the capture's meter (task B9g). The normal range's
+/// 2⁻¹¹ relative rounding is left out (it moves a pixel by 0.0007 EV).
+pub fn through_f16(l: f32, pre: f32, subnormals: Subnormals) -> f32 {
     let x = f64::from(l) * f64::from(pre);
-    let q = if x < F16_MIN_NORMAL {
-        (x / F16_MIN_SUBNORMAL).round() * F16_MIN_SUBNORMAL
-    } else {
-        x
+    let q = match subnormals {
+        _ if x >= F16_MIN_NORMAL => x,
+        Subnormals::Flush => 0.0,
+        Subnormals::Keep => (x / F16_MIN_SUBNORMAL).round() * F16_MIN_SUBNORMAL,
     };
     (q / f64::from(pre)) as f32
 }
@@ -395,7 +439,11 @@ pub fn through_f16(l: f32, pre: f32) -> f32 {
 /// of the EV it meters ([`through_f16`]), so the EV is the fixed point of meter → EV → storage,
 /// found by iteration from the unquantised reading (what the capture's settle loop does on the
 /// GPU). Returns the meter, its target [EV100] and that target's pre-exposure.
-fn settled_meter(lums: &[f32], total: u32) -> (Option<uni_post::histogram::Meter>, f32, f32) {
+fn settled_meter(
+    lums: &[f32],
+    total: u32,
+    subnormals: Subnormals,
+) -> (Option<uni_post::histogram::Meter>, f32, f32) {
     let mut meter = Histogram::from_luminances(lums.iter().copied()).meter(total);
     let mut ev = uni_post::target_ev(meter, 0.0);
     let dimmest = lums.iter().copied().fold(f32::INFINITY, f32::min);
@@ -405,7 +453,8 @@ fn settled_meter(lums: &[f32], total: u32) -> (Option<uni_post::histogram::Meter
             // Every pixel is stored as a normal f16: nothing to quantise.
             break;
         }
-        meter = Histogram::from_luminances(lums.iter().map(|&l| through_f16(l, pre))).meter(total);
+        meter = Histogram::from_luminances(lums.iter().map(|&l| through_f16(l, pre, subnormals)))
+            .meter(total);
         let next = uni_post::target_ev(meter, 0.0);
         let settled = (next - ev).abs() < 1.0e-3;
         ev = next;

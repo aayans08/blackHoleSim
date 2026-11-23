@@ -636,7 +636,9 @@ mod tests {
     use crate::starindex::star_pos_pc;
 
     /// The snapshot as `build` made it before B9g's speed-up: the reference for
-    /// `build_matches_the_reference`.
+    /// `build_matches_the_reference`. A verbatim copy of the old code, kept to prove the
+    /// speed-up changed nothing: remove it (and that test) after the Wave B gate, rather than
+    /// mirror later changes to `build` here (review B9g r0 minor 5).
     pub(crate) fn build_reference(world: &World, view: &CameraView, viewport: UVec2) -> Snapshot {
         let proj = Projector::new(view, viewport);
         let height = f64::from(viewport.y.max(1));
