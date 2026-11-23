@@ -1,8 +1,9 @@
 //! AT-HYG stars in 3-D, pass "stars" (Task B4).
 //!
 //! Every star of `World::star_data()` is one instance of a screen-aligned quad (four vertices,
-//! two triangles from an index buffer), blended additively into `hdr` at the far plane (depth 0,
-//! compare `GreaterEqual`, as M0). Per star the vertex stage of `stars3d.wgsl`:
+//! two triangles from an index buffer), blended additively into `hdr` at the far plane (depth 0)
+//! with no depth attachment: bodies occlude a star through `lens_mask` alone (lead ruling B9c,
+//! [`STARS3D_DEPTH`]). Per star the vertex stage of `stars3d.wgsl`:
 //! 1. skips the instance slots in [`StarInput::suppressed`] (near stars uni-sim draws as surfaces
 //!    or points): all four vertices go to one point outside the clip volume, a degenerate quad;
 //! 2. places the star: p = (sector centre − camera) + offset + v·t, in f32 (below);
@@ -31,7 +32,12 @@
 //!    [`vivid_color`] while [`StarInput::vivid_colours`] is on.
 //!
 //! The fragment stage writes radiance × PSF weight × (1 − r)(1 − g) of `lens_mask` (the frame
-//! contract's sky-light rule), clamped to `HDR_MAX`.
+//! contract's sky-light rule, `star_sky_factor`), clamped to `HDR_MAX`. That factor is the only
+//! occlusion: every opaque writer stores its coverage in g (bodies and star surfaces their
+//! coverage, rings their opacity, atmospheres 1 − T), so a star behind a body's interior gets 0
+//! and one behind a body's anti-aliased edge pixel its (1 − coverage) share. Before task B9c a
+//! far-plane depth test (`GreaterEqual` against 0) also ran, and since the bodies pass writes
+//! depth on every edge fragment it dropped the sky there entirely.
 //!
 //! **Precision (design §5.2, Review Focus 5).** [`StarField3::new`] sorts the stars by 16-pc
 //! sector ([`crate::sectors`]) and stores each star's f32 offset from its sector's centre. The
@@ -433,16 +439,83 @@ pub(crate) fn star_bgl_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     ]
 }
 
-/// The splat pipeline of the star (`vs_stars`/`fs_stars`, depth `GreaterEqual` at the far plane)
-/// or point (`vs_points`/`fs_points`, depth `Greater` at the true distance) pass: an indexed
-/// triangle list, no face culling (the quad's winding depends on the y flip), additive blending
-/// into `hdr`'s colour, depth tested and never written.
+/// How a sky pass meets the depth buffer (lead ruling B9c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkyDepth {
+    /// No depth attachment and no depth state: far-plane sky light (the band, catalogue stars)
+    /// is occluded by the `lens_mask` factors alone. Every opaque writer stores its coverage in
+    /// g, so a body's interior pixel keeps none of the sky and an anti-aliased edge pixel its
+    /// (1 − coverage) share. A far-plane test (`GreaterEqual` against the cleared 0) drops the
+    /// whole sky on every edge fragment the bodies pass writes depth for: B9c measured it on
+    /// Venus's night limb (22 pixels with no band behind them).
+    MaskOnly,
+    /// A read-only test against the scene depth with this compare, never written: the reflected
+    /// bodies' point sprites, drawn at their true distance, which can be behind a body.
+    Test(wgpu::CompareFunction),
+}
+
+impl SkyDepth {
+    /// The pipeline's depth state: none for [`SkyDepth::MaskOnly`], else read-only with the
+    /// compare.
+    pub(crate) fn state(self) -> Option<wgpu::DepthStencilState> {
+        match self {
+            SkyDepth::MaskOnly => None,
+            SkyDepth::Test(compare) => Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(compare),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+        }
+    }
+
+    /// The pass's depth attachment: `view` read-only (`depth_ops: None`) exactly when
+    /// [`SkyDepth::state`] has a depth state (wgpu requires the two to agree).
+    pub(crate) fn attachment(
+        self,
+        view: &wgpu::TextureView,
+    ) -> Option<wgpu::RenderPassDepthStencilAttachment<'_>> {
+        self.state()
+            .map(|_| wgpu::RenderPassDepthStencilAttachment {
+                view,
+                depth_ops: None,
+                stencil_ops: None,
+            })
+    }
+}
+
+/// The 3-D star pass's depth: none ([`SkyDepth::MaskOnly`], lead ruling B9c).
+pub(crate) const STARS3D_DEPTH: SkyDepth = SkyDepth::MaskOnly;
+
+/// The splat pipeline of the point pass (`vs_points`/`fs_points`, depth `depth_compare` at the
+/// true distance, read-only): [`splat_pipeline_with`] with [`SkyDepth::Test`].
 pub(crate) fn splat_pipeline(
     device: &wgpu::Device,
     module: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
     entry_points: (&str, &str),
     depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    splat_pipeline_with(
+        device,
+        module,
+        layout,
+        entry_points,
+        SkyDepth::Test(depth_compare),
+    )
+}
+
+/// The splat pipeline of the star (`vs_stars`/`fs_stars`, [`STARS3D_DEPTH`]: no depth) or point
+/// (`vs_points`/`fs_points`, depth `Greater` at the true distance) pass: an indexed triangle
+/// list, no face culling (the quad's winding depends on the y flip), additive blending into
+/// `hdr`'s colour, depth as `depth` says (never written).
+pub(crate) fn splat_pipeline_with(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    entry_points: (&str, &str),
+    depth: SkyDepth,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(entry_points.0),
@@ -465,13 +538,7 @@ pub(crate) fn splat_pipeline(
             })],
         }),
         primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(false),
-            depth_compare: Some(depth_compare),
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
+        depth_stencil: depth.state(),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
@@ -487,12 +554,31 @@ pub(crate) fn quad_index_buffer(device: &wgpu::Device) -> wgpu::Buffer {
     })
 }
 
-/// Begins a render pass named `label` that adds into `hdr` and tests (never writes) depth.
+/// Begins the point pass's render pass `label`, which adds into `hdr` and tests (never writes)
+/// depth: [`begin_splat_pass_with`] with [`SkyDepth::Test`] (the compare is the pipeline's).
 pub(crate) fn begin_splat_pass<'e>(
     enc: &'e mut wgpu::CommandEncoder,
     targets: &FrameTargets,
     timer: &mut PassTimer,
     label: &'static str,
+) -> wgpu::RenderPass<'e> {
+    begin_splat_pass_with(
+        enc,
+        targets,
+        timer,
+        label,
+        SkyDepth::Test(wgpu::CompareFunction::Greater),
+    )
+}
+
+/// Begins a render pass named `label` that adds into `hdr`, with the depth attachment `depth`
+/// asks for ([`SkyDepth::attachment`]; never written).
+pub(crate) fn begin_splat_pass_with<'e>(
+    enc: &'e mut wgpu::CommandEncoder,
+    targets: &FrameTargets,
+    timer: &mut PassTimer,
+    label: &'static str,
+    depth: SkyDepth,
 ) -> wgpu::RenderPass<'e> {
     enc.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
@@ -505,12 +591,7 @@ pub(crate) fn begin_splat_pass<'e>(
                 store: wgpu::StoreOp::Store,
             },
         })],
-        // Read-only depth (`depth_ops: None`): tested, never written.
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &targets.depth_view,
-            depth_ops: None,
-            stencil_ops: None,
-        }),
+        depth_stencil_attachment: depth.attachment(&targets.depth_view),
         timestamp_writes: timer.render_writes(label),
         occlusion_query_set: None,
         multiview_mask: None,
@@ -631,14 +712,14 @@ impl StarField3 {
             bind_group_layouts: &[Some(camera_bgl), Some(&bgl)],
             immediate_size: 0,
         });
-        // Stars sit on the far plane (depth 0). Reversed-Z GreaterEqual against the cleared 0.0
-        // passes, and anything nearer occludes them.
-        let pipeline = splat_pipeline(
+        // Stars sit on the far plane (depth 0) with no depth test: lens_mask's (1 − r)(1 − g)
+        // occludes them (lead ruling B9c, STARS3D_DEPTH).
+        let pipeline = splat_pipeline_with(
             device,
             &module,
             &layout,
             ("vs_stars", "fs_stars"),
-            wgpu::CompareFunction::GreaterEqual,
+            STARS3D_DEPTH,
         );
         if let Some(err) = pollster::block_on(scope.pop()) {
             anyhow::bail!("creating the 3-D star pipeline: {err}");
@@ -741,7 +822,7 @@ impl RenderFeature for StarField3 {
         let Some(bind_group) = &self.bind_group else {
             return;
         };
-        let mut pass = begin_splat_pass(enc, targets, timer, "stars");
+        let mut pass = begin_splat_pass_with(enc, targets, timer, "stars", STARS3D_DEPTH);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, frame.camera, &[]);
         pass.set_bind_group(1, bind_group, &[]);
@@ -1212,7 +1293,8 @@ pub(crate) mod twin {
     }
 
     /// The share of a sky source's light a star keeps under `lens_mask` value `mask`:
-    /// (1 − r)(1 − g). Twin of `star_sky_factor`.
+    /// (1 − r)(1 − g). Twin of `star_sky_factor` in M0's `stars.wgsl`, which both catalogue
+    /// passes call (`stars3d.wgsl` imports it).
     pub fn star_sky_factor(mask: Vec4) -> f32 {
         (1.0 - mask.x.clamp(0.0, 1.0)) * (1.0 - mask.y.clamp(0.0, 1.0))
     }
@@ -2308,6 +2390,69 @@ mod tests {
         }
         // 1 km/s in pc/yr: the brief's 1.0227 × 10⁻⁶.
         assert!((PC_PER_YR_PER_KMS / 1.0227e-6 - 1.0).abs() < 1e-4);
+    }
+
+    /// Lead ruling B9c: the catalogue star passes (3-D and M0's BSC5 fallback) and the band have
+    /// no depth state, so the pass has no depth attachment either ([`SkyDepth::attachment`]
+    /// follows [`SkyDepth::state`]); the reflected bodies' points keep a read-only test at their
+    /// true distance (they can be behind a body), never written.
+    #[test]
+    fn sky_passes_have_no_depth_test_and_points_keep_theirs() {
+        assert!(SkyDepth::MaskOnly.state().is_none());
+        for (what, depth) in [
+            ("3-D stars", STARS3D_DEPTH),
+            ("BSC5 stars", crate::stars::STARS_DEPTH),
+            ("band", crate::band::BAND_DEPTH),
+        ] {
+            assert_eq!(depth, SkyDepth::MaskOnly, "{what}");
+        }
+        // The point pass's state, as `splat_pipeline` (its only pipeline helper) builds it.
+        let points = SkyDepth::Test(wgpu::CompareFunction::Greater)
+            .state()
+            .expect("points test depth");
+        assert_eq!(points.format, DEPTH_FORMAT);
+        assert_eq!(points.depth_compare, Some(wgpu::CompareFunction::Greater));
+        assert_eq!(points.depth_write_enabled, Some(false));
+        assert_eq!(points.stencil, wgpu::StencilState::default());
+    }
+
+    /// Lead ruling B9c: with the depth test gone, `star_sky_factor` is a star's only occlusion,
+    /// in both catalogue passes: a body's anti-aliased edge pixel (coverage 0.5 in g) keeps half
+    /// of the star's light, its interior none. M0's BSC5 pass reads g too (it read only r).
+    #[test]
+    fn catalogue_stars_keep_the_uncovered_share_at_a_body_edge() {
+        for path in [STARS3D_WGSL, crate::STARS_SHADER] {
+            let m = module(path);
+            let fs = if path == STARS3D_WGSL {
+                "fs_stars"
+            } else {
+                "fs_main"
+            };
+            assert!(
+                calls(&entry(&m, fs).body, func(&m, "star_sky_factor")),
+                "{path}: {fs} must call star_sky_factor"
+            );
+        }
+        for (mask, want, what) in [
+            (
+                Vec4::new(0.0, 0.5, 0.0, 0.0),
+                0.5,
+                "edge pixel, coverage 0.5",
+            ),
+            (Vec4::new(0.0, 1.0, 0.0, 0.0), 0.0, "body interior"),
+            (
+                Vec4::new(0.0, 0.25, 0.0, 0.0),
+                0.75,
+                "edge pixel, coverage 0.25",
+            ),
+            (
+                Vec4::new(0.5, 0.5, 1.0, 1.0),
+                0.25,
+                "half captured, half covered; b, a ignored",
+            ),
+        ] {
+            assert_eq!(star_sky_factor(mask), want, "{what}");
+        }
     }
 
     /// The star pass writes sky light at the star exposure, masked by (1 − r)(1 − g).

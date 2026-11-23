@@ -9,7 +9,7 @@
 //   PSF = (1 − h)·Gaussian core (σ = CORE_SIGMA_PX) + h·Moffat glare halo,
 //   h = HALO_ENERGY_FRACTION above HALO_MIN_LUX, else 0.
 //
-//   hdr value = E / Ω(θ) × star_pre() × (1 − lens_mask) × PSF weight
+//   hdr value = E / Ω(θ) × star_pre() × (1 − r)(1 − g) × PSF weight
 //
 // E is the star's illuminance at the observer [lux]; E/Ω(θ) is its radiance [cd/m²] spread over
 // the pixel. Ω(θ) = Ω_c·cos³θ is the solid angle [sr] of a pixel θ off the optical axis, where
@@ -21,7 +21,11 @@
 // the scene EV. When star_ev100 ≠ scene_ev100 that is the "Eye-adapted stars" dual exposure of
 // design §7 item 4, which the HUD labels.
 //
-// Blending is additive into `hdr`. Depth is tested (GreaterEqual, no writes) at the far plane.
+// Blending is additive into `hdr`, with no depth test (lead ruling B9c): (1 − r)(1 − g) of
+// lens_mask (star_sky_factor) is the only occlusion. r is the fraction a black hole captured;
+// g the sky occlusion every opaque writer stores (bodies and star surfaces their coverage), so a
+// star behind a body's anti-aliased edge pixel keeps its (1 − coverage) share instead of
+// vanishing behind the body's depth write.
 // The CPU twins are in crates/uni-sky/src/psf.rs and stars.rs. `shader_constants_match_cpu`
 // checks that the constants below match them, and `star_instance_layout_matches_wgsl` checks
 // the struct layout.
@@ -39,7 +43,8 @@ struct StarInstance {
 }
 
 @group(1) @binding(0) var<storage, read> stars: array<StarInstance>;
-// uni_gfx::LENS_MASK_FORMAT; `.r` is the fraction of the pixel a black hole captured (1 = shadow).
+// uni_gfx::LENS_MASK_FORMAT; `.r` is the fraction of the pixel a black hole captured (1 = shadow),
+// `.g` the sky occlusion by bodies, rings and atmospheres (M1 frame contract).
 // It is read with textureLoad at the fragment's integer pixel. It is the same size as `hdr`
 // (uni_gfx::FrameTargets), so the vertex stage also reads the attachment size from it.
 @group(1) @binding(1) var lens_mask: texture_2d<f32>;
@@ -211,7 +216,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // @builtin(position).xy is this pixel's centre (k + 0.5), so floor gives the pixel index k.
     let pix = floor(in.pos.xy);
-    let captured = clamp(textureLoad(lens_mask, vec2<i32>(pix), 0).r, 0.0, 1.0);
+    let mask = textureLoad(lens_mask, vec2<i32>(pix), 0);
     // Core: the Gaussian integrated over this pixel's square [pix, pix + 1]², relative to the
     // star's centre.
     let edge = pix - in.centre_px;
@@ -219,6 +224,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (in.halo.x > 0.0) {
         weight += in.halo.x * halo_weight(length(pix + vec2<f32>(0.5) - in.centre_px), in.halo.y);
     }
-    let rgb = in.radiance * (weight * (1.0 - captured));
+    let rgb = in.radiance * (weight * star_sky_factor(mask));
     return vec4<f32>(min(rgb, vec3<f32>(HDR_MAX)), 0.0);
+}
+
+// The share of sky light a star keeps under lens-mask value `mask`: (1 − r)(1 − g) (M1 frame
+// contract), shared by M0's pass above and the 3-D star pass (sky/stars3d.wgsl imports this
+// file). Twin of `uni_sky::stars3d::twin::star_sky_factor`.
+fn star_sky_factor(mask: vec4<f32>) -> f32 {
+    return (1.0 - clamp(mask.r, 0.0, 1.0)) * (1.0 - clamp(mask.g, 0.0, 1.0));
 }

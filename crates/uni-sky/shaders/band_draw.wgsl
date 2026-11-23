@@ -4,9 +4,10 @@
 //     hdr += units × ENV_UNIT_CD_M2 × star_pre() × (1 − r)(1 − g)(1 − b), clamped to HDR_MAX,
 // with r, g, b the lens_mask channels (M1 frame contract, uni_gfx::targets): r the captured
 // fraction, g the sky occlusion by bodies, rings and atmospheres, b where the lens pass already
-// drew the lensed environment. The pipeline blends additively and tests depth GreaterEqual
-// against the cleared 0.0 without writing it, so the band shows only where no body was drawn
-// (ruling 4: the band comes after the opaque passes and the meter).
+// drew the lensed environment (band_sky_factor). The pipeline blends additively and has no depth
+// attachment (lead ruling B9c; uni_sky::band::BAND_DEPTH): every opaque writer stores its
+// coverage in g, so a body's interior keeps none of the band and an anti-aliased edge pixel its
+// (1 − coverage) share. Ruling 4: the band comes after the opaque passes and the meter.
 
 #import "common/camera.wgsl"
 
@@ -18,6 +19,12 @@ const BAND_ENV_UNIT_CD_M2: f32 = 1.0e-4;
 @group(1) @binding(1) var band_sampler: sampler;
 // uni_gfx::FrameTargets::lens_mask, read with textureLoad at integer pixels.
 @group(1) @binding(2) var band_lens_mask: texture_2d<f32>;
+
+// The share of the band a pixel keeps under lens-mask value `mask`: (1 − r)(1 − g)(1 − b) (M1
+// frame contract). Twin of `uni_sky::band::tests::band_sky_factor`.
+fn band_sky_factor(mask: vec4<f32>) -> f32 {
+    return saturate(1.0 - mask.r) * saturate(1.0 - mask.g) * saturate(1.0 - mask.b);
+}
 
 // A triangle covering the screen, at depth 0 (the far plane of the reversed-Z projection).
 @vertex
@@ -32,7 +39,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let pix = floor(pos.xy);
     let units = textureSampleLevel(band_env, band_sampler, pixel_dir(pix), 0.0).rgb;
     let mask = textureLoad(band_lens_mask, vec2<i32>(pix), 0);
-    let visible = saturate(1.0 - mask.r) * saturate(1.0 - mask.g) * saturate(1.0 - mask.b);
-    let light = units * (BAND_ENV_UNIT_CD_M2 * star_pre() * visible);
+    let light = units * (BAND_ENV_UNIT_CD_M2 * star_pre() * band_sky_factor(mask));
     return vec4<f32>(clamp(light, vec3<f32>(0.0), vec3<f32>(HDR_MAX)), 0.0);
 }

@@ -22,9 +22,15 @@
 //!
 //! **Draw.** [`BandDraw`] draws a full-screen triangle at depth 0 after the opaque passes and the
 //! meter (ruling 4): mip 0 in each pixel's direction × `ENV_UNIT_CD_M2 × star_pre()` ×
-//! (1 − r)(1 − g)(1 − b) of `lens_mask`, blended additively, depth test `GreaterEqual` without
-//! writing (only where no body was drawn), clamped to `HDR_MAX`. [`BandInput::enabled`] `= false`
-//! skips both passes.
+//! (1 − r)(1 − g)(1 − b) of `lens_mask` (`band_sky_factor`), blended additively, clamped to
+//! `HDR_MAX`. It has no depth attachment ([`BAND_DEPTH`], lead ruling B9c): the mask factors are
+//! the only occlusion. Every opaque writer stores its coverage in g (bodies and star surfaces
+//! their coverage, rings their opacity, atmospheres 1 − T), so a body's interior keeps none of
+//! the band and an anti-aliased edge pixel its (1 − coverage) share. The far-plane depth test it
+//! had before (`GreaterEqual` against the cleared 0) dropped the whole band on every edge
+//! fragment the bodies pass writes depth for: on Venus's night limb, 22 pixels with no sky behind
+//! their haze, which row 13's limb check read as 14 % too little haze (task B9c).
+//! [`BandInput::enabled`] `= false` skips both passes.
 //!
 //! **Honesty.** The band is the galaxy model v0 (a smooth dust layer, no clouds or clusters), so
 //! the HUD shows "Milky Way band: galaxy model v0 (real dust map in M4)" while it is on screen
@@ -39,13 +45,20 @@ use uni_data::f16_to_f32;
 use uni_gfx::env::cube_dir;
 use uni_gfx::probe::{ProbeResult, run_compute};
 use uni_gfx::{
-    DEPTH_FORMAT, ENV_UNIT_CD_M2, EnvMap, FrameBindings, FrameCtx, FrameTargets, GpuContext,
-    HDR_FORMAT, HDR_MAX, PassTimer, RenderFeature, ShaderLib, SharedInput,
+    ENV_UNIT_CD_M2, EnvMap, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, HDR_MAX,
+    PassTimer, RenderFeature, ShaderLib, SharedInput,
 };
 use uni_procgen::galaxy::{GalaxyGpu, GalaxyModel};
 use wgpu::util::DeviceExt as _;
 
+use crate::stars3d::SkyDepth;
 use crate::{BAND_DRAW_WGSL, BAND_UPDATE_WGSL};
+
+/// The band draw's depth: none (lead ruling B9c; see the module docs). Only the full-screen
+/// triangle's fragment cost grows, by the body pixels the depth test used to reject early: B9p's
+/// interleaved runs measured 0.56–0.65 ms without a depth attachment against 0.51–0.68 ms with
+/// it (1920×1080, M3), no measurable change.
+pub(crate) const BAND_DEPTH: SkyDepth = SkyDepth::MaskOnly;
 
 /// Edge of each cubemap face [texels]: 90° / 512 = 0.18° per texel, about 2 px at a 90° field
 /// over 1080 lines. B5's brief had 256 (0.35°, 4–6 px per texel), too coarse for the galaxy
@@ -600,15 +613,9 @@ impl BandDraw {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            // The triangle sits on the far plane (depth 0). Reversed-Z GreaterEqual against the
-            // cleared 0.0 passes only where no body was drawn (ruling 4); depth is never written.
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            // The triangle sits on the far plane (depth 0) with no depth test: lens_mask's
+            // (1 − r)(1 − g)(1 − b) occludes it (lead ruling B9c, BAND_DEPTH).
+            depth_stencil: BAND_DEPTH.state(),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -690,12 +697,7 @@ impl RenderFeature for BandDraw {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            // Read-only depth (`depth_ops: None`): tested, never written.
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth_view,
-                depth_ops: None,
-                stencil_ops: None,
-            }),
+            depth_stencil_attachment: BAND_DEPTH.attachment(&targets.depth_view),
             timestamp_writes: timer.render_writes(DRAW_NAME),
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1762,6 +1764,71 @@ mod tests {
         );
         assert_eq!(binding(&probe, "probe_in"), Some((0, 0)));
         assert_eq!(binding(&probe, "probe_out"), Some((0, 1)));
+    }
+
+    /// The share of the band a pixel keeps under `lens_mask` value `mask`: (1 − r)(1 − g)(1 − b),
+    /// each factor clamped to [0, 1]. Twin of `band_sky_factor` in band_draw.wgsl.
+    fn band_sky_factor(mask: glam::Vec4) -> f32 {
+        (1.0 - mask.x.clamp(0.0, 1.0))
+            * (1.0 - mask.y.clamp(0.0, 1.0))
+            * (1.0 - mask.z.clamp(0.0, 1.0))
+    }
+
+    /// Lead ruling B9c: the band draw has no depth state or attachment, its fragment stage
+    /// occludes through `band_sky_factor` alone, and that factor gives a body's anti-aliased edge
+    /// pixel (coverage 0.5 in g) half the band, its interior none, and open sky all of it. With
+    /// the old far-plane test, the edge pixel got none (the bodies pass writes depth there).
+    #[test]
+    fn band_draw_occludes_by_the_mask_alone() {
+        assert_eq!(BAND_DEPTH, SkyDepth::MaskOnly);
+        assert!(BAND_DEPTH.state().is_none());
+        let m = module(BAND_DRAW_WGSL);
+        let fs = &m
+            .entry_points
+            .iter()
+            .find(|e| e.name == "fs_main")
+            .expect("fs_main")
+            .function;
+        let factor = m
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("band_sky_factor"))
+            .map(|(h, _)| h)
+            .expect("fn band_sky_factor");
+        assert!(
+            crate::stars3d::tests_support::calls(&fs.body, factor),
+            "fs_main must call band_sky_factor"
+        );
+        use glam::Vec4;
+        for (mask, want, what) in [
+            (
+                Vec4::new(0.0, 0.5, 0.0, 0.0),
+                0.5,
+                "edge pixel, coverage 0.5",
+            ),
+            (Vec4::new(0.0, 1.0, 0.0, 0.0), 0.0, "body interior"),
+            (Vec4::ZERO, 1.0, "open sky"),
+            // An edge pixel behind haze: g = max(coverage, 1 − T) (both written with Max).
+            (
+                Vec4::new(0.0, 0.31, 0.0, 0.0),
+                0.69,
+                "edge under haze, T 0.69",
+            ),
+            (Vec4::new(1.0, 0.0, 0.0, 0.0), 0.0, "black-hole shadow"),
+            (
+                Vec4::new(0.0, 0.0, 1.0, 0.0),
+                0.0,
+                "lensed environment drawn",
+            ),
+            (Vec4::new(0.5, 0.5, 0.5, 1.0), 0.125, "all three halves"),
+            (Vec4::new(-1.0, 2.0, 0.0, 0.0), 0.0, "clamped"),
+        ] {
+            assert!(
+                (band_sky_factor(mask) - want).abs() < 1e-6,
+                "{what}: {} vs {want}",
+                band_sky_factor(mask)
+            );
+        }
     }
 
     /// CLAUDE.md §3: every WGSL file validates with naga, with the entry points the pipelines

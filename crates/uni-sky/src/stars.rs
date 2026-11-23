@@ -14,13 +14,20 @@ use glam::{Mat4, Vec2, Vec3};
 use uni_core::{blackbody_linear_srgb, star_illuminance_lux};
 use uni_data::CatalogStar;
 use uni_gfx::{
-    DEPTH_FORMAT, FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer,
-    RenderFeature, ShaderLib,
+    FrameBindings, FrameCtx, FrameTargets, GpuContext, HDR_FORMAT, PassTimer, RenderFeature,
+    ShaderLib,
 };
 use wgpu::util::DeviceExt as _;
 
+use crate::stars3d::SkyDepth;
+
 /// Path of the star shader in the [`ShaderLib`].
 pub const STARS_SHADER: &str = "sky/stars.wgsl";
+
+/// The BSC5 star pass's depth: none, as the 3-D star pass's (lead ruling B9c,
+/// `stars3d::SkyDepth::MaskOnly`). `star_sky_factor`'s (1 − r)(1 − g) of `lens_mask` occludes
+/// the stars, so a star behind a body's anti-aliased edge pixel keeps its (1 − coverage) share.
+pub(crate) const STARS_DEPTH: SkyDepth = SkyDepth::MaskOnly;
 
 /// Default star exposure [EV at ISO 100]: an artistic choice, the "Eye-adapted stars" dual
 /// exposure of design §7 item 4. The HUD exposes it as the star EV slider.
@@ -290,15 +297,9 @@ impl StarField {
             }),
             // Triangle list, no face culling (the quad's winding depends on the y flip).
             primitive: wgpu::PrimitiveState::default(),
-            // Stars sit on the far plane (depth 0). Reversed-Z GreaterEqual against the cleared
-            // 0.0 passes, and anything nearer occludes them. Depth is never written.
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            // Stars sit on the far plane (depth 0) with no depth test: lens_mask's
+            // (1 − r)(1 − g) occludes them (lead ruling B9c, STARS_DEPTH).
+            depth_stencil: STARS_DEPTH.state(),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -381,12 +382,7 @@ impl RenderFeature for StarField {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            // Read-only depth (`depth_ops: None`): tested, never written.
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth_view,
-                depth_ops: None,
-                stencil_ops: None,
-            }),
+            depth_stencil_attachment: STARS_DEPTH.attachment(&targets.depth_view),
             timestamp_writes: timer.render_writes("stars"),
             occlusion_query_set: None,
             multiview_mask: None,

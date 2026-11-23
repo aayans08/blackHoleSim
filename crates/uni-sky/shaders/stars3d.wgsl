@@ -2,8 +2,9 @@
 // (sky/points.wgsl) shares by importing this file.
 //
 // Each star is one instance of a screen-aligned quad (four vertices, two triangles from an index
-// buffer) centred on its exact sub-pixel projected position, drawn at the far plane (depth 0,
-// GreaterEqual). Per star the vertex stage:
+// buffer) centred on its exact sub-pixel projected position, drawn at the far plane (depth 0)
+// without a depth test: bodies occlude stars through lens_mask's (1 − r)(1 − g) alone (lead
+// ruling B9c; uni_sky::stars3d::STARS3D_DEPTH). Per star the vertex stage:
 //   1. emits a degenerate quad for a suppressed instance slot (near stars drawn elsewhere);
 //   2. places the star relative to the camera [pc]:
 //        p = (sector centre − camera) + offset + v·t,
@@ -19,7 +20,8 @@
 //   5. for a drawn splat only, the colour from B−V through the Planck table, boosted by
 //      vivid_color when the option is on.
 // The fragment stage integrates the PSF over its pixel (erf differences, so the footprint sums
-// to the star's energy at any sub-pixel position) and writes it × (1 − r)(1 − g) of lens_mask.
+// to the star's energy at any sub-pixel position) and writes it × (1 − r)(1 − g) of lens_mask
+// (star_sky_factor, M0's, imported).
 //
 //   hdr value = E / Ω(θ) × star_pre() × (1 − r)(1 − g) × PSF weight,  Ω(θ) = Ω_c·cos³θ.
 //
@@ -355,12 +357,6 @@ fn psf_weight(pix: vec2<f32>, centre: vec2<f32>, halo: vec3<f32>) -> f32 {
         weight += halo.x * stars3d_halo_weight(r, halo.y, halo.z);
     }
     return weight;
-}
-
-// The share of sky light kept under lens-mask value `mask`: (1 − r)(1 − g) (frame contract).
-// Twin of `uni_sky::stars3d::twin::star_sky_factor`.
-fn star_sky_factor(mask: vec4<f32>) -> f32 {
-    return (1.0 - clamp(mask.r, 0.0, 1.0)) * (1.0 - clamp(mask.g, 0.0, 1.0));
 }
 
 fn is_suppressed(slot: u32) -> bool {
