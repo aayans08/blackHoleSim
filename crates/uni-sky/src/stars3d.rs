@@ -14,10 +14,13 @@
 //! 5. splats it with an energy-normalised eye PSF at E/Ω(θ) × `star_pre()`, Ω(θ) = Ω_c·cos³θ as
 //!    M0 (`crate::stars`): M0's erf-integrated Gaussian core (`crate::psf`) holding
 //!    1 − [`STARS3D_HALO_FRACTION`] of the light, plus, for every star, the eye's glare halo,
-//!    a Moffat β = 1.5 profile fitted to the CIE general disability glare equation (Task B4L;
-//!    see [`STARS3D_HALO_FRACTION`]). The PSF is linear, so a bright star is not given a bigger
-//!    image: its halo simply rises above the display's black over more pixels (radius ∝ E^⅓),
-//!    and the brightest stars glow while faint ones stay points. It culls the splat when no
+//!    a Moffat profile (β = 1.36, α = 0.1°) fitted to the CIE general disability glare equation
+//!    (Task B4L; see [`STARS3D_HALO_FRACTION`]). Every star gets the same profile, so a bright
+//!    star is not given a bigger image: its halo simply rises above the display's black over
+//!    more pixels (the radius grows as E^(1/2β) = E^0.37), and the brightest stars glow while
+//!    faint ones stay points. (The halo is renormalised inside the footprint radius, which grows
+//!    with E, so the PSF is energy-conserving but not exactly linear: a faint star's halo is
+//!    packed into its 2-px footprint, below the display's black.) It culls the splat when no
 //!    pixel would rise above `psf::VISIBILITY_CUTOFF` ([`star_is_visible`]), and sizes its quad
 //!    with [`footprint_radius_px`] (M0's rule with this halo and a 2-px minimum,
 //!    [`STARS3D_MIN_RADIUS_PX`], review m16). The core's WGSL is M0's own: `stars3d.wgsl`
@@ -80,7 +83,7 @@ pub const STARS3D_MIN_RADIUS_PX: f32 = 2.0;
 /// profile (Moffat 1969) h·(β − 1)/(πα²)·(1 + θ²/α²)^(−β), its width fixed at α = 0.1°, where
 /// the equation starts and the eye's optical core (≈ 1′) has long ended, and β and h fitted to
 /// the equation (minimax in log) over 0.3°–3°, where a bright star's glow shows: β = 1.36,
-/// h = 0.239, within ±11 % of the equation there (0.73× at 0.2°; `halo_follows_the_cie_glare_
+/// h = 0.239, within ±12 % of the equation there (0.73× at 0.2°; `halo_follows_the_cie_glare_
 /// equation`). It holds 0.165 of the light between 0.1° and 3° (the equation: 0.219) and 0.053
 /// inside 0.1° (the equation says nothing there); the equation's light beyond 3° (0.055, a veil
 /// tens of degrees wide) is left to uni-post's bloom. A β = 1.5 fit to the 10/θ³ term alone
@@ -88,8 +91,10 @@ pub const STARS3D_MIN_RADIUS_PX: f32 = 2.0;
 ///
 /// The halo is fixed in display pixels, as the eye looking at the screen would see it, at the
 /// reference display of the default view: a 60° field over 1080 lines, 0.0556° per pixel, so
-/// α = 0.1° = 1.8 px. Every star has it (the PSF is linear); a faint star's halo stays below
-/// the display's black.
+/// α = 0.1° = 1.8 px. Every star has it (the same profile whatever its light); a faint star's
+/// halo stays below the display's black. Because it is fixed in pixels, the "0.1°" holds only at
+/// that reference field: at a 2° zoom the halo is 0.0033° on the sky, as an eye at a telescope
+/// sees glare in its own field, not the sky's.
 pub const STARS3D_HALO_FRACTION: f32 = 0.239;
 /// Moffat width α of the 3-D halo [px]: 0.1° at 0.0556° per pixel ([`STARS3D_HALO_FRACTION`]).
 pub const STARS3D_HALO_ALPHA_PX: f32 = 1.8;
@@ -1834,8 +1839,8 @@ mod tests {
         assert!(samples.iter().all(|&x| x > 0.0));
     }
 
-    /// Review r0 M7, B4L: the halo share never depends on the star's light or its twinkle (the
-    /// eye's PSF is linear), so no star's halo switches on or off, M0's 1e-6 lx threshold
+    /// Review r0 M7, B4L: the halo share never depends on the star's light or its twinkle (every
+    /// star has the eye's halo), so no star's halo switches on or off, M0's 1e-6 lx threshold
     /// included.
     #[test]
     fn halo_share_ignores_the_twinkle() {

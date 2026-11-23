@@ -324,8 +324,8 @@ fn splat_vertex(
     let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
     // Display-normalised energy: the footprint's sum of pre-exposed hdr values.
     let energy = min(lux * twinkle * star_pre() / omega, MAX_SPLAT_ENERGY);
-    // Every star has the eye's halo (B4L): the PSF is linear, so its shape never depends on the
-    // star's light (nor switches at the twinkle rate, review r0 M7).
+    // Every star has the eye's halo (B4L): its share never depends on the star's light (nor
+    // switches at the twinkle rate, review r0 M7).
     let h = STARS3D_HALO_FRACTION;
     if (!star_is_visible(energy, h)) {
         return out_culled;
