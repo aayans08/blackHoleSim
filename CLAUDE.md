@@ -22,12 +22,12 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: the M0 final-review fix wave (after tag `m0`; report:
-> `.superpowers/sdd/2026-11-20-m0-foundation/final-fix-report.md`).
-> 272 unit tests pass (workspace lib + bins; 241 at tag `m0`). On the M3, `universe --selftest` passes 3/3
-> (pcg3d bit-exact, AgX 1.5e-5, Binet 1.27e-4 rad), `--capture bookmarks/m0.ron` renders 6/6 bookmarks (each
-> within 1 code value of its `m0` capture), and the shadow measures 158.745 px (GR: 158.745). Every GPU pass time
-> is now a valid measurement. `--bench` at 1920×1080 measured: sky views 0.9–1.3 ms GPU per frame; `start`
+> **Updated by the lead after each wave.** Last update: the M1 Wave A gate (A10, 2026-11-23; ledger
+> `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`). 632 unit tests pass, 1 ignored (workspace lib +
+> bins). On the M3, `universe --selftest` passes 4/4 (pcg3d bit-exact, AgX 1.5e-5, Binet 1.27e-4 rad, cube_dir
+> 1.0e-7); `--capture bookmarks/m0.ron` renders 6/6, every PNG bit-identical to the `m0` captures; the shadow
+> measures 158.745 px (GR: 158.745). Wave A's crates are not drawn yet, so the M0 numbers below still hold.
+> Measured before Wave A (M0 final-review fix wave): every GPU pass time valid; `--bench` at 1920×1080: sky views 0.9–1.3 ms GPU per frame; `start`
 > (lens scale 0.5) 38.7 ms GPU, 25.6 fps serial; `bh-shadow-30M` (lens scale 1.0) 157 ms. At the window's
 > 1728×1080 internal size, `start` runs at 27 fps. The brute-force lens pass is ground truth only; M3 replaces it.
 > The window itself was not run in this wave, so its FPS is still unmeasured; the HUD now shows it.
@@ -43,14 +43,28 @@ crates/
   uni-core/     FROZEN API, implemented: units, pos (UniversePos), epoch (TDB, leap seconds), frame (FrameTree),
                 camera, hash (pcg3d, splitmix64), color (CIE blackbody, B−V→Teff, star lux), galactic
   uni-gfx/      FROZEN API, implemented: context (GpuContext, headless + windowed, GPU error log), targets (pass
-                contract, HDR_MAX), frame (FrameCtx, CameraUniform 240 B, ExposureUniform 32 B, exposure_scale),
-                timer (PassTimer: Option ms per pass + whole-frame ms), renderer (RenderFeature, Renderer,
-                FrameBindings), shader (ShaderLib #import + naga validate), capture, proj (reversed-Z
-                infinite); shaders/common/*.wgsl
+                contract, HDR_MAX), frame (FrameCtx, CameraUniform 336 B, ExposureUniform 32 B, LightUniform
+                144 B, exposure_scale), timer (PassTimer: Option ms per pass + whole-frame ms), renderer
+                (RenderFeature, Renderer, FrameBindings), shared (SharedInput<T>), env (cube_dir twin), probe
+                (compute probes for --selftest), shader (ShaderLib #import + naga validate), capture, proj
+                (reversed-Z infinite); shaders/common/*.wgsl
   uni-post/     upscale (internal → output) + AgX tonemap + TPDF dither pass on pre-exposed HDR; CPU twin
                 uni_post::agx
-  uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks
-  uni-data/     BSC5 loader (binary format v1); data_dir()
+  uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks;
+                anchor (camera parented to a body frame, resolve_bookmark) [M1 A6]
+  uni-data/     loaders: BSC5, AT-HYG 3-D stars + names, maps (BC7/BC4 .big + 2k fallbacks, index.ron),
+                saturn ring profile, JPL satellite elements, SBDB comets and asteroids, exoplanet hosts, body
+                facts, Horizons goldens; data_dir() [M1 A7–A9.1]
+  uni-physics/  planets: Standish 1992 Table 1 (1800–2050) / Table 2 with 20-yr blend bands 1780–1800 and
+                2050–2070, Meeus Pluto, SSB; moons: Meeus 47 Moon, E5 Galileans, Meeus 46 Saturn moons
+                (approximate, labelled), JPL mean elements; WGCCRE 2015 rotation; Ephemeris; photometry
+                (Mallama & Hilton 2018, phase correction C ≤ 10), small bodies (two-body + planet-perturbed
+                RK4, osculate_at), Finson–Probstein dust, calculators [M1 A1–A3]
+  uni-sim/      time warp, registry (17 821 objects incl. 8 973 H ≤ 10 asteroids, grows at runtime),
+                cached f64 states (threaded refresh, 0.42 ms per tick release), snapshot (≤ 1.34 ms
+                release), honesty flags, near-star index; comets start from data/baked/comets_2026.ron and
+                catch up after date jumps under the "catching up" label [M1 A4, A4r, A4p]
+  uni-procgen/  galaxy model v0 (+ galaxy.wgsl), faint-star luminosity function [M1 A5]
   uni-sky/      StarField: energy-conserving erf-integrated PSF splats, Moffat glare, Planck LUT
   uni-rel/      binet CPU tracer (golden-tested); LensTracer compute pass (writes only its traced rectangle,
                 lens_mask); DebugSkyBackground (the M0 debug grid, drawn only while the lens is traced); LensScale
@@ -59,8 +73,10 @@ crates/
                 `--capture <bookmarks.ron> --out <dir> [--size WxH] [--frames N] [--hud]`;
                 `--bench <bookmarks.ron> [--size WxH] [--frames N]`; `--selftest`. World (TestBH-1: 10 M☉ at
                 SSB + 1000 AU), scene wiring, F12 saves a view bookmark
-  uni-planet/, uni-atmo/, uni-physics/, uni-procgen/, uni-sim/   doc comment only (later milestones)
-tools/bake/     bin `uni-bake bsc5`: data/cache/bsc5/catalog.gz → data/baked/bsc5.bin (9096 stars)
+  uni-planet/, uni-atmo/   doc comment only (M1 Wave B)
+  The app still draws the M0 world: Wave A's crates are not wired into uni-app yet (Wave B, B9).
+tools/bake/     bin `uni-bake`: bsc5, athyg, exo, map, rings, sbdb, sats, facts, horizons, comets-epoch
+                (raw inputs in data/cache/, outputs in data/baked/)
 tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html>`, `contact --captures <dir> --out <png>
                 [--width 2400]` (one labelled grid PNG), `shadow --png <f> --expected-px <r> --tol <t>`
 bookmarks/m0.ron             the six M0 capture bookmarks (RON, implicit_some)
@@ -69,8 +85,11 @@ archive/legacy-2025.tar.xz   legacy Python, GLSL, run scripts, old docs and old 
 archive/old-rust/            the old wgpu 0.19 renderer and shaders (every frame one flat colour; reference only)
 textures/*.jpg               7 Solar System Scope 2k maps (CC BY 4.0, see ATTRIBUTION.md);
                              stars_milky_way.jpg is never the sky: no photo skyboxes (design §7.6)
-data/manifest.toml           one entry per data file: id, url, sha256, license, credit, paths (BSC5 so far)
-data/baked/                  small baked outputs, committed (bsc5.bin so far)
+data/manifest.toml           one entry per data file: id, url, sha256, license, credit, paths (44 entries)
+data/baked/                  small baked outputs, committed: bsc5.bin, athyg_m10.bin (329 768 stars, CC BY-SA),
+                             athyg_names.ron, asteroids.bin (33 678) + names, comets.ron (512, SBDB) and
+                             comets_2026.ron (derived), sat_elements.ron, body_facts.ron, exoplanets.ron,
+                             saturn_rings.ron, maps/index.ron; maps/*.big are git-ignored (rebuild with uni-bake map)
 docs/superpowers/specs/      the design (binding)
 docs/superpowers/plans/      milestone plans
 docs/research/               research reports, golden values, wgpu30-skeleton/
@@ -81,7 +100,7 @@ Target responsibilities per crate are in design §5.1. Every render crate implem
 Git-ignored outputs: `data/cache/` (raw downloads), `captures/` (capture PNG + JSON).
 
 **Render contract (uni-gfx: the M1 frame contract, set by Task A0a; full text in the `crates/uni-gfx/src/targets.rs`
-doc comment; every feature follows it)**
+doc comment; every feature must follow it)**
 - *Shared group 0.* `RenderFeature::encode(gpu, enc, frame: &FrameBindings, targets, output, timer)`. Bind
   `frame.camera` at group 0 (layout `Renderer::camera_bind_group_layout()`): binding 0 `CameraUniform` (336 B:
   view_rot, proj, inv_view_proj, prev_view_proj, viewport, output, time, sim, cam_delta), binding 1
@@ -186,6 +205,8 @@ Verbatim from the M0 plan. They bind every task.
 - Request `adapter.limits()` explicitly.
 - Required features = `adapter.features() ∩ {SHADER_F16, FLOAT32_FILTERABLE, TIMESTAMP_QUERY}`.
 - The app must run when `TIMESTAMP_QUERY` is absent.
+- (Superseded in M1, ruling 1: the set also includes `TEXTURE_COMPRESSION_BC` and `DUAL_SOURCE_BLENDING`, and
+  the app must run without either; see §2 "GPU errors and features".)
 
 **Units and coordinates**
 - CPU: SI units (m, s, kg) in f64.
@@ -218,6 +239,7 @@ Verbatim from the M0 plan. They bind every task.
 - Anything approximate or non-physical is labelled on screen. In M0 that means the lens background ("M0 debug grid") and speeds faster than c ("FTL · non-physical").
 - (Added after M0, review I4.) Dual exposure: whenever star EV ≠ scene EV (the default: star EV −4, scene EV 0),
   the HUD shows the amber line "Eye-adapted stars (dual exposure, non-physical)" (design §2, §7.4).
+  (Refined in M1, review m12/m13: the label follows `ExposureSettings.eye_adapted && !daylight`, as §2 states.)
 
 **Standing commit rule** (renewed at tag `m0`; it overrides "Agents never commit" above, which is kept verbatim
 from the M0 plan). When a workflow task tells an implementer to commit, it commits only its own paths with a
