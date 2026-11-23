@@ -122,8 +122,9 @@ doc comment; every feature must follow it)**
   inside an atmosphere shell with the Sun above its local horizon (a daytime sky hides the stars, review m12). The
   HUD's amber label follows exactly this condition, not `FrameCtx.exposure` (review m13). A resolved body whose
   projected radius is between `POINT_LOD_PX` (1.5 px) and `BLEND_LOD_PX` (4 px) blends its exposure factor from
-  `star_pre` to `scene_pre` (CPU twin `uni_planet::lod_exposure_mix`, B0), so the point → disk handover never
-  pops; the blend is labelled as part of "Eye-adapted stars". Each factor is `exposure_scale(EV) =
+  `star_pre` to `scene_pre` in log space, `pre_mix(star_pre, scene_pre, w)` = exp2(mix(log2 a, log2 b, w))
+  (`common/exposure.wgsl`, CPU twin `uni_gfx::pre_mix`, B11; w from `uni_planet::lod_exposure_mix`, B0), so the
+  point → disk handover never pops; the blend is labelled as part of "Eye-adapted stars". Each factor is `exposure_scale(EV) =
   1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 < f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4
   at scene EV 15. The exposure buffer is also `STORAGE`, so the auto-exposure resolve can write it on the GPU;
   the meter reads world light only, before any sky light or point source is written. Environment cubemap texels
@@ -137,9 +138,9 @@ doc comment; every feature must follow it)**
   background, written with `BlendOperation::Max` (bodies and comet nuclei their coverage, rings
   their opacity, atmospheres 1 − luminance(T)); the lens pass writes `g = 0` on pixels it repaints. `b`: 1 where
   the lens pass wrote the lensed environment. `a` (since B10, lead ruling on B6 I1): the star share s = 1 − w of a
-  world writer whose exposure is `mix(star_pre, scene_pre, w)` (bodies, rings, star surfaces and atmospheres in the
+  world writer whose exposure is `pre_mix(star_pre, scene_pre, w)` (bodies, rings, star surfaces and atmospheres in the
   1.5–4 px LOD band; w snapped to 1 when 1 − w < 2⁻¹⁴), Max-composited, 0 elsewhere; the histogram meter divides by
-  `mix(scene_pre, star_pre, s)`. M3's star magnification will need a new channel. Sky features multiply what they
+  `pre_mix(scene_pre, star_pre, s)`. M3's star magnification will need a new channel. Sky features multiply what they
   add by (1 − r)(1 − g), the band also by (1 − b); point sprites and asteroids by (1 − r) only, and by (1 − g) too
   when the camera is inside an atmosphere shell (B4 fix). The lens pass writes (captured, 0, 1, 0) on its traced
   pixels.
