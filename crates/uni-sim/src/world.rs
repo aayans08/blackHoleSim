@@ -49,7 +49,14 @@
 //!   epoch), and under a warp faster than the steps keep up with, a comet lags the date and is
 //!   drawn two-body from the nearest conic it has until it catches up: a drawn comet at 24 RK4
 //!   steps per tick (Halley, ten years past the start date, in 77 ticks, 1.3 s at 60 fps), the
-//!   whole catalogue in minutes after a decades-long jump. [`HonestyFlag::CometsCatchingUp`]
+//!   whole catalogue in minutes after a decades-long jump. That rate holds far from the Sun,
+//!   where the RK4 step is its 2-day cap (a tick step is 16 days, 48 days of date per tick for
+//!   a drawn comet). Near the Sun the step is η·√(r³/GM) (and shorter near a planet), so a tick
+//!   covers far less date: at 0.6 AU about 15 hours per tick by that formula (computed, not
+//!   measured), and a comet drawn there after a jump takes proportionally more ticks, down to
+//!   the 60 s minimum step at r → 0. The refresh of the cached positions is threaded (A4p) but
+//!   the comet steps are not sped up by it; the start-up settle (A4r) happens only for comets
+//!   more than 90 days from the start date, so none at the default date. [`HonestyFlag::CometsCatchingUp`]
 //!   labels it while the selected comet or a comet the last snapshot drew has work left; the
 //!   other comets may lag unlabelled (lead ruling A4: not visible, and selecting one moves it
 //!   to the front). Captures call [`World::settle_comets`] after setting a bookmark's epoch.
@@ -78,7 +85,9 @@ use uni_physics::frames::ecliptic_j2000_to_icrs;
 use uni_physics::kepler::{Conic, perifocal_to_reference, solve_kepler};
 use uni_physics::photometry::star_radius_m;
 use uni_physics::sat_elements::SatElements;
-use uni_physics::smallbody::{conic_from_perihelion, heliocentric_state_icrs, osculate_at};
+use uni_physics::smallbody::{
+    MAX_STEP_S, STEP_ETA, conic_from_perihelion, heliocentric_state_icrs, osculate_at,
+};
 use uni_physics::standish::{self, Planet, Validity};
 use uni_physics::{pluto, rotation};
 
@@ -124,28 +133,28 @@ const TEST_BH_DISTANCE_AU: f64 = 1000.0;
 /// rounding at Neptune's 4.5 × 10¹² m is 10⁻³ m / 20 s = 5 × 10⁻⁵ m/s.
 const VELOCITY_STEP_S: f64 = 10.0;
 
-/// Radius [m] assumed for a moon whose size no data file gives (414 of JPL's 460 moons have
+/// Assumed default (B1 must use the same value): radius [m] of a moon whose size no data file gives (414 of JPL's 460 moons have
 /// no radius in `sat_elements.ron`): 2 km, the same assumption plan C2 makes for comet nuclei
 /// without a diameter. Not a measurement; such moons are a few km across at most.
-const ASSUMED_RADIUS_M: f64 = 2.0e3;
+pub const ASSUMED_RADIUS_M: f64 = 2.0e3;
 /// Bulk density [kg/m³] assumed for a moon without a GM, used only for its Hill sphere (frame
 /// anchoring), never shown: of the order of small moons' measured densities (0.4–0.6 g/cm³ for
 /// Saturn's small inner moons, Thomas 2010, Icarus 208, 395; 1.9 g/cm³ for Phobos).
 const ASSUMED_DENSITY_KG_M3: f64 = 1000.0;
-/// V geometric albedo assumed for a moon without one in `body_facts.ron`. An assumption, not a
+/// Assumed default (B1 must use the same value): V geometric albedo of a moon without one in `body_facts.ron`. An assumption, not a
 /// measurement: most such moons are small irregular moons, darker than this, so they may be
 /// drawn somewhat too bright (they are V ≳ 15 points from anywhere but close by).
-const DEFAULT_MOON_ALBEDO: f64 = 0.1;
-/// V geometric albedo of comet nuclei, 0.04 (Lamy et al. 2004, in *Comets II*, 223).
-const COMET_ALBEDO: f64 = 0.04;
+pub const DEFAULT_MOON_ALBEDO: f64 = 0.1;
+/// Assumed default (B1 must use the same value): V geometric albedo of comet nuclei, 0.04 (Lamy et al. 2004, in *Comets II*, 223).
+pub const COMET_ALBEDO: f64 = 0.04;
 /// Asteroid diameter from H and p_V: D = 1329 km / √p_V · 10^(−H/5) (Harris & Harris 1997,
 /// Icarus 126, 450, eq. 2, as NASA's NEO Properties tool cites it; JPL CNEOS's size estimator,
 /// https://cneos.jpl.nasa.gov/tools/ast_size_est.html, uses the same 10^3.1236 km = 1329 km).
 const H_DIAMETER_KM: f64 = 1329.0;
-/// p_V assumed for an asteroid with neither a measured albedo nor a diameter: 0.14 ± 0.02, the
+/// Assumed default (B1 must use the same value): p_V of an asteroid with neither a measured albedo nor a diameter: 0.14 ± 0.02, the
 /// debiased mean of near-Earth objects (Stuart & Binzel 2004, Icarus 170, 295). The point's
 /// brightness at zero phase does not depend on it (D² p_V is fixed by H); only the size does.
-const ASSUMED_ASTEROID_ALBEDO: f64 = 0.14;
+pub const ASSUMED_ASTEROID_ALBEDO: f64 = 0.14;
 /// Asteroids with H at or below this are registry objects (plan A4), and so is any asteroid
 /// with a sheet in `body_facts.ron` (none today); the others are `uni-sky`'s points. An
 /// asteroid without an H is not "H ≤ 10".
@@ -159,9 +168,11 @@ const DWARF_PLANET_SPKIDS: [u32; 4] = [20_000_001, 20_136_108, 20_136_199, 20_13
 /// Saturn's ring radii [m] unless [`World::set_ring_profile`] gives others: the span of A8's
 /// `saturn_rings.ron`, so `RingView` covers exactly the radii of the profile B2 draws (review
 /// I2). A8's bake (`tools/bake/src/rings.rs`) fitted that span to Solar System Scope's ring
-/// texture by placing the texture's Cassini-division drop at the Huygens gap, 117 680 km, and
-/// its A ring's outer edge at 136 775 km, both the M1 plan's values (NSSDCA's Saturnian Rings
-/// Fact Sheet gives 117 507 km and 136 780 km): 69 934–140 972 km. [`WorldData::rings`] gives
+/// texture by placing the texture's Cassini-division drop (the B ring's outer edge) at the
+/// Huygens gap, 117 680 km, and its A ring's outer edge at 136 775 km, both the M1 plan's values
+/// (`HUYGENS_GAP_KM`, `A_RING_OUTER_KM` there; NSSDCA's Saturnian Rings Fact Sheet,
+/// https://nssdc.gsfc.nasa.gov/planetary/factsheet/satringfact.html, gives 117 507 km for the B
+/// ring's outer edge and 136 780 km for the A ring's): 69 934–140 972 km. [`WorldData::rings`] gives
 /// the profile itself ([`World::new`] applies it); these are the fallback when it is missing, and
 /// the test `saturn_carries_its_rings` pins them to the baked file, so a re-bake that moves them
 /// fails there.
@@ -178,13 +189,9 @@ const REOSC_INTERVAL_S: f64 = 30.0 * DAY;
 /// [`World::new`] settles only comets whose conic epoch is more than this far from the start
 /// date (lead ruling A4 P1); a tick finishes the ones between [`REOSC_INTERVAL_S`] and this.
 const NEW_SETTLE_GAP_S: f64 = 90.0 * DAY;
-/// `uni_physics::smallbody`'s RK4 step rule, repeated here (its private `STEP_ETA` and
-/// `MAX_STEP_S`) to size the tick steps: η = 10⁻³ of the shortest local dynamical time
-/// √(d³/GM) about the Sun and the eight planetary systems, at most 2 days
-/// ([`smallbody_rk4_step_s`]).
-pub(crate) const SMALLBODY_STEP_ETA: f64 = 1.0e-3;
-/// See [`SMALLBODY_STEP_ETA`].
-pub(crate) const SMALLBODY_MAX_STEP_S: f64 = 2.0 * DAY;
+// The tick steps use `uni_physics::smallbody`'s own RK4 step rule, `STEP_ETA` (η = 10⁻³ of the
+// shortest local dynamical time √(d³/GM) about the Sun and the eight planetary systems) capped at
+// `MAX_STEP_S` (2 days); see [`smallbody_rk4_step_s`].
 /// A tick step integrates this many of `uni_physics::smallbody`'s RK4 steps, sized at its
 /// start: `REOSC_CHUNK_STEPS ·` [`smallbody_rk4_step_s`], so 16 days at most. One RK4 step costs
 /// 16 Standish planet states; measured on the M3 over the baked catalogue's first steps (review
@@ -193,7 +200,7 @@ pub(crate) const SMALLBODY_MAX_STEP_S: f64 = 2.0 * DAY;
 /// too, so a tick's comet work stays inside its share of the frame budget (ruling 3).
 pub(crate) const REOSC_CHUNK_STEPS: f64 = 8.0;
 /// Longest tick step [s] (far from the Sun, where the 2-day RK4 step applies).
-pub(crate) const REOSC_CHUNK_S: f64 = REOSC_CHUNK_STEPS * SMALLBODY_MAX_STEP_S;
+pub(crate) const REOSC_CHUNK_S: f64 = REOSC_CHUNK_STEPS * MAX_STEP_S;
 /// Shortest tick step [s], so a comet at r → 0 still moves on.
 pub(crate) const REOSC_MIN_CHUNK_S: f64 = 60.0;
 /// Most comet steps one tick runs, in all (review r1 N1: a tick never integrates a whole
@@ -248,7 +255,7 @@ pub(crate) fn smallbody_rk4_step_s(r: DVec3, t: Epoch) -> f64 {
             t_dyn = t_dyn.min((d.powi(3) / gm).sqrt());
         }
     }
-    (SMALLBODY_STEP_ETA * t_dyn).min(SMALLBODY_MAX_STEP_S)
+    (STEP_ETA * t_dyn).min(MAX_STEP_S)
 }
 
 /// The span [s] of a tick step from heliocentric `r` [m] at `t` ([`REOSC_CHUNK_STEPS`]).
@@ -560,6 +567,8 @@ struct CometOrbit {
     magnitude: Option<(f64, f64)>,
     /// The perturbed integration failed (a non-finite result): stay two-body.
     failed: bool,
+    /// SBDB name, for the one warning when `failed` is set.
+    name: String,
 }
 
 impl CometOrbit {
@@ -574,6 +583,7 @@ impl CometOrbit {
             osc_epoch: catalogue_epoch,
             magnitude: c.m1.zip(c.k1),
             failed: false,
+            name: c.name.clone(),
         }
     }
 
@@ -707,6 +717,13 @@ impl CometOrbit {
             self.remember(always_keep);
             true
         } else {
+            // `needs_work` is false once `failed` is set, so this runs once per comet.
+            log::warn!(
+                "comet {}: perturbed re-osculation to JD {:.1} gave a non-finite orbit; it stays \
+                 two-body from its last good conic",
+                self.name,
+                to.jd_tdb()
+            );
             self.failed = true;
             false
         }
@@ -1630,6 +1647,7 @@ fn run_small_work<R>(
     t: Epoch,
     main_job: impl FnOnce() -> R,
 ) -> R {
+    let n_chunks = cached.len().div_ceil(SMALL_CHUNK);
     let chunks = Mutex::new(cached.chunks_mut(SMALL_CHUNK).enumerate());
     let take = || chunks.lock().unwrap_or_else(PoisonError::into_inner).next();
     let drain = || {
@@ -1639,7 +1657,6 @@ fn run_small_work<R>(
             }
         }
     };
-    let n_chunks = work.physical.len().div_ceil(SMALL_CHUNK);
     let helpers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(n_chunks)
@@ -1966,7 +1983,7 @@ impl World {
         let t = self.epoch;
         let selected = self
             .selected
-            .and_then(|id| match self.physical[id as usize].source {
+            .and_then(|id| match self.physical.get(id as usize)?.source {
                 Source::Comet(k) => Some(k),
                 _ => None,
             });
@@ -2976,6 +2993,34 @@ mod tests {
         );
     }
 
+    /// `load_world_data` reads `comets.ron` when `comets_2026.ron` is missing, and says so in one
+    /// warning (a directory holding only `comets.ron`); with both present there is no warning.
+    #[test]
+    fn missing_comets_2026_falls_back_with_a_warning() {
+        let dir =
+            std::env::temp_dir().join(format!("uni-sim-comets-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::copy(baked("comets.ron"), dir.join("comets.ron")).expect("copy comets.ron");
+        let data = load_world_data(&dir);
+        assert!(!data.comets.is_empty(), "comets.ron should load");
+        let hits: Vec<_> = data
+            .warnings
+            .iter()
+            .filter(|w| w.contains("comets_2026.ron missing"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{:?}", data.warnings);
+        assert!(hits[0].contains("settle from catalogue epochs"));
+        std::fs::copy(baked("comets_2026.ron"), dir.join("comets_2026.ron")).expect("copy");
+        let data = load_world_data(&dir);
+        assert!(
+            !data.warnings.iter().any(|w| w.contains("comets_2026.ron")),
+            "{:?}",
+            data.warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `WorldData::rings` sets Saturn's ring radii in `World::new`: the profile's first and
     /// last radius, the baked file's and a different one.
     #[test]
@@ -2996,6 +3041,14 @@ mod tests {
             },
         );
         assert_eq!(world.ring_m, (profile.inner_m, profile.outer_m));
+        // The same from the profile's samples: sample i covers [inner + iΔ, inner + (i+1)Δ)
+        // (uni-data `rings` doc), so the first radius entry is sample 0's inner edge and the
+        // last is sample n−1's outer edge.
+        let delta = (profile.outer_m - profile.inner_m) / profile.samples.len() as f64;
+        let first = profile.inner_m;
+        let last = profile.inner_m + (profile.samples.len() - 1) as f64 * delta + delta;
+        assert_eq!(world.ring_m.0, first);
+        assert!((world.ring_m.1 - last).abs() < 1e-6 * last, "{last}");
         let other = RingProfile {
             inner_m: 7.4658e7,
             outer_m: 1.36775e8,
@@ -3135,7 +3188,7 @@ mod tests {
             let limit = short_span_s(r, start);
             // At most eight of the integrator's RK4 steps by the Sun's dynamical time alone
             // (A3's step rule); a planet can only shorten them.
-            let sun_rk4 = (SMALLBODY_STEP_ETA * dynamical_time_s(r.length())).min(2.0 * DAY);
+            let sun_rk4 = (STEP_ETA * dynamical_time_s(r.length())).min(2.0 * DAY);
             assert!(limit <= (8.0 * sun_rk4).max(REOSC_MIN_CHUNK_S) * (1.0 + 1e-12));
             let clock = std::time::Instant::now();
             if !comet.step(t, Chunk::Short) {
@@ -3161,7 +3214,7 @@ mod tests {
         let jupiter = standish::heliocentric_state_icrs(Planet::Jupiter, t).0;
         let close = jupiter + DVec3::new(0.0, 0.05 * AU, 0.0);
         let gm = system_gm_m3s2(Planet::Jupiter.barycentre_id()).expect("Jupiter's GM");
-        let want = SMALLBODY_STEP_ETA * ((0.05 * AU).powi(3) / gm).sqrt();
+        let want = STEP_ETA * ((0.05 * AU).powi(3) / gm).sqrt();
         assert!((smallbody_rk4_step_s(close, t) / want - 1.0).abs() < 1e-9);
         assert!(short_span_s(close, t) < 0.1 * short_span_s(jupiter * 1.1, t));
         let one = osculate_at(
@@ -3918,8 +3971,9 @@ mod tests {
         assert!(checked > 20_000, "{checked}");
     }
 
-    /// Prints the steady tick's split (release: `--release -- --nocapture tick_split`).
+    /// Prints the steady tick's split (release: `--release -- --nocapture tick_split --ignored`).
     #[test]
+    #[ignore = "print-only timing"]
     fn tick_split() {
         let data = load_world_data(&uni_data::data_dir().join("baked"));
         let mut world = World::new(data, date("2026-11-20T00:00:00Z"));

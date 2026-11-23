@@ -13,8 +13,5 @@ pub mod starindex;
 pub mod time;
 pub mod world;
 
-// A0b pre-adds every Wave A manifest entry (review I8), so a crate can be declared before the task
-// that uses it lands. These lines keep `cargo::unused_dependencies` quiet until then; delete each
-// one once its crate is used.
-use ron as _;
-use serde as _;
+// The assumed defaults B1 must use for its own p_V / radius fallbacks (one source of truth).
+pub use world::{ASSUMED_ASTEROID_ALBEDO, ASSUMED_RADIUS_M, COMET_ALBEDO, DEFAULT_MOON_ALBEDO};

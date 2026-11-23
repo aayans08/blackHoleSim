@@ -13,3 +13,4 @@ uni-data.workspace = true
 glam.workspace = true
 serde.workspace = true
 ron.workspace = true
+log.workspace = true
