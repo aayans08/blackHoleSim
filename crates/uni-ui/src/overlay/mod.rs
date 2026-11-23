@@ -706,14 +706,14 @@ mod tests {
         acc
     }
 
-    /// `draw_overlay` paints each part where the overlay puts it: the bracket's capitalised name,
-    /// a marker's label, a solid orbit as one path, a dashed one as many dashes, the exoplanet
-    /// dot, and an off-screen marker as a chevron on the inner frame's left edge.
-    #[test]
-    fn draw_overlay_paints_every_part() {
+    /// The overlay of `draw_overlay_paints_every_part`: a bracket on Mars, Mars's selected marker,
+    /// Earth aimed at, an off-screen comet, Jupiter's label-only marker over its large disk, and
+    /// a solid orbit, a dashed one and an exoplanet dot.
+    fn every_part() -> Overlay {
         let marker = |id, pt: Vec2, label: Option<&str>, kind| Marker {
             id,
             pt,
+            glyph: true,
             label: label.map(str::to_owned),
             kind,
             selected: false,
@@ -722,7 +722,7 @@ mod tests {
             target: false,
             off_axis_rad: 0.1,
         };
-        let o = Overlay {
+        Overlay {
             bracket: Some(Bracket {
                 center_pt: Vec2::new(400.0, 300.0),
                 half_size_pt: 40.0,
@@ -744,6 +744,15 @@ mod tests {
                     )
                 },
                 marker(3, Vec2::new(-3000.0, 478.0), None, MarkerKind::Comet),
+                Marker {
+                    glyph: false,
+                    ..marker(
+                        4,
+                        Vec2::new(1000.0, 200.0),
+                        Some("Jupiter"),
+                        MarkerKind::Planet,
+                    )
+                },
             ],
             orbits: vec![
                 OrbitLine {
@@ -766,8 +775,16 @@ mod tests {
                     tone: LabelTone::Neutral,
                 },
             ],
-        };
+        }
+    }
+
+    /// Paints `o` in a fresh egui context of the output's size, with the HUD's fonts when
+    /// `hud_fonts` (as `hud.rs`'s context has them), and returns every shape.
+    fn paint(o: &Overlay, hud_fonts: bool) -> Vec<Shape> {
         let ctx = egui::Context::default();
+        if hud_fonts {
+            ctx.set_fonts(crate::theme::font_definitions());
+        }
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 Pos2::ZERO,
@@ -775,25 +792,66 @@ mod tests {
             )),
             ..Default::default()
         };
-        let mut out = ctx.run_ui(raw, |ui| draw_overlay(ui, &o));
+        let mut out = ctx.run_ui(raw, |ui| draw_overlay(ui, o));
         // No GPU here to upload to; epaint asserts that deltas are not silently dropped.
         out.textures_delta.clear();
-        let shapes = painted(&out);
-        let texts: Vec<String> = shapes
+        painted(&out)
+    }
+
+    /// Every text painted, with the font family of its first section.
+    fn texts(shapes: &[Shape]) -> Vec<(String, egui::FontFamily)> {
+        shapes
             .iter()
             .filter_map(|s| match s {
-                Shape::Text(t) => Some(t.galley.text().to_owned()),
+                Shape::Text(t) => Some((
+                    t.galley.text().to_owned(),
+                    t.galley.job.sections[0].format.font_id.family.clone(),
+                )),
                 _ => None,
             })
-            .collect();
-        for want in [
-            "MARS",
-            "1.524 AU \u{b7} closing 2.10 km/s",
-            "Earth",
-            "1.000 AU",
+            .collect()
+    }
+
+    /// `draw_overlay` paints each part where the overlay puts it: the bracket's capitalised name,
+    /// a marker's label, a solid orbit as one path, a dashed one as many dashes, the exoplanet
+    /// dot, an off-screen marker as a chevron on the inner frame's left edge, and a label-only
+    /// marker as its label with no glyph. With the HUD's fonts, the bracket's name is Inter
+    /// SemiBold (brief: 600), a marker's name Inter Medium (lead ruling for C5: 500), both
+    /// sub-lines IBM Plex Mono Regular (review r0 I2).
+    #[test]
+    fn draw_overlay_paints_every_part() {
+        use crate::theme::{FONT_MONO, FONT_TEXT_MEDIUM, FONT_TEXT_SEMIBOLD};
+        use egui::FontFamily;
+        let shapes = paint(&every_part(), true);
+        let texts = texts(&shapes);
+        let named = |f: &str| FontFamily::Name(f.into());
+        for (want, family) in [
+            ("MARS", named(FONT_TEXT_SEMIBOLD)),
+            ("1.524 AU \u{b7} closing 2.10 km/s", named(FONT_MONO)),
+            ("Earth", named(FONT_TEXT_MEDIUM)),
+            ("1.000 AU", named(FONT_MONO)),
+            ("Jupiter", named(FONT_TEXT_MEDIUM)),
         ] {
-            assert!(texts.iter().any(|t| t == want), "{want:?} not in {texts:?}");
+            assert!(
+                texts.iter().any(|(t, f)| t == want && *f == family),
+                "{want:?} in {family:?} not in {texts:?}"
+            );
         }
+        // The label-only marker: its label, but no glyph (no circle) at its centre.
+        let jupiter = Pos2::new(1000.0, 200.0);
+        assert!(
+            !shapes
+                .iter()
+                .any(|s| matches!(s, Shape::Circle(c) if c.center == jupiter)),
+            "no glyph over a large disk"
+        );
+        let earth = Pos2::new(800.0, 500.0);
+        assert!(
+            shapes
+                .iter()
+                .any(|s| matches!(s, Shape::Circle(c) if c.center == earth && c.radius == 4.2)),
+            "a glyph-marker keeps its ring"
+        );
         let solid = shapes.iter().any(|s| match s {
             Shape::Path(p) => p.points.len() == 3 && p.points[0] == Pos2::new(100.0, 100.0),
             _ => false,
@@ -827,5 +885,35 @@ mod tests {
                 .iter()
                 .all(|s| s.visual_bounding_rect().min.x > -100.0)
         );
+    }
+
+    /// In a context without the HUD's fonts the overlay still draws (egui panics on a family it
+    /// has no font for): the names fall back to egui's proportional family, the sub-lines to its
+    /// monospace one.
+    #[test]
+    fn draw_overlay_without_hud_fonts_falls_back() {
+        use egui::FontFamily;
+        let texts = texts(&paint(&every_part(), false));
+        for (want, family) in [
+            ("MARS", FontFamily::Proportional),
+            ("1.524 AU \u{b7} closing 2.10 km/s", FontFamily::Monospace),
+            ("Earth", FontFamily::Proportional),
+            ("1.000 AU", FontFamily::Monospace),
+        ] {
+            assert!(
+                texts.iter().any(|(t, f)| t == want && *f == family),
+                "{want:?} in {family:?} not in {texts:?}"
+            );
+        }
+    }
+
+    /// An egui context with the HUD's fonts, after one pass (fonts take effect at a pass's
+    /// start), for measuring real text.
+    pub(super) fn fonts_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(crate::theme::font_definitions());
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx
     }
 }

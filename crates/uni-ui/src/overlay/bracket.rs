@@ -5,10 +5,12 @@
 //! letter-spacing 0.14 em, cyan) and "distance · closing speed" (mono 13 pt). The mockup's
 //! in-flight artboard sets the rest: the name in capitals ("MARS"), the label block's left edge
 //! on the bracket's, 12 pt below it, the sub-line in `theme::INK` 2 pt under the name, worded
-//! "14 200 km · closing 2.10 km/s" ("receding" when the distance grows).
+//! "14 200 km · closing 2.10 km/s" ("receding" when the distance grows). The name is Inter
+//! SemiBold, the sub-line IBM Plex Mono Regular (`theme::text_font`, `theme::mono_font`; egui's
+//! proportional and monospace families where the context lacks them, `markers::installed_font`).
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{FontId, Painter, Rect, Shape, Stroke};
+use egui::{FontFamily, Painter, Rect, Shape, Stroke};
 use glam::Vec2;
 
 use crate::format::{format_distance, format_speed};
@@ -27,6 +29,12 @@ pub struct Bracket {
 /// Gap between the bracket and its label, and between the name and the sub-line [pt] (mockup).
 const LABEL_GAP_PT: f32 = 12.0;
 const SUB_GAP_PT: f32 = 2.0;
+/// Advance per character [em] for the label estimate (review r0 m3). The name: Inter SemiBold
+/// capitals at 12 pt, measured over all 17 821 registry names with the HUD's fonts on
+/// 2026-11-23 at 0.555 em per character (median), 0.736 (99.9 %) and 0.789 at most ("HOMAM", a
+/// star); 0.8 covers every one. The sub-line: IBM Plex Mono's fixed 0.6 em.
+const CAPS_ADVANCE_EM: f32 = 0.8;
+const MONO_ADVANCE_EM: f32 = 0.6;
 
 /// Half the bracket's side [pt] around a disk of projected radius `radius_pt`:
 /// max(radius + `theme::BRACKET_PAD`, `theme::BRACKET_MIN_HALF`).
@@ -49,14 +57,14 @@ pub(crate) fn bracket_sub(dist_m: f64, closing_mps: f64) -> String {
     }
 }
 
-/// Where the label block lies [pt], estimated without fonts (markers keep their labels off it):
-/// 0.6 em per character, IBM Plex Mono's advance and above Inter's average.
+/// Where the label block lies [pt], estimated without fonts (markers keep their labels off it).
+/// The name is painted in capitals: [`CAPS_ADVANCE_EM`] per character plus the tracking. The
+/// sub-line is mono: [`MONO_ADVANCE_EM`] per character.
 pub(crate) fn label_rect(b: &Bracket) -> Rect {
-    const ADVANCE_EM: f32 = 0.6;
-    let name_w = b.name.chars().count() as f32
+    let name_w = b.name.to_uppercase().chars().count() as f32
         * theme::BRACKET_NAME_SIZE
-        * (ADVANCE_EM + theme::BRACKET_NAME_TRACKING_EM);
-    let sub_w = b.sub.chars().count() as f32 * theme::BRACKET_SUB_SIZE * ADVANCE_EM;
+        * (CAPS_ADVANCE_EM + theme::BRACKET_NAME_TRACKING_EM);
+    let sub_w = b.sub.chars().count() as f32 * theme::BRACKET_SUB_SIZE * MONO_ADVANCE_EM;
     let min = egui::pos2(
         b.center_pt.x - b.half_size_pt,
         b.center_pt.y + b.half_size_pt + LABEL_GAP_PT,
@@ -82,7 +90,11 @@ pub(crate) fn draw(painter: &Painter, b: &Bracket) {
         ));
     }
     let name = TextFormat {
-        font_id: FontId::proportional(theme::BRACKET_NAME_SIZE),
+        font_id: super::markers::installed_font(
+            painter,
+            theme::text_font(theme::BRACKET_NAME_SIZE, theme::Weight::SemiBold),
+            FontFamily::Proportional,
+        ),
         extra_letter_spacing: theme::BRACKET_NAME_TRACKING_EM * theme::BRACKET_NAME_SIZE,
         color: theme::TARGET,
         ..TextFormat::default()
@@ -92,7 +104,11 @@ pub(crate) fn draw(painter: &Painter, b: &Bracket) {
     let sub_top = top + egui::vec2(0.0, name.size().y + SUB_GAP_PT);
     let sub = painter.layout_no_wrap(
         b.sub.clone(),
-        FontId::monospace(theme::BRACKET_SUB_SIZE),
+        super::markers::installed_font(
+            painter,
+            theme::mono_font(theme::BRACKET_SUB_SIZE, theme::Weight::Regular),
+            FontFamily::Monospace,
+        ),
         theme::INK,
     );
     super::markers::paint_text(painter, top, name, 1.0);
@@ -146,5 +162,72 @@ mod tests {
             "left on the bracket's edge, 12 pt below it"
         );
         assert!(r.height() > 20.0 && r.width() > 10.0);
+    }
+
+    /// The label estimate covers the label as painted in the HUD's fonts (review r0 m3): the
+    /// name in Inter SemiBold capitals with its tracking, the sub-line in IBM Plex Mono. Each
+    /// line is checked alone (the other empty), so the longer one cannot hide a short estimate.
+    #[test]
+    fn label_rect_covers_the_painted_label() {
+        let ctx = crate::overlay::tests::fonts_context();
+        let names = [
+            "Mars",
+            "Jupiter",
+            "Mercury",
+            "Ganymede",
+            "TestBH-1",
+            "TRAPPIST-1",
+            "1P/Halley",
+            "Wolf 359",
+            "Mimas",
+            "67P/Churyumov\u{2013}Gerasimenko",
+            // The widest registry names per character (the constant's measurement).
+            "Homam",
+            "Manwe",
+            "Moon",
+            "M\u{f6}nch",
+        ];
+        let bracket = |name: &str, sub: &str| Bracket {
+            center_pt: Vec2::new(500.0, 300.0),
+            half_size_pt: 40.0,
+            name: name.into(),
+            sub: sub.into(),
+        };
+        for name in names {
+            let painted = ctx.fonts_mut(|f| {
+                let format = TextFormat {
+                    font_id: theme::text_font(theme::BRACKET_NAME_SIZE, theme::Weight::SemiBold),
+                    extra_letter_spacing: theme::BRACKET_NAME_TRACKING_EM
+                        * theme::BRACKET_NAME_SIZE,
+                    ..TextFormat::default()
+                };
+                f.layout_job(LayoutJob::single_section(name.to_uppercase(), format))
+                    .size()
+                    .x
+            });
+            let est = label_rect(&bracket(name, "")).width();
+            assert!(est >= painted, "{name}: estimate {est} < painted {painted}");
+        }
+        for (d, v) in [
+            (5.2 * uni_core::AU, 13_100.0),
+            (14_200e3, -2100.0),
+            (3.1e16, 0.0),
+        ] {
+            let sub = bracket_sub(d, v);
+            let painted = ctx.fonts_mut(|f| {
+                f.layout_no_wrap(
+                    sub.clone(),
+                    theme::mono_font(theme::BRACKET_SUB_SIZE, theme::Weight::Regular),
+                    theme::INK,
+                )
+                .size()
+                .x
+            });
+            let est = label_rect(&bracket("", &sub)).width();
+            assert!(
+                est >= painted - 1e-3,
+                "{sub:?}: estimate {est} < painted {painted}"
+            );
+        }
     }
 }

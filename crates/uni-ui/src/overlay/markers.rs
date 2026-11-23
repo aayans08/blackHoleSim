@@ -11,16 +11,22 @@
 //! white track at `theme::AIM_TRACK_ALPHA` and a `theme::TARGET` arc from 12 o'clock, clockwise,
 //! filled by `aim_fill`.
 //!
+//! Fonts: the name is Inter Medium, the distance IBM Plex Mono Regular (`theme::text_font`,
+//! `theme::mono_font`), as installed by `theme::font_definitions`; in a context without them the
+//! overlay falls back to egui's proportional and monospace families ([`installed_font`]).
+//!
 //! Hidden (preview `74-hud.js:256-279`, `:298`): the place you are at (the nearest surface,
 //! within [`AT_PLACE_RADII`] of its radii), anything behind a resolved body nearer the camera
 //! (the preview hides what is behind the body you are at; every resolved body is a superset),
 //! all but the target during a flight (and the target once its disk is over 30 pt), and anything
 //! within 14 pt of the sides, 24 pt of the top or 30 pt of the bottom. Over a disk larger than
-//! `theme::MARKER_MAX_DISK_PT` the marker is not drawn on the disk but beside its limb (plan C5:
-//! "no marker over a disk larger than 20 pt"); the selected object's large disk has no marker,
-//! its bracket names it. Labels are drawn only where they do not overlap (lead ruling B.3): the
-//! flight target, the aimed and the selected marker first, then the Sun and planets, TestBH-1,
-//! dwarf planets, moons, comets, asteroids, exoplanet hosts and stars, nearer first.
+//! `theme::MARKER_MAX_DISK_PT` there is no glyph, only the label (plan C5: "no marker over a disk
+//! larger than 20 pt (label only)"; [`Marker::glyph`] is false); the aim ring is still drawn
+//! there, since it counts down a goto (lead ruling for C5). The selected object's large disk has
+//! no label either, its bracket names it. Labels are drawn only where they do not overlap (lead
+//! ruling B.3): the flight target, the aimed and the selected marker first, then the Sun and
+//! planets, TestBH-1, dwarf planets, moons, comets, asteroids, exoplanet hosts and stars, nearer
+//! first.
 //!
 //! **Off-screen destinations** (lead ruling for C5): the selected object and the goto target,
 //! when outside that inner frame or behind the camera, keep a marker whose `pt` lies outside the
@@ -31,7 +37,7 @@ use std::f32::consts::TAU;
 use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke};
+use egui::{Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke};
 use glam::Vec2;
 use uni_sim::registry::{ObjectId, ObjectKind};
 
@@ -56,10 +62,13 @@ pub enum MarkerKind {
 pub struct Marker {
     /// The object it marks.
     pub id: ObjectId,
-    /// Where its glyph is drawn: the object's centre, or beside the limb of a disk larger than
-    /// `theme::MARKER_MAX_DISK_PT`. Outside the inner frame (module docs) for an off-screen
-    /// destination: [`draw`] then paints an edge chevron pointing toward `pt`.
+    /// The object's centre, where the glyph is drawn and the label hangs from. Outside the inner
+    /// frame (module docs) for an off-screen destination: [`draw`] then paints an edge chevron
+    /// pointing toward `pt`.
     pub pt: Vec2,
+    /// Its glyph is drawn. False over a disk larger than `theme::MARKER_MAX_DISK_PT`: label only
+    /// (plan C5), the label where it would be beside a glyph.
+    pub glyph: bool,
     /// `None` where the label would overlap another, where the bracket already names the
     /// object, for an off-screen chevron, or with labels off.
     pub label: Option<String>,
@@ -99,11 +108,14 @@ const SUB_GAP_PT: f32 = 8.0;
 const NAME_SIZE_PT: f32 = 11.0;
 const SUB_SIZE_PT: f32 = 10.0;
 const NAME_TRACKING_EM: f32 = 0.03;
-/// Gap between a large disk's limb and the glyph's box beside it [pt].
-const LIMB_GAP_PT: f32 = 4.0;
-/// Average advance of a character [em] for the label-overlap estimate (build time has no fonts):
-/// IBM Plex Mono's advance is exactly 0.6 em; Inter's mixed-case average is below it.
-const LABEL_ADVANCE_EM: f32 = 0.6;
+/// Advance of a character [em] for the label-overlap estimate (build time has no fonts). Names
+/// are Inter Medium at 11 pt: over all 17 821 registry names, measured with the HUD's fonts on
+/// 2026-11-23, 0.538 em per character (median), 0.630 (99 %), 0.663 (99.9 %) and 0.733 at most
+/// ("Homam", a star). 0.67 covers 99.9 %; the few wider names overrun by under 4 pt, which is
+/// cheaper than reserving the widest name's advance for every label and dropping more of them.
+const LABEL_ADVANCE_EM: f32 = 0.67;
+/// IBM Plex Mono's advance, exactly 0.6 em (the distance line).
+const MONO_ADVANCE_EM: f32 = 0.6;
 /// The off-screen chevron: inset from the inner frame's edge, half its arm span and its depth
 /// [pt], stroke [pt], opacity.
 const CHEVRON_INSET_PT: f32 = 6.0;
@@ -216,6 +228,7 @@ pub(crate) fn layout(cands: &[Candidate], rules: &Rules) -> Vec<Marker> {
         let marker = Marker {
             id: c.id,
             pt: c.toward_pt,
+            glyph: true,
             label: None,
             kind: marker_kind(c.kind),
             selected,
@@ -241,24 +254,18 @@ pub(crate) fn layout(cands: &[Candidate], rules: &Rules) -> Vec<Marker> {
         if c.occluded {
             continue;
         }
-        let pt = if c.disk_pt > theme::MARKER_MAX_DISK_PT {
-            if selected && rules.bracket_shown {
-                continue;
-            }
-            // Beside the limb, not on the disk (module docs).
-            let beside = center + Vec2::new(c.disk_pt + LIMB_GAP_PT + 0.5 * GLYPH_BOX_PT, 0.0);
-            if !inner.contains(pos2(beside)) {
-                continue;
-            }
-            beside
-        } else {
-            center
-        };
+        // Plan C5: no glyph over a disk larger than 20 pt, label only (a NaN size keeps it).
+        let glyph = !(c.disk_pt > theme::MARKER_MAX_DISK_PT);
         let named = rules.labels && !(selected && rules.bracket_shown);
+        if !glyph && !named && aim_fill == 0.0 {
+            // Nothing left to draw (the selected disk's bracket names it, or labels are off).
+            continue;
+        }
         shown.push((
             c,
             Marker {
-                pt,
+                pt: center,
+                glyph,
                 label: named.then(|| c.name.clone()),
                 sub: named.then(|| format_distance(c.dist_m)),
                 ..marker
@@ -304,7 +311,7 @@ fn label_rect(m: &Marker) -> Option<Rect> {
     let chars = |s: &str| s.chars().count() as f32;
     let name_w = chars(name) * NAME_SIZE_PT * (LABEL_ADVANCE_EM + NAME_TRACKING_EM);
     let sub_w = m.sub.as_ref().map_or(0.0, |s| {
-        SUB_GAP_PT + chars(s) * SUB_SIZE_PT * LABEL_ADVANCE_EM
+        SUB_GAP_PT + chars(s) * SUB_SIZE_PT * MONO_ADVANCE_EM
     });
     let left = m.pt.x + 0.5 * GLYPH_BOX_PT + NAME_GAP_PT;
     Some(Rect::from_min_size(
@@ -342,7 +349,9 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
         } else {
             theme::INK_SOFT
         };
-        draw_glyph(painter, p, m.kind, ink.gamma_multiply(o));
+        if m.glyph {
+            draw_glyph(painter, p, m.kind, ink.gamma_multiply(o));
+        }
         if m.aim_fill > 0.0 {
             draw_aim_ring(painter, p, m.aim_fill);
         }
@@ -355,7 +364,11 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
             ink
         };
         let format = TextFormat {
-            font_id: FontId::proportional(NAME_SIZE_PT),
+            font_id: installed_font(
+                painter,
+                theme::text_font(NAME_SIZE_PT, theme::Weight::Medium),
+                FontFamily::Proportional,
+            ),
             extra_letter_spacing: NAME_TRACKING_EM * NAME_SIZE_PT,
             color: name_color.gamma_multiply(o),
             ..TextFormat::default()
@@ -372,7 +385,11 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
         if let Some(sub) = &m.sub {
             let sub = painter.layout_no_wrap(
                 sub.clone(),
-                FontId::monospace(SUB_SIZE_PT),
+                installed_font(
+                    painter,
+                    theme::mono_font(SUB_SIZE_PT, theme::Weight::Regular),
+                    FontFamily::Monospace,
+                ),
                 theme::INK_3.gamma_multiply(o),
             );
             paint_text(
@@ -382,6 +399,20 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
                 o,
             );
         }
+    }
+}
+
+/// `want` when `painter`'s context has its family (the HUD's `theme::font_definitions` install
+/// every weight), else the same size in `fallback`: egui panics on the first glyph of a family it
+/// has no font for, and the overlay may be drawn in a context without the HUD's fonts.
+pub(crate) fn installed_font(painter: &Painter, want: FontId, fallback: FontFamily) -> FontId {
+    let have = painter
+        .ctx()
+        .fonts(|f| f.definitions().families.contains_key(&want.family));
+    if have {
+        want
+    } else {
+        FontId::new(want.size, fallback)
     }
 }
 
@@ -554,35 +585,52 @@ mod tests {
         markers.iter().find(|m| m.id == id)
     }
 
-    /// Plan C5 step 1: a body whose disk is 25 pt gets its label but no glyph on the disk (the
-    /// marker sits beside the limb); at 15 pt the glyph sits on the centre, with its label.
+    /// Plan C5 step 1: "body disk 25 pt → label, no ring; 15 pt → ring and label". Exactly
+    /// 20 pt still has its glyph ("larger than 20 pt"). The selected large disk has neither (its
+    /// bracket names it) unless it is aimed at, when only the aim ring is left; with labels off a
+    /// large disk has no marker.
     #[test]
     fn markers_suppressed_over_large_disks() {
         let big = cand(1, ObjectKind::Planet, (600.0, 400.0), 25.0, 1.0e9);
         let small = cand(2, ObjectKind::Planet, (900.0, 400.0), 15.0, 1.0e9);
-        let m = layout(&[big, small], &rules());
-        let big = find(&m, 1).expect("big disk labelled");
-        assert_eq!(big.label.as_deref(), Some("Object 1"));
-        assert!(big.sub.is_some());
-        let off_centre = big.pt.distance(Vec2::new(600.0, 400.0));
-        assert!(
-            off_centre - 0.5 * GLYPH_BOX_PT >= 25.0,
-            "glyph box clear of the disk: {off_centre}"
-        );
+        let edge = cand(3, ObjectKind::Moon, (300.0, 400.0), 20.0, 1.0e9);
+        let m = layout(&[big.clone(), small, edge], &rules());
+        let big_m = find(&m, 1).expect("big disk labelled");
+        assert!(!big_m.glyph, "no ring over a 25 pt disk");
+        assert_eq!(big_m.label.as_deref(), Some("Object 1"));
+        assert!(big_m.sub.is_some());
+        assert_eq!(big_m.pt, Vec2::new(600.0, 400.0), "label from the centre");
         let small = find(&m, 2).expect("small disk marked");
+        assert!(small.glyph, "ring on a 15 pt disk");
         assert_eq!(small.pt, Vec2::new(900.0, 400.0));
         assert_eq!(small.label.as_deref(), Some("Object 2"));
+        assert!(find(&m, 3).expect("20 pt disk").glyph);
         // The selected object's large disk carries the bracket instead.
         let r = Rules {
             selected: Some(1),
             bracket_shown: true,
             ..rules()
         };
-        let m = layout(
-            &[cand(1, ObjectKind::Planet, (600.0, 400.0), 25.0, 1.0e9)],
-            &r,
+        assert!(layout(std::slice::from_ref(&big), &r).is_empty());
+        // Aimed at, it keeps the aim ring (a goto counting down), still with no glyph or label.
+        let aimed = layout(
+            std::slice::from_ref(&big),
+            &Rules {
+                aim: Some((1, 0.5)),
+                ..r
+            },
         );
-        assert!(m.is_empty());
+        assert_eq!(aimed.len(), 1);
+        let a = &aimed[0];
+        assert!(!a.glyph && a.label.is_none() && a.aim_fill == 0.5);
+        let off = Rules {
+            labels: false,
+            ..rules()
+        };
+        assert!(
+            layout(&[big], &off).is_empty(),
+            "labels off: nothing to draw"
+        );
     }
 
     /// Preview `74-hud.js:256-298`: no marker within 14 pt of the sides, 24 pt of the top or
@@ -747,6 +795,63 @@ mod tests {
             inner,
             Rect::from_min_max(egui::pos2(14.0, 24.0), egui::pos2(1456.0, 926.0))
         );
+    }
+
+    /// The label estimate covers a marker's name as painted in Inter Medium with its tracking
+    /// (lead ruling for C5: 11 px, 500), so the overlap rule sees the label's real extent: fully
+    /// for ordinary names, within `OVERRUN_PT` for the widest registry names
+    /// ([`LABEL_ADVANCE_EM`]).
+    #[test]
+    fn label_rect_covers_the_painted_name() {
+        const OVERRUN_PT: f32 = 4.0;
+        let ctx = crate::overlay::tests::fonts_context();
+        for name in [
+            "Mars",
+            "Jupiter",
+            "Mercury",
+            "Ganymede",
+            "Miranda",
+            "TestBH-1",
+            "TRAPPIST-1",
+            "1P/Halley",
+            "Wolf 359",
+            "67P/Churyumov\u{2013}Gerasimenko",
+            // The widest registry names per character.
+            "Homam",
+            "Emma",
+            "Mneme",
+            "Ogma",
+        ] {
+            let painted = ctx.fonts_mut(|f| {
+                let format = TextFormat {
+                    font_id: theme::text_font(NAME_SIZE_PT, theme::Weight::Medium),
+                    extra_letter_spacing: NAME_TRACKING_EM * NAME_SIZE_PT,
+                    ..TextFormat::default()
+                };
+                f.layout_job(LayoutJob::single_section(name.to_owned(), format))
+                    .size()
+                    .x
+            });
+            let m = Marker {
+                id: 1,
+                pt: Vec2::new(500.0, 300.0),
+                glyph: true,
+                label: Some(name.to_owned()),
+                kind: MarkerKind::Planet,
+                selected: false,
+                sub: None,
+                aim_fill: 0.0,
+                target: false,
+                off_axis_rad: 0.0,
+            };
+            let est = label_rect(&m).expect("labelled").width();
+            let wide = ["Homam", "Emma", "Mneme", "Ogma"].contains(&name);
+            let slack = if wide { OVERRUN_PT } else { 0.0 };
+            assert!(
+                est + slack >= painted,
+                "{name}: estimate {est} < painted {painted}"
+            );
+        }
     }
 
     /// Every object kind has a glyph; the Sun is a star and dwarf planets are planets.
