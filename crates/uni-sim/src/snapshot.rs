@@ -22,10 +22,13 @@
 //! (C2) skips them; it is the same list every frame ([`World::suppressed_asteroid_records`]).
 //!
 //! `destinations` are the objects that carry a marker and can be aimed at (lead ruling B.3, for
-//! C3's aim and C5's markers), on screen or off it: always the Sun, the planets, the dwarf
-//! planets, the dominant planet's major moons ([`MAJOR_MOONS`]) and TestBH-1; any object that is
-//! selected or the goto target; and comets, asteroids and exoplanet hosts only as one of those or
-//! as one of the [`MAX_BRIGHT_DESTINATIONS`] brightest of their kind on screen.
+//! C3's aim and C5's markers; amended by the coordinator's ruling at Task C6: soft and
+//! uncluttered), on screen or off it: always the Sun, the planets, the dominant planet's major
+//! moons ([`MAJOR_MOONS`]; from Earth, the Moon) and TestBH-1 (B.3's, which the amendment leaves
+//! as it was); any object that is selected or the goto target; and dwarf planets, comets,
+//! asteroids and exoplanet hosts only as one of those or as one of the
+//! [`MAX_BRIGHT_DESTINATIONS`] brightest of them all together on screen (C5's overlay drops one
+//! of those whose label would overlap another's).
 
 use glam::{DQuat, DVec2, DVec3, UVec2, Vec2, Vec3};
 use uni_core::{
@@ -62,9 +65,10 @@ const MAX_OTHER_OCCLUDERS: usize = 3;
 /// A comet nearer the Sun than this [au] is active: it has a coma and tails (plan C1, "Only
 /// comets with r_h < 5 AU get a coma and tails"), so it is in [`Snapshot::comets`].
 pub const COMET_ACTIVE_AU: f64 = 5.0;
-/// Comets, asteroids and exoplanet hosts that are neither selected nor the goto target are
-/// destinations only as one of this many brightest of their kind on screen (lead ruling B.3).
-pub const MAX_BRIGHT_DESTINATIONS: usize = 6;
+/// Dwarf planets, comets, asteroids and exoplanet hosts that are neither selected nor the goto
+/// target are destinations only as one of this many brightest of them all together on screen
+/// (coordinator ruling at Task C6, amending lead ruling B.3's six per kind).
+pub const MAX_BRIGHT_DESTINATIONS: usize = 3;
 /// NAIF ids of the major moons, those with their own NASA NSSDCA fact sheet (the moons of A9's
 /// `body_facts.ron`, from <https://nssdc.gsfc.nasa.gov/planetary/factsheet/>): the Moon, Phobos,
 /// Deimos, the four Galileans, Saturn's eight (Mimas … Iapetus), Uranus's five, Triton and
@@ -292,6 +296,29 @@ impl Projector {
             && p.x <= self.size.x + margin_px
             && p.y <= self.size.y + margin_px
     }
+
+    /// Whether a sphere of `radius` [m] at `rel` [m] from the camera may reach into the view:
+    /// the sphere-vs-frustum plane test (e.g. Akenine-Möller, Haines & Hoffman, *Real-Time
+    /// Rendering*, 4th ed., §22.14.1) against the four side planes through the eye and the
+    /// camera plane (no near or far plane: the projection is infinite). Exact on every side, off
+    /// axis too, where the on-axis pixel radius undercounts the limb's reach by up to 1/cos²
+    /// (Task C6, C0 review minor); conservative only near a corner, where a sphere outside the
+    /// frame but within `radius` of two planes passes.
+    pub(crate) fn sphere_in_frustum(&self, rel: DVec3, radius: f64) -> bool {
+        let c = self.to_camera * rel;
+        if !(c.is_finite() && radius >= 0.0) {
+            return false;
+        }
+        // Inside: |x| ≤ a·t·(−z) and |y| ≤ t·(−z); each plane's outward signed distance is
+        // (±x + a·t·z)/√(1 + (a·t)²), (±y + t·z)/√(1 + t²).
+        let (tx, ty) = (self.aspect * self.tan_half_y, self.tan_half_y);
+        let (nx, ny) = ((1.0 + tx * tx).sqrt(), (1.0 + ty * ty).sqrt());
+        c.z < radius
+            && (c.x + tx * c.z) / nx <= radius
+            && (-c.x + tx * c.z) / nx <= radius
+            && (c.y + ty * c.z) / ny <= radius
+            && (-c.y + ty * c.z) / ny <= radius
+    }
 }
 
 /// Pick priority, higher first (C3: bodies and the Sun > comets > named stars and exoplanet
@@ -391,7 +418,7 @@ impl StarCull {
 /// (a few ulps of |rel|), so the shortcut never disagrees with `Projector::screen`.
 const BEHIND_COS: f64 = 1.0e-9;
 
-/// The objects of one kind that may become destinations by brightness (lead ruling B.3):
+/// The objects that may become destinations by brightness (lead ruling B.3, amended at C6):
 /// (illuminance at the camera [lx], +∞ for a resolved one; the destination).
 type BrightCandidates = Vec<(f64, Destination)>;
 
@@ -509,19 +536,22 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                 }
             }
             // Never in `bodies` (lead ruling A.2a): the comet pass draws a resolved nucleus.
+            // The point carries the nucleus alone (lead ruling "comet double light", Task C6):
+            // the comet pass draws the coma and tails, which hold the rest of SBDB's total
+            // magnitude. The comet's prominence (destinations by brightness, catch-up order)
+            // stays its total magnitude ([`comet_prominence_lux`]).
             Source::Comet(c) => {
                 let resolved = px >= POINT_LOD_PX;
                 if resolved {
                     drawn_lux = Some(f64::INFINITY);
                 } else if on_screen() {
-                    let lux = reflected_lux(world, id, rel, sun_rel(), sun_cd);
                     snap.points.push(PointView {
                         id: Some(id),
                         rel_pos_m: rel,
-                        illuminance_lux: lux,
+                        illuminance_lux: reflected_lux(world, id, rel, sun_rel(), sun_cd),
                         color: sun_color,
                     });
-                    drawn_lux = Some(lux);
+                    drawn_lux = Some(comet_prominence_lux(world, id, rel, sun_rel(), sun_cd));
                 }
                 let active = sun_pos.is_some() && sun_rel().length() < COMET_ACTIVE_AU * AU;
                 if resolved || active {
@@ -529,7 +559,7 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                         .push(comet_view(world, id, c, rel, sun_rel(), px));
                     // Every listed comet counts as drawn (carry-over 8).
                     let lux = drawn_lux
-                        .unwrap_or_else(|| reflected_lux(world, id, rel, sun_rel(), sun_cd));
+                        .unwrap_or_else(|| comet_prominence_lux(world, id, rel, sun_rel(), sun_cd));
                     shown_comets.push((c, lux));
                 } else if let Some(lux) = drawn_lux {
                     shown_comets.push((c, lux));
@@ -563,10 +593,8 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
             proj_radius_px: px,
         };
         let always = match info.kind {
-            ObjectKind::Sun
-            | ObjectKind::Planet
-            | ObjectKind::DwarfPlanet
-            | ObjectKind::BlackHole => true,
+            ObjectKind::Sun | ObjectKind::Planet | ObjectKind::BlackHole => true,
+            ObjectKind::DwarfPlanet => false,
             ObjectKind::Moon => {
                 home.is_some()
                     && info.parent == home
@@ -583,7 +611,9 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
         {
             match info.kind {
                 ObjectKind::Comet => bright_comets.push((lux, dest())),
-                ObjectKind::Asteroid => bright_asteroids.push((lux, dest())),
+                ObjectKind::Asteroid | ObjectKind::DwarfPlanet => {
+                    bright_asteroids.push((lux, dest()));
+                }
                 _ => {}
             }
         }
@@ -716,9 +746,10 @@ pub(crate) fn build(world: &World, view: &CameraView, viewport: UVec2) -> Snapsh
                 .push(star_destination(id, kind, rel, proj.screen(rel)));
         }
     }
+    // One pool for every "other" kind (coordinator ruling at Task C6).
+    bright_comets.extend(bright_asteroids);
+    bright_comets.extend(bright_hosts);
     snap.destinations.extend(brightest(bright_comets));
-    snap.destinations.extend(brightest(bright_asteroids));
-    snap.destinations.extend(brightest(bright_hosts));
     snap.destinations.sort_by_key(|d| d.id);
     snap
 }
@@ -892,7 +923,13 @@ fn occluders(
 /// for the planets, clamped to ≤ 10 as in the disk path (lead ruling). C holds its value
 /// beyond each law's range; for Earth and Mars that hold starts at 170°, A3's choice accepted
 /// by the lead. ρ comes from p_V (`rho_from_geometric_albedo`), R is the volumetric mean
-/// radius. A comet with SBDB's M1, K1 uses its total (nucleus + coma) magnitude instead.
+/// radius.
+///
+/// A comet is its nucleus alone (lead ruling "comet double light", Task C6): a p_V 0.04
+/// lunar-Lambert (L = 0.9) body of its (assumed) radius with no planetary phase correction, the
+/// model of `uni_planet::comet::nucleus::nucleus_illuminance_lux` (uni-app's
+/// `comet_point_is_the_nucleus_alone` pins the two equal). The comet pass draws the coma and
+/// tails, which carry the rest of SBDB's total magnitude ([`comet_prominence_lux`]).
 pub(crate) fn reflected_lux(
     world: &World,
     id: ObjectId,
@@ -904,9 +941,6 @@ pub(crate) fn reflected_lux(
     if !(d > 0.0 && r_sun > 0.0) {
         return 0.0;
     }
-    if let Some((m1, k1)) = world.comet_magnitude(id) {
-        return star_illuminance_lux(comet_total_v(m1, k1, r_sun / AU, d / AU));
-    }
     let physical = &world.physical[id as usize];
     let brdf = physical.brdf;
     let phase = angle(sun_rel, -rel);
@@ -915,8 +949,11 @@ pub(crate) fn reflected_lux(
         Brdf::LunarLambert { l } => l + 2.0 * (1.0 - l) / 3.0,
     };
     let rho = rho_from_geometric_albedo(brdf, physical.geometric_albedo);
+    // A comet's `naif` holds its SBDB SPK-ID (ruling C.9), never a planet's id: no correction.
+    let is_comet = matches!(physical.source, Source::Comet(_));
     let correction = world.objects[id as usize]
         .naif
+        .filter(|_| !is_comet)
         .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
         .min(MAX_PHASE_CORRECTION);
     let ratio = physical.mean_radius_m / d;
@@ -926,6 +963,26 @@ pub(crate) fn reflected_lux(
         * ratio
         * disk_phase_function(brdf, phase)
         * correction
+}
+
+/// A comet's prominence [lx] at the camera: its total (nucleus + coma) magnitude from SBDB's
+/// M1, K1 (`photometry::comet_total_v`), or its nucleus ([`reflected_lux`]) without them. It
+/// ranks comets (destinations by brightness, the catch-up order); the drawn point is the
+/// nucleus alone.
+pub(crate) fn comet_prominence_lux(
+    world: &World,
+    id: ObjectId,
+    rel: DVec3,
+    sun_rel: DVec3,
+    sun_cd: f64,
+) -> f64 {
+    let (d, r_sun) = (rel.length(), sun_rel.length());
+    match world.comet_magnitude(id) {
+        Some((m1, k1)) if d > 0.0 && r_sun > 0.0 => {
+            star_illuminance_lux(comet_total_v(m1, k1, r_sun / AU, d / AU))
+        }
+        _ => reflected_lux(world, id, rel, sun_rel, sun_cd),
+    }
 }
 
 #[cfg(test)]

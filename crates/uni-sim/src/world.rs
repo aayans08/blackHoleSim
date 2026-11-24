@@ -96,7 +96,7 @@ use crate::registry::{
     NameTable, ObjectId, ObjectInfo, ObjectKind, Physical, Source, atmosphere_top_m, brdf_for,
     has_atmosphere,
 };
-use crate::snapshot::{self, Projector, Snapshot, proj_radius_px};
+use crate::snapshot::{self, Projector, Snapshot};
 use crate::starindex::{StarIndex, catalogue_pos_pc, star_pos_pc, velocity_pc_per_yr};
 use crate::time::TimeController;
 
@@ -556,8 +556,32 @@ pub(crate) fn luminous_intensity_cd(abs_mag_v: f64) -> f64 {
     star_illuminance_lux(abs_mag_v) * ten_pc * ten_pc
 }
 
-/// The Sun's luminous intensity [cd]: 1.26 × 10⁵ lx at 1 AU (M_V☉ = 4.83, Cox 2000).
-pub(crate) fn sun_intensity_cd() -> f64 {
+/// Total visual magnitude laws (M1, K1) that replace SBDB's for comets whose SBDB parameters
+/// are aperture (nuclear) magnitudes, by SBDB SPK-ID (Task C6, coordinator ruling on row 20).
+///
+/// SBDB gives C/2020 F3 (NEOWISE) M1 = 12.1, K1 = 12.25: on 2020-07-15 (r_h 0.455 AU, Δ 0.784 AU)
+/// that is V ≈ 7.4, while observers saw a naked-eye comet of total visual magnitude about 2.0 in
+/// mid-July 2020 (N. James, British Astronomical Association Comet Section, visual observations,
+/// as cited by Wikipedia "Comet NEOWISE", read 2026-11-24). SBDB's fit matches 5″-aperture
+/// photometry instead: Aravind et al. 2025 (A&A 701, A161, §3.1.1) fit the V magnitude within a
+/// 5″ aperture after perihelion with M0 = 11.92, n = 3.85. The law here keeps that activity index
+/// (K1 = 2.5 n = 9.63, Aravind et al.'s V fit) and sets M1 so the total magnitude is 2.0 on
+/// 2020-07-15 03:00 UTC: M1 = 2.0 − 5 log₁₀ 0.784 − 9.63 log₁₀ 0.455 = 5.82. One observed point,
+/// so approximate away from mid-July (the card's "brightness approximate" note,
+/// `uni_ui::theme::NOTE_TAILS`).
+pub const VISUAL_MAGNITUDE_LAWS: [(i32, f64, f64); 1] = [(1_003_667, 5.82, 9.63)];
+
+/// Replaces `c`'s SBDB magnitude parameters by its [`VISUAL_MAGNITUDE_LAWS`] entry, if any.
+fn apply_visual_magnitudes(c: &mut Comet) {
+    if let Some(&(_, m1, k1)) = VISUAL_MAGNITUDE_LAWS.iter().find(|l| l.0 == c.spkid) {
+        c.m1 = Some(m1);
+        c.k1 = Some(k1);
+    }
+}
+
+/// The Sun's luminous intensity [cd]: 1.26 × 10⁵ lx at 1 AU (M_V☉ = 4.83, Cox 2000). Public
+/// so uni-app can pin uni-planet's copy (C1's comet pass) to it (Task C6, C1 review m8).
+pub fn sun_intensity_cd() -> f64 {
     luminous_intensity_cd(uni_core::M_V_SUN)
 }
 
@@ -950,7 +974,7 @@ impl World {
             stars,
             star_names,
             sats,
-            comets,
+            mut comets,
             asteroids,
             asteroid_names,
             exo,
@@ -1002,6 +1026,9 @@ impl World {
             .collect();
         let sheets: HashSet<i32> = facts.iter().map(|f| f.naif).collect();
         world.add_ephemeris_bodies(&sats, &albedos);
+        for c in &mut comets {
+            apply_visual_magnitudes(c);
+        }
         world.add_comets(&comets);
         world.add_asteroids(&asteroids, &asteroid_names, &sheets);
         world.add_test_black_hole();
@@ -2141,13 +2168,13 @@ impl World {
             .any(|k| self.comets.get(k).is_some_and(|c| c.needs_work(t)))
     }
 
-    /// Whether Pluto or Charon is selected or in the frame: its centre projects inside the
-    /// viewport widened by its projected radius (Task C0 carry-over 4: the real frame, not a
-    /// cone), or the camera is inside it. A body whose centre is behind the camera counts as off
-    /// screen even if its limb reaches into view (only from within a few radii of it).
+    /// Whether Pluto or Charon is selected or in the frame: its sphere reaches into the real
+    /// frustum of `view` at `viewport` (Task C0 carry-over 4: the real frame, not a cone; Task
+    /// C6, C0 review minor: a sphere-vs-frustum plane test, not the centre widened by the
+    /// on-axis pixel radius, which misses a limb near the frame's edge), or the camera is
+    /// inside it.
     fn pluto_shown(&self, view: &CameraView, viewport: UVec2) -> bool {
         let proj = Projector::new(view, viewport);
-        let height = f64::from(viewport.y.max(1));
         self.ephem_order.iter().any(|&id| {
             let info = &self.objects[id as usize];
             if !matches!(info.naif, Some(PLUTO | CHARON)) {
@@ -2159,12 +2186,7 @@ impl World {
             let rel = self.cached[id as usize].delta_from(view.pos);
             let d = rel.length();
             let radius = info.radii_m.max_element();
-            if d <= radius {
-                return true;
-            }
-            let margin_px = proj_radius_px(radius, d, view.fov_y_rad, height);
-            proj.screen(rel)
-                .is_some_and(|p| proj.on_screen(p, margin_px))
+            d <= radius || proj.sphere_in_frustum(rel, radius)
         })
     }
 
@@ -4789,10 +4811,10 @@ mod tests {
         );
     }
 
-    /// Task C0 (lead ruling B.3): the destinations are the Sun, the planets, TestBH-1 and the
-    /// dominant planet's major moons always (on screen or not), the selected object and the goto
-    /// target wherever they are, and otherwise only the six brightest comets, asteroids and
-    /// exoplanet hosts on screen.
+    /// Task C0 (lead ruling B.3, amended by the coordinator at Task C6): the destinations are the
+    /// Sun, the planets, TestBH-1 and the dominant planet's major moons always (on screen or
+    /// not), the selected object and the goto target wherever they are, and otherwise only the
+    /// three brightest dwarf planets, comets, asteroids and exoplanet hosts together on screen.
     #[test]
     fn destinations_follow_the_marker_rule() {
         let mut data = empty_data();
@@ -4879,10 +4901,19 @@ mod tests {
         }
         assert!(!has("Io"), "Jupiter is not the dominant planet: {got:?}");
         assert!(!has("NAIF 9399"), "not a major moon: {got:?}");
-        for k in 0..8 {
-            assert_eq!(has(&format!("Comet-{k}")), k < 6, "Comet-{k}: {got:?}");
-            assert_eq!(has(&format!("Rock-{k}")), k < 6, "Rock-{k}: {got:?}");
-            assert_eq!(has(&format!("Host-{k}")), k < 6, "Host-{k}: {got:?}");
+        // Coordinator ruling at Task C6 (amends B.3): the 3 brightest "others" in one pool. The
+        // hosts at 10 pc (V 1, 2, 3, …) outshine every comet (V ≳ 10) and rock (V ≳ 6) here.
+        let others: Vec<&String> = got
+            .iter()
+            .filter(|g| g.starts_with("Comet-") || g.starts_with("Rock-") || g.starts_with("Host-"))
+            .collect();
+        assert_eq!(
+            others.len(),
+            crate::snapshot::MAX_BRIGHT_DESTINATIONS,
+            "{got:?}"
+        );
+        for k in 0..3 {
+            assert!(has(&format!("Host-{k}")), "Host-{k}: {got:?}");
         }
         assert!(
             !has("Rock-8") && !has("Host-8"),
@@ -4953,6 +4984,94 @@ mod tests {
         // Straight ahead it is flagged at any aspect.
         let ahead = looking_at(view.pos, pluto, 60.0);
         assert!(world.honesty(&ahead, VIEWPORT).contains(&flag));
+    }
+
+    /// Task C6 (coordinator ruling on row 20): C/2020 F3 (NEOWISE) carries its total visual
+    /// magnitude law, not SBDB's aperture fit: V = 2.0 ± 0.1 on 2020-07-15 03:00 UTC at the
+    /// geometry of the plan's row 20 (r_h 0.455 AU, Δ 0.784 AU).
+    #[test]
+    fn neowise_has_its_visual_magnitude_law() {
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let raw = data
+            .comets
+            .iter()
+            .find(|c| c.spkid == 1_003_667)
+            .expect("NEOWISE");
+        assert_eq!((raw.m1, raw.k1), (Some(12.1), Some(12.25)), "SBDB's values");
+        let world = World::new(data, date("2026-11-20T00:00:00Z"));
+        let id = id_of(&world, "C/2020 F3 (NEOWISE)");
+        let (m1, k1) = world.comet_magnitude(id).expect("magnitude law");
+        assert_eq!((m1, k1), (5.82, 9.63));
+        let v = uni_physics::photometry::comet_total_v(m1, k1, 0.455, 0.784);
+        assert!((v - 2.0).abs() < 0.1, "{v}");
+        let ObjectDetails::Comet { record, .. } = world.details(id).expect("details") else {
+            panic!("not a comet");
+        };
+        assert_eq!(
+            (record.m1, record.k1),
+            (Some(5.82), Some(9.63)),
+            "the card agrees"
+        );
+    }
+
+    /// Task C6 (C0 review minor): Pluto's limb inside a 16:9 frame near its right edge raises
+    /// the flag although its centre is outside, where the old on-axis pixel margin (the centre's
+    /// overshoot is ≈ 1/cos² ≈ 4.2× that margin at 60.6° off axis) missed it; the same Pluto a
+    /// little farther out, its whole sphere beyond the edge plane, does not. (No Charon here: it
+    /// would sit 7° inside the frame.)
+    #[test]
+    fn pluto_limb_near_a_16_9_edge_is_on_screen() {
+        let mut world = fake_world(
+            vec![
+                (10, None, DVec3::ZERO),
+                (999, Some(10), DVec3::new(40.0 * AU, 0.0, 0.0)),
+            ],
+            empty_data(),
+        );
+        world.time.set_epoch(date("2200-01-01T00:00:00Z"));
+        world.tick(0.0);
+        let pluto_id = id_of(&world, "Pluto");
+        let pluto = world.position(pluto_id);
+        let radius = world.objects()[pluto_id as usize].radii_m.max_element();
+        // Camera axes: right +x, up +z, back −y (looking along +y); fov 90°, 1920 × 1080.
+        let orient = DQuat::from_mat3(&glam::DMat3::from_cols(DVec3::X, DVec3::Z, -DVec3::Y));
+        let fov = 90f64.to_radians();
+        let edge = (16.0 / 9.0 * (0.5 * fov).tan()).atan(); // 60.64° to the right edge
+        // Pluto 0.5° across in angular radius: d = R / sin 0.5°.
+        let rho = 0.5f64.to_radians();
+        let d = radius / rho.sin();
+        let flag = HonestyFlag::PlutoExtrapolated;
+        let view_for = |offset: f64| {
+            let side = edge + offset;
+            let dir = DVec3::new(side.sin(), side.cos(), 0.0);
+            CameraView {
+                pos: pluto.offset(-dir * d),
+                orient,
+                fov_y_rad: fov,
+                velocity_mps: DVec3::ZERO,
+            }
+        };
+        // Centre 0.4° beyond the edge, so the limb is 0.1° inside: the centre projects ≈ 16 px
+        // off the frame, beyond the old margin of ≈ 4.7 px.
+        let near = view_for(0.8 * rho);
+        let proj = Projector::new(&near, VIEWPORT);
+        let rel = pluto.delta_from(near.pos);
+        let p = proj.screen(rel).unwrap();
+        let old_margin = proj_radius_px(radius, d, fov, f64::from(VIEWPORT.y));
+        assert!(
+            p.x > f64::from(VIEWPORT.x) + old_margin,
+            "{p} vs {old_margin}"
+        );
+        assert!(
+            world.honesty(&near, VIEWPORT).contains(&flag),
+            "limb in frame"
+        );
+        // Centre 2° beyond the edge: the whole sphere is outside.
+        let far = view_for(4.0 * rho);
+        assert!(
+            !world.honesty(&far, VIEWPORT).contains(&flag),
+            "limb off frame"
+        );
     }
 
     /// Prints the steady tick's split (release: `--release -- --nocapture tick_split --ignored`).
