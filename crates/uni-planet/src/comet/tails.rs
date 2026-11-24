@@ -36,8 +36,9 @@
 //! - **Ion:** straight along the aberrated anti-sunward direction û = normalize(400 km/s · r̂_h −
 //!   v_comet) (Brandt 1968, in *Introduction to the Solar Wind*; ruling 8), 0.3 AU / r_h long (at
 //!   most 1 AU), falling off exponentially along its length, a Gaussian 10⁵ km wide (FWHM)
-//!   across it, CO⁺ blue (427 nm chromaticity, gamut-mapped, then desaturated 50 % toward white),
-//!   0.2 × the coma's light (v0). Drawn as a ribbon that turns about its axis to face the camera,
+//!   across it, CO⁺ blue (the comet-tail system's 36 bands summed through the CMFs, Rousselot et
+//!   al. 2024 g-factors at Opitom et al. 2019 wavelengths, [`ion_colour`]; C1L fix round 2, lead
+//!   ruling C1L-R2), 0.2 × the coma's light (v0; [`ION_TAIL_LIGHT`]). Drawn as a ribbon that turns about its axis to face the camera,
 //!   with the surface brightness of an optically thin cylinder ([`ion_tail_brightness`]); from
 //!   afar its σ is widened to at least [`ION_MIN_SIGMA_PX`] with the light across it kept
 //!   ([`ion_tail_drawn_brightness`], review C1 I2), so it never aliases into a beaded line.
@@ -74,7 +75,12 @@ pub const ION_TAIL_LENGTH_AT_1AU_M: f64 = 0.3 * AU;
 pub const ION_TAIL_MAX_LENGTH_M: f64 = AU;
 /// Ion-tail width [m], the FWHM of its Gaussian cross-section (plan C1: 10⁵ km).
 pub const ION_TAIL_WIDTH_M: f64 = 1.0e8;
-/// The ion tail's light as a fraction of the coma's (plan C1, v0).
+/// The ion tail's light as a fraction of the coma's (plan C1, v0; approximate, card note
+/// `uni_ui::theme::NOTE_TAILS`). C1L fix round 2 derived it from Aravind et al. 2025's CO⁺ fluxes
+/// with every band of the system counted ([`aravind_co_plus_luminance`]) and this ribbon's
+/// profile calibrated at their outermost aperture: 0.34 (`ion_light_from_aravind`), which would
+/// make the line brighter, not the 10⁻⁶–10⁻⁵ cd/m² lead ruling C1L-R2 expected. The v0 value
+/// stays until the lead rules (the along-tail profile beyond 10⁵ km is not measured there).
 pub const ION_TAIL_LIGHT: f64 = 0.2;
 /// e-foldings of the ion tail's exponential fall-off over its length (a choice: the brightness
 /// at the tip is e^(−3) = 5 % of the base's before the profile is brought to 0 there).
@@ -342,9 +348,174 @@ pub const KEPLER_SOLVE_US: f64 = 0.5;
 pub const NOMINAL_SOLVES_PER_FRAME: usize = 2_000;
 
 /// CIE 1931 2° colour-matching functions x̄, ȳ, z̄ at 427 nm, the CO⁺ comet-tail band (CIE 2018
-/// data table, DOI 10.25039/CIE.DS.xvudnb9b; read 2026-11-23).
+/// data table, DOI 10.25039/CIE.DS.xvudnb9b; read 2026-11-23). C1 drew the ion tail in this one
+/// band's colour; since C1L fix round 2 it is the reference the CMF fit
+/// ([`cie_1931_cmf_fit`]) is checked against.
 pub const CO_PLUS_CMF: [f64; 3] = [0.244_879_7, 0.008_908_72, 1.188_497_1];
 
+/// Fluorescence efficiencies g [erg s⁻¹ ion⁻¹] of the ¹²CO⁺ comet-tail system A²Πᵢ–X²Σ⁺ at
+/// r_h = 1 au and heliocentric velocity 0, row v′ = 0–5, column v″ = 0–5 (Rousselot et al. 2024,
+/// "¹²CO⁺ and ¹³CO⁺ fluorescence models for measuring the ¹²C/¹³C isotopic ratio in comets",
+/// A&A 683, arXiv:2311.05700, Table 1; read 2026-11-24). Aravind et al. 2025 convert their
+/// CO⁺ (3-0) and (2-0) fluxes with its 1.70 and 1.36 × 10⁻¹⁴. All bands scale as r_h⁻² together
+/// (fluorescence), so their ratios hold at any r_h; the Swings effect (Doppler shifts into the
+/// solar lines, a factor of up to about 2 per band, Rousselot et al. §4) is left out.
+pub const CO_PLUS_G: [[f64; 6]; 6] = [
+    [8.40e-16, 1.87e-15, 1.81e-15, 9.99e-16, 3.45e-16, 7.63e-17],
+    [7.68e-15, 8.41e-15, 2.19e-15, 7.10e-18, 7.63e-16, 7.87e-16],
+    [1.36e-14, 5.38e-15, 9.28e-17, 2.25e-15, 1.03e-15, 2.94e-18],
+    [1.70e-14, 9.24e-16, 3.07e-15, 1.90e-15, 5.49e-17, 8.79e-16],
+    [1.04e-14, 1.97e-16, 2.96e-15, 2.23e-17, 9.53e-16, 2.80e-16],
+    [5.12e-15, 1.21e-15, 1.04e-15, 4.14e-16, 5.21e-16, 4.16e-17],
+];
+
+/// Observed CO⁺ A²Π–X²Σ band wavelengths [nm] as (v′, v″, λ) (Opitom et al. 2019, "High
+/// resolution optical spectroscopy of the N₂-rich comet C/2016 R2 (PanSTARRS)", A&A 624, A64,
+/// Table 3; read 2026-11-24).
+pub const CO_PLUS_BANDS_NM: [(u32, u32, f64); 15] = [
+    (6, 0, 341.0),
+    (7, 1, 351.0),
+    (5, 0, 359.0),
+    (4, 0, 378.0),
+    (3, 0, 400.0),
+    (2, 0, 425.0),
+    (4, 2, 452.0),
+    (1, 0, 454.0),
+    (2, 1, 468.0),
+    (3, 2, 484.0),
+    (0, 0, 490.0),
+    (1, 1, 504.0),
+    (0, 1, 547.0),
+    (1, 2, 567.0),
+    (0, 2, 619.0),
+];
+
+/// The band wavenumbers' vibrational fit [cm⁻¹], ν(v′, v″) = c₀ + c₁v′ − c₂v′(v′ + 1) − c₃v″ +
+/// c₄v″(v″ + 1) (the anharmonic-oscillator term differences, Herzberg 1950, *Spectra of Diatomic
+/// Molecules*, ch. III), least squares over [`CO_PLUS_BANDS_NM`]: it places the 23 bands of
+/// [`CO_PLUS_G`] Opitom et al. do not list within about 1.5 nm, their largest residual.
+pub fn co_plus_vibrational_fit() -> [f64; 5] {
+    let row = |v1: f64, v2: f64| [1.0, v1, -v1 * (v1 + 1.0), -v2, v2 * (v2 + 1.0)];
+    let mut ata = [[0.0_f64; 5]; 5];
+    let mut aty = [0.0_f64; 5];
+    for &(v1, v2, nm) in &CO_PLUS_BANDS_NM {
+        let a = row(f64::from(v1), f64::from(v2));
+        let y = 1.0e7 / nm;
+        for i in 0..5 {
+            aty[i] += a[i] * y;
+            for j in 0..5 {
+                ata[i][j] += a[i] * a[j];
+            }
+        }
+    }
+    // Gauss–Jordan elimination with partial pivoting on the 5 × 5 normal equations.
+    for i in 0..5 {
+        let p = (i..5)
+            .max_by(|&a, &b| ata[a][i].abs().total_cmp(&ata[b][i].abs()))
+            .unwrap_or(i);
+        ata.swap(i, p);
+        aty.swap(i, p);
+        for r in 0..5 {
+            if r != i && ata[i][i] != 0.0 {
+                let f = ata[r][i] / ata[i][i];
+                for c in 0..5 {
+                    ata[r][c] -= f * ata[i][c];
+                }
+                aty[r] -= f * aty[i];
+            }
+        }
+    }
+    std::array::from_fn(|i| aty[i] / ata[i][i])
+}
+
+/// The wavelength [nm] of CO⁺ band (v′, v″): Opitom et al.'s where they list it
+/// ([`CO_PLUS_BANDS_NM`]), else the vibrational fit's ([`co_plus_vibrational_fit`]).
+pub fn co_plus_band_nm(v1: u32, v2: u32) -> f64 {
+    if let Some(&(_, _, nm)) = CO_PLUS_BANDS_NM.iter().find(|b| b.0 == v1 && b.1 == v2) {
+        return nm;
+    }
+    let c = co_plus_vibrational_fit();
+    let (a, b) = (f64::from(v1), f64::from(v2));
+    1.0e7 / (c[0] + c[1] * a - c[2] * a * (a + 1.0) - c[3] * b + c[4] * b * (b + 1.0))
+}
+
+/// CIE 1931 2° colour-matching functions x̄, ȳ, z̄ at `lambda_nm`: the multi-lobe piecewise
+/// Gaussian fit of Wyman, Sloan & Shirley 2013 ("Simple Analytic Approximations to the CIE XYZ
+/// Color Matching Functions", JCGT 2(2)), the fit `uni_core::color` uses (private there, so
+/// repeated here). Against the CIE 2018 table: within 5 % at 427 nm, ȳ within 1 % at 516 nm
+/// (`cmf_fit_matches_the_cie_table`); x̄ near its 505 nm minimum and ȳ below 410 nm (4 × 10⁻⁴)
+/// are rougher, where the CO⁺ bands carry little x̄ or ȳ (about a per cent of the totals).
+pub fn cie_1931_cmf_fit(lambda_nm: f64) -> DVec3 {
+    let lobe = |a: f64, mu: f64, w1: f64, w2: f64| {
+        let t = (lambda_nm - mu) * if lambda_nm < mu { w1 } else { w2 };
+        a * (-0.5 * t * t).exp()
+    };
+    DVec3::new(
+        lobe(0.362, 442.0, 0.0624, 0.0374)
+            + lobe(1.056, 599.8, 0.0264, 0.0323)
+            + lobe(-0.065, 501.1, 0.0490, 0.0382),
+        lobe(0.821, 568.8, 0.0213, 0.0247) + lobe(0.286, 530.9, 0.0613, 0.0322),
+        lobe(1.217, 437.0, 0.0845, 0.0278) + lobe(0.681, 459.0, 0.0385, 0.0725),
+    )
+}
+
+/// The CO⁺ comet-tail system's tristimulus values per ion at 1 au: Σ over the 36 bands of
+/// [`CO_PLUS_G`] of g·(x̄, ȳ, z̄)(λ) [erg s⁻¹ ion⁻¹] (a line spectrum's XYZ is its lines' powers
+/// weighted by the CMFs, CIE 15:2004). Its Y is the photopic share: × 683 lm/W
+/// ([`LUMINOUS_EFFICACY_LM_PER_W`]) per 10⁷ erg it is lumens.
+pub fn co_plus_xyz() -> DVec3 {
+    let mut xyz = DVec3::ZERO;
+    for (v1, row) in (0_u32..).zip(CO_PLUS_G.iter()) {
+        for (v2, &g) in (0_u32..).zip(row.iter()) {
+            xyz += g * cie_1931_cmf_fit(co_plus_band_nm(v1, v2));
+        }
+    }
+    xyz
+}
+
+/// The maximum luminous efficacy of radiation K_m = 683 lm/W (the candela's definition, CGPM
+/// 1979, kept in the 2019 SI): luminance = K_m ∫ L_e,λ ȳ(λ) dλ.
+pub const LUMINOUS_EFFICACY_LM_PER_W: f64 = 683.0;
+
+/// Aravind et al. 2025 (A&A 701, arXiv:2507.21707; read 2026-11-24) Table 4, the CO⁺ ion fluxes
+/// of C/2020 F3 (NEOWISE) on 2020-07-24 (r_h 0.66, Δ 0.69 AU; HFOSC on the 2-m HCT): (projected
+/// distance from the photocentre [km], CO⁺ (3-0), CO⁺ (2-0) [erg cm⁻² s⁻¹]), each in a 12″
+/// aperture along the 1.92″-wide slit ([`ARAVIND_APERTURE_ARCSEC`]), extracted tailward with
+/// the slit 22° from the anti-sunward direction (their §2.2).
+pub const ARAVIND_CO_PLUS_FLUX: [(f64, f64, f64); 5] = [
+    (35_809.0, 3.91e-13, 1.49e-13),
+    (53_783.0, 2.48e-13, 1.12e-13),
+    (71_688.0, 1.74e-13, 7.71e-14),
+    (89_294.0, 1.57e-13, 7.48e-14),
+    (103_548.0, 1.48e-13, 6.99e-14),
+];
+/// Aravind et al.'s apertures [″]: 12″ along the slit × the slit's 1.92″ width (our reading of
+/// their §2.2: a long-slit extraction box; a 12″ circle would make the luminance 4.9 × lower).
+pub const ARAVIND_APERTURE_ARCSEC: [f64; 2] = [12.0, 1.92];
+/// The angle between their slit and the anti-sunward direction [°] (Aravind et al. §2.2).
+pub const ARAVIND_SLIT_TO_TAIL_DEG: f64 = 22.0;
+/// Their ion night: r_h, Δ and the Earth–Sun distance [AU] on 2020-07-24 (the last from the
+/// Earth's orbit on that date, `ion_light_is_derived` recomputes it).
+pub const ARAVIND_ION_NIGHT_AU: [f64; 3] = [0.66, 0.69, 1.0158];
+
+/// The CO⁺ luminance [cd/m²] in Aravind et al.'s aperture `k` ([`ARAVIND_CO_PLUS_FLUX`]): their
+/// two bands' surface brightness (F₃₀ + F₂₀)/Ω [10⁻³ W m⁻² sr⁻¹ per erg cm⁻² s⁻¹ sr⁻¹], scaled to
+/// every band of the system by fluorescence equilibrium, Σg / (g₃₀ + g₂₀), and to luminance by
+/// 683 lm/W × the system's ȳ-weighted share ([`co_plus_xyz`]):
+/// L = 683 × (F₃₀ + F₂₀)/Ω × Y_CO⁺ / (g₃₀ + g₂₀). The two measured bands carry 0.8 % of that
+/// luminance: the system's light that the eye sees is in its green–yellow bands (v″ = 1–3, 504–
+/// 590 nm), where ȳ is 100 × larger than at 400–427 nm.
+pub fn aravind_co_plus_luminance(k: usize) -> f64 {
+    let Some(&(_, f30, f20)) = ARAVIND_CO_PLUS_FLUX.get(k) else {
+        return 0.0;
+    };
+    let arcsec = std::f64::consts::PI / (180.0 * 3600.0);
+    let omega = ARAVIND_APERTURE_ARCSEC[0] * ARAVIND_APERTURE_ARCSEC[1] * arcsec * arcsec;
+    // erg cm⁻² s⁻¹ → W m⁻²: 10⁻⁷ J/erg × 10⁴ cm²/m².
+    let radiance = (f30 + f20) * 1.0e-3 / omega;
+    let g_measured = CO_PLUS_G[3][0] + CO_PLUS_G[2][0];
+    LUMINOUS_EFFICACY_LM_PER_W * radiance * co_plus_xyz().y / g_measured
+}
 
 /// Direction of the ion tail (unit, ICRS) from the Sun → nucleus geometry: `sun_rel` is the Sun
 /// relative to the nucleus [m] (`CometView::sun_rel_m`), `helio_vel` the comet's heliocentric
@@ -420,9 +591,12 @@ pub fn ion_drawn_sigma_m(pixel_m: f64) -> f64 {
     ion_sigma_m().max(ION_MIN_SIGMA_PX * pixel_m)
 }
 
-/// The ion tail's colour, linear Rec. 709 with luminance 1 (module docs).
+/// The ion tail's colour, linear Rec. 709 with luminance 1: the CO⁺ comet-tail system's
+/// band-summed tristimulus values ([`co_plus_xyz`], C1L fix round 2, lead ruling C1L-R2) through
+/// the CIE path ([`line_colour`]). A blue: the energy is in the 400–470 nm bands, the luminance in
+/// the 504–590 nm ones. C1's single 427 nm chromaticity, mixed 50 % with white, read violet.
 pub fn ion_colour() -> Vec3 {
-    0.5 * line_colour(CO_PLUS_CMF) + 0.5 * Vec3::ONE
+    line_colour(co_plus_xyz().to_array())
 }
 
 /// Henyey & Greenstein 1941 (ApJ 93, 70) phase function with g = [`DUST_PHASE_G`], normalised
@@ -1833,6 +2007,23 @@ mod tests {
         (view, camera, vel, coma)
     }
 
+    /// The CMF fit (Wyman, Sloan & Shirley 2013) against the CIE 2018 table values this module
+    /// holds: within 5 % at 427 nm, ȳ within 1 % and z̄ within 6 % at 516 nm (x̄, 0.035 there near
+    /// its minimum, within 30 %).
+    #[test]
+    fn cmf_fit_matches_the_cie_table() {
+        let at427 = cie_1931_cmf_fit(427.0);
+        let at516 = cie_1931_cmf_fit(516.0);
+        let rel = |a: f64, b: f64| (a / b - 1.0).abs();
+        let c516 = crate::comet::coma::C2_SWAN_CMF;
+        println!("CMF fit 427 nm {at427} vs {CO_PLUS_CMF:?}; 516 nm {at516} vs {c516:?}");
+        for k in 0..3 {
+            assert!(rel(at427[k], CO_PLUS_CMF[k]) < 0.05, "427 nm [{k}]");
+        }
+        assert!(rel(at516.y, c516[1]) < 0.01 && rel(at516.z, c516[2]) < 0.06);
+        assert!(rel(at516.x, c516[0]) < 0.30);
+    }
+
     /// Lead ruling C1L-R1: NEOWISE's dust law's valid range is Biver et al. 2022's Fig. 19 span,
     /// 2020-07-13 to 2020-08-14 (from the start of the first day to the end of the last), on the
     /// SBDB orbit, after perihelion.
@@ -1901,6 +2092,109 @@ mod tests {
         assert_eq!(dust_production_exponent(1, 10.0), K1_10_EXPONENT);
         assert_eq!(dust_production_exponent(NEOWISE_SPKID, 9.63), -4.0);
         assert!((dust_production(0.5, -4.0) - 16.0).abs() < 1e-12);
+    }
+
+    /// Lead ruling C1L-R2: Aravind et al.'s CO⁺ fluxes as luminance, and the ion light they imply.
+    /// - The vibrational fit places Opitom et al.'s 15 bands within 1.5 nm.
+    /// - The two measured bands (3-0, 2-0) carry < 1 % of the system's luminance (Rousselot et
+    ///   al.'s g and the CIE ȳ), so the outermost aperture (1.04 × 10⁵ km) is 1.33 × 10⁻⁴ cd/m².
+    /// - The colour is a blue (B > G > R; R:G 0.38), not C1's violet (R > G).
+    /// - The ribbon calibrated there, with its present profile, carries 0.34 × the coma's light
+    ///   (C1's v0: 0.2), which puts row 20's line at 5.6, 4.2 and 3.0 × 10⁻⁴ cd/m² at 1°, 5° and
+    ///   10°: the ruling's expected 10⁻⁶–10⁻⁵ is not reached (the fix round 2 report). Prints the
+    ///   numbers; `ION_TAIL_LIGHT` stays C1's 0.2 until the lead rules.
+    #[test]
+    fn ion_light_from_aravind() {
+        use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
+        let c = co_plus_vibrational_fit();
+        let worst = CO_PLUS_BANDS_NM
+            .iter()
+            .map(|&(a, b, nm)| {
+                let (a, b) = (f64::from(a), f64::from(b));
+                (1.0e7 / (c[0] + c[1] * a - c[2] * a * (a + 1.0) - c[3] * b + c[4] * b * (b + 1.0))
+                    - nm)
+                    .abs()
+            })
+            .fold(0.0, f64::max);
+        let xyz = co_plus_xyz();
+        let g2 = CO_PLUS_G[3][0] + CO_PLUS_G[2][0];
+        let two_band = (CO_PLUS_G[3][0] * cie_1931_cmf_fit(400.0).y
+            + CO_PLUS_G[2][0] * cie_1931_cmf_fit(425.0).y)
+            / xyz.y;
+        let col = ion_colour();
+        assert!(worst < 1.5, "{worst} nm");
+        assert!(two_band < 0.01, "{two_band}");
+        assert!(
+            col.z > col.y && col.y > col.x && col.x / col.y < 0.5,
+            "{col}"
+        );
+        println!(
+            "CO+ fit {c:?}, worst residual {worst:.2} nm; Y/(g30+g20) {:.4}; the two measured \
+             bands carry {:.2} % of the luminance; colour {col}, xy ({:.3}, {:.3})",
+            xyz.y / g2,
+            100.0 * two_band,
+            xyz.x / xyz.element_sum(),
+            xyz.y / xyz.element_sum()
+        );
+        for k in 0..5 {
+            println!(
+                "  ρ {:.0} km: {:.3e} cd/m²",
+                ARAVIND_CO_PLUS_FLUX[k].0,
+                aravind_co_plus_luminance(k)
+            );
+        }
+        assert!((aravind_co_plus_luminance(4) / 1.328e-4 - 1.0).abs() < 0.01);
+        assert_eq!(aravind_co_plus_luminance(5), 0.0);
+        let t = Epoch::parse_iso_utc("2020-07-24T21:00:00Z").expect("date");
+        let (earth, _) = planet_state(Planet::EmBary, t);
+        let (nuc, _) = heliocentric_state_icrs(&neowise_conic(), t);
+        println!(
+            "2020-07-24: r_h {:.4}, Δ {:.4}, Earth–Sun {:.4} AU",
+            nuc.length() / AU,
+            (nuc - earth).length() / AU,
+            earth.length() / AU
+        );
+        assert!((earth.length() / AU - ARAVIND_ION_NIGHT_AU[2]).abs() < 5e-4);
+        let [r, d, e] = ARAVIND_ION_NIGHT_AU;
+        let cos_a = (r * r + d * d - e * e) / (2.0 * r * d);
+        let sin_psi = (1.0 - cos_a * cos_a).sqrt();
+        let len = ion_tail_length_m(r);
+        let (rho, _, _) = ARAVIND_CO_PLUS_FLUX[4];
+        let a = ARAVIND_SLIT_TO_TAIL_DEG.to_radians();
+        let (s_m, x_m) = (rho * 1e3 * a.cos() / sin_psi, rho * 1e3 * a.sin());
+        let per_cd = ion_tail_brightness(s_m, x_m, len, 1.0, sin_psi);
+        let i_ion = aravind_co_plus_luminance(4) / per_cd;
+        let law = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("law");
+        let coma = crate::comet::coma::comet_total_intensity_cd(law.m1(), law.k1, r, d);
+        let ratio = i_ion / coma;
+        assert!((0.30..0.38).contains(&ratio), "{ratio}");
+        println!(
+            "ion night: sin ψ {sin_psi:.4}; I_ion {i_ion:.3e} cd = {ratio:.4} × the coma ({coma:.3e} cd)"
+        );
+        // Row 20.
+        let (view, camera, vel, coma20) = neowise_row_20();
+        let axis = ion_tail_dir(view.sun_rel_m, vel);
+        let len20 = ion_tail_length_m(view.r_au);
+        let pixel_rad = 2.0 * (0.5 * camera.fov_y_rad).tan() / 1080.0;
+        for deg in [1.0_f64, 5.0, 10.0] {
+            let angle = |s: f64| angle_deg(view.nucleus_rel_m, view.nucleus_rel_m + axis * s);
+            let (mut lo, mut hi) = (0.0, len20);
+            for _ in 0..100 {
+                let mid = 0.5 * (lo + hi);
+                if angle(mid) < deg { lo = mid } else { hi = mid }
+            }
+            let p = view.nucleus_rel_m + axis * lo;
+            let sp = axis.cross(p.normalize()).length();
+            let sigma = ion_drawn_sigma_m(p.length() * pixel_rad);
+            let at =
+                |light: f64| ion_tail_drawn_brightness(lo, 0.0, len20, light * coma20, sp, sigma);
+            println!(
+                "  row 20 at {deg}°: s {:.3e} m, sin ψ {sp:.3}; ion line now (0.2) {:.3e}, derived ({ratio:.3}) {:.3e} cd/m²",
+                lo,
+                at(ION_TAIL_LIGHT),
+                at(ratio)
+            );
+        }
     }
 
     /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry
