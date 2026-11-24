@@ -8,9 +8,14 @@
 //   coma_drawn_brightness (Haser-like K/ρ e^(-ρ/ℓ), softened over one pixel), additive.
 // - ion tail (vs_ion / fs_ion): a ribbon along the tail's axis that turns to face the camera,
 //   ion_tail_drawn_brightness (σ at least ION_MIN_SIGMA_PX on screen, light kept), additive.
-// - dust tail (vs_dust / fs_dust): one Gaussian sprite per Finson-Probstein grain, lit by
-//   E☉ ∝ 1/r² at the grain and the Henyey-Greenstein phase function (dust_grain_light), times
-//   the tail's per-view scale so the drawn grains carry 0.5 × the coma's light, additive.
+// - dust tail (vs_dust / fs_dust): one elliptical Gaussian splat per Finson-Probstein grain or
+//   merged block (C1L; EWA splatting, Zwicker et al. 2001): its 3D covariance projected onto the
+//   sprite's plane (splat_axes), lit by E☉ ∝ 1/r² at the grain and the Henyey-Greenstein phase
+//   function (dust_grain_light) × the tail's emission weight × the dust's light production
+//   (TailGpu.sun.w = I_coma / DUST_HEAD_TIME_S), additive.
+//
+// Glow (coma, ion, dust) whose brightest point would land below GLOW_CULL_PRE pre-exposed is not
+// drawn: a thousandth of AgX's black point, invisible at the frame's exposure.
 //
 // World light: luminance [cd/m²] × scene_pre() (the frame contract); the coma and the tails are
 // optically thin and write nothing to lens_mask (their location 1 has an empty write mask).
@@ -22,8 +27,8 @@
 #import "common/camera.wgsl"
 #import "common/constants.wgsl"
 
-// Grains per tail slot: 32 β × 64 ages (twin of tails::GRAINS_PER_TAIL).
-const GRAINS_PER_TAIL: u32 = 2048u;
+// Splat slots per tail: 16 β × 64 ages (twin of tails::GRAINS_PER_TAIL).
+const GRAINS_PER_TAIL: u32 = 1024u;
 // Segments of the ion-tail ribbon (twin of tails::ION_SEGMENTS).
 const ION_SEGMENTS: u32 = 32u;
 // e-foldings of the ion tail's fall-off over its length (tails::ION_TAIL_EFOLDS).
@@ -39,14 +44,18 @@ const ION_MIN_SIGMA_PX: f32 = 0.75;
 const FWHM_PER_SIGMA: f32 = 2.354820045;
 // Henyey-Greenstein asymmetry of the dust (tails::DUST_PHASE_G).
 const DUST_G: f32 = 0.6;
-// Grain sprites are cut at this many σ (tails::SPRITE_SIGMAS).
-const SPRITE_SIGMAS: f32 = 3.0;
-// A grain sprite is at least this many pixels wide (σ), so a sub-pixel sprite neither aliases nor
-// vanishes; its light is kept.
+// Grain splats are cut at this many σ (tails::SPRITE_SIGMAS).
+const SPRITE_SIGMAS: f32 = 2.0;
+// A splat's σ gets this many pixels added in quadrature on both axes (tails::SPRITE_MIN_PX), so
+// a sub-pixel splat neither aliases nor vanishes; its light is kept.
 const SPRITE_MIN_PX: f32 = 0.75;
-// ...and at most this many: a nearer sprite keeps its central surface brightness but is cut to
-// this size (a camera inside a tail sees a veil, not 2 048 screen-filling quads; approximate).
-const SPRITE_MAX_PX: f32 = 32.0;
+// ...and each axis is at most this many: a nearer splat keeps its surface brightness but is cut
+// to this size (a camera inside a tail sees a veil, not screen-filling quads; approximate). From
+// afar (row 20) the tail's splats stay below it (comet::SPRITE_MAX_PX).
+const SPRITE_MAX_PX: f32 = 64.0;
+// Glow whose brightest point is below this pre-exposed value is not drawn (comet::GLOW_CULL_PRE:
+// AgX's black point 2^-12.47393 / 1000).
+const GLOW_CULL_PRE: f32 = 1.75e-7;
 // The coma quad reaches this many scale lengths (coma::COMA_EXTENT_SCALES).
 const COMA_EXTENT_SCALES: f32 = 10.0;
 // Lunar-Lambert weight of the nucleus (nucleus::NUCLEUS_BRDF, McEwen 1991).
@@ -80,8 +89,8 @@ struct ComaGpu {
 struct TailGpu {
     // xyz: nucleus − camera [m]; w: the ion tail's luminous intensity [cd].
     nucleus: vec4<f32>,
-    // xyz: Sun − nucleus [m]; w: the dust tail's per-view scale [cd] (tails::dust_light_scale:
-    // 0.5 × the coma's light / Σ dust_grain_light from this camera).
+    // xyz: Sun − nucleus [m]; w: the dust's light production [cd/s per unit of HG]
+    // (tails::dust_emission_cd_per_s: I_coma / DUST_HEAD_TIME_S).
     sun: vec4<f32>,
     // xyz: the ion tail's unit direction; w: its length [m].
     ion_axis: vec4<f32>,
@@ -91,12 +100,14 @@ struct TailGpu {
     dust_colour: vec4<f32>,
 }
 
-// Twin of uni_planet::comet::GrainGpu: 32 bytes.
+// Twin of uni_planet::comet::GrainGpu: 48 bytes, one dust splat.
 struct GrainGpu {
-    // xyz: offset from the nucleus [m]; w: the sprite's σ [m].
+    // xyz: offset from the nucleus [m]; w: the emission weight [s] (tails::TailGrain::weight).
     offset: vec4<f32>,
-    // x: light weight (Σ w·(r_h/r)² = 1 over the tail at its refresh); yzw: 0.
-    weight: vec4<f32>,
+    // The 3D covariance [m²]: xx, yy, zz (w: 0)...
+    cov_diag: vec4<f32>,
+    // ...and xy, xz, yz (w: 0).
+    cov_off: vec4<f32>,
 }
 
 @group(1) @binding(0) var<storage, read> nuclei: array<NucleusGpu>;
@@ -167,8 +178,8 @@ fn dust_phase(cos_theta: f32) -> f32 {
     return (1.0 - g * g) / (denom * sqrt(denom));
 }
 
-// A grain's share of the dust light before the tail's per-view scale: weight × (r_h/r)² (E☉ at
-// the grain relative to the nucleus's) × HG(θ), θ between the Sun → grain and grain → camera
+// A grain's light per unit of the dust's light production: emission weight [s] × (r_h/r)² (E☉
+// at the grain relative to the nucleus's) × HG(θ), θ between the Sun → grain and grain → camera
 // directions. `offset`: grain − nucleus, `nucleus_rel`: nucleus − camera, `sun_rel`: Sun −
 // nucleus [m]. 0 with the camera within 1 m of the grain. Twin of tails::dust_grain_light.
 fn dust_grain_light(
@@ -200,6 +211,36 @@ fn sprite_profile(r: f32, sigma: f32) -> f32 {
     let norm = TAU * sigma * sigma * (1.0 - edge * (1.0 + 0.5 * cut2));
     let t = r / sigma;
     return (exp(-0.5 * t * t) - edge) / norm;
+}
+
+// A splat's ellipse on the sprite plane (C1L): the symmetric 3D covariance (diag xx yy zz, off
+// xy xz yz) [m²] projected on the unit vectors right and up, plus floor² on both axes, then
+// diagonalised. Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and −sin φ·right +
+// cos φ·up. Twin of tails::splat_axes.
+fn splat_axes(
+    cov_diag: vec3<f32>,
+    cov_off: vec3<f32>,
+    right: vec3<f32>,
+    up: vec3<f32>,
+    floor: f32,
+) -> vec3<f32> {
+    let c = mat3x3<f32>(
+        vec3<f32>(cov_diag.x, cov_off.x, cov_off.y),
+        vec3<f32>(cov_off.x, cov_diag.y, cov_off.z),
+        vec3<f32>(cov_off.y, cov_off.z, cov_diag.z),
+    );
+    let floor2 = floor * floor;
+    let sr = c * right;
+    let su = c * up;
+    let p = dot(right, sr) + floor2;
+    let q = dot(right, su);
+    let r = dot(up, su) + floor2;
+    let m = 0.5 * (p + r);
+    let h = 0.5 * (p - r);
+    let d = sqrt(h * h + q * q);
+    let l1 = m + d;
+    let l2 = max(m - d, floor2);
+    return vec3<f32>(sqrt(l1), sqrt(l2), 0.5 * atan2(2.0 * q, p - r));
 }
 
 // Lunar-Lambert reflectance factor (McEwen 1991, Icarus 92, 298), L = NUCLEUS_L:
@@ -331,14 +372,27 @@ struct ComaOut {
 @vertex
 fn vs_coma(@builtin(vertex_index) vi: u32, @builtin(instance_index) k: u32) -> ComaOut {
     let c = comae[k];
+    var out: ComaOut;
+    out.k = k;
+    // Visibility (C1L): the drawn profile is at most C/ρ with C = I·e^(a/ℓ')/(2πℓ'), ℓ' =
+    // max(ℓ, a), and at most I/(2πℓ'a) at the centre; nothing beyond ρ = C·pre/GLOW_CULL_PRE (or
+    // at all) can reach the cut.
+    let l = max(c.profile.y, c.profile.z);
+    let big_c = c.profile.x * exp(c.profile.z / l) / (TAU * l);
+    let pre = scene_pre();
+    let peak = c.profile.x / (TAU * l * c.profile.z) * pre;
+    if (!(peak >= GLOW_CULL_PRE)) {
+        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.local = vec2<f32>(0.0);
+        return out;
+    }
+    let half = min(c.centre.w, big_c * pre / GLOW_CULL_PRE);
     let dir = normalize(c.centre.xyz);
     let right = facing_right(dir);
     let up = cross(right, dir);
-    let local = quad_corner(vi % 6u) * c.centre.w;
-    var out: ComaOut;
+    let local = quad_corner(vi % 6u) * half;
     out.clip = to_clip(c.centre.xyz + right * local.x + up * local.y);
     out.local = local;
-    out.k = k;
     return out;
 }
 
@@ -349,6 +403,7 @@ fn fs_coma(in: ComaOut) -> GlowOut {
     if (rho > c.centre.w) {
         discard;
     }
+    // (The quad may be smaller than c.centre.w: vs_coma's visibility bound.)
     let s = coma_drawn_brightness(rho, c.profile.x, c.profile.y, c.profile.z);
     return glow(c.colour.rgb * s);
 }
@@ -389,9 +444,21 @@ fn vs_ion(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) ->
     let sigma = ion_drawn_sigma(pixel_size_at(dist));
     let x = corner.x * ION_HALF_WIDTH_SIGMAS * sigma;
     var out: IonOut;
+    out.slot = slot;
+    // Visibility (C1L): a segment whose start (its brightest point, the axis at the segment's
+    // first s) stays below GLOW_CULL_PRE is not drawn; all six vertices decide alike.
+    let s0 = t.ion_axis.w * f32(seg) / f32(ION_SEGMENTS);
+    let p0 = t.nucleus.xyz + axis * s0;
+    let sin0 = length(cross(axis, normalize(p0)));
+    let sigma0 = ion_drawn_sigma(pixel_size_at(length(p0)));
+    let peak = ion_tail_drawn_brightness(s0, 0.0, t.ion_axis.w, t.nucleus.w, sin0, sigma0);
+    if (!(peak * scene_pre() >= GLOW_CULL_PRE)) {
+        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.coords = vec4<f32>(0.0);
+        return out;
+    }
     out.clip = to_clip(p + side * x);
     out.coords = vec4<f32>(s, x, sin_psi, sigma);
-    out.slot = slot;
     return out;
 }
 
@@ -408,7 +475,7 @@ fn fs_ion(in: IonOut) -> GlowOut {
 
 struct DustOut {
     @builtin(position) clip: vec4<f32>,
-    // xy: position in the sprite's plane relative to the grain [m]; z: σ [m]; w: intensity [cd].
+    // xy: position on the splat in units of its σ₁, σ₂; z: σ₁σ₂ [m²]; w: intensity [cd].
     @location(0) sprite: vec4<f32>,
     @location(1) @interpolate(flat) slot: u32,
 }
@@ -422,35 +489,50 @@ fn vs_dust(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> D
     let dist = length(rel);
     var out: DustOut;
     out.slot = slot;
+    out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.sprite = vec4<f32>(0.0);
     if (!(dist > 1.0)) {
         // Degenerate (the camera on the grain): every corner at one point, nothing drawn.
-        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-        out.sprite = vec4<f32>(0.0);
         return out;
     }
     let dir = rel / dist;
-    // The grain's light (E☉ ∝ 1/r², HG) × the tail's per-view scale: the grains carry 0.5 × the
-    // coma's light from this camera (review C1 I1).
+    // The splat's light: the dust's light production × its emission weight × (r_h/r)² × HG.
     var intensity =
-        t.sun.w * dust_grain_light(grain.offset.xyz, grain.weight.x, t.nucleus.xyz, t.sun.xyz);
-    let px = pixel_size_at(dist);
-    var sigma = max(grain.offset.w, SPRITE_MIN_PX * px);
-    let sigma_max = SPRITE_MAX_PX * px;
-    if (sigma > sigma_max) {
-        intensity = intensity * (sigma_max / sigma) * (sigma_max / sigma);
-        sigma = sigma_max;
-    }
+        t.sun.w * dust_grain_light(grain.offset.xyz, grain.offset.w, t.nucleus.xyz, t.sun.xyz);
     let right = facing_right(dir);
     let up = cross(right, dir);
-    let local = quad_corner(vi % 6u) * (SPRITE_SIGMAS * sigma);
-    out.clip = to_clip(rel + right * local.x + up * local.y);
-    out.sprite = vec4<f32>(local, sigma, intensity);
+    let px = pixel_size_at(dist);
+    let axes = splat_axes(grain.cov_diag.xyz, grain.cov_off.xyz, right, up, SPRITE_MIN_PX * px);
+    var s1 = axes.x;
+    var s2 = axes.y;
+    let s_max = SPRITE_MAX_PX * px;
+    if (s1 > s_max) {
+        intensity = intensity * (s_max / s1);
+        s1 = s_max;
+    }
+    if (s2 > s_max) {
+        intensity = intensity * (s_max / s2);
+        s2 = s_max;
+    }
+    // Visibility (C1L): the splat's centre is its brightest point.
+    let area = s1 * s2;
+    if (!(intensity * sprite_profile(0.0, 1.0) / area * scene_pre() >= GLOW_CULL_PRE)) {
+        return out;
+    }
+    let c = cos(axes.z);
+    let sn = sin(axes.z);
+    let e1 = c * right + sn * up;
+    let e2 = c * up - sn * right;
+    let q = quad_corner(vi % 6u) * SPRITE_SIGMAS;
+    out.clip = to_clip(rel + e1 * (q.x * s1) + e2 * (q.y * s2));
+    out.sprite = vec4<f32>(q, area, intensity);
     return out;
 }
 
 @fragment
 fn fs_dust(in: DustOut) -> GlowOut {
     let t = tails[in.slot];
-    let s = in.sprite.w * sprite_profile(length(in.sprite.xy), in.sprite.z);
+    // The unit profile in σ units, over the ellipse's area σ₁σ₂: ∫ = 1 over the plane.
+    let s = in.sprite.w * sprite_profile(length(in.sprite.xy), 1.0) / in.sprite.z;
     return glow(t.dust_colour.rgb * s);
 }

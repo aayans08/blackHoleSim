@@ -1,17 +1,27 @@
 //! The dust and ion tails (Task C1).
 //!
-//! - **Dust:** `uni_physics::dust::finson_probstein` (Finson & Probstein 1968, ApJ 154, 327) on
-//!   `CometView::conic` (J2000 ecliptic, as it expects; lead ruling A.1: never rotate it to ICRS
-//!   first), β ∈ [0.001, 0.9] in 32 log steps × ages up to 60 d in 64 steps = 2 048 grains, dust
-//!   production ∝ r_h^(−K1/2.5) at emission (SBDB's magnitude law). Each grain is a soft Gaussian
-//!   sprite whose width comes from the spacing of its grid neighbours, so the syndynes and
-//!   synchrones join into a curved sheet. A grain's light ∝ its weight (production × √β) ×
-//!   E☉(r) at its own heliocentric distance × a Henyey–Greenstein phase function with g = 0.6
-//!   (the plan's single forward lobe, after Marcus 2007, ICQ 29, 39, whose model is a compound
-//!   forward/backward HG; [`DUST_PHASE_G`]). The tail's light is 0.5 × the coma's from every
-//!   viewpoint (v0 ratio; card note `uni_ui::theme::NOTE_TAILS`): it is normalised per view
-//!   ([`dust_light_scale`], review C1 I1), so HG only shapes how the light is spread along the
-//!   tail, and the total follows the coma's (SBDB's magnitude law has no phase term).
+//! - **Dust** (Task C1L): `uni_physics::dust::finson_probstein` (Finson & Probstein 1968, ApJ 154,
+//!   327) on `CometView::conic` (J2000 ecliptic, as it expects; lead ruling A.1: never rotate it
+//!   to ICRS first), β ∈ [0.001, 0.9] in 16 log steps × ages up to 60 d in 64 steps = 1 024 grains
+//!   ([`DUST_PARAMS`]), dust production ∝ r_h^(−K1/2.5) at emission (the comet's magnitude law).
+//!   - *Light.* Each grain stands for the dust emitted in its cell of ln β × age. The dust's light
+//!     production now is the coma's light divided by [`DUST_HEAD_TIME_S`], a time calibrated on
+//!     C/2020 F3 (NEOWISE) from its measured dust production A(0)fρ (Aravind et al. 2025), its
+//!     measured dust speed (Manzini et al. 2021) and the steady-outflow relation of A'Hearn et al.
+//!     1984 (derivation on the constant). A grain carries that rate × its emission weight
+//!     [`TailGrain::weight`] (production at emission relative to now × its size class's share ×
+//!     the cell's age span) × the sunlight at its own heliocentric distance × a
+//!     Henyey–Greenstein phase function with g = 0.6 ([`DUST_PHASE_G`]). The tail is therefore
+//!     several times brighter than the coma just after perihelion (≈ 6 × for row 20's NEOWISE)
+//!     and fainter on the way in; it depends on the viewing phase as the phase function does.
+//!     The v0 ratio "dust = 0.5 × coma" is gone (C1L: it made NEOWISE's tail short).
+//!   - *Shape.* The grains are drawn as elliptical Gaussian splats (Zwicker et al. 2001, "EWA
+//!     Splatting", IEEE TVCG 8, 223), whose 3D covariance spans half a grid step toward each
+//!     grid neighbour (so the syndynes and synchrones join into one smooth curved sheet) plus the
+//!     spread of the grains' ejection speed, 1.11 km/s (Manzini et al. 2021) × age, which blurs
+//!     the sheet as a real dust tail is blurred. Where that blur is wider than the grid, 2 × 2
+//!     blocks of grains are merged into one splat with the same light and second moments
+//!     ([`tail_grains`]): fewer, equally smooth splats, so less fill.
 //! - **Ion:** straight along the aberrated anti-sunward direction û = normalize(400 km/s · r̂_h −
 //!   v_comet) (Brandt 1968, in *Introduction to the Solar Wind*; ruling 8), 0.3 AU / r_h long (at
 //!   most 1 AU), falling off exponentially along its length, a Gaussian 10⁵ km wide (FWHM)
@@ -35,7 +45,7 @@
 
 use std::collections::HashMap;
 
-use glam::{DVec3, Vec3};
+use glam::{DMat3, DVec3, Vec3};
 use uni_core::{AU, Epoch};
 use uni_physics::dust::{DustGrain, DustParams, finson_probstein};
 use uni_physics::kepler::Conic;
@@ -70,31 +80,104 @@ pub const ION_HALF_WIDTH_SIGMAS: f64 = 3.5;
 /// breaks into dashes as it moves. Twin of `ION_MIN_SIGMA_PX` in `comet.wgsl`.
 pub const ION_MIN_SIGMA_PX: f64 = 0.75;
 
-/// The dust tail's light as a fraction of the coma's, from every viewpoint (plan C1, v0;
-/// normalised per view by [`dust_light_scale`]).
-pub const DUST_TAIL_LIGHT: f64 = 0.5;
+/// The dust's "head time" τ [s]: the coma's luminous intensity divided by the light the dust
+/// emitted per second at the current production carries per unit of the phase function
+/// [`dust_phase`] (C1L). The light of a grain is (I_coma/τ) × w × (r_h/r)² × HG(θ)
+/// ([`dust_grain_light`]); the drawn tail carries I_coma × Σw (r_h/r)² HG/τ.
+///
+/// Calibrated on C/2020 F3 (NEOWISE) on 2020-07-22, the first night of Aravind et al. 2025's
+/// photometry (r_h 0.63 AU, Δ 0.69 AU, their Table; Earth–Sun 1.0160 AU, so phase α = 100.56°):
+/// - the dust's light production is v·A(α)fρ·E☉/(2π): a steady 1/ρ dust coma flowing out at v
+///   holds the light emitted over the last πρ/(2v) inside the aperture ρ, and its light there is
+///   A(α)fρ·ρ·E☉/4 (A'Hearn et al. 1984, AJ 89, 579: the definition of Afρ);
+/// - A(0)fρ = 34.99 m ([`NEOWISE_AFRHO0_M`]: 3 499 ± 7 cm, green continuum 526 nm, 10⁴ km,
+///   phase-corrected to 0°; Aravind et al. 2025, arXiv:2507.21707, Table "Afρ"), back to the
+///   observed phase with the Halley–Marcus composite they corrected with (Schleicher & Bair
+///   2011, AJ 141, 177; Marcus 2007, ICQ 29, 39; table as in sbpy `phase_HalleyMarcus`):
+///   Φ(100.56°) = 0.7103 ([`neowise_calibration`]);
+/// - v = 1.11 km/s ([`DUST_EJECTION_SPEED_MPS`]);
+/// - E☉ = 3.178 × 10⁵ lx at 0.63 AU; I_coma = 1.441 × 10¹⁵ cd from the comet's visual law
+///   (`uni_sim::world::COMET_VISUAL_LAWS`: V 3.18 there, extrapolated along its K1 = 9.63, which
+///   is Aravind et al.'s own slope over 0.63–1.61 AU);
+/// - HG(0.6) at the scattering angle 180° − α = 0.5257.
+///
+/// τ = I_coma·HG/(v·A(α)fρ·E☉/2π) = 5.42 × 10⁵ s = 6.3 d; `neowise_head_time_is_derived`
+/// recomputes it. It is one comet's value applied to all (a gas-rich comet's tail is drawn too
+/// bright, a dustier one's too faint) and rests on one dust speed for all grain sizes; within a
+/// factor of about 2 (card note `uni_ui::theme::NOTE_TAILS`: brightness approximate). The v0
+/// ratio (tail = 0.5 × coma) it replaces drew NEOWISE's tail 12 × too faint.
+pub const DUST_HEAD_TIME_S: f64 = 5.421e5;
+/// NEOWISE's A(0)fρ on 2020-07-22 [m] (green continuum, ρ = 10⁴ km; Aravind et al. 2025).
+pub const NEOWISE_AFRHO0_M: f64 = 34.99;
+/// Dust ejection speed [m/s]: the mean deprojected expansion speed of C/2020 F3 (NEOWISE)'s
+/// dust shells, 1.11 ± 0.08 km/s (Manzini et al. 2021, MNRAS, arXiv:2109.02039). It calibrates
+/// [`DUST_HEAD_TIME_S`] and blurs the Finson–Probstein sheet: a grain emitted isotropically at
+/// v has moved v·t from its zero-velocity position after an age t, a spread of v·t/√3 per axis
+/// ([`dust_ejection_sigma_m`]). One speed for every size and r_h (approximate).
+pub const DUST_EJECTION_SPEED_MPS: f64 = 1_110.0;
 /// Henyey–Greenstein asymmetry of the dust's phase function (plan C1). Checked 2026-11-23: the
 /// plan cites Marcus 2007 as "Icarus 191"; the paper is Marcus 2007, ICQ 29, 39, and its model is
 /// a compound HG with a strong forward lobe (k = 0.95, as Li & Jewitt 2015, arXiv:1503.00387,
 /// quote it; they fit g_f = 0.926, g_b = −0.584 for C/2010 X1). The single g = 0.6 lobe is the
 /// plan's simplification: it under-predicts the forward-scattering surge near phase 180°.
 pub const DUST_PHASE_G: f64 = 0.6;
-/// The Finson–Probstein grid (plan C1): β ∈ [0.001, 0.9], 32 log steps; ages to 60 d, 64 steps.
+/// The Halley–Marcus composite dust phase function Φ(α)/Φ(0) at α = 100° and 101° (Schleicher &
+/// Bair 2011, AJ 141, 177; Marcus 2007, ICQ 29, 39; the 1° table as sbpy's
+/// `phase_HalleyMarcus` holds it, read 2026-11-24): the curve Aravind et al. 2025 corrected
+/// A(α)fρ to 0° with.
+pub const HALLEY_MARCUS_100_101: [f64; 2] = [0.6987, 0.7196];
+/// The NEOWISE calibration night (Aravind et al. 2025, Table "Afρ", 2020-07-22): r_h, Δ and the
+/// Earth–Sun distance [AU] (the last from the Earth's orbit on that date).
+pub const NEOWISE_CALIBRATION_AU: [f64; 3] = [0.63, 0.69, 1.0160];
+/// C/2020 F3 (NEOWISE)'s SBDB SPK-ID, whose visual law calibrates [`DUST_HEAD_TIME_S`].
+pub const NEOWISE_SPKID: i32 = 1_003_667;
+
+/// [`DUST_HEAD_TIME_S`] from its inputs (its doc): returns (τ [s], the phase angle α [°] of the
+/// calibration night, Φ_HM(α)). NaN when uni-sim has no visual law for NEOWISE.
+pub fn neowise_calibration() -> (f64, f64, f64) {
+    let [r_au, delta_au, earth_au] = NEOWISE_CALIBRATION_AU;
+    // The Sun–comet–Earth angle from the triangle's three sides.
+    let cos_alpha =
+        (r_au * r_au + delta_au * delta_au - earth_au * earth_au) / (2.0 * r_au * delta_au);
+    let alpha = cos_alpha.clamp(-1.0, 1.0).acos().to_degrees();
+    let [p100, p101] = HALLEY_MARCUS_100_101;
+    let phi = p100 + (p101 - p100) * (alpha - 100.0);
+    let Some(law) = uni_sim::world::comet_visual_law(NEOWISE_SPKID) else {
+        return (f64::NAN, alpha, phi);
+    };
+    let head_cd = super::coma::comet_total_intensity_cd(law.m1(), law.k1, r_au, delta_au);
+    let r_m = r_au * AU;
+    let sun_lux = super::sun_intensity_cd() / (r_m * r_m);
+    // A'Hearn et al. 1984: the dust's light production v·A(α)fρ·E☉/(2π) [cd/s].
+    let rate = DUST_EJECTION_SPEED_MPS * NEOWISE_AFRHO0_M * phi * sun_lux / std::f64::consts::TAU;
+    // The scattering angle is 180° − α: cos θ = −cos α.
+    let tau = head_cd * dust_phase(-cos_alpha) / rate;
+    (tau, alpha, phi)
+}
+
+/// The Finson–Probstein grid: β ∈ [0.001, 0.9], 16 log steps (C1L ladder step 1: 32 → 16 rows,
+/// 2 048 → 1 024 grains); ages to 60 d, 64 steps (plan C1). β ≤ 0.9 keeps NEOWISE's main dust
+/// band, which Afghan et al. 2024 (PSJ 5, 264) bound at the β = 0.82 syndyne.
 pub const DUST_PARAMS: DustParams = DustParams {
     beta_min: 0.001,
     beta_max: 0.9,
-    n_beta: 32,
+    n_beta: 16,
     max_age_days: 60.0,
     n_age: 64,
 };
-/// Grains per tail: 32 × 64.
-pub const GRAINS_PER_TAIL: usize = 2_048;
-/// A sprite's σ as a fraction of the larger spacing to its grid neighbours (a choice: Gaussians
-/// spaced 1/0.6 σ apart blend into a smooth sheet without washing out the syndynes' curve).
-pub const SPRITE_SPACING_FRACTION: f64 = 0.6;
-/// Sprites are cut at this many σ (the profile is shifted to reach 0 there and renormalised).
-pub const SPRITE_SIGMAS: f64 = 3.0;
-
+/// Grains (splat slots) per tail: 16 × 64. Merging leaves at most this many splats.
+pub const GRAINS_PER_TAIL: usize = 1_024;
+/// A grain's splat spans this many grid steps (σ) toward its β and age neighbours (a choice: a
+/// Gaussian of σ = 0.5 step sampled every step sums to a flat sheet within 2·e^(−2π²/4) = 1.4 %,
+/// Poisson summation).
+pub const SPLAT_GRID_SIGMA: f64 = 0.5;
+/// A 2 × 2 block of splats merges into one when every member lies within this many σ of the
+/// block's ejection spread from their light-weighted mean ([`tail_grains`]; a choice: the
+/// merged Gaussian keeps the block's light, mean and second moments).
+pub const SPLAT_MERGE_SPREAD: f64 = 2.0;
+/// Sprites are cut at this many σ (the profile is shifted to reach 0 there and renormalised;
+/// C1L: 3 → 2, overlapping splats hide the cut, and the quads cover 4/9 of the area).
+pub const SPRITE_SIGMAS: f64 = 2.0;
 /// A tail is recomputed once the epoch has moved this far [s of sim time] from its last
 /// refresh (plan C1: 1 h).
 pub const TAIL_SIM_REFRESH_S: f64 = 3_600.0;
@@ -198,14 +281,14 @@ pub fn dust_phase(cos_theta: f64) -> f64 {
     (1.0 - g * g) / (denom * denom.sqrt())
 }
 
-/// A grain's share of the dust tail's light before the per-view scale (review C1 I1): its
-/// `weight` × the sunlight at the grain relative to the nucleus's, (r_h/r)², × HG(θ)
-/// ([`dust_phase`]), θ the scattering angle between the Sun → grain and grain → camera
+/// A grain's light per unit of the tail's emission rate [s] (C1L): its emission `weight` [s]
+/// ([`TailGrain::weight`]) × the sunlight at the grain relative to the nucleus's, (r_h/r)², ×
+/// HG(θ) ([`dust_phase`]), θ the scattering angle between the Sun → grain and grain → camera
 /// directions (0 = forward). `offset` is the grain's offset from the nucleus, `nucleus_rel` the
 /// nucleus relative to the camera and `sun_rel` the Sun relative to the nucleus [m]. 0 with the
-/// camera within 1 m of the grain (the pass draws nothing there). CPU twin of the shader's
-/// `dust_grain_light`, which `vs_dust` multiplies by `TailGpu::sun.w` ([`dust_light_scale`]);
-/// probed on the GPU.
+/// camera within 1 m of the grain (the pass draws nothing there). × [`dust_emission_cd_per_s`]
+/// (`TailGpu::sun.w`) it is the grain's luminous intensity [cd]. CPU twin of the shader's
+/// `dust_grain_light`; probed on the GPU.
 pub fn dust_grain_light(offset: DVec3, weight: f64, nucleus_rel: DVec3, sun_rel: DVec3) -> f64 {
     let rel = nucleus_rel + offset;
     let dist = rel.length();
@@ -220,27 +303,47 @@ pub fn dust_grain_light(offset: DVec3, weight: f64, nucleus_rel: DVec3, sun_rel:
     weight * lit * dust_phase(cos_theta)
 }
 
-/// The per-view scale of a dust tail [cd] (review C1 I1; plan C1: "total tail light = 0.5 ×
-/// coma light"): `dust_light_cd` divided by Σᵢ [`dust_grain_light`] over `grains` for this
-/// camera, so the sprites drawn this frame carry exactly `dust_light_cd` from every viewpoint
-/// and the Henyey–Greenstein phase function only shapes how that light is spread along the tail
-/// (forward-scattering grains brighter). 0 when the sum is not positive and finite.
-pub(crate) fn dust_light_scale(
-    dust_light_cd: f64,
-    grains: &[TailGrain],
-    nucleus_rel: DVec3,
-    sun_rel: DVec3,
-) -> f64 {
-    let total: f64 = grains
-        .iter()
-        .map(|g| dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel))
-        .sum();
-    if total > 0.0 && total.is_finite() {
-        dust_light_cd / total
+/// The dust's light production [cd/s per unit of HG] for a coma of luminous intensity
+/// `coma_cd` [cd]: I_coma/[`DUST_HEAD_TIME_S`] (C1L; `TailGpu::sun.w`). 0 for a non-positive or
+/// non-finite coma.
+pub fn dust_emission_cd_per_s(coma_cd: f64) -> f64 {
+    if coma_cd > 0.0 && coma_cd.is_finite() {
+        coma_cd / DUST_HEAD_TIME_S
     } else {
         0.0
     }
 }
+
+/// The spread [m, σ per axis] of grains emitted isotropically at [`DUST_EJECTION_SPEED_MPS`]
+/// after `age_s`: v·t/√3 (the variance of a uniform direction is 1/3 per axis).
+pub fn dust_ejection_sigma_m(age_s: f64) -> f64 {
+    DUST_EJECTION_SPEED_MPS * age_s.max(0.0) / 3.0_f64.sqrt()
+}
+
+/// A splat's screen-plane ellipse (C1L): the grain's 3D covariance `cov` [m²] projected onto
+/// the plane spanned by the unit vectors `right` and `up` (the sprite's plane, facing the
+/// camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`] pixels), then
+/// diagonalised. Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
+/// cos φ·right + sin φ·up and −sin φ·right + cos φ·up. CPU twin of the shader's `splat_axes`
+/// (same order of operations); probed on the GPU.
+pub fn splat_axes(cov: DMat3, right: DVec3, up: DVec3, floor_m: f64) -> (f64, f64, f64) {
+    let floor2 = floor_m * floor_m;
+    let (sr, su) = (cov * right, cov * up);
+    let p = right.dot(sr) + floor2;
+    let q = right.dot(su);
+    let r = up.dot(su) + floor2;
+    let m = 0.5 * (p + r);
+    let h = 0.5 * (p - r);
+    let d = (h * h + q * q).sqrt();
+    let l1 = m + d;
+    // ≥ floor² in exact arithmetic (the floor is added to both axes); kept there under rounding.
+    let l2 = (m - d).max(floor2);
+    (l1.sqrt(), l2.sqrt(), 0.5 * (2.0 * q).atan2(p - r))
+}
+
+/// The smallest splat σ drawn [px] (twin of `SPRITE_MIN_PX` in `comet.wgsl`): a sub-pixel splat
+/// neither aliases nor vanishes; its light is kept (C1 review I2's floor).
+pub const SPRITE_MIN_PX: f64 = 0.75;
 
 /// A grain sprite's normalised profile [1/m²] at distance `r` from its centre for width `sigma`:
 /// a Gaussian cut at [`SPRITE_SIGMAS`]·σ, shifted to reach 0 there and renormalised so its
@@ -338,19 +441,22 @@ pub(crate) fn dust_rows(
     };
     // Production ∝ r_h^(−K1/2.5): SBDB's total-magnitude law m = M1 + 5 log Δ + K1 log r_h
     // (plan C1).
-    finson_probstein(conic, t_obs, &p, &|r_h| r_h.powf(-k1 / 2.5))
+    finson_probstein(conic, t_obs, &p, &|r_h| dust_production(r_h, k1))
 }
 
-/// One grain as the dust pass draws it.
+/// One dust splat as the pass draws it (C1L): a grain of the Finson–Probstein grid, or a merged
+/// 2 × 2 block of them ([`tail_grains`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TailGrain {
-    /// Offset from the nucleus at the refresh epoch [m], ICRS.
+    /// Offset from the nucleus at the refresh epoch [m], ICRS (a merged block's light-weighted
+    /// mean).
     pub(crate) offset_m: DVec3,
-    /// Sprite σ [m] (neighbour spacing).
-    pub(crate) sigma_m: f64,
-    /// Light weight, normalised so Σ wᵢ·(r_h/rᵢ)² = 1 at the refresh epoch (rᵢ the grain's
-    /// heliocentric distance; this keeps the f32 weights near 1/2 048). The pass draws
-    /// [`dust_grain_light`] (w × (r_h/rᵢ)² × phase) × the per-view [`dust_light_scale`].
+    /// The splat's 3D covariance [m²] (symmetric): half a grid step toward its neighbours, the
+    /// ejection spread, and for a merged block its members' spread about the mean.
+    pub(crate) cov_m2: DMat3,
+    /// Emission weight [s]: the dust emitted in the grain's cell, as seconds of the current
+    /// production, Σ over the grid of P(t_e)/P_now × (√β / Σ√β) × Δt (module docs). The pass
+    /// draws [`dust_grain_light`] (weight × (r_h/r)² × HG) × [`dust_emission_cd_per_s`].
     pub(crate) weight: f64,
 }
 
@@ -360,7 +466,7 @@ pub(crate) struct TailState {
     /// The epoch the grains were computed for.
     pub(crate) epoch: Epoch,
     pub(crate) grains: Vec<TailGrain>,
-    /// Largest |offset| + [`SPRITE_SIGMAS`]·σ [m]: the tail's reach from the nucleus.
+    /// Largest |offset| + [`SPRITE_SIGMAS`]·σ_max [m]: the tail's reach from the nucleus.
     pub(crate) reach_m: f64,
     /// Bumped at every completed refresh (the renderer re-uploads on a change).
     pub(crate) version: u64,
@@ -368,62 +474,180 @@ pub(crate) struct TailState {
     pub(crate) last_seen_wall_s: f64,
 }
 
-/// The sprites of a complete β × age grid of grains (`grains` in `finson_probstein`'s order) seen
-/// from a nucleus whose Sun is at `sun_rel` [m] (module docs).
+/// v vᵀ.
+fn outer(v: DVec3) -> DMat3 {
+    DMat3::from_cols(v * v.x, v * v.y, v * v.z)
+}
+
+/// A splat while blocks are merged: its [`TailGrain`] and the smallest ejection spread [m] of
+/// the grains in it.
+#[derive(Clone, Copy, Debug)]
+struct Splat {
+    grain: TailGrain,
+    spread_m: f64,
+}
+
+/// The splats of a complete β × age grid of grains (`grains` in `finson_probstein`'s order, rows
+/// of [`DUST_PARAMS`]`.n_age` ages) whose production law gives `production_now` at the refresh
+/// epoch (module docs, C1L).
 ///
-/// σ = [`SPRITE_SPACING_FRACTION`] × the larger of the mean distances to the grain's β
-/// neighbours (same age) and to its age neighbours (same β; the youngest grain's younger
-/// neighbour is the nucleus), so neighbouring sprites always overlap. Weights are normalised so
-/// that Σ wᵢ·(r_h/rᵢ)² = 1, rᵢ = |offsetᵢ − sun_rel| the grain's heliocentric distance.
-pub(crate) fn tail_grains(grains: &[DustGrain], sun_rel: DVec3) -> Vec<TailGrain> {
+/// - **Weights:** a grain's `weight` (production at emission × √β) / (production now × Σ√β over
+///   the β rows) × the age step [s]; they sum to the emission history's equivalent span
+///   H = Σ_k P(t_e,k)/P_now·Δt (60 d at a constant production).
+/// - **Covariance:** σ = [`SPLAT_GRID_SIGMA`] grid steps along the central differences to the β
+///   and age neighbours (one-sided at the edges; the youngest grain's younger neighbour is the
+///   nucleus), plus [`dust_ejection_sigma_m`] of its age on every axis.
+/// - **Merging:** level by level, a 2 × 2 block of splats (each present) becomes one when every
+///   member lies within [`SPLAT_MERGE_SPREAD`] × the block's smallest ejection spread of the
+///   light-weighted mean: weight = Σ, offset = the weighted mean, covariance = the weighted mean
+///   of (member covariance + its offset from the mean, outer product), so the light and its
+///   first and second moments are kept.
+pub(crate) fn tail_grains(grains: &[DustGrain], production_now: f64) -> Vec<TailGrain> {
+    tail_grains_merged_within(grains, production_now, SPLAT_MERGE_SPREAD)
+}
+
+/// [`tail_grains`] with the merge threshold `merge_spread` (in ejection spreads; 0 keeps every
+/// grain apart).
+fn tail_grains_merged_within(
+    grains: &[DustGrain],
+    production_now: f64,
+    merge_spread: f64,
+) -> Vec<TailGrain> {
     let n_age = DUST_PARAMS.n_age as usize;
     let n_beta = grains.len() / n_age;
+    if n_beta == 0 || !(production_now > 0.0 && production_now.is_finite()) {
+        return Vec::new();
+    }
     let at = |j: usize, k: usize| grains[j * n_age + k].pos_rel_nucleus_m;
-    let mean_distance = |p: DVec3, others: &[DVec3]| {
-        others.iter().map(|o| (*o - p).length()).sum::<f64>() / others.len().max(1) as f64
-    };
-    let r_h2 = sun_rel.length_squared();
-    let lit = |g: &DustGrain| g.weight * r_h2 / (g.pos_rel_nucleus_m - sun_rel).length_squared();
-    let total: f64 = grains[..n_beta * n_age].iter().map(lit).sum();
-    let norm = if total > 0.0 && total.is_finite() {
-        1.0 / total
-    } else {
-        0.0
-    };
-    let mut out = Vec::with_capacity(n_beta * n_age);
+    let sum_sqrt_beta: f64 = (0..n_beta).map(|j| grains[j * n_age].beta.sqrt()).sum();
+    let dt = DUST_PARAMS.max_age_days * uni_core::DAY / DUST_PARAMS.n_age as f64;
+    let norm = dt / (production_now * sum_sqrt_beta);
+    let s2 = SPLAT_GRID_SIGMA * SPLAT_GRID_SIGMA;
+    let mut level: Vec<Option<Splat>> = Vec::with_capacity(n_beta * n_age);
     for j in 0..n_beta {
         for k in 0..n_age {
-            let p = at(j, k);
-            let beta_nb: Vec<DVec3> = [j.checked_sub(1), (j + 1 < n_beta).then_some(j + 1)]
-                .into_iter()
-                .flatten()
-                .map(|jj| at(jj, k))
-                .collect();
-            let age_nb: Vec<DVec3> = [
-                Some(k.checked_sub(1).map_or(DVec3::ZERO, |kk| at(j, kk))),
-                (k + 1 < n_age).then(|| at(j, k + 1)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            let spacing = mean_distance(p, &beta_nb).max(mean_distance(p, &age_nb));
-            out.push(TailGrain {
-                offset_m: p,
-                // 1 m floor: a sprite is never degenerate.
-                sigma_m: (SPRITE_SPACING_FRACTION * spacing).max(1.0),
-                weight: grains[j * n_age + k].weight * norm,
-            });
+            let g = &grains[j * n_age + k];
+            let x = g.pos_rel_nucleus_m;
+            let along_beta = match (j.checked_sub(1), j + 1 < n_beta) {
+                (Some(jm), true) => 0.5 * (at(j + 1, k) - at(jm, k)),
+                (Some(jm), false) => x - at(jm, k),
+                (None, true) => at(j + 1, k) - x,
+                (None, false) => DVec3::ZERO,
+            };
+            let younger = k.checked_sub(1).map_or(DVec3::ZERO, |km| at(j, km));
+            let along_age = if k + 1 < n_age {
+                0.5 * (at(j, k + 1) - younger)
+            } else {
+                x - younger
+            };
+            let spread = dust_ejection_sigma_m(g.age_s);
+            let cov = (outer(along_beta) + outer(along_age)) * s2
+                + DMat3::from_diagonal(DVec3::splat(spread * spread));
+            let weight = g.weight * norm;
+            level.push((weight.is_finite() && weight >= 0.0).then_some(Splat {
+                grain: TailGrain {
+                    offset_m: x,
+                    cov_m2: cov,
+                    weight,
+                },
+                spread_m: spread,
+            }));
         }
     }
+    let mut out = Vec::with_capacity(n_beta * n_age);
+    let (mut rows, mut cols) = (n_beta, n_age);
+    while rows >= 2 && cols >= 2 {
+        let (rows2, cols2) = (rows / 2, cols / 2);
+        let mut next: Vec<Option<Splat>> = vec![None; rows2 * cols2];
+        for j in 0..rows2 {
+            for k in 0..cols2 {
+                let members: Vec<Splat> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .iter()
+                    .filter_map(|&(dj, dk)| level[(2 * j + dj) * cols + 2 * k + dk])
+                    .collect();
+                if members.len() == 4 {
+                    next[j * cols2 + k] = merge(&members, merge_spread);
+                }
+            }
+        }
+        // The members of blocks that stayed apart are final.
+        for j in 0..rows {
+            for k in 0..cols {
+                let merged =
+                    j / 2 < rows2 && k / 2 < cols2 && next[(j / 2) * cols2 + k / 2].is_some();
+                if let (Some(splat), false) = (level[j * cols + k], merged) {
+                    out.push(splat.grain);
+                }
+            }
+        }
+        level = next;
+        (rows, cols) = (rows2, cols2);
+    }
+    out.extend(level.into_iter().flatten().map(|s| s.grain));
     out
+}
+
+/// One splat for `members` when they lie within `merge_spread` × their smallest ejection
+/// spread of their light-weighted mean (moments kept, [`tail_grains`]); `None` otherwise.
+fn merge(members: &[Splat], merge_spread: f64) -> Option<Splat> {
+    let weight: f64 = members.iter().map(|m| m.grain.weight).sum();
+    if !(weight > 0.0) {
+        return None;
+    }
+    let mean = members
+        .iter()
+        .map(|m| m.grain.offset_m * m.grain.weight)
+        .sum::<DVec3>()
+        / weight;
+    let spread = members
+        .iter()
+        .map(|m| m.spread_m)
+        .fold(f64::INFINITY, f64::min);
+    let far = members
+        .iter()
+        .map(|m| (m.grain.offset_m - mean).length())
+        .fold(0.0, f64::max);
+    if !(far <= merge_spread * spread) {
+        return None;
+    }
+    let cov = members
+        .iter()
+        .map(|m| (m.grain.cov_m2 + outer(m.grain.offset_m - mean)) * (m.grain.weight / weight))
+        .fold(DMat3::ZERO, |a, c| a + c);
+    Some(Splat {
+        grain: TailGrain {
+            offset_m: mean,
+            cov_m2: cov,
+            weight,
+        },
+        spread_m: spread,
+    })
+}
+
+/// The largest σ [m] of a splat's covariance: an upper bound on its largest eigenvalue's root
+/// (the largest row sum of |cov|, Gershgorin).
+fn sigma_bound_m(cov: DMat3) -> f64 {
+    let c = cov.abs();
+    let rows = [
+        c.x_axis.x + c.y_axis.x + c.z_axis.x,
+        c.x_axis.y + c.y_axis.y + c.z_axis.y,
+        c.x_axis.z + c.y_axis.z + c.z_axis.z,
+    ];
+    rows.into_iter().fold(0.0, f64::max).sqrt()
 }
 
 /// The reach of a tail of `grains` from the nucleus [m]: its farthest sprite edge.
 pub(crate) fn tail_reach_m(grains: &[TailGrain]) -> f64 {
     grains
         .iter()
-        .map(|g| g.offset_m.length() + SPRITE_SIGMAS * g.sigma_m)
+        .map(|g| g.offset_m.length() + SPRITE_SIGMAS * sigma_bound_m(g.cov_m2))
         .fold(0.0, f64::max)
+}
+
+/// The production law's value at heliocentric distance `r_au` for slope `k1`: r_h^(−K1/2.5)
+/// (the factor `dust_rows` weights the emissions with).
+pub(crate) fn dust_production(r_au: f64, k1: f64) -> f64 {
+    r_au.powf(-k1 / 2.5)
 }
 
 /// A conservative reach [m] of a dust tail not computed yet, for culling: 1.5 × the drift
@@ -544,7 +768,8 @@ impl TailManager {
             job.rows_done += rows;
             work.solves += (rows as usize + 1) * n_age;
             if let Some(done) = self.job.take_if(|j| j.rows_done >= DUST_PARAMS.n_beta) {
-                let grains = tail_grains(&done.grains, done.sun_rel);
+                let production_now = dust_production(done.sun_rel.length() / AU, done.k1);
+                let grains = tail_grains(&done.grains, production_now);
                 self.next_version += 1;
                 self.tails.insert(
                     done.id,
@@ -753,7 +978,8 @@ mod tests {
 
     /// A prograde short-period comet and 1P/Halley (retrograde) shortly after perihelion: the
     /// dust tail trails the motion (mean grain offset · v < 0) and points away from the Sun
-    /// (· r̂_h > 0); the sprites cover every grain, and the light weights sum to 1.
+    /// (· r̂_h > 0); the splats are at most one per grain, every covariance is positive definite,
+    /// and the weights add up to the emission history H = Σ P(t_e)/P_now·Δt.
     #[test]
     fn dust_tail_lags_motion() {
         let comets = [
@@ -787,74 +1013,294 @@ mod tests {
                 "mean offset {mean} m leads the motion {v}"
             );
             assert!(mean.dot(r) > 0.0, "mean offset {mean} m points sunward");
-            let sprites = tail_grains(&grains, -r);
-            assert_eq!(sprites.len(), GRAINS_PER_TAIL);
-            assert!(sprites.iter().all(|g| g.sigma_m > 0.0 && g.weight >= 0.0));
-            let lit: f64 = sprites
-                .iter()
-                .map(|g| g.weight * r.length_squared() / (r + g.offset_m).length_squared())
+            let now = dust_production(r.length() / AU, 10.0);
+            let splats = tail_grains(&grains, now);
+            assert!(!splats.is_empty() && splats.len() <= GRAINS_PER_TAIL);
+            assert!(
+                splats
+                    .iter()
+                    .all(|g| g.weight >= 0.0 && g.cov_m2.determinant() > 0.0)
+            );
+            let sqrt_beta: f64 = (0..DUST_PARAMS.n_beta as usize)
+                .map(|j| grains[j * DUST_PARAMS.n_age as usize].beta.sqrt())
                 .sum();
-            assert!((lit - 1.0).abs() < 1e-9, "Σ w (r_h/r)² = {lit}");
+            let dt = DUST_PARAMS.max_age_days * DAY / f64::from(DUST_PARAMS.n_age);
+            let h: f64 = grains
+                .iter()
+                .map(|g| g.weight / (now * sqrt_beta) * dt)
+                .sum();
+            let got: f64 = splats.iter().map(|g| g.weight).sum();
+            assert!((got / h - 1.0).abs() < 1e-12, "Σw {got} s vs H {h} s");
+            println!(
+                "{days} d after perihelion: {} splats, H {:.1} d",
+                splats.len(),
+                h / DAY
+            );
         }
     }
 
-    /// Review C1 I1 (plan C1: "total tail light = 0.5 × coma light"): with the per-view scale
-    /// the dust light drawn, Σ scale × `dust_grain_light`, is 0.5 × the coma's from every phase
-    /// angle and distance (inside the tail included), not only averaged over viewing directions.
-    /// The old scale (Σ w (r_h/r)² = 1 at refresh, HG of mean 1) drew Σ `dust_grain_light` of
-    /// that: about 0.16 × at phase 20° and 0.4 × at 90°.
+    /// C1L: with a constant production (a circular orbit) the weights add up to the 60 days of
+    /// ages; merging keeps the tail's light and its first and second moments about the nucleus
+    /// (Σw, Σw·x, Σw·(cov + x xᵀ)) and only ever reduces the splat count.
     #[test]
-    fn dust_tail_light_is_half_the_coma_from_every_view() {
-        let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
-        let t = conic.tp.add_seconds(20.0 * DAY);
-        let (r, _) = heliocentric_state_icrs(&conic, t);
-        let sun_rel = -r;
-        let grains = tail_grains(&dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta), sun_rel);
-        let dust_cd = DUST_TAIL_LIGHT * 3.0e15;
-        let to_sun = sun_rel.normalize();
-        let side = to_sun.any_orthonormal_vector();
-        let mut old = Vec::new();
-        for phase_deg in [0.0_f64, 20.0, 45.0, 90.0, 135.0, 160.0, 175.0] {
-            // The camera seen from the nucleus at the phase angle from the Sun.
-            let a = phase_deg.to_radians();
-            let to_camera = a.cos() * to_sun + a.sin() * side;
-            for delta_au in [0.01, 0.3, 2.0] {
-                let nucleus_rel = -delta_au * AU * to_camera;
-                let light =
-                    |g: &TailGrain| dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel);
-                let scale = dust_light_scale(dust_cd, &grains, nucleus_rel, sun_rel);
-                let drawn: f64 = grains.iter().map(|g| scale * light(g)).sum();
-                assert!(
-                    (drawn / dust_cd - 1.0).abs() < 1e-12,
-                    "phase {phase_deg}°, Δ {delta_au} AU: {drawn} of {dust_cd} cd"
-                );
-                if delta_au == 0.3 {
-                    old.push((phase_deg, grains.iter().map(light).sum::<f64>()));
+    fn dust_weights_and_merging_keep_the_light() {
+        let conic = conic_from_perihelion(0.8, 0.0, 0.0, 0.0, 0.0, 2_451_545.0);
+        let t = conic.tp.add_seconds(30.0 * DAY);
+        let grains = dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta);
+        let now = dust_production(0.8, 10.0);
+        let apart = tail_grains_merged_within(&grains, now, 0.0);
+        assert_eq!(apart.len(), GRAINS_PER_TAIL);
+        let h: f64 = apart.iter().map(|g| g.weight).sum();
+        assert!((h / (60.0 * DAY) - 1.0).abs() < 1e-9, "H {} d", h / DAY);
+        let moments = |splats: &[TailGrain]| {
+            let w: f64 = splats.iter().map(|g| g.weight).sum();
+            let m1 = splats.iter().map(|g| g.offset_m * g.weight).sum::<DVec3>();
+            let m2 = splats
+                .iter()
+                .map(|g| (g.cov_m2 + outer(g.offset_m)) * g.weight)
+                .fold(DMat3::ZERO, |a, c| a + c);
+            (w, m1, m2)
+        };
+        let (w0, a0, b0) = moments(&apart);
+        for conic_t in [(conic, t), {
+            let c = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
+            (c, c.tp.add_seconds(20.0 * DAY))
+        }] {
+            let g = dust_rows(&conic_t.0, 10.0, conic_t.1, 0..DUST_PARAMS.n_beta);
+            let now = dust_production(
+                heliocentric_state_icrs(&conic_t.0, conic_t.1).0.length() / AU,
+                10.0,
+            );
+            let (w0, a0, b0) = moments(&tail_grains_merged_within(&g, now, 0.0));
+            let merged = tail_grains(&g, now);
+            let (w1, a1, b1) = moments(&merged);
+            assert!(merged.len() < GRAINS_PER_TAIL, "nothing merged");
+            assert!((w1 / w0 - 1.0).abs() < 1e-12);
+            assert!((a1 - a0).length() <= 1e-9 * a0.length());
+            let scale = b0.abs().to_cols_array().into_iter().fold(0.0, f64::max);
+            let diff = (b1 - b0)
+                .abs()
+                .to_cols_array()
+                .into_iter()
+                .fold(0.0, f64::max);
+            assert!(
+                diff <= 1e-9 * scale,
+                "second moments differ by {diff:e} of {scale:e}"
+            );
+            println!("{} → {} splats", g.len(), merged.len());
+        }
+        assert!(w0 > 0.0 && a0.length() > 0.0 && b0.determinant() > 0.0);
+        // Members farther apart than the threshold stay apart.
+        let far = |x: f64| Splat {
+            grain: TailGrain {
+                offset_m: DVec3::new(x, 0.0, 0.0),
+                cov_m2: DMat3::IDENTITY,
+                weight: 1.0,
+            },
+            spread_m: 1.0,
+        };
+        assert!(merge(&[far(0.0), far(1.0), far(2.0), far(3.0)], 2.0).is_some());
+        assert!(merge(&[far(0.0), far(1.0), far(2.0), far(30.0)], 2.0).is_none());
+    }
+
+    /// The splat ellipse (CPU twin of `splat_axes` in comet.wgsl): σ₁² cos²φ + σ₂² sin²φ etc.
+    /// rebuild the covariance projected on (right, up) plus the floor; a flat (rank-1)
+    /// covariance seen edge-on still gets the floor on its minor axis.
+    #[test]
+    fn splat_axes_rebuild_the_projected_covariance() {
+        let right = DVec3::new(0.6, 0.8, 0.0);
+        let up = DVec3::new(-0.48, 0.36, 0.8);
+        assert!(right.dot(up).abs() < 1e-12);
+        let a = DVec3::new(3.0e9, -1.0e9, 2.0e8);
+        let b = DVec3::new(2.0e8, 5.0e8, -7.0e8);
+        for (cov, floor) in [
+            (outer(a) + outer(b), 1.0e6),
+            (
+                outer(a) * 0.25 + DMat3::from_diagonal(DVec3::splat(4.0e16)),
+                3.0e7,
+            ),
+            (outer(right * 2.0e9), 1.0e7),
+            (DMat3::ZERO, 2.0e6),
+        ] {
+            let (s1, s2, phi) = splat_axes(cov, right, up, floor);
+            assert!(s1 >= s2 && s2 >= floor * (1.0 - 1e-12), "{s1} {s2} {floor}");
+            let (c, s) = (phi.cos(), phi.sin());
+            let p = s1 * s1 * c * c + s2 * s2 * s * s;
+            let q = (s1 * s1 - s2 * s2) * c * s;
+            let r = s1 * s1 * s * s + s2 * s2 * c * c;
+            let want = [
+                right.dot(cov * right) + floor * floor,
+                right.dot(cov * up),
+                up.dot(cov * up) + floor * floor,
+            ];
+            let tol = 1e-9 * (s1 * s1);
+            assert!(
+                (p - want[0]).abs() <= tol
+                    && (q - want[1]).abs() <= tol
+                    && (r - want[2]).abs() <= tol
+            );
+        }
+        let (s1, s2, _) = splat_axes(outer(up * 5.0e8), right, up, 1.0e6);
+        assert!((s1 / 5.0e8 - 1.0).abs() < 1e-5 && (s2 / 1.0e6 - 1.0).abs() < 1e-6);
+    }
+
+    /// C1L: `DUST_HEAD_TIME_S` is what its documented inputs give: NEOWISE's visual law at Aravind
+    /// et al.'s first night (r_h 0.63 AU, Δ 0.69 AU, Earth–Sun 1.0160 AU), their A(0)fρ 34.99 m
+    /// taken back to the observed phase with the Halley–Marcus composite, the 1.11 km/s dust
+    /// speed, and HG(0.6) at the scattering angle.
+    #[test]
+    fn neowise_head_time_is_derived() {
+        let (tau, phase_deg, phi) = neowise_calibration();
+        println!(
+            "τ {tau:.4e} s ({:.3} d), phase {phase_deg:.3}°, Φ_HM {phi:.4}",
+            tau / DAY
+        );
+        assert!((phase_deg - 100.56).abs() < 0.01, "{phase_deg}");
+        assert!((phi - 0.7103).abs() < 1e-4, "{phi}");
+        assert!(
+            (tau / DUST_HEAD_TIME_S - 1.0).abs() < 1e-3,
+            "{tau} vs {DUST_HEAD_TIME_S}"
+        );
+    }
+
+    /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry
+    /// (2020-07-15 03:00 UTC from the Earth, fov 20°, 1 080 lines, up = ICRS +z) the splats,
+    /// rasterised on the CPU at 1/4 of the lines, give a dust tail brighter than 10⁻⁴ cd/m²
+    /// (22.6 mag/arcsec², about the natural night sky) at 3° from the nucleus, whose centre line's
+    /// direction from the nucleus turns by more than 4° between 1° and 4° (a tangent turn of more
+    /// than 8°: curved, not a straight streak), on the side of the ion tail away from the comet's
+    /// motion. Prints the peak luminance and centre line by radius.
+    #[test]
+    fn neowise_dust_tail_is_long_and_curved() {
+        use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
+        let conic = conic_from_perihelion(
+            0.294_651_249_380_919_6,
+            0.999_178_026_253_129_2,
+            128.937_502_759_480_9,
+            61.010_428_185_369_88,
+            37.278_658_448_125_7,
+            2_459_034.178_898_044_4,
+        );
+        let t = Epoch::from_unix_utc(1_594_782_000.0);
+        let (nucleus, vel) = heliocentric_state_icrs(&conic, t);
+        let (earth, _) = planet_state(Planet::EmBary, t);
+        let rel = nucleus - earth;
+        let (r_au, delta_au) = (nucleus.length() / AU, rel.length() / AU);
+        let law = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("NEOWISE's law");
+        let coma = crate::comet::coma::comet_total_intensity_cd(law.m1(), law.k1, r_au, delta_au);
+        let grains = dust_rows(&conic, law.k1, t, 0..DUST_PARAMS.n_beta);
+        let splats = tail_grains(&grains, dust_production(r_au, law.k1));
+        let rate = dust_emission_cd_per_s(coma);
+        let fwd = rel.normalize();
+        let right = fwd.cross(DVec3::Z).normalize();
+        let up = right.cross(fwd);
+        // Row 20's pixel, and the test's 4 × coarser grid.
+        let f_full = 540.0 / 10.0_f64.to_radians().tan();
+        let (w, h, k) = (480_usize, 270_usize, 4.0);
+        let f = f_full / k;
+        let mut img = vec![0.0_f64; w * h];
+        let (mut light, mut drawn) = (0.0, 0.0);
+        for g in &splats {
+            let p = rel + g.offset_m;
+            let d = p.length();
+            let mut i = rate * dust_grain_light(g.offset_m, g.weight, rel, -nucleus);
+            light += i;
+            let pixel_m = d / f_full;
+            let (mut s1, mut s2, phi) = splat_axes(g.cov_m2, right, up, SPRITE_MIN_PX * pixel_m);
+            let s_max = crate::comet::SPRITE_MAX_PX * pixel_m;
+            if s1 > s_max {
+                i *= s_max / s1;
+                s1 = s_max;
+            }
+            if s2 > s_max {
+                i *= s_max / s2;
+                s2 = s_max;
+            }
+            drawn += i;
+            let z = p.dot(fwd);
+            let (cx, cy) = (
+                0.5 * w as f64 + f * p.dot(right) / z,
+                0.5 * h as f64 - f * p.dot(up) / z,
+            );
+            let m_per_px = d / f;
+            let reach = SPRITE_SIGMAS * s1 / m_per_px + 1.0;
+            let (e1, e2) = (
+                DVec3::new(phi.cos(), phi.sin(), 0.0),
+                DVec3::new(-phi.sin(), phi.cos(), 0.0),
+            );
+            let x0 = (cx - reach).floor().max(0.0) as usize;
+            let y0 = (cy - reach).floor().max(0.0) as usize;
+            let x1 = ((cx + reach).ceil().max(0.0) as usize).min(w);
+            let y1 = ((cy + reach).ceil().max(0.0) as usize).min(h);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    // Screen offset → metres on the sprite plane (x right, y up).
+                    let v = DVec3::new(x as f64 + 0.5 - cx, cy - (y as f64 + 0.5), 0.0) * m_per_px;
+                    let q = (v.dot(e1) / s1).hypot(v.dot(e2) / s2);
+                    img[y * w + x] += i * sprite_profile(q, 1.0) / (s1 * s2);
                 }
             }
         }
-        println!("old phase-averaged tail light / 0.5 coma by phase: {old:?}");
-        let old_at = |p: f64| old.iter().find(|o| o.0 == p).map_or(f64::NAN, |o| o.1);
-        assert!(old_at(20.0) < 0.3 && old_at(90.0) < 0.55 && old_at(160.0) > 2.5);
-        // Nothing lit, nothing drawn.
-        assert_eq!(dust_light_scale(dust_cd, &[], DVec3::Z, sun_rel), 0.0);
-        let on_grain = -grains[100].offset_m;
-        assert_eq!(
-            dust_grain_light(grains[100].offset_m, 1.0, on_grain, sun_rel),
-            0.0
-        );
-
-        // Cost of the per-view scale (computed per tailed comet per frame).
-        let clock = std::time::Instant::now();
-        let mut sum = 0.0;
-        for k in 0..64 {
-            let nucleus_rel = -(0.3 + 0.01 * f64::from(k)) * AU * side;
-            sum += dust_light_scale(dust_cd, &grains, nucleus_rel, sun_rel);
-        }
+        // On circles about the nucleus, by radius in degrees: the brightest pixel, and the
+        // tail's centre line (the luminance-weighted mean direction).
+        let px_per_deg = f * 1.0_f64.to_radians().tan();
+        let angle = |v: DVec3| v.dot(up).atan2(v.dot(right)).to_degrees();
+        let circle = |deg: f64| {
+            let r = deg * px_per_deg;
+            let (mut peak, mut sx, mut sy) = (0.0_f64, 0.0, 0.0);
+            for a in 0..1440 {
+                let az = (f64::from(a) * 0.25).to_radians();
+                let (x, y) = (0.5 * w as f64 + r * az.cos(), 0.5 * h as f64 - r * az.sin());
+                if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h {
+                    let l = img[y as usize * w + x as usize];
+                    peak = peak.max(l);
+                    (sx, sy) = (sx + l * az.cos(), sy + l * az.sin());
+                }
+            }
+            (peak, sy.atan2(sx).to_degrees())
+        };
+        let rows: Vec<(f64, f64, f64)> = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .map(|d| {
+                let (peak, centre) = circle(d);
+                (d, peak, centre)
+            })
+            .to_vec();
+        let ion = angle(ion_tail_dir(-nucleus, vel));
+        let motion = angle(vel);
         println!(
-            "per-view dust scale: {:.1} µs per {GRAINS_PER_TAIL}-grain tail (this build; \
-             {sum:.3e})",
-            clock.elapsed().as_secs_f64() * 1e6 / 64.0
+            "row 20: {} splats, tail {:.3e} cd = {:.2} × the coma ({:.2} % cut by SPRITE_MAX_PX); \
+             ion {ion:.1}°, motion {motion:.1}°; by radius (deg, peak cd/m², centre line °):",
+            splats.len(),
+            light,
+            light / coma,
+            100.0 * (1.0 - drawn / light),
+        );
+        for r in &rows {
+            println!("  {:.1}°  {:.3e}  {:.1}°", r.0, r.1, r.2);
+        }
+        let at = |d: f64| {
+            rows.iter()
+                .find(|r| r.0 == d)
+                .map_or((0.0, 0.0), |r| (r.1, r.2))
+        };
+        assert!(
+            at(3.0).0 > 1.0e-4,
+            "the tail at 3°: {:.2e} cd/m²",
+            at(3.0).0
+        );
+        // A straight streak keeps one direction from the nucleus; an arc's direction from its
+        // start turns by half its tangent's turn.
+        let turn = at(1.0).1 - at(4.0).1;
+        assert!(
+            turn.abs() > 4.0,
+            "the centre line turns by {turn:.1}° between 1° and 4°"
+        );
+        // Trailing: the centre line lies on the far side of the ion axis from the motion.
+        let side = |a: f64| (a - ion).to_radians().sin();
+        assert!(
+            side(at(2.0).1) * side(motion) < 0.0,
+            "centre line {:.1}° vs ion {ion:.1}°, motion {motion:.1}°",
+            at(2.0).1
         );
     }
 
@@ -958,7 +1404,7 @@ mod tests {
         assert_eq!(manager.tails.len(), 8);
         for (id, tail) in &manager.tails {
             assert!(tailed.contains(id));
-            assert_eq!(tail.grains.len(), GRAINS_PER_TAIL);
+            assert!(!tail.grains.is_empty() && tail.grains.len() <= GRAINS_PER_TAIL);
             assert!(tail.reach_m > 0.0 && tail.reach_m.is_finite());
         }
     }

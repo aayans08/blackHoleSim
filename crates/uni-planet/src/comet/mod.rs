@@ -12,12 +12,13 @@
 //! **Light (lead ruling "comet double light").** SBDB's total magnitude (M1, K1) is the nucleus
 //! plus the coma. The nucleus reflects sunlight as a p_V 0.04 lunar-Lambert body of its (assumed)
 //! radius ([`nucleus::nucleus_illuminance_lux`], which the app's nucleus point should use too);
-//! the coma carries the total minus that, floored at 0 ([`coma::coma_intensity_cd`]); the dust
-//! tail adds 0.5 × and the ion tail 0.2 × the coma's light (v0 ratios, card note
-//! `uni_ui::theme::NOTE_TAILS`), from every viewpoint: the dust tail is normalised per view
-//! ([`tails::dust_light_scale`]), so its phase function only shapes where along the tail the
-//! light is. A dust sprite nearer than its `SPRITE_MAX_PX` cut (a camera inside the tail) and an
-//! ion tail seen end-on lose some of that light (approximate; stated where they are drawn).
+//! the coma carries the total minus that, floored at 0 ([`coma::coma_intensity_cd`]); the ion
+//! tail adds 0.2 × the coma's light (v0 ratio, card note `uni_ui::theme::NOTE_TAILS`); the dust
+//! tail carries the dust emitted over the last 60 days, at the coma's light /
+//! [`tails::DUST_HEAD_TIME_S`] per second of current production (C1L, calibrated on NEOWISE),
+//! lit and phased grain by grain. A dust splat wider than `SPRITE_MAX_PX` (a camera inside the
+//! tail) and an ion tail seen end-on lose some of that light (approximate; stated where they are
+//! drawn). Glow (coma, ion and dust) fainter than [`GLOW_CULL_PRE`] pre-exposed is not drawn.
 //!
 //! **Pass.** One render pass, timer label "comets" (no sub-pass, so no extra label): the nuclei
 //! (opaque, depth write, `lens_mask.g` and `.a`), then the comae, ion tails and dust sprites
@@ -58,10 +59,10 @@ use self::nucleus::{
     nucleus_vertices, vertex_normals,
 };
 use self::tails::{
-    DUST_TAIL_LIGHT, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
-    KEPLER_SOLVE_US, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light, dust_light_scale,
-    dust_phase, dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m, ion_sigma_m,
-    ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m, is_active,
+    GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT, KEPLER_SOLVE_US,
+    TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_emission_cd_per_s, dust_grain_light, dust_phase,
+    dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness,
+    ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m, is_active, splat_axes,
     sprite_profile, tailed_comets,
 };
 use crate::body::{exposure_weight, lens_mask_target, sphere_in_view};
@@ -176,8 +177,8 @@ pub(crate) struct ComaGpu {
 pub(crate) struct TailGpu {
     /// xyz: nucleus − camera [m], root axes; w: the ion tail's luminous intensity [cd].
     pub(crate) nucleus: [f32; 4],
-    /// xyz: Sun − nucleus [m]; w: the dust tail's per-view scale [cd] (`tails::dust_light_scale`:
-    /// 0.5 × the coma's light / Σ `dust_grain_light` for this camera; 0 without a dust tail).
+    /// xyz: Sun − nucleus [m]; w: the dust's light production [cd/s per unit of HG]
+    /// (`tails::dust_emission_cd_per_s`: the coma's light / `DUST_HEAD_TIME_S`).
     pub(crate) sun: [f32; 4],
     /// xyz: the ion tail's direction (unit); w: its length [m].
     pub(crate) ion_axis: [f32; 4],
@@ -187,15 +188,42 @@ pub(crate) struct TailGpu {
     pub(crate) dust_colour: [f32; 4],
 }
 
-/// Twin of `struct GrainGpu` in `comet.wgsl`: one dust grain sprite.
+/// Twin of `struct GrainGpu` in `comet.wgsl`: one dust splat (C1L).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct GrainGpu {
-    /// xyz: offset from the nucleus [m], root axes; w: the sprite's σ [m].
+    /// xyz: offset from the nucleus [m], root axes; w: the emission weight [s]
+    /// (`tails::TailGrain::weight`).
     pub(crate) offset: [f32; 4],
-    /// x: light weight (`tails::TailGrain::weight`); yzw: 0.
-    pub(crate) weight: [f32; 4],
+    /// The 3D covariance's diagonal xx, yy, zz [m²]; w: 0.
+    pub(crate) cov_diag: [f32; 4],
+    /// Its off-diagonal xy, xz, yz [m²]; w: 0.
+    pub(crate) cov_off: [f32; 4],
 }
+
+impl GrainGpu {
+    /// The GPU record of a splat.
+    pub(crate) fn of(g: &tails::TailGrain) -> Self {
+        let c = g.cov_m2;
+        GrainGpu {
+            offset: vec4(g.offset_m, g.weight),
+            cov_diag: [c.x_axis.x as f32, c.y_axis.y as f32, c.z_axis.z as f32, 0.0],
+            cov_off: [c.y_axis.x as f32, c.z_axis.x as f32, c.z_axis.y as f32, 0.0],
+        }
+    }
+}
+
+/// Glow (coma, ion ribbon and dust splats) whose brightest point would be written below this
+/// pre-exposed value is not drawn (C1L): 1/1 000 of AgX's black point 2^−12.47393 = 1.75 × 10⁻⁴
+/// (uni-post `agx`, after Sobotka's AgX and Wrensch 2023), so even a thousand such splats on one
+/// pixel stay below black. Twin of `GLOW_CULL_PRE` in `comet.wgsl`. It removes the fill of faint
+/// comets' comae and tails, which no exposure the frame has could show.
+pub const GLOW_CULL_PRE: f64 = 1.75e-7;
+/// A dust splat's σ is at most this many pixels on each axis (twin of `SPRITE_MAX_PX` in
+/// `comet.wgsl`); a wider one keeps its surface brightness and loses the light beyond (a camera
+/// inside a tail; approximate). C1 had 32 px on round sprites; the C1L splats of row 20's tail
+/// stay below 64 px.
+pub const SPRITE_MAX_PX: f64 = 64.0;
 
 /// `[v.x, v.y, v.z, w]` in f32 (camera-relative values are formed in f64 first).
 fn vec4(v: DVec3, w: f64) -> [f32; 4] {
@@ -336,21 +364,18 @@ pub(crate) fn plan_frame(
         } else {
             ION_TAIL_LIGHT * intensity
         };
-        // Per view (review C1 I1): the grains drawn from this camera carry 0.5 × the coma's
-        // light. These are the grains `upload` puts on the GPU this frame.
-        let dust_scale = manager.tails.get(&view.id).map_or(0.0, |t| {
-            dust_light_scale(
-                DUST_TAIL_LIGHT * intensity,
-                &t.grains,
-                view.nucleus_rel_m,
-                view.sun_rel_m,
-            )
-        });
+        // C1L: the dust's light production; each splat's light is this × its emission weight ×
+        // (r_h/r)² × HG, evaluated on the GPU.
+        let dust_rate = if manager.tails.contains_key(&view.id) {
+            dust_emission_cd_per_s(intensity)
+        } else {
+            0.0
+        };
         plan.tails.push(TailDraw {
             id: view.id,
             gpu: TailGpu {
                 nucleus: vec4(view.nucleus_rel_m, ion_light),
-                sun: vec4(view.sun_rel_m, dust_scale),
+                sun: vec4(view.sun_rel_m, dust_rate),
                 ion_axis: vec4(axis, ion_tail_length_m(view.r_au)),
                 ion_colour: rgb0(ion_rgb),
                 dust_colour: rgb0(sun_colour),
@@ -448,10 +473,12 @@ pub struct CometRenderer {
     meshes: HashMap<ObjectId, NucleusMesh>,
     manager: TailManager,
     slots: [Slot; MAX_TAILED_COMETS],
-    /// This frame's draws: nucleus ids in record order, the coma count, (slot, has dust).
+    /// This frame's draws: nucleus ids in record order, the coma count, (slot, dust splats).
     nucleus_draws: Vec<ObjectId>,
     coma_count: u32,
-    tail_draws: Vec<(u32, bool)>,
+    tail_draws: Vec<(u32, u32)>,
+    /// The dust splats uploaded per slot.
+    slot_splats: [u32; MAX_TAILED_COMETS],
     clock: Instant,
     frame: u64,
     /// Measured cost of one Kepler solve [µs] (moving average; starts at the plan's 0.5 µs).
@@ -629,6 +656,7 @@ impl CometRenderer {
             meshes: HashMap::new(),
             manager: TailManager::default(),
             slots: [None; MAX_TAILED_COMETS],
+            slot_splats: [0; MAX_TAILED_COMETS],
             nucleus_draws: Vec::new(),
             coma_count: 0,
             tail_draws: Vec::new(),
@@ -743,19 +771,23 @@ impl CometRenderer {
                     .grains
                     .iter()
                     .take(GRAINS_PER_TAIL)
-                    .map(|g| GrainGpu {
-                        offset: vec4(g.offset_m, g.sigma_m),
-                        weight: [g.weight as f32, 0.0, 0.0, 0.0],
-                    })
+                    .map(GrainGpu::of)
                     .collect();
                 let offset = (slot * GRAINS_PER_TAIL * size_of::<GrainGpu>()) as u64;
-                gpu.queue
-                    .write_buffer(&self.grains_buffer, offset, bytemuck::cast_slice(&grains));
+                if !grains.is_empty() {
+                    gpu.queue.write_buffer(
+                        &self.grains_buffer,
+                        offset,
+                        bytemuck::cast_slice(&grains),
+                    );
+                }
+                self.slot_splats[slot] = grains.len() as u32;
                 self.slots[slot] = Some((tail.id, Some(version)));
             }
             let has_dust = self.slots[slot].is_some_and(|(_, v)| v.is_some());
             records[slot] = tail.gpu;
-            self.tail_draws.push((slot as u32, has_dust));
+            let splats = if has_dust { self.slot_splats[slot] } else { 0 };
+            self.tail_draws.push((slot as u32, splats));
         }
         if !self.tail_draws.is_empty() {
             gpu.queue
@@ -882,8 +914,8 @@ impl RenderFeature for CometRenderer {
             }
             pass.set_pipeline(&self.dust_pipeline);
             let per_tail = GRAINS_PER_TAIL as u32;
-            for &(slot, _) in self.tail_draws.iter().filter(|(_, dust)| *dust) {
-                pass.draw(0..6, slot * per_tail..(slot + 1) * per_tail);
+            for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
+                pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
             }
         }
     }
@@ -942,6 +974,25 @@ fn cs_ion(@builtin(global_invocation_id) gid: vec3<u32>) {
         sigma,
         0.0,
     );
+}
+
+// C1L. in: four vec4 per case, (cov xx, yy, zz, floor), (cov xy, xz, yz, 0), (right, 0),
+// (up, 0); out[case]: splat_axes's ellipse rebuilt as the projected covariance
+// (σ₁²c² + σ₂²s², (σ₁² − σ₂²)cs, σ₁²s² + σ₂²c², σ₁σ₂), c, s = cos φ, sin φ.
+@compute @workgroup_size(64, 1, 1)
+fn cs_splat(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_in) / 4u) {
+        return;
+    }
+    let i = 4u * gid.x;
+    let a = probe_in[i];
+    let b = probe_in[i + 1u];
+    let e = splat_axes(a.xyz, b.xyz, probe_in[i + 2u].xyz, probe_in[i + 3u].xyz, a.w);
+    let c = cos(e.z);
+    let s = sin(e.z);
+    let l1 = e.x * e.x;
+    let l2 = e.y * e.y;
+    probe_out[gid.x] = vec4<f32>(l1 * c * c + l2 * s * s, (l1 - l2) * c * s, l1 * s * s + l2 * c * c, e.x * e.y);
 }
 
 // in: (cos θ, r/σ, μ₀, μ); out: (dust_phase, sprite_profile at σ = SPRITE_PROBE_SIGMA,
@@ -1053,6 +1104,86 @@ pub(crate) fn phase_probe_inputs() -> Vec<[f32; 4]> {
         .collect()
 }
 
+/// Splat probe inputs (C1L): 64 cases of four vec4 each, (cov diagonal, floor), (cov
+/// off-diagonal, 0), (right, 0), (up, 0): covariances from two tangent vectors and an
+/// ejection spread of 10⁶–10¹⁰ m (round, elongated, flat and edge-on), floors 10⁵–10⁸ m, and
+/// sprite planes at 64 orientations.
+pub(crate) fn splat_probe_inputs() -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(256);
+    for k in 0..64_u32 {
+        let f = f64::from(k);
+        let a = DVec3::new((0.7 * f).cos(), (1.3 * f).sin(), (0.4 * f).cos())
+            * 10f64.powf(7.0 + 3.0 * ((k * 5) % 64) as f64 / 63.0);
+        let b = DVec3::new((2.1 * f).sin(), (0.5 * f).cos(), (1.7 * f).sin())
+            * 10f64.powf(6.0 + 3.0 * ((k * 11) % 64) as f64 / 63.0);
+        let spread = if k % 4 == 0 {
+            0.0
+        } else {
+            10f64.powf(6.0 + 3.0 * ((k * 13) % 64) as f64 / 63.0)
+        };
+        let cov = tails_outer(a) * 0.25
+            + tails_outer(b) * 0.25
+            + DMat3::from_diagonal(DVec3::splat(spread * spread));
+        let floor = 10f64.powf(5.0 + 3.0 * ((k * 7) % 64) as f64 / 63.0);
+        let (yaw, pitch) = (0.1 + 0.37 * f, -1.2 + 2.4 * ((k * 3) % 64) as f64 / 63.0);
+        let dir = DVec3::new(
+            pitch.cos() * yaw.cos(),
+            pitch.cos() * yaw.sin(),
+            pitch.sin(),
+        );
+        // Edge-on cases: the line of sight in the plane of a and b.
+        let dir = if k % 8 == 3 {
+            (a.normalize() + 0.3 * b.normalize()).normalize()
+        } else {
+            dir
+        };
+        let right = dir.cross(DVec3::Z).normalize_or(DVec3::X);
+        let up = right.cross(dir);
+        out.push([
+            cov.x_axis.x as f32,
+            cov.y_axis.y as f32,
+            cov.z_axis.z as f32,
+            floor as f32,
+        ]);
+        out.push([
+            cov.y_axis.x as f32,
+            cov.z_axis.x as f32,
+            cov.z_axis.y as f32,
+            0.0,
+        ]);
+        out.push([right.x as f32, right.y as f32, right.z as f32, 0.0]);
+        out.push([up.x as f32, up.y as f32, up.z as f32, 0.0]);
+    }
+    out
+}
+
+/// v vᵀ (the probe inputs' covariances).
+fn tails_outer(v: DVec3) -> DMat3 {
+    DMat3::from_cols(v * v.x, v * v.y, v * v.z)
+}
+
+/// A splat probe case's covariance, floor and plane, as `cs_splat` reads them (f32 → f64).
+fn splat_probe_case(c: &[[f32; 4]]) -> (DMat3, f64, DVec3, DVec3) {
+    let v = |i: usize| c[i].map(f64::from);
+    let (d, o, r, u) = (v(0), v(1), v(2), v(3));
+    let cov = DMat3::from_cols(
+        DVec3::new(d[0], o[0], o[1]),
+        DVec3::new(o[0], d[1], o[2]),
+        DVec3::new(o[1], o[2], d[2]),
+    );
+    (
+        cov,
+        d[3],
+        DVec3::new(r[0], r[1], r[2]),
+        DVec3::new(u[0], u[1], u[2]),
+    )
+}
+
+/// Largest |GPU − CPU| of the splat ellipse's rebuilt covariance, relative to σ₁² (C1L): a
+/// projection, a square root and an atan2 in f32 err by ~1e-6; a wrong axis or angle errs by
+/// ≳ 1e-2.
+const SPLAT_PROBE_TOLERANCE: f64 = 1e-3;
+
 fn run_probe(
     gpu: &GpuContext,
     lib: &ShaderLib,
@@ -1096,7 +1227,7 @@ fn probe_result(name: &str, outcome: anyhow::Result<(bool, String)>) -> ProbeRes
 /// `coma_surface_brightness` and `coma_drawn_brightness` (64 radii, ±1e-3, plan C1),
 /// `ion_tail_brightness`, `ion_tail_drawn_brightness` and `ion_drawn_sigma` (64 cases, both
 /// sides of the pixel floor), `dust_phase`, `sprite_profile`, `nucleus_reflectance` and
-/// `dust_grain_light` (64 cases).
+/// `dust_grain_light` (64 cases), and `splat_axes` (64 cases, C1L).
 pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     lib.add(COMET_PROBE_WGSL_PATH, COMET_PROBE_WGSL);
     let lib = &*lib;
@@ -1193,10 +1324,41 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
             ),
         ))
     };
+    let splat = || -> anyhow::Result<(bool, String)> {
+        let input = splat_probe_inputs();
+        let out = run_probe(gpu, lib, "cs_splat", &input)?;
+        let err = worst(input.chunks(4).zip(&out).flat_map(|(c, g)| {
+            let (cov, floor, right, up) = splat_probe_case(c);
+            let (s1, s2, phi) = splat_axes(cov, right, up, floor);
+            let (cs, sn) = (phi.cos(), phi.sin());
+            let (l1, l2) = (s1 * s1, s2 * s2);
+            let cpu = [
+                l1 * cs * cs + l2 * sn * sn,
+                (l1 - l2) * cs * sn,
+                l1 * sn * sn + l2 * cs * cs,
+            ];
+            let area = s1 * s2;
+            [
+                (f64::from(g[0]) - cpu[0]).abs() / l1,
+                (f64::from(g[1]) - cpu[1]).abs() / l1,
+                (f64::from(g[2]) - cpu[2]).abs() / l1,
+                (f64::from(g[3]) - area).abs() / area,
+            ]
+        }));
+        Ok((
+            err <= SPLAT_PROBE_TOLERANCE,
+            format!(
+                "{} cases, max |GPU − CPU| of the rebuilt ellipse / σ₁² and of σ₁σ₂ {err:.1e} \
+                 (tolerance {SPLAT_PROBE_TOLERANCE:.0e})",
+                input.len() / 4
+            ),
+        ))
+    };
     vec![
         probe_result("coma_surface_brightness", coma()),
         probe_result("ion_tail_brightness", ion()),
         probe_result("comet_phase_and_sprite", phase()),
+        probe_result("comet_dust_splat", splat()),
     ]
 }
 
@@ -1400,21 +1562,24 @@ mod tests {
         assert!(plan.comae.is_empty() && plan.tails.is_empty());
     }
 
-    /// Review C1 I1: the tail record's dust scale (`TailGpu::sun.w`) makes the grains the pass
-    /// draws (`dust_grain_light` × sun.w, from the record's f32 positions and weights) carry
-    /// 0.5 × the coma's light from whichever side the camera sees the comet.
+    /// C1L: the tail record's dust rate (`TailGpu::sun.w`) is the coma's light / τ, so the splats
+    /// the pass draws (`dust_grain_light` × sun.w, from the record's f32 positions and weights)
+    /// carry I_coma/τ × Σ w (r_h/r)² HG(θ): from afar, where every grain is seen at the
+    /// nucleus's scattering angle, that is I_coma × H × HG(θ₀)/τ. The light follows the phase
+    /// function (forward scattering brighter) instead of the v0 constant 0.5 × coma.
     #[test]
-    fn dust_light_is_half_the_coma_in_every_view() {
+    fn dust_record_carries_the_emission_rate() {
         let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
         let t = conic.tp.add_seconds(20.0 * DAY);
         let (r, _) = heliocentric_state_icrs(&conic, t);
         let to_sun = -r.normalize();
         let side = to_sun.any_orthonormal_vector();
         let xyz = |v: [f32; 4]| DVec3::new(v[0].into(), v[1].into(), v[2].into());
+        let mut drawn_by_phase = Vec::new();
         for phase_deg in [10.0_f64, 90.0, 160.0] {
             let a = phase_deg.to_radians();
             let to_camera = a.cos() * to_sun + a.sin() * side;
-            let view = comet_on(5, conic, t, r + 0.4 * AU * to_camera, 8.0, 10.0);
+            let view = comet_on(5, conic, t, r + 3.0 * AU * to_camera, 8.0, 10.0);
             let look = CameraView {
                 orient: DQuat::from_rotation_arc(DVec3::NEG_Z, view.nucleus_rel_m.normalize()),
                 ..camera()
@@ -1429,23 +1594,38 @@ mod tests {
             assert_eq!(plan.tails.len(), 1, "phase {phase_deg}°");
             assert!(plan.tails[0].dust_version.is_some());
             let gpu = plan.tails[0].gpu;
-            let drawn: f64 = manager.tails[&view.id]
-                .grains
+            let coma = coma_intensity_cd(&view);
+            let rate = f64::from(gpu.sun[3]);
+            assert!((rate / (coma / tails::DUST_HEAD_TIME_S) - 1.0).abs() < 1e-6);
+            let grains = &manager.tails[&view.id].grains;
+            let drawn: f64 = grains
                 .iter()
                 .map(|g| {
-                    let weight = f64::from(g.weight as f32);
-                    let offset = g.offset_m.as_vec3().as_dvec3();
-                    f64::from(gpu.sun[3])
-                        * dust_grain_light(offset, weight, xyz(gpu.nucleus), xyz(gpu.sun))
+                    let rec = GrainGpu::of(g);
+                    rate * dust_grain_light(
+                        xyz(rec.offset),
+                        f64::from(rec.offset[3]),
+                        xyz(gpu.nucleus),
+                        xyz(gpu.sun),
+                    )
                 })
                 .sum();
-            let want = DUST_TAIL_LIGHT * coma_intensity_cd(&view);
-            assert!(want > 0.0);
+            let h: f64 = grains.iter().map(|g| g.weight).sum();
+            let lit: f64 = grains
+                .iter()
+                .map(|g| g.weight * r.length_squared() / (r + g.offset_m).length_squared())
+                .sum::<f64>()
+                / h;
+            // The scattering angle at the nucleus: 180° − phase.
+            let want = coma / tails::DUST_HEAD_TIME_S * h * lit * dust_phase(-a.cos());
             assert!(
-                (drawn / want - 1.0).abs() < 1e-5,
-                "phase {phase_deg}°: {drawn} of {want} cd"
+                (drawn / want - 1.0).abs() < 0.02,
+                "phase {phase_deg}°: {drawn:.4e} vs {want:.4e} cd"
             );
+            drawn_by_phase.push(drawn / coma);
         }
+        println!("dust / coma at phases 10°, 90°, 160°: {drawn_by_phase:.3?}");
+        assert!(drawn_by_phase[0] < drawn_by_phase[1] && drawn_by_phase[1] < drawn_by_phase[2]);
     }
 
     /// naga's layout of one struct of `comet.wgsl`: its size and (name, offset) members.
@@ -1522,7 +1702,8 @@ mod tests {
             size_of::<GrainGpu>(),
             &[
                 ("offset", offset_of!(GrainGpu, offset)),
-                ("weight", offset_of!(GrainGpu, weight)),
+                ("cov_diag", offset_of!(GrainGpu, cov_diag)),
+                ("cov_off", offset_of!(GrainGpu, cov_off)),
             ],
         );
         assert_eq!(
@@ -1532,7 +1713,7 @@ mod tests {
                 size_of::<TailGpu>(),
                 size_of::<GrainGpu>()
             ],
-            [96, 48, 80, 32]
+            [96, 48, 80, 48]
         );
     }
 
@@ -1563,6 +1744,7 @@ mod tests {
         assert_eq!(arity("ion_tail_drawn_brightness"), Some(6));
         assert_eq!(arity("ion_drawn_sigma"), Some(1));
         assert_eq!(arity("dust_grain_light"), Some(4));
+        assert_eq!(arity("splat_axes"), Some(5));
         assert_eq!(arity("dust_phase"), Some(1));
         assert_eq!(arity("sprite_profile"), Some(2));
         assert_eq!(arity("nucleus_reflectance"), Some(2));
@@ -1587,6 +1769,9 @@ mod tests {
         assert_eq!(scalar("ION_MIN_SIGMA_PX"), f32_of(ION_MIN_SIGMA_PX));
         assert_eq!(scalar("DUST_G"), f32_of(tails::DUST_PHASE_G));
         assert_eq!(scalar("SPRITE_SIGMAS"), f32_of(tails::SPRITE_SIGMAS));
+        assert_eq!(scalar("SPRITE_MIN_PX"), f32_of(tails::SPRITE_MIN_PX));
+        assert_eq!(scalar("SPRITE_MAX_PX"), f32_of(SPRITE_MAX_PX));
+        assert_eq!(scalar("GLOW_CULL_PRE"), f32_of(GLOW_CULL_PRE));
         assert_eq!(
             scalar("COMA_EXTENT_SCALES"),
             f32_of(coma::COMA_EXTENT_SCALES)
@@ -1625,7 +1810,7 @@ mod tests {
         lib.add(COMET_PROBE_WGSL_PATH, COMET_PROBE_WGSL);
         let src = lib.compose(COMET_PROBE_WGSL_PATH).unwrap();
         let m = validate_wgsl(&src).unwrap_or_else(|e| panic!("{e}\n{src}"));
-        for entry in ["cs_coma", "cs_ion", "cs_phase"] {
+        for entry in ["cs_coma", "cs_ion", "cs_phase", "cs_splat"] {
             assert!(
                 m.entry_points
                     .iter()
@@ -1684,6 +1869,24 @@ mod tests {
         assert!(
             cos.iter().any(|&c| c > 0.5) && cos.iter().any(|&c| c < -0.5),
             "{cos:?}"
+        );
+        // The splat cases (C1L): orthonormal planes, finite positive floors, round and very
+        // elongated ellipses, and edge-on ones whose minor axis is the floor.
+        let splat = splat_probe_inputs();
+        assert_eq!(splat.len(), 256);
+        let mut ratios = Vec::new();
+        for c in splat.chunks(4) {
+            let (cov, floor, right, up) = splat_probe_case(c);
+            assert!((right.length() - 1.0).abs() < 1e-6 && (up.length() - 1.0).abs() < 1e-6);
+            assert!(right.dot(up).abs() < 1e-6 && floor > 0.0);
+            let (s1, s2, _) = splat_axes(cov, right, up, floor);
+            assert!(s1.is_finite() && s2 > 0.0);
+            ratios.push((s1 / s2, s2 / floor));
+        }
+        assert!(ratios.iter().any(|r| r.0 > 100.0) && ratios.iter().any(|r| r.0 < 2.0));
+        assert!(
+            ratios.iter().filter(|r| r.1 < 1.01).count() >= 4,
+            "{ratios:?}"
         );
     }
 }
