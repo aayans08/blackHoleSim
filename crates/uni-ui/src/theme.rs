@@ -249,8 +249,12 @@ pub fn note_orbit_two_body(date_ymd: &str) -> String {
 
 /// A body without a surface map.
 pub const NOTE_NO_SURFACE_MAP: &str = "No surface map: uniform albedo";
-/// A comet's tails.
-pub const NOTE_TAILS: &str = "Tails: Finson\u{2013}Probstein dust model; brightness approximate";
+/// A comet's tails. The dust tail's light is calibrated on one comet's measured dust production
+/// (uni-planet `comet::tails::DUST_HEAD_TIME_S`), so the note says so (lead ruling C1L-c,
+/// 2026-11-24).
+pub const NOTE_TAILS: &str = "Tails: Finson\u{2013}Probstein dust model; brightness approximate. \
+                              Dust tail calibrated on C/2020 F3 (NEOWISE) only; other comets \
+                              approximate";
 /// A comet's nucleus (review m11).
 pub const NOTE_NUCLEUS_SHAPE: &str = "Nucleus shape: procedural";
 /// A comet's brightness from SBDB's M1, K1: every comet without a cited total visual light curve
@@ -973,7 +977,8 @@ mod tests {
         );
         assert_eq!(
             NOTE_TAILS,
-            "Tails: Finson–Probstein dust model; brightness approximate"
+            "Tails: Finson–Probstein dust model; brightness approximate. Dust tail calibrated on \
+             C/2020 F3 (NEOWISE) only; other comets approximate"
         );
         // Task C6 fix round 1 (I1): the comet brightness notes.
         assert_eq!(
