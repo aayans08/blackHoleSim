@@ -200,6 +200,7 @@ pub struct HazeRay {
 /// perpendicular distance from each nucleus in front of the camera, with one pixel
 /// (`pixel_angle` [rad] across) of softening at the nucleus's distance, every comet at every
 /// distance. The reference [`coma_raster`] is checked against; the paper itself uses the raster.
+#[cfg(test)]
 pub fn coma_luminance(comets: &[CometView], dir: DVec3, pixel_angle: f64) -> f64 {
     comets
         .iter()
