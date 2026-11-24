@@ -575,16 +575,47 @@ fn fs_dust(in: DustOut) -> GlowOut {
     return out;
 }
 
+// The scene depth, read by the coarse paths (group 3 of their own layout).
+@group(3) @binding(0) var dust_scene_depth: texture_depth_2d;
+
+// Whether splat g's centre lies behind the body the scene depth holds at its pixel (C1L): the
+// coarse paths have no depth test of their own, so such a splat is not drawn (approximate: per
+// splat, not per pixel; the composite also hides the coarse dust wherever a body wrote depth).
+// Reading the depth also orders the coarse passes after the passes that write it (Metal orders
+// encoders only through shared resources), so the "comets" timer does not open early.
+fn behind_body(g: u32) -> bool {
+    let t = tails[g / GRAINS_PER_TAIL];
+    let c = to_clip(t.nucleus.xyz + grains[g].offset.xyz);
+    if (!(c.w > 0.0)) {
+        return false;
+    }
+    let ndc = c.xyz / c.w;
+    if (!(abs(ndc.x) <= 1.0 && abs(ndc.y) <= 1.0)) {
+        return false;
+    }
+    let size = vec2<f32>(textureDimensions(dust_scene_depth));
+    let pix = min(vec2<f32>(ndc.x, -ndc.y) * 0.5 + 0.5, vec2<f32>(1.0)) * (size - 1.0);
+    return textureLoad(dust_scene_depth, vec2<i32>(pix), 0) > ndc.z;
+}
+
 // The coarse paths (C1L): wide splats, drawn into the coarse targets (1/8 and 1/64 of the lines,
-// cleared every frame, no depth), at 1/64 and 1/4096 of the fill.
+// cleared every frame, no depth test), at 1/64 and 1/4096 of the fill.
 @vertex
 fn vs_dust_coarse(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> DustOut {
-    return dust_vertex(vi, g, 1u);
+    var out = dust_vertex(vi, g, 1u);
+    if (behind_body(g)) {
+        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return out;
 }
 
 @vertex
 fn vs_dust_coarser(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> DustOut {
-    return dust_vertex(vi, g, 2u);
+    var out = dust_vertex(vi, g, 2u);
+    if (behind_body(g)) {
+        out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return out;
 }
 
 @fragment

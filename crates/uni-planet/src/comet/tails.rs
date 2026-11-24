@@ -1222,6 +1222,7 @@ mod tests {
         let f = f_full / k;
         let mut img = vec![0.0_f64; w * h];
         let (mut light, mut drawn) = (0.0, 0.0);
+        let (mut fill, mut count) = ([0.0_f64; 3], [0_u32; 3]);
         for g in &splats {
             let p = rel + g.offset_m;
             let d = p.length();
@@ -1248,6 +1249,21 @@ mod tests {
                 s2 = s_max;
             }
             drawn += i;
+            {
+                // The fill per path: texels of the path's target (quads clipped roughly).
+                let level = if s2 >= crate::comet::COARSER_MIN_SIGMA_PX * pixel_m {
+                    2
+                } else if s2 >= crate::comet::COARSE_MIN_SIGMA_PX * pixel_m {
+                    1
+                } else {
+                    0
+                };
+                let ds = [1.0, 8.0, 64.0][level];
+                let (a, b) = (4.0 * s1 / pixel_m / ds, 4.0 * s2 / pixel_m / ds);
+                let (tw, th) = (1920.0 / ds, 1080.0 / ds);
+                fill[level] += a.min(tw * 1.5) * b.min(th * 1.5);
+                count[level] += 1;
+            }
             let z = p.dot(fwd);
             let (cx, cy) = (
                 0.5 * w as f64 + f * p.dot(right) / z,
@@ -1309,6 +1325,9 @@ mod tests {
         for r in &rows {
             println!("  {:.1}°  {:.3e}  {:.1}°", r.0, r.1, r.2);
         }
+        println!(
+            "splats and fill by path (full, 1/8, 1/64; texels, unclipped): {count:?} {fill:.0?}"
+        );
         let at = |d: f64| {
             rows.iter()
                 .find(|r| r.0 == d)

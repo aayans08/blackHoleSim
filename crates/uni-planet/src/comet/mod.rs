@@ -489,6 +489,7 @@ pub struct CometRenderer {
     dust_coarser_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     coarse_bgl: wgpu::BindGroupLayout,
+    depth_bgl: wgpu::BindGroupLayout,
     coarse_sampler: wgpu::Sampler,
     /// The coarse dust targets (C1L), at the internal size / [`COARSE_DOWNSAMPLE`] and /
     /// [`COARSER_DOWNSAMPLE`].
@@ -642,10 +643,30 @@ impl CometRenderer {
         let dust_pipeline = pipeline("comet dust tails", "vs_dust", "fs_dust", &[], &glow, false);
         // C1L: wide dust splats into the coarse target (additive, no depth), and the composite
         // that adds the target back to hdr where no body wrote depth.
+        // The coarse paths read the scene depth at group 3 (their splat occlusion, which also
+        // orders their passes after the depth writers).
+        let depth_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("comets scene depth bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let coarse_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("comets coarse layout"),
+            bind_group_layouts: &[Some(camera_bgl), Some(&bgl), None, Some(&depth_bgl)],
+            immediate_size: 0,
+        });
         let coarse_pipeline = |label: &str, vs: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(&coarse_layout),
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some(vs),
@@ -809,6 +830,7 @@ impl CometRenderer {
             dust_coarser_pipeline,
             composite_pipeline,
             coarse_bgl,
+            depth_bgl,
             coarse_sampler,
             coarse: None,
             coarse_scissor: None,
@@ -1020,7 +1042,7 @@ impl RenderFeature for CometRenderer {
 
     fn encode(
         &mut self,
-        _gpu: &GpuContext,
+        gpu: &GpuContext,
         enc: &mut wgpu::CommandEncoder,
         frame: &FrameBindings<'_>,
         targets: &FrameTargets,
@@ -1061,17 +1083,25 @@ impl RenderFeature for CometRenderer {
             _ => (None, writes.clone()),
         };
         let per_tail = GRAINS_PER_TAIL as u32;
-        if let Some(targets) = coarse {
+        if let Some(coarse_targets) = coarse {
+            let depth = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("comets scene depth bg"),
+                layout: &self.depth_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+                }],
+            });
             // The timer's begin goes on the first of the two coarse passes.
             let mut begin = coarse_writes;
             for (view, pipeline, label) in [
                 (
-                    &targets.coarse_view,
+                    &coarse_targets.coarse_view,
                     &self.dust_coarse_pipeline,
                     "comets coarse dust",
                 ),
                 (
-                    &targets.coarser_view,
+                    &coarse_targets.coarser_view,
                     &self.dust_coarser_pipeline,
                     "comets coarser dust",
                 ),
@@ -1094,6 +1124,7 @@ impl RenderFeature for CometRenderer {
                 });
                 pass.set_bind_group(0, frame.camera, &[]);
                 pass.set_bind_group(1, &self.bind_group, &[]);
+                pass.set_bind_group(3, &depth, &[]);
                 pass.set_pipeline(pipeline);
                 for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
                     pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
