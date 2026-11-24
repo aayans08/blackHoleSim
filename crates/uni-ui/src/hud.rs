@@ -89,6 +89,15 @@ const PERF_RESERVE: f32 = 40.0;
 /// Gap between neighbouring panels [pt]; also the least gap a notes block keeps from the
 /// other HUD blocks ([`rise`], [`fall`]).
 const PANEL_GAP: f32 = 16.0;
+/// The window's least inner size [pt] (lead ruling C4w-I1; uni-app sets it on the window).
+/// Chosen from the C4w size sweep (`honesty_notes_stay_whole_on_screen`):
+/// - 960 pt keeps the honesty line beside the perf block (its 560 pt least width and the perf
+///   block need about 880 pt), the 520 pt Speed panel on screen, and Location clear of the
+///   centred time line while the card is open;
+/// - 600 pt leaves the expanded notes stack, between Location and the Gravity and Speed panels,
+///   206 pt, room for the most honesty notes M1 raises at once (nine, 192 pt with their wrapped
+///   lines; at 540 pt the room is 146 pt).
+pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 600.0];
 /// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
 /// line's area, which hangs 4 pt lower than the margin).
 const POPUP_GAP: f32 = 10.0;
@@ -575,11 +584,12 @@ fn area(id: &str, order: Order) -> egui::Area {
 /// Layout (C4w): the top blocks first, then the bottom ones, then the notes. egui places an
 /// anchored area from the size it had on its last pass, so a bottom block that grew since (a
 /// longer note list, a wrapped note, the FTL line) was drawn too low, over the block under it;
-/// a capture, which draws each bookmark once on one HUD, kept it there. Every bottom block is
-/// therefore placed from its size measured this pass ([`measure`], [`show_measured`]), and the
-/// notes blocks (the honesty line, its pop-up, the stack under Location) keep [`PANEL_GAP`]
-/// clear of every block drawn before them ([`rise`], [`fall`]); one with no room scrolls
-/// ([`fit`]).
+/// a capture, which draws each bookmark once on one HUD, kept it there. Every bottom block (and
+/// the centred time line) is therefore placed from its size measured this pass ([`measure`],
+/// [`show_measured`]), and the notes blocks (the honesty line, its pop-up, the stack under
+/// Location) keep [`PANEL_GAP`] clear of every block drawn before them ([`rise`], [`fall`]).
+/// A pop-up or stack with too little room keeps its honesty notes whole and first, and scrolls
+/// or leaves out the others ([`plan_notes`]; lead ruling C4w-I1).
 fn draw_hud(
     ctx: &egui::Context,
     data: &HudData,
@@ -647,7 +657,7 @@ fn draw_hud(
         (Align2::RIGHT_TOP, [-m, m])
     };
     let time = if c.show_warp {
-        area("warp", Order::Middle)
+        let warp = area("warp", Order::Middle)
             .anchor(time_anchor.0, time_anchor.1)
             .show(ctx, |ui| {
                 match panels::show_warp(ui, &data.time) {
@@ -656,27 +666,33 @@ fn draw_hud(
                     None => {}
                 }
                 ui.is_sizing_pass()
-            })
+            });
+        shown_rect(&warp)
     } else if expanded && card.is_none() {
-        area("time", Order::Middle)
+        let panel = area("time", Order::Middle)
             .anchor(Align2::RIGHT_TOP, [-m, m])
             .show(ctx, |ui| {
                 panels::show_time(ui, &data.time);
                 ui.is_sizing_pass()
-            })
+            });
+        shown_rect(&panel)
     } else {
-        area("time line", Order::Middle)
-            .anchor(Align2::CENTER_TOP, [0.0, m])
-            .interactable(false)
-            .show(ctx, |ui| {
-                let font = mono_font(TIME_LINE_SIZE, Weight::Regular);
-                haloed(ui, |ui| {
-                    theme::text(ui, &panels::time_line(&data.time), font, INK_SOFT)
-                });
-                ui.is_sizing_pass()
-            })
+        // Centred from its width this pass: a new rate changes it (review C4w M4).
+        let time_line = panels::time_line(&data.time);
+        let line = Measured {
+            id: "time line",
+            order: Order::Middle,
+            align: Align2::CENTER_TOP,
+            at: egui::pos2(screen.center().x, screen.top() + m),
+            max_width: screen.width(),
+            interactable: false,
+        };
+        Some(show_measured(ctx, line, |ui| {
+            let font = mono_font(TIME_LINE_SIZE, Weight::Regular);
+            haloed(ui, |ui| theme::text(ui, &time_line, font, INK_SOFT));
+        }))
     };
-    taken.extend(shown_rect(&time));
+    taken.extend(time);
 
     // The bottom row, each block placed from its size this pass.
     let hint = if card.is_some() {
@@ -733,24 +749,24 @@ fn draw_hud(
             .rect;
         // The notes stack under Location (12 pt, in tone; the flight label is the Speed
         // header), 11 pt under it as in C4 (egui's item spacing and 8 pt). It ends
-        // `PANEL_GAP` over the Gravity panel (or any block below it); longer, it scrolls.
-        let stack: Vec<_> = notes
-            .iter()
-            .filter(|(t, _)| *t != data.speed.header)
-            .collect();
+        // `PANEL_GAP` over the Gravity panel (or any block below it); with less room, its
+        // honesty notes stay whole and the others scroll or are left out ([`plan_notes`]).
+        let stack = block_notes(&notes, &data.warnings, Some(&data.speed.header));
         if !stack.is_empty() {
-            let h = measure(ctx, "notes stack", LOCATION_WIDTH, |ui| {
-                notes_stack(ui, &stack)
-            })
-            .y;
+            let height = |fit| {
+                measure(ctx, "notes stack", LOCATION_WIDTH, |ui| {
+                    notes_stack(ui, &stack, fit)
+                })
+                .y
+            };
+            let all = height(NotesFit::All);
             let x = egui::Rangef::new(left, left + LOCATION_WIDTH);
             let top = location.bottom() + ctx.global_style().spacing.item_spacing.y + 8.0;
-            let slot = fall(x, top, h, screen.bottom() - m, &taken, PANEL_GAP);
+            let slot = fall(x, top, all, screen.bottom() - m, &taken, PANEL_GAP);
+            let (fit, _) = plan_notes(slot.height, all, || height(NotesFit::HONESTY_ONLY));
             placed("notes stack", Order::Middle, egui::pos2(left, slot.top)).show(ctx, |ui| {
                 ui.set_max_width(LOCATION_WIDTH);
-                fit(ui, "notes stack", slot.height, h, |ui| {
-                    notes_stack(ui, &stack)
-                });
+                notes_stack(ui, &stack, fit);
             });
         }
     } else if !notes.is_empty() {
@@ -767,6 +783,9 @@ fn draw_hud(
         let x = egui::Rangef::new(left, left + size.x);
         let bottom = screen.bottom() - m + 4.0;
         let slot = rise(x, bottom, size.y, screen.top() + m, &taken, PANEL_GAP);
+        // One line, always drawn whole from the slot's top (it holds the flight label, ruling
+        // 6): a screen with less than a line of room, far under the window's least size
+        // (`MIN_WINDOW_PT`), would see it over the block that lifted it (review C4w M2).
         let line = placed("notes", Order::Middle, egui::pos2(left, slot.top))
             .show(ctx, |ui| {
                 let line = notes_line(ui, &notes, line_w);
@@ -776,19 +795,23 @@ fn draw_hud(
                 line.rect
             })
             .inner;
-        // Its pop-up stands on it, from its height this pass, and stops under the top row.
+        // Its pop-up stands on it, from its height this pass, and stops under the top row;
+        // with less room, its honesty notes stay whole and the others scroll or are left out.
         if c.notes_expanded {
-            let size = measure(ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
-                notes_popup(ui, &notes)
-            });
-            let x = egui::Rangef::new(left, left + size.x);
-            let bottom = line.top() - POPUP_GAP;
-            let slot = rise(x, bottom, size.y, screen.top() + m, &taken, PANEL_GAP);
-            placed("notes popup", Order::Foreground, egui::pos2(left, slot.top)).show(ctx, |ui| {
-                fit(ui, "notes popup", slot.height, size.y, |ui| {
-                    notes_popup(ui, &notes)
+            let popup = block_notes(&notes, &data.warnings, None);
+            let size = |fit| {
+                measure(ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
+                    notes_popup(ui, &popup, fit)
                 })
-            });
+            };
+            let all = size(NotesFit::All);
+            let x = egui::Rangef::new(left, left + all.x);
+            let bottom = line.top() - POPUP_GAP;
+            let slot = rise(x, bottom, all.y, screen.top() + m, &taken, PANEL_GAP);
+            let (fit, h) = plan_notes(slot.height, all.y, || size(NotesFit::HONESTY_ONLY).y);
+            let top = slot.top + slot.height - h;
+            placed("notes popup", Order::Foreground, egui::pos2(left, top))
+                .show(ctx, |ui| notes_popup(ui, &popup, fit));
         }
     }
 
@@ -852,7 +875,12 @@ fn show_measured(
     );
     placed(at.id, at.order, at.at - corner)
         .interactable(at.interactable)
-        .show(ctx, add)
+        .show(ctx, |ui| {
+            // The width it was measured at, not the width egui stored for the area last pass,
+            // so text wraps as it did when measured.
+            ui.set_max_width(at.max_width);
+            add(ui)
+        })
         .response
         .rect
 }
@@ -883,21 +911,107 @@ fn measure(
 /// block is wide or tall, small enough for f32 to keep sub-point positions (2⁻⁹ pt).
 const MEASURE_OFFSET: f32 = 20_000.0;
 
-/// Draws `add` as it is when `room` holds its measured `height`, else in a vertical scroll
-/// area `room` tall, so a notes block never runs into the next block.
-fn fit(ui: &mut egui::Ui, id: &str, room: f32, height: f32, add: impl FnOnce(&mut egui::Ui)) {
-    if height <= room + 0.5 {
-        add(ui);
+/// One note of a notes block (the pop-up or the stack): its sentence and tone, and whether it
+/// is an honesty note, which no block scrolls out of view or leaves out (lead ruling C4w-I1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Note<'a> {
+    text: &'a str,
+    tone: LabelTone,
+    honesty: bool,
+}
+
+/// The notes a block lists: every note but `skip` (expanded, the flight label, which the Speed
+/// header shows), in order. Honesty notes are the non-physical and danger ones and the
+/// renderer warnings (`HudData::warnings`, whatever tone the app gave the same text).
+fn block_notes<'a>(
+    notes: &'a [(String, LabelTone)],
+    warnings: &[String],
+    skip: Option<&str>,
+) -> Vec<Note<'a>> {
+    notes
+        .iter()
+        .filter(|(t, _)| Some(t.as_str()) != skip)
+        .map(|(text, tone)| Note {
+            text,
+            tone: *tone,
+            honesty: matches!(tone, LabelTone::NonPhysical | LabelTone::Danger)
+                || warnings.contains(text),
+        })
+        .collect()
+}
+
+/// How a notes block lays out its notes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NotesFit {
+    /// Every note, in order.
+    All,
+    /// Its honesty notes first, whole, in order; then the others in a scroll area at most
+    /// `room` tall, or none when `room` is 0.
+    HonestyFirst { room: f32 },
+}
+
+impl NotesFit {
+    /// The honesty notes alone (the block's least height).
+    const HONESTY_ONLY: Self = Self::HonestyFirst { room: 0.0 };
+}
+
+/// The vertical gap between a block's note rows [pt] (also before its scroll area).
+const NOTE_ROW_GAP: f32 = 4.0;
+/// The least scroll area for the informational notes [pt]: a 12 pt row is about 15 pt, so
+/// less would show a sliver; they are then left out.
+const MIN_SCROLL_ROOM: f32 = 24.0;
+
+/// How a notes block whose notes take `all` points fits `room`, and the height it is drawn at
+/// (lead ruling C4w-I1: honesty notes are never scrolled out of view or dropped):
+/// - it fits: every note in order, `all` tall;
+/// - else its honesty notes (`honesty_only()` tall with the block's chrome) are drawn whole and
+///   first, and the informational ones scroll in what is left, or are left out when that is
+///   under [`MIN_SCROLL_ROOM`]. Honesty notes taller than `room` are drawn whole all the same
+///   (taller than the slot; the window's least size, [`MIN_WINDOW_PT`], keeps M1's worst set
+///   inside it).
+fn plan_notes(room: f32, all: f32, honesty_only: impl FnOnce() -> f32) -> (NotesFit, f32) {
+    if all <= room + 0.5 {
+        return (NotesFit::All, all);
+    }
+    let honesty = honesty_only();
+    if honesty + 0.5 >= all {
+        // Nothing informational to give up.
+        return (NotesFit::All, all);
+    }
+    let rest = room - honesty - NOTE_ROW_GAP;
+    if rest >= MIN_SCROLL_ROOM {
+        (NotesFit::HonestyFirst { room: rest }, room)
     } else {
-        egui::ScrollArea::vertical()
-            .id_salt(("hud fit", id))
-            .max_height(room)
-            .show(ui, add);
+        (NotesFit::HONESTY_ONLY, honesty)
+    }
+}
+
+/// Draws a block's note rows with `row`, as `fit` says.
+fn note_rows(
+    ui: &mut egui::Ui,
+    id: &str,
+    notes: &[Note<'_>],
+    fit: NotesFit,
+    row: impl Fn(&mut egui::Ui, &Note<'_>),
+) {
+    match fit {
+        NotesFit::All => notes.iter().for_each(|n| row(ui, n)),
+        NotesFit::HonestyFirst { room } => {
+            notes.iter().filter(|n| n.honesty).for_each(|n| row(ui, n));
+            if room > 0.0 {
+                egui::ScrollArea::vertical()
+                    .id_salt(("hud notes", id))
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        notes.iter().filter(|n| !n.honesty).for_each(|n| row(ui, n));
+                    });
+            }
+        }
     }
 }
 
 /// A block's place on the screen's vertical axis [pt]: its top edge and the height it gets,
-/// which is less than its own only when it has no room (it then scrolls, [`fit`]).
+/// which is less than its own only when it has no room ([`plan_notes`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Slot {
     top: f32,
@@ -1111,13 +1225,13 @@ fn notes_line(ui: &mut egui::Ui, notes: &[(String, LabelTone)], max_w: f32) -> e
     response
 }
 
-/// "What is approximate here": every note in full, in its tone, with its dot.
-fn notes_popup(ui: &mut egui::Ui, notes: &[(String, LabelTone)]) {
+/// "What is approximate here": every note in full, in its tone, with its dot, as `fit` says.
+fn notes_popup(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
     theme::panel_frame(theme::HAIRLINE)
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(panels::inner_width(NOTES_POPUP_WIDTH, 14.0));
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, NOTE_ROW_GAP);
             theme::kicker(
                 ui,
                 NOTES_POPUP_TITLE,
@@ -1126,37 +1240,38 @@ fn notes_popup(ui: &mut egui::Ui, notes: &[(String, LabelTone)]) {
                 KICKER_TRACKING_EM,
             );
             ui.add_space(2.0);
-            for (text, tone) in notes {
+            note_rows(ui, "notes popup", notes, fit, |ui, n| {
                 ui.horizontal_top(|ui| {
                     let (dot, _) = ui.allocate_exact_size(
                         egui::vec2(NOTE_DOT, NOTES_SIZE + 2.0),
                         egui::Sense::hover(),
                     );
                     ui.painter()
-                        .circle_filled(dot.center(), NOTE_DOT / 2.0, tone_color(*tone));
+                        .circle_filled(dot.center(), NOTE_DOT / 2.0, tone_color(n.tone));
                     theme::text(
                         ui,
-                        text,
+                        n.text,
                         text_font(NOTES_SIZE, Weight::Regular),
-                        tone_color(*tone),
+                        tone_color(n.tone),
                     );
                 });
-            }
+            });
         });
 }
 
-/// The notes stack under the Location panel: each note in full, 12 pt, in its tone.
-fn notes_stack(ui: &mut egui::Ui, notes: &[&(String, LabelTone)]) {
+/// The notes stack under the Location panel: each note in full, 12 pt, in its tone, as `fit`
+/// says.
+fn notes_stack(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
     haloed(ui, |ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-        for (text, tone) in notes {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, NOTE_ROW_GAP);
+        note_rows(ui, "notes stack", notes, fit, |ui, n| {
             theme::text(
                 ui,
-                text,
+                n.text,
                 text_font(NOTES_SIZE, Weight::Regular),
-                tone_color(*tone),
+                tone_color(n.tone),
             );
-        }
+        });
     });
 }
 
@@ -1407,6 +1522,8 @@ mod tests {
         color: Color32,
         font: egui::FontId,
         tracking: f32,
+        /// The clip rect it was painted with (a scroll area's viewport clips its rows).
+        clip: egui::Rect,
     }
 
     impl Painted {
@@ -1441,9 +1558,9 @@ mod tests {
     }
 
     fn collect(out: &egui::FullOutput) -> Frame {
-        fn walk(shape: &egui::Shape, f: &mut Frame) {
+        fn walk(shape: &egui::Shape, clip: egui::Rect, f: &mut Frame) {
             match shape {
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, f)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, clip, f)),
                 egui::Shape::Text(t) => {
                     let first = t.galley.job.sections.first();
                     let rect = t.galley.rect.translate(t.pos.to_vec2());
@@ -1454,6 +1571,7 @@ mod tests {
                         color: first.map_or(Color32::PLACEHOLDER, |s| s.format.color),
                         font: first.map_or_else(Default::default, |s| s.format.font_id.clone()),
                         tracking: first.map_or(0.0, |s| s.format.extra_letter_spacing),
+                        clip,
                     });
                 }
                 egui::Shape::Rect(r) => f.rects.push((r.rect, r.fill, r.stroke.color)),
@@ -1463,7 +1581,7 @@ mod tests {
         }
         let mut f = Frame::default();
         for clipped in &out.shapes {
-            walk(&clipped.shape, &mut f);
+            walk(&clipped.shape, clipped.clip_rect, &mut f);
         }
         f
     }
@@ -2227,6 +2345,138 @@ mod tests {
         );
     }
 
+    /// Lead ruling C4w-I1: a block that fits keeps every note in order; one that does not keeps
+    /// its honesty notes whole and first, the others in what is left (left out under
+    /// `MIN_SCROLL_ROOM`); honesty notes taller than the room are drawn whole all the same.
+    #[test]
+    fn plan_notes_keeps_honesty_notes_whole() {
+        let never = || -> f32 { panic!("measured although it fits") };
+        assert_eq!(plan_notes(200.0, 150.0, never), (NotesFit::All, 150.0));
+        // Halley's stack at 960 × 540 pt: 154.5 pt of notes in 148.
+        assert_eq!(
+            plan_notes(148.0, 154.5, || 60.0),
+            (NotesFit::HonestyFirst { room: 84.0 }, 148.0)
+        );
+        // Under a scroll area's least room the informational notes are left out.
+        assert_eq!(
+            plan_notes(80.0, 200.0, || 60.0),
+            (NotesFit::HONESTY_ONLY, 60.0)
+        );
+        // Honesty notes never shrink, even past the room.
+        assert_eq!(
+            plan_notes(100.0, 300.0, || 191.5),
+            (NotesFit::HONESTY_ONLY, 191.5)
+        );
+        // Only honesty notes: nothing to give up.
+        assert_eq!(plan_notes(100.0, 150.0, || 150.0), (NotesFit::All, 150.0));
+    }
+
+    /// Honesty notes are the non-physical and danger ones and the renderer warnings, whatever
+    /// tone the app gave a warning's text; expanded, the stack leaves the flight label out.
+    #[test]
+    fn block_notes_mark_honesty_notes() {
+        let notes: Vec<(String, LabelTone)> = [
+            (FREE_FLIGHT_LABEL, LabelTone::NonPhysical),
+            ("Milky Way band: galaxy model v0", LabelTone::Neutral),
+            (INSIDE_HORIZON_LABEL, LabelTone::Danger),
+            ("No surface map: uniform albedo", LabelTone::Neutral),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_owned(), t))
+        .collect();
+        let warnings = vec!["No surface map: uniform albedo".to_owned()];
+        let all = block_notes(&notes, &warnings, None);
+        let honesty: Vec<bool> = all.iter().map(|n| n.honesty).collect();
+        assert_eq!(honesty, [true, false, true, true]);
+        let stack = block_notes(&notes, &[], Some(FREE_FLIGHT_LABEL));
+        let texts: Vec<&str> = stack.iter().map(|n| n.text).collect();
+        assert_eq!(
+            texts,
+            [
+                "Milky Way band: galaxy model v0",
+                INSIDE_HORIZON_LABEL,
+                "No surface map: uniform albedo"
+            ]
+        );
+        assert_eq!(stack[2].tone, LabelTone::Neutral);
+        assert!(!stack[2].honesty, "not a warning here");
+    }
+
+    /// Review C4w M3: what the HUD's measuring costs. Prints the mean of one settled HUD run
+    /// (collapsed with the pop-up; expanded with the card) and of one frame's measure calls
+    /// alone (all six measured blocks, more than either mode makes)
+    /// (`cargo test -p uni-ui --lib -- --ignored --nocapture hud_measure_cost`).
+    #[test]
+    #[ignore = "print-only timing"]
+    fn hud_measure_cost() {
+        let n = 200;
+        let mut d = data();
+        d.notes = comet_notes(true);
+        d.eye_adapted_stars = true;
+        d.lens_on_screen = true;
+        d.target = Some(mars_card());
+        let ov = Overlay::default();
+        for (mode, start) in [
+            (
+                "collapsed + pop-up",
+                HudControls {
+                    notes_expanded: true,
+                    ..controls()
+                },
+            ),
+            ("expanded + card", expanded()),
+        ] {
+            let ctx = headless_context();
+            let mut c = start;
+            let (mut o, _, _) = run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &ov, &mut c);
+            o.textures_delta.clear();
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let (mut o, _) = run_hud(&ctx, headless_input(SIZE, 1.0, 8192), &d, &ov, &mut c);
+                o.textures_delta.clear();
+            }
+            let run_us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            println!("{mode}: one HUD run {run_us:.0} µs");
+        }
+        let ctx = headless_context();
+        let c = HudControls {
+            notes_expanded: true,
+            ..controls()
+        };
+        let notes = hud_notes(&d, &c);
+        let popup = block_notes(&notes, &d.warnings, None);
+        let lines = [perf_line(&d), HINT_COLLAPSED.to_owned()];
+        let g = d.gravity.clone().expect("gravity");
+        // One pass per frame, as in the HUD; only the measure calls are timed.
+        let mut total = std::time::Duration::ZERO;
+        for _ in 0..n {
+            let mut o = ctx.run_ui(headless_input(SIZE, 1.0, 8192), |ui| {
+                let ctx = ui.ctx().clone();
+                let t0 = std::time::Instant::now();
+                measure(&ctx, "perf", 1920.0, |ui| perf_block(ui, &lines));
+                measure(&ctx, "gravity", SPEED_WIDTH, |ui| {
+                    panels::show_gravity(ui, &g)
+                });
+                measure(&ctx, "speed", SPEED_WIDTH, |ui| {
+                    panels::show_speed(ui, &d.speed)
+                });
+                measure(&ctx, "notes line", 1000.0, |ui| {
+                    notes_line(ui, &notes, 1000.0);
+                });
+                measure(&ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
+                    notes_popup(ui, &popup, NotesFit::All)
+                });
+                measure(&ctx, "notes stack", LOCATION_WIDTH, |ui| {
+                    notes_stack(ui, &popup, NotesFit::All)
+                });
+                total += t0.elapsed();
+            });
+            o.textures_delta.clear();
+        }
+        let us = total.as_secs_f64() * 1e6 / f64::from(n);
+        println!("one frame's measure calls (6 blocks): {us:.0} µs");
+    }
+
     /// The HUD's visible blocks after the last run on `ctx`: (area name, rect).
     fn blocks(ctx: &egui::Context) -> Vec<(&'static str, egui::Rect)> {
         const NAMES: [&str; 12] = [
@@ -2256,13 +2506,32 @@ mod tests {
         })
     }
 
-    /// C4w (the owner: soft and uncluttered): however long the note list, however long its
-    /// notes, on the capture size and the owner's windows down to 960 × 540 and 800 × 600 pt,
-    /// collapsed (line and pop-up) or expanded (the stack under Location, with or without the
-    /// card), no notes block touches another HUD block or leaves the screen, also when the list
-    /// grew since the last draw (C1L r1). Blocks that would not fit scroll.
-    #[test]
-    fn notes_never_overlap_other_blocks() {
+    /// The C4w sweep sizes (px, points per pixel): the capture size, the owner's windows
+    /// (1280 × 832 and 1470 × 956 pt), the window's least size ([`MIN_WINDOW_PT`]), and 960 ×
+    /// 540 and 800 × 600 pt.
+    fn sweep_sizes() -> Vec<([u32; 2], f32)> {
+        let min = [
+            (2.0 * MIN_WINDOW_PT[0]) as u32,
+            (2.0 * MIN_WINDOW_PT[1]) as u32,
+        ];
+        vec![
+            ([1920, 1080], 1.0),
+            ([2560, 1664], 2.0),
+            ([2940, 1912], 2.0),
+            (min, 2.0),
+            ([1920, 1080], 2.0),
+            ([1600, 1200], 2.0),
+        ]
+    }
+
+    /// A screen at least the window's least size.
+    fn holds_min(size_px: [u32; 2], ppp: f32) -> bool {
+        f64::from(size_px[0]) / f64::from(ppp) >= MIN_WINDOW_PT[0]
+            && f64::from(size_px[1]) / f64::from(ppp) >= MIN_WINDOW_PT[1]
+    }
+
+    /// The comet notes and nine long informational notes, each two lines in the pop-up.
+    fn long_notes() -> Vec<(String, LabelTone)> {
         let mut long = comet_notes(true);
         for i in 0..9 {
             long.push((
@@ -2270,80 +2539,190 @@ mod tests {
                     "Test note {i}: an approximation stated in a sentence long enough to wrap \
                      onto two lines in the pop-up (renderer limit)"
                 ),
-                if i % 2 == 0 {
-                    LabelTone::Neutral
-                } else {
-                    LabelTone::NonPhysical
-                },
+                LabelTone::Neutral,
             ));
         }
-        let lists = [("comets", comet_notes(true)), ("long", long)];
-        let popup = HudControls {
-            notes_expanded: true,
-            ..controls()
-        };
-        let sizes = [
-            ([1920, 1080], 1.0),
-            ([2560, 1664], 2.0),
-            ([2940, 1912], 2.0),
-            ([1920, 1080], 2.0),
-            ([1600, 1200], 2.0),
+        long
+    }
+
+    /// The most honesty notes M1 raises at once: inside a horizon at a traced hole on the debug
+    /// grid, planets extrapolated, the belt highlighted, two renderer warnings (one wraps), on
+    /// top of the comet captures' labels.
+    fn worst_honesty(d: &mut HudData, c: &mut HudControls) {
+        use uni_sim::honesty::{HonestyFlag, label};
+        d.notes = comet_notes(true);
+        d.notes
+            .push((DEBUG_GRID_LABEL.into(), LabelTone::NonPhysical));
+        d.notes.push((
+            label(HonestyFlag::PlanetsExtrapolated).into(),
+            LabelTone::NonPhysical,
+        ));
+        d.inside_horizon = true;
+        d.warnings = vec![
+            "Inside Sun".into(),
+            "GPU error: validation error in the bodies pass (the frame may be incomplete; see \
+             the log)"
+                .into(),
         ];
-        for (size_px, ppp) in sizes {
+        c.highlight_belt = true;
+    }
+
+    /// One case of the sweep: a fresh HUD draws `d` with only the plain notes, then with its
+    /// own (C1L r1: a list that grew since the last draw). Returns the HUD and the second draw.
+    fn draw_grown(
+        size_px: [u32; 2],
+        ppp: f32,
+        d: &HudData,
+        c: HudControls,
+    ) -> (egui::Context, Frame) {
+        let ctx = headless_context();
+        let plain = HudData {
+            notes: data().notes,
+            warnings: Vec::new(),
+            ..d.clone()
+        };
+        let mut c1 = c;
+        let (mut o, _, _) = run_hud_settled(
+            &ctx,
+            size_px,
+            ppp,
+            8192,
+            &plain,
+            &Overlay::default(),
+            &mut c1,
+        );
+        o.textures_delta.clear();
+        let mut c2 = c;
+        let (mut o, _, _) =
+            run_hud_settled(&ctx, size_px, ppp, 8192, d, &Overlay::default(), &mut c2);
+        o.textures_delta.clear();
+        let f = collect(&o);
+        (ctx, f)
+    }
+
+    /// Every case of the sweep: (case name, size, ppp, data, controls, expanded). The lists:
+    /// the comet captures', the long one, and the worst honesty set on screens at least the
+    /// window's least size; collapsed with the pop-up, expanded, expanded with the card; the
+    /// warp panel off and on.
+    fn sweep_cases() -> Vec<(String, [u32; 2], f32, HudData, HudControls, bool)> {
+        let mut cases = Vec::new();
+        for (size_px, ppp) in sweep_sizes() {
+            for list in ["comets", "long", "worst"] {
+                if list == "worst" && !holds_min(size_px, ppp) {
+                    continue;
+                }
+                for (mode, card_expanded, card) in [
+                    ("collapsed", false, false),
+                    ("expanded", true, false),
+                    ("card", true, true),
+                ] {
+                    for show_warp in [false, true] {
+                        let mut d = data();
+                        let mut c = HudControls {
+                            card_expanded,
+                            notes_expanded: true,
+                            show_warp,
+                            ..controls()
+                        };
+                        d.target = card.then(mars_card);
+                        d.eye_adapted_stars = true;
+                        d.lens_on_screen = true;
+                        match list {
+                            "comets" => d.notes = comet_notes(true),
+                            "long" => d.notes = long_notes(),
+                            _ => worst_honesty(&mut d, &mut c),
+                        }
+                        let case = format!("{size_px:?} @ {ppp}, {list}, {mode}, warp {show_warp}");
+                        cases.push((case, size_px, ppp, d, c, card_expanded));
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// C4w (the owner: soft and uncluttered): over the sweep (every size, list, mode, the warp
+    /// panel off and on, the list grown since the last draw), no notes block touches another
+    /// HUD block or leaves the screen. Informational notes that would not fit scroll or are
+    /// left out.
+    #[test]
+    fn notes_never_overlap_other_blocks() {
+        for (case, size_px, ppp, d, c, expanded) in sweep_cases() {
             let screen = egui::Rect::from_min_size(
                 Pos2::ZERO,
                 egui::vec2(size_px[0] as f32, size_px[1] as f32) / ppp,
             );
-            for (list_name, list) in &lists {
-                for (mode, c, card) in [
-                    ("collapsed", popup, false),
-                    ("expanded", expanded(), false),
-                    ("card", expanded(), true),
-                ] {
-                    let case = format!("{size_px:?} @ {ppp}, {list_name}, {mode}");
-                    let ctx = headless_context();
-                    let mut d = data();
-                    d.target = card.then(mars_card);
-                    d.eye_adapted_stars = true;
-                    d.lens_on_screen = true;
-                    // First the plain list, then this one on the same HUD.
-                    let mut c1 = c;
-                    let (mut o, _, _) =
-                        run_hud_settled(&ctx, size_px, ppp, 8192, &d, &Overlay::default(), &mut c1);
-                    o.textures_delta.clear();
-                    d.notes = list.clone();
-                    let mut c2 = c;
-                    let (mut o, _, _) =
-                        run_hud_settled(&ctx, size_px, ppp, 8192, &d, &Overlay::default(), &mut c2);
-                    o.textures_delta.clear();
-                    let blocks = blocks(&ctx);
-                    let names: Vec<&str> = blocks.iter().map(|b| b.0).collect();
-                    let note_blocks: &[&str] = if mode == "collapsed" {
-                        &["notes", "notes popup"]
-                    } else {
-                        &["notes stack"]
-                    };
-                    for name in note_blocks {
-                        assert!(names.contains(name), "{case}: no {name} in {names:?}");
-                    }
-                    for (name, rect) in &blocks {
-                        if !note_blocks.contains(name) {
-                            continue;
-                        }
+            let (ctx, _) = draw_grown(size_px, ppp, &d, c);
+            let blocks = blocks(&ctx);
+            let names: Vec<&str> = blocks.iter().map(|b| b.0).collect();
+            let note_blocks: &[&str] = if expanded {
+                &["notes stack"]
+            } else {
+                &["notes", "notes popup"]
+            };
+            for name in note_blocks {
+                assert!(names.contains(name), "{case}: no {name} in {names:?}");
+            }
+            for (name, rect) in &blocks {
+                if !note_blocks.contains(name) {
+                    continue;
+                }
+                assert!(
+                    screen.expand(0.5).contains_rect(*rect),
+                    "{case}: {name} {rect:?} off {screen:?}"
+                );
+                for (other, r) in &blocks {
+                    if other != name {
                         assert!(
-                            screen.expand(0.5).contains_rect(*rect),
-                            "{case}: {name} {rect:?} off {screen:?}"
+                            !rect.shrink(0.5).intersects(*r),
+                            "{case}: {name} {rect:?} touches {other} {r:?}"
                         );
-                        for (other, r) in &blocks {
-                            if other != name {
-                                assert!(
-                                    !rect.shrink(0.5).intersects(*r),
-                                    "{case}: {name} {rect:?} touches {other} {r:?}"
-                                );
-                            }
-                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// The honesty notes of `d` under `c`: non-physical or danger in tone, or a renderer
+    /// warning; expanded, without the flight label (the Speed header shows it).
+    fn honesty_texts(d: &HudData, c: &HudControls) -> Vec<String> {
+        hud_notes(d, c)
+            .into_iter()
+            .filter(|(t, tone)| {
+                matches!(tone, LabelTone::NonPhysical | LabelTone::Danger) || d.warnings.contains(t)
+            })
+            .filter(|(t, _)| !c.card_expanded || *t != d.speed.header)
+            .map(|(t, _)| t)
+            .collect()
+    }
+
+    /// Lead ruling C4w-I1: the honesty notes (non-physical, danger, renderer warnings) are never
+    /// scrolled out of view or dropped. Over the whole sweep, 960 × 540 pt and the window's
+    /// least size included, every one is painted in full in the pop-up or the stack: inside its
+    /// clip rect and on screen. Before the ruling they came last and a scroll area cut them
+    /// first (960 × 540 pt, expanded: "Stars near the hole are not yet lensed (M3)").
+    #[test]
+    fn honesty_notes_stay_whole_on_screen() {
+        for (case, size_px, ppp, d, c, _) in sweep_cases() {
+            let screen = egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(size_px[0] as f32, size_px[1] as f32) / ppp,
+            );
+            let (_, f) = draw_grown(size_px, ppp, &d, c);
+            let expected = honesty_texts(&d, &c);
+            assert!(expected.len() >= 3, "{case}: {expected:?}");
+            for text in &expected {
+                let p = f
+                    .texts
+                    .iter()
+                    .find(|p| p.text == *text && p.font.size == NOTES_SIZE)
+                    .unwrap_or_else(|| panic!("{case}: {text:?} not drawn: {:?}", f.all_text()));
+                let r = egui::Rect::from_min_size(p.pos, p.size);
+                assert!(
+                    p.clip.expand(0.5).contains_rect(r) && screen.expand(0.5).contains_rect(r),
+                    "{case}: {text:?} at {r:?} cut by {:?} or off {screen:?}",
+                    p.clip
+                );
             }
         }
     }

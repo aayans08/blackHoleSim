@@ -259,9 +259,14 @@ impl App {
         el: &ActiveEventLoop,
         instance: wgpu::Instance,
     ) -> anyhow::Result<Gfx> {
+        // The least size keeps room for the HUD's honesty notes (lead ruling C4w-I1).
         let attrs = Window::default_attributes()
             .with_title(WINDOW_TITLE)
-            .with_inner_size(WINDOW_SIZE);
+            .with_inner_size(WINDOW_SIZE)
+            .with_min_inner_size(LogicalSize::new(
+                uni_ui::hud::MIN_WINDOW_PT[0],
+                uni_ui::hud::MIN_WINDOW_PT[1],
+            ));
         let window = Arc::new(el.create_window(attrs).context("creating the window")?);
         let gpu = pollster::block_on(GpuContext::new_windowed(instance, Arc::clone(&window)))?;
         let config = &gpu
