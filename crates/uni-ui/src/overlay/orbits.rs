@@ -341,8 +341,13 @@ pub fn exo_planet_position(
     SkyOrbit::new(sys.planets.get(planet)?, None)?.position_at(host_icrs_dir, t)
 }
 
+/// The smallest projected semi-major axis [pt] an exoplanet orbit is drawn with (Task C6 fix round
+/// 1, I2; context item 7): a smaller one is a ring of dots stacked on the host's glyph.
+pub(crate) const EXO_ORBIT_MIN_SEMI_MAJOR_PT: f64 = 3.0;
+
 /// The lines of one exoplanet orbit around a host at `host_rel` [m from the camera]: the orbit
-/// (dashed when assumed) and the planet's dot at `t` when it is in the frame.
+/// (dashed when assumed) and the planet's dot at `t` when it is in the frame. None when the
+/// orbit's semi-major axis projects under [`EXO_ORBIT_MIN_SEMI_MAJOR_PT`] (on the frame's axis).
 pub(crate) fn exo_orbit_lines(
     map: &ScreenMap,
     host_rel: DVec3,
@@ -355,7 +360,9 @@ pub(crate) fn exo_orbit_lines(
         dashed: orbit.assumed,
         tone: LabelTone::Neutral,
     };
-    if !map.may_see_sphere(map.camera(host_rel), orbit.a_m * (1.0 + orbit.e)) {
+    if !map.may_see_sphere(map.camera(host_rel), orbit.a_m * (1.0 + orbit.e))
+        || map.size_pt(orbit.a_m, host_rel.length()) < EXO_ORBIT_MIN_SEMI_MAJOR_PT
+    {
         return Vec::new();
     }
     let pts = orbit.points(host_dir, theme::ORBIT_POINTS);
@@ -1027,6 +1034,40 @@ mod tests {
             ..planet(Some(88.0), None, None)
         }]);
         assert!(exo_planet_position(&no_t, 0, dir, t_transit).is_none());
+    }
+
+    /// Task C6 fix round 1 (I2, context item 7): an exoplanet orbit whose semi-major axis
+    /// projects under 3 pt is not drawn, nor its dot (they would stack on the host's glyph);
+    /// just over 3 pt it is. The scale is the 60° frame's: 540 internal px per tan 30°, at
+    /// 956/1080 pt per px.
+    #[test]
+    fn sub_three_point_exo_orbits_are_skipped() {
+        let orbit =
+            SkyOrbit::new(&planet(Some(85.0), Some(0.1), Some(30.0)), Some(30.0)).expect("orbit");
+        let map = ScreenMap::new(&camera_at_origin(), INTERNAL, OUTPUT);
+        let pt_per_rad = 540.0 / 30f64.to_radians().tan() * 956.0 / 1080.0;
+        let host_dir = DVec3::new(0.6, 0.0, -0.8);
+        let t = Epoch::from_days_since_j2000(2_457_000.25 - JD_J2000);
+        let lines_at = |a_pt: f64| {
+            let dist = orbit.a_m * pt_per_rad / a_pt;
+            assert!((map.size_pt(orbit.a_m, dist) - a_pt).abs() < 1e-9 * a_pt);
+            exo_orbit_lines(&map, DVec3::new(0.0, 0.0, -dist), host_dir, &orbit, t)
+        };
+        for a_pt in [0.2, 1.0, 2.9] {
+            assert!(lines_at(a_pt).is_empty(), "{a_pt} pt: nothing drawn");
+        }
+        for a_pt in [3.1, 40.0] {
+            let lines = lines_at(a_pt);
+            assert!(
+                lines.iter().any(|l| l.pts.len() >= 2),
+                "{a_pt} pt: orbit drawn"
+            );
+            assert_eq!(
+                lines.iter().filter(|l| l.pts.len() == 1).count(),
+                1,
+                "{a_pt} pt: dot"
+            );
+        }
     }
 
     /// Plan C5 step 1 (ruling 13, lead ruling B.2): Ω missing → dashed (every archive orbit), i

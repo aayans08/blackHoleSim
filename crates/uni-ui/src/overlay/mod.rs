@@ -98,6 +98,16 @@ impl ScreenMap {
         self.scale.y
     }
 
+    /// The on-screen length [pt] of `len_m` [m] across the line of sight at distance `dist_m`
+    /// [m], on the frame's axis (small angles, as `proj_radius_px`; off axis it is longer).
+    /// Infinite when the camera is within `len_m` of the point.
+    pub(crate) fn size_pt(&self, len_m: f64, dist_m: f64) -> f64 {
+        if !(dist_m > len_m) {
+            return f64::INFINITY;
+        }
+        0.5 * self.internal.y * (len_m / dist_m) / self.tan_half_y * self.scale.y
+    }
+
     /// Whether any of the sphere at camera-space `c` with radius `r` [m] may be in the frame:
     /// false only when it lies wholly outside the cone around the view frustum (half-angle to
     /// the frame's corner). Always true with the camera inside it, or for NaN.
