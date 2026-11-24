@@ -20,9 +20,10 @@
 // World light: luminance [cd/m²] × scene_pre() (the frame contract); the coma and the tails are
 // optically thin and write nothing to lens_mask (their location 1 has an empty write mask).
 // Everything is camera-relative f32 in root (ICRS) axes. CPU twins (crates/uni-planet/src/comet/):
-// coma_surface_brightness, coma_drawn_brightness, ion_tail_brightness,
+// coma_surface_brightness, coma_drawn_brightness, coma_visible_half, ion_tail_brightness,
 // ion_tail_drawn_brightness, ion_drawn_sigma, dust_phase, dust_grain_light, sprite_profile,
-// nucleus_reflectance; `universe --selftest` compares them on the GPU.
+// splat_axes, nucleus_reflectance; `universe --selftest` compares them on the GPU. The dust
+// pass as a whole has a CPU twin too (tails::splat_draw and tails::dust_tail_luminance).
 
 #import "common/camera.wgsl"
 #import "common/constants.wgsl"
@@ -50,8 +51,8 @@ const SPRITE_SIGMAS: f32 = 2.0;
 // a sub-pixel splat neither aliases nor vanishes; its light is kept.
 const SPRITE_MIN_PX: f32 = 0.75;
 // ...and each axis is at most this many: a wider splat keeps its surface brightness but is cut
-// to this size and loses the light beyond (approximate: 9 % of row 20's dust light, most of a
-// tail seen from close by; comet::SPRITE_MAX_PX).
+// to this size and loses the light beyond (approximate: 11 % of row 20's dust light, 94 % of
+// row 21's; comet::SPRITE_MAX_PX, and a grey HUD note below 80 %, lead ruling C1L-I3).
 const SPRITE_MAX_PX: f32 = 64.0;
 // Glow whose brightest point is below this pre-exposed value is not drawn (comet::GLOW_CULL_PRE:
 // AgX's black point 2^-12.47393 / 1000).
@@ -130,6 +131,21 @@ fn coma_drawn_brightness(rho: f32, intensity: f32, scale: f32, pixel: f32) -> f3
     let l = max(scale, pixel);
     let u = sqrt(rho * rho + pixel * pixel);
     return coma_surface_brightness(u, intensity * exp(pixel / l), l);
+}
+
+// The half size [m] of the coma quad drawn (C1L's visibility cull) for a coma of `intensity`,
+// `scale` and softening `pixel` whose full quad reaches `half`, at exposure `pre`: the drawn
+// profile is at most C/ρ with C = I·e^(a/ℓ′)/(2πℓ′), ℓ′ = max(ℓ, a), and at most I/(2πℓ′a) at
+// the centre, so 0 (not drawn) when the centre is below GLOW_CULL_PRE, else min(half,
+// C·pre/GLOW_CULL_PRE). Twin of coma::coma_visible_half_m (fix round 1, review minor 4).
+fn coma_visible_half(intensity: f32, scale: f32, pixel: f32, half: f32, pre: f32) -> f32 {
+    let l = max(scale, pixel);
+    let big_c = intensity * exp(pixel / l) / (TAU * l);
+    let peak = intensity / (TAU * l * pixel) * pre;
+    if (!(peak >= GLOW_CULL_PRE)) {
+        return 0.0;
+    }
+    return min(half, big_c * pre / GLOW_CULL_PRE);
 }
 
 // The ion tail as the ribbon draws it [cd/m²], at s along and x across the axis, for a tail of
@@ -391,19 +407,13 @@ fn vs_coma(@builtin(vertex_index) vi: u32, @builtin(instance_index) k: u32) -> C
     let c = comae[k];
     var out: ComaOut;
     out.k = k;
-    // Visibility (C1L): the drawn profile is at most C/ρ with C = I·e^(a/ℓ')/(2πℓ'), ℓ' =
-    // max(ℓ, a), and at most I/(2πℓ'a) at the centre; nothing beyond ρ = C·pre/GLOW_CULL_PRE (or
-    // at all) can reach the cut.
-    let l = max(c.profile.y, c.profile.z);
-    let big_c = c.profile.x * exp(c.profile.z / l) / (TAU * l);
-    let pre = scene_pre();
-    let peak = c.profile.x / (TAU * l * c.profile.z) * pre;
-    if (!(peak >= GLOW_CULL_PRE)) {
+    // Visibility (C1L): nothing beyond coma_visible_half (or nothing at all) reaches the cut.
+    let half = coma_visible_half(c.profile.x, c.profile.y, c.profile.z, c.centre.w, scene_pre());
+    if (!(half > 0.0)) {
         out.clip = vec4<f32>(0.0, 0.0, 0.0, 1.0);
         out.local = vec2<f32>(0.0);
         return out;
     }
-    let half = min(c.centre.w, big_c * pre / GLOW_CULL_PRE);
     let dir = normalize(c.centre.xyz);
     let right = facing_right(dir);
     let up = cross(right, dir);
@@ -462,8 +472,13 @@ fn vs_ion(@builtin(vertex_index) vi: u32, @builtin(instance_index) slot: u32) ->
     let x = corner.x * ION_HALF_WIDTH_SIGMAS * sigma;
     var out: IonOut;
     out.slot = slot;
-    // Visibility (C1L): a segment whose start (its brightest point, the axis at the segment's
-    // first s) stays below GLOW_CULL_PRE is not drawn; all six vertices decide alike.
+    // Visibility (C1L): a segment whose start (the axis at the segment's first s) stays below
+    // GLOW_CULL_PRE is not drawn; all six vertices decide alike. The start is the segment's
+    // brightest point while σ and sin ψ do not shrink along it; for a tail pointing toward the
+    // camera with σ at the pixel floor (σ ∝ distance) the far end can be brighter, by up to
+    // about the ratio of the two ends' distances (fix round 1, review minor 4). A culled segment
+    // is then still below about that ratio × a thousandth of black: harmless, but not a strict
+    // bound.
     let s0 = t.ion_axis.w * f32(seg) / f32(ION_SEGMENTS);
     let p0 = t.nucleus.xyz + axis * s0;
     let sin0 = length(cross(axis, normalize(p0)));

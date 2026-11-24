@@ -18,6 +18,9 @@
 //!     NEOWISE, 12 d after it: `neowise_dust_tail_is_long_and_curved` prints it) and fainter on
 //!     the way in; it depends on the viewing phase as the phase function does.
 //!     The v0 ratio "dust = 0.5 × coma" is gone (C1L: it made NEOWISE's tail short).
+//!   - *Colour.* Sunlight (5 772 K), with no dust reddening (approximate: the C1L brief describes
+//!     NEOWISE's dust tail as yellowish, the render reads whitish; review C1L minor 8, an M2
+//!     item).
 //!   - *Shape.* The grains are drawn as elliptical Gaussian splats (Zwicker et al. 2001, "EWA
 //!     Splatting", IEEE TVCG 8, 223), whose 3D covariance spans half a grid step toward each
 //!     grid neighbour (so the syndynes and synchrones join into one smooth curved sheet) plus the
@@ -100,15 +103,31 @@ pub const ION_MIN_SIGMA_PX: f64 = 0.75;
 ///   Φ(100.56°) = 0.7103 ([`neowise_calibration`]);
 /// - v = 1.11 km/s ([`DUST_EJECTION_SPEED_MPS`]);
 /// - E☉ = 3.178 × 10⁵ lx at 0.63 AU; I_coma = 1.441 × 10¹⁵ cd from the comet's visual law
-///   (`uni_sim::world::COMET_VISUAL_LAWS`: V 3.18 there, extrapolated along its K1 = 9.63, which
-///   is Aravind et al.'s own slope over 0.63–1.61 AU);
+///   (`uni_sim::world::COMET_VISUAL_LAWS`: V 3.18 there). The law rests on COBS estimates at
+///   r_h 0.431–0.494 AU (its valid range), so at 0.63 AU it is extrapolated along its K1 = 9.63,
+///   Aravind et al.'s slope of their aperture photometry over 0.63–1.61 AU (review C1L minor 3;
+///   a COBS median for 2020-07-21/23 would remove the extrapolation: a change to uni-sim's data,
+///   not made here). For NEOWISE itself the law's M1 cancels between τ and the tail; every other
+///   comet's τ carries it;
 /// - HG(0.6) at the scattering angle 180° − α = 0.5257.
 ///
 /// τ = I_coma·HG/(v·A(α)fρ·E☉/2π) = 5.42 × 10⁵ s = 6.3 d; `neowise_head_time_is_derived`
-/// recomputes it. It is one comet's value applied to all (a gas-rich comet's tail is drawn too
-/// bright, a dustier one's too faint) and rests on one dust speed for all grain sizes; within a
-/// factor of about 2 (card note `uni_ui::theme::NOTE_TAILS`: brightness approximate). The v0
-/// ratio (tail = 0.5 × coma) it replaces drew NEOWISE's tail 12 × too faint.
+/// recomputes it. Approximations (card note `uni_ui::theme::NOTE_TAILS`: "Dust tail calibrated on
+/// C/2020 F3 (NEOWISE) only; other comets approximate", lead ruling C1L-c):
+/// - **One comet's value for all.** NEOWISE is not a dusty comet: Aravind et al. 2025 (§3.1.1)
+///   classify it as gas-rich, with dust-to-gas ratios (log₁₀ A(0)fρ/Q(OH) = −25.42 ± 0.40)
+///   "similar to typical gas-rich comets". The typical comets of A'Hearn et al. 1995 (Icarus 118,
+///   223) scatter by about ±0.4 dex in that ratio about −25.8 (as quoted secondhand by the C1L
+///   review; not checked against the original): another comet's dust tail may be drawn too
+///   bright or too faint by about × 2.5 at 1σ, more for unusual comets. A per-comet A(0)fρ table
+///   is an M2 item.
+/// - One dust speed for all grain sizes and distances.
+/// - The coma has no phase function, the dust does: the tail-to-coma ratio runs 1.43, 3.60 and
+///   51 at phases 10°, 90° and 160° (`dust_record_carries_the_emission_rate`), where near
+///   forward scattering the coma's own dust would brighten too (review C1L minor 7).
+///
+/// The v0 ratio (tail = 0.5 × coma) it replaces drew row 20's NEOWISE tail 7 × too faint
+/// (3.55 × the coma now).
 pub const DUST_HEAD_TIME_S: f64 = 5.421e5;
 /// NEOWISE's A(0)fρ on 2020-07-22 [m] (green continuum, ρ = 10⁴ km; Aravind et al. 2025).
 pub const NEOWISE_AFRHO0_M: f64 = 34.99;
@@ -160,7 +179,9 @@ pub fn neowise_calibration() -> (f64, f64, f64) {
 
 /// The Finson–Probstein grid: β ∈ [0.001, 0.9], 16 log steps (C1L ladder step 1: 32 → 16 rows,
 /// 2 048 → 1 024 grains); ages to 60 d, 64 steps (plan C1). β ≤ 0.9 keeps NEOWISE's main dust
-/// band, which Afghan et al. 2024 (PSJ 5, 264) bound at the β = 0.82 syndyne.
+/// band, which Afghan et al. 2024 (PSJ 5, 264) bound at the β = 0.82 syndyne. Their second band,
+/// beyond the β = 1.20 syndyne, is left out (the plan's β < 1: above 1 radiation pressure beats
+/// gravity and the grains leave on hyperbolic orbits; Burns, Lamy & Soter 1979, Icarus 40, 1).
 pub const DUST_PARAMS: DustParams = DustParams {
     beta_min: 0.001,
     beta_max: 0.9,

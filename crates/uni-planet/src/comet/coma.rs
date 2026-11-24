@@ -66,6 +66,32 @@ pub fn coma_drawn_brightness(rho_m: f64, intensity_cd: f64, scale_m: f64, pixel_
     coma_surface_brightness(u, intensity_cd * (pixel_m / l).exp(), l)
 }
 
+/// The half size [m] of the coma quad the pass draws (C1L's visibility cull; fix round 1,
+/// review minor 4: CPU twin of `coma_visible_half` in `comet.wgsl`, probed on the GPU), for a
+/// coma of `intensity_cd`, scale `scale_m` and softening `pixel_m` ([`coma_drawn_brightness`])
+/// whose full quad reaches `half_m`, at exposure `pre` (`scene_pre()`).
+///
+/// The drawn profile falls with ρ (u = √(ρ² + a²) grows), so its brightest point is the centre,
+/// I/(2πℓ′a) with ℓ′ = max(ℓ, a); and since u ≥ ρ and e^(−u/ℓ′) ≤ 1 it is at most C/ρ with
+/// C = I·e^(a/ℓ′)/(2πℓ′). So: 0 (nothing drawn) when the centre × `pre` is below
+/// `GLOW_CULL_PRE`; otherwise min(`half_m`, C·`pre`/`GLOW_CULL_PRE`), beyond which every point
+/// is below the cut.
+pub fn coma_visible_half_m(
+    intensity_cd: f64,
+    scale_m: f64,
+    pixel_m: f64,
+    half_m: f64,
+    pre: f64,
+) -> f64 {
+    let l = scale_m.max(pixel_m);
+    let big_c = intensity_cd * (pixel_m / l).exp() / (std::f64::consts::TAU * l);
+    let peak = intensity_cd / (std::f64::consts::TAU * l * pixel_m) * pre;
+    if !(peak >= super::GLOW_CULL_PRE) {
+        return 0.0;
+    }
+    half_m.min(big_c * pre / super::GLOW_CULL_PRE)
+}
+
 /// Total (nucleus + coma) luminous intensity [cd] of a comet with SBDB's M1, K1 at heliocentric
 /// `r_au` and camera distance `delta_au`: E·Δ² (module docs). Independent of Δ.
 pub fn comet_total_intensity_cd(m1: f64, k1: f64, r_au: f64, delta_au: f64) -> f64 {
@@ -149,6 +175,62 @@ mod tests {
             (drawn / exact - 1.0).abs() < 2.0 * a / l,
             "{drawn} vs {exact}"
         );
+    }
+
+    /// Review minor 4: the coma's visibility cull ([`coma_visible_half_m`]) never removes light
+    /// at or above `GLOW_CULL_PRE` pre-exposed: a culled coma is below it everywhere, and a
+    /// shrunk quad's edge and everything beyond it are below it; the bound is not loose by more
+    /// than the softening's e^(a/ℓ′) and the 1/ρ envelope (the true radius where the profile
+    /// meets the cut is within a factor 30 of the bound for every case here).
+    #[test]
+    fn coma_visibility_cull_keeps_what_shows() {
+        let cut = crate::comet::GLOW_CULL_PRE;
+        let (mut culled, mut shrunk, mut full) = (0, 0, 0);
+        for &i in &[1.0e10, 1.0e12, 3.0e15, 2.0e17] {
+            for &l in &[9.0e6_f64, 1.0e8, 2.4e9] {
+                for &a_rel in &[1e-4, 1e-2, 0.3, 5.0] {
+                    for &pre in &[1e-6, 1e-3, 1.0, 40.0] {
+                        let a = a_rel * l;
+                        let half = super::COMA_EXTENT_SCALES * l.max(a);
+                        let vis = coma_visible_half_m(i, l, a, half, pre);
+                        let drawn = |rho: f64| coma_drawn_brightness(rho, i, l, a) * pre;
+                        if vis == 0.0 {
+                            culled += 1;
+                            assert!(drawn(0.0) < cut, "I {i} ℓ {l} a {a} pre {pre}");
+                            continue;
+                        }
+                        assert!(drawn(0.0) >= cut * (1.0 - 1e-12));
+                        if vis < half {
+                            shrunk += 1;
+                            for k in 0..=200 {
+                                let rho = vis * (1.0 + 0.05 * f64::from(k));
+                                assert!(
+                                    drawn(rho) <= cut * (1.0 + 1e-12),
+                                    "I {i} ℓ {l} a {a} pre {pre}: {:e} at {rho:e} m (bound \
+                                     {vis:e})",
+                                    drawn(rho)
+                                );
+                            }
+                            // Where the profile really meets the cut (bisection in ρ).
+                            let (mut lo, mut hi) = (0.0, vis);
+                            for _ in 0..200 {
+                                let mid = 0.5 * (lo + hi);
+                                if drawn(mid) >= cut {
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                            }
+                            assert!(vis <= 30.0 * hi.max(a), "bound {vis:e} vs {hi:e} m");
+                        } else {
+                            full += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("coma cull cases: {culled} culled, {shrunk} shrunk, {full} full quads");
+        assert!(culled > 0 && shrunk > 0 && full > 0);
     }
 
     /// The total intensity follows SBDB's K1 law: from r_h 1 to 2 AU at fixed Δ it scales by

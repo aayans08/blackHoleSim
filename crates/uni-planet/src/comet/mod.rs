@@ -52,7 +52,7 @@ use wgpu::util::DeviceExt as _;
 
 use self::coma::{
     COMA_EXTENT_SCALES, coma_colour, coma_drawn_brightness, coma_intensity_cd, coma_scale_m,
-    coma_surface_brightness,
+    coma_surface_brightness, coma_visible_half_m,
 };
 use self::nucleus::{
     Icosphere, NUCLEUS_ALBEDO, NUCLEUS_BRDF, NUCLEUS_SUBDIVISIONS, icosphere, nucleus_orientation,
@@ -229,10 +229,14 @@ impl GrainGpu {
 pub const GLOW_CULL_PRE: f64 = 1.75e-7;
 /// A dust splat's σ is at most this many pixels on each axis (twin of `SPRITE_MAX_PX` in
 /// `comet.wgsl`; C1 had 32 px on round sprites); a wider one keeps its surface brightness and
-/// loses the light beyond (approximate). That is 9 % of row 20's dust light (its oldest, faintest
+/// loses the light beyond (approximate). That is 11 % of row 20's dust light (its oldest, widest
 /// splats; `neowise_dust_tail_is_long_and_curved` prints it) and most of a tail seen from close
-/// by: at row 21 (1P/Halley from 2 × 10⁶ km) 98 %, a diffuse glow of ≈ 4 × 10⁻⁴ cd/m² at the
-/// frame's edge (C1L report, §6: a coarse-resolution path that keeps it cost 0.77 ms at row 20).
+/// by: at row 21 (1P/Halley from 2 × 10⁶ km) the pass draws 6 % of it
+/// (`halley_row_21_draws_a_small_share_of_its_dust`); the rest would be a diffuse glow over the
+/// frame (C1L report §6: a coarse-resolution path that kept it cost 0.77 ms at row 20). Each
+/// drawn tail's share is computed on the CPU ([`DustDrawn`]); below [`DUST_DRAWN_NOTE_BELOW`]
+/// the HUD says so (lead ruling C1L-I3). Drawing the lost light (one residual ellipse per tail,
+/// or the coarse path with a clipped composite) is an M2 item.
 pub const SPRITE_MAX_PX: f64 = 64.0;
 
 /// `[v.x, v.y, v.z, w]` in f32 (camera-relative values are formed in f64 first).
@@ -1062,8 +1066,8 @@ pub(crate) const COMET_PROBE_WGSL: &str = r#"// probe/planet_comet.wgsl: `univer
 @group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
 @group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
 
-// Twins of ION_PROBE_INTENSITY_CD, ION_PROBE_PIXEL_M, SPRITE_PROBE_SIGMA_M and the DUST_PROBE_*
-// constants in comet/mod.rs.
+// Twins of ION_PROBE_INTENSITY_CD, ION_PROBE_PIXEL_M, SPRITE_PROBE_SIGMA_M, the DUST_PROBE_*
+// constants and COMA_PROBE_PRE in comet/mod.rs.
 const ION_PROBE_INTENSITY: f32 = 1.0e14;
 const ION_PROBE_PIXEL: f32 = 1.2e8;
 const SPRITE_PROBE_SIGMA: f32 = 3.0e7;
@@ -1072,18 +1076,21 @@ const DUST_PROBE_SUN_Y: f32 = 2.0e10;
 const DUST_PROBE_OFFSET: f32 = 1.0e10;
 const DUST_PROBE_NUCLEUS: f32 = 1.0e11;
 const DUST_PROBE_WEIGHT: f32 = 4.8828125e-4;
+const COMA_PROBE_PRE: f32 = 1.0;
 
-// in: (ρ, I, ℓ, pixel); out: (coma_surface_brightness, coma_drawn_brightness, 0, 0).
+// in: (ρ, I, ℓ, pixel); out: (coma_surface_brightness, coma_drawn_brightness,
+// coma_visible_half of a quad of COMA_EXTENT_SCALES · max(ℓ, pixel) at COMA_PROBE_PRE, 0).
 @compute @workgroup_size(64, 1, 1)
 fn cs_coma(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= arrayLength(&probe_in)) {
         return;
     }
     let c = probe_in[gid.x];
+    let half = COMA_EXTENT_SCALES * max(c.z, c.w);
     probe_out[gid.x] = vec4<f32>(
         coma_surface_brightness(c.x, c.y, c.z),
         coma_drawn_brightness(c.x, c.y, c.z, c.w),
-        0.0,
+        coma_visible_half(c.y, c.z, c.w, half, COMA_PROBE_PRE),
         0.0,
     );
 }
@@ -1176,6 +1183,13 @@ fn dust_probe_geometry(c: &[f32; 4]) -> (DVec3, DVec3, DVec3) {
         DVec3::new(a, 0.5, -1.0) * DUST_PROBE_NUCLEUS_M,
         DUST_PROBE_SUN_M,
     )
+}
+/// The exposure the coma probe's visibility cull runs at (twin of `COMA_PROBE_PRE`; fix round 1,
+/// review minor 4): with it the 64 cases include culled, shrunk and full quads.
+const COMA_PROBE_PRE: f64 = 1.0;
+/// The coma probe case `c` = (ρ, I, ℓ, pixel)'s full quad half size [m], as `cs_coma` builds it.
+fn coma_probe_half_m(c: &[f32; 4]) -> f64 {
+    coma::COMA_EXTENT_SCALES * f64::from(c[2]).max(f64::from(c[3]))
 }
 /// The sprite σ in the probe [m] (twin of `SPRITE_PROBE_SIGMA`).
 const SPRITE_PROBE_SIGMA_M: f64 = 3.0e7;
@@ -1400,16 +1414,22 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
         let out = run_probe(gpu, lib, "cs_coma", &input)?;
         let err = worst(input.iter().zip(&out).flat_map(|(c, g)| {
             let [rho, i, l, a] = c.map(f64::from);
+            let half = coma_probe_half_m(c);
             [
                 rel(g[0], coma_surface_brightness(rho, i, l), f64::MIN_POSITIVE),
                 rel(g[1], coma_drawn_brightness(rho, i, l, a), f64::MIN_POSITIVE),
+                rel(
+                    g[2],
+                    coma_visible_half_m(i, l, a, half, COMA_PROBE_PRE),
+                    f64::MIN_POSITIVE,
+                ),
             ]
         }));
         Ok((
             err <= COMA_PROBE_TOLERANCE,
             format!(
-                "{} radii, exact and drawn profiles, max relative |GPU − CPU| {err:.1e} \
-                 (tolerance {COMA_PROBE_TOLERANCE:.0e})",
+                "{} radii, exact and drawn profiles and the visible quad (cull), max relative \
+                 |GPU − CPU| {err:.1e} (tolerance {COMA_PROBE_TOLERANCE:.0e})",
                 input.len()
             ),
         ))
@@ -1921,6 +1941,7 @@ mod tests {
         };
         assert_eq!(arity("coma_surface_brightness"), Some(3));
         assert_eq!(arity("coma_drawn_brightness"), Some(4));
+        assert_eq!(arity("coma_visible_half"), Some(5));
         assert_eq!(arity("ion_tail_brightness"), Some(5));
         assert_eq!(arity("ion_tail_drawn_brightness"), Some(6));
         assert_eq!(arity("ion_drawn_sigma"), Some(1));
@@ -2011,6 +2032,7 @@ mod tests {
         assert_eq!(scalar("DUST_PROBE_OFFSET"), f32_of(DUST_PROBE_OFFSET_M));
         assert_eq!(scalar("DUST_PROBE_NUCLEUS"), f32_of(DUST_PROBE_NUCLEUS_M));
         assert_eq!(scalar("DUST_PROBE_WEIGHT"), f32_of(DUST_PROBE_WEIGHT));
+        assert_eq!(scalar("COMA_PROBE_PRE"), f32_of(COMA_PROBE_PRE));
         assert_eq!(DUST_PROBE_SUN_M.z, 0.0);
     }
 
@@ -2026,6 +2048,28 @@ mod tests {
         assert!(
             coma.iter()
                 .all(|c| c.iter().all(|x| x.is_finite() && *x > 0.0))
+        );
+        // The visibility cull (fix round 1, review minor 4): culled, shrunk and full quads, none
+        // within 1 % of the cut (where f32 and f64 could disagree on culling).
+        let (mut culled, mut shrunk, mut full) = (0, 0, 0);
+        for c in &coma {
+            let [_, i, l, a] = c.map(f64::from);
+            let lp = l.max(a);
+            let peak = i / (std::f64::consts::TAU * lp * a) * COMA_PROBE_PRE;
+            assert!((peak / GLOW_CULL_PRE - 1.0).abs() > 0.01, "{c:?}");
+            let half = coma_probe_half_m(c);
+            match coma_visible_half_m(i, l, a, half, COMA_PROBE_PRE) {
+                v if v == 0.0 => culled += 1,
+                v if v < half => {
+                    shrunk += 1;
+                    assert!((v / half - 1.0).abs() > 0.01);
+                }
+                _ => full += 1,
+            }
+        }
+        assert!(
+            culled >= 4 && shrunk >= 4 && full >= 4,
+            "{culled} {shrunk} {full}"
         );
         let ion = ion_probe_inputs();
         assert_eq!(ion.len(), 64);
