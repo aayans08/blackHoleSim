@@ -195,20 +195,26 @@ pub(crate) struct GrainGpu {
     /// xyz: offset from the nucleus [m], root axes; w: the emission weight [s]
     /// (`tails::TailGrain::weight`).
     pub(crate) offset: [f32; 4],
-    /// The 3D covariance's diagonal xx, yy, zz [m²]; w: 0.
-    pub(crate) cov_diag: [f32; 4],
-    /// Its off-diagonal xy, xz, yz [m²]; w: 0.
-    pub(crate) cov_off: [f32; 4],
+    /// The 3D covariance's lower-triangular factor L (Σ = L Lᵀ, `tails::cov_factor`) [m]: L₀₀,
+    /// L₁₀, L₂₀, L₁₁...
+    pub(crate) cov_l0: [f32; 4],
+    /// ...and L₂₁, L₂₂; zw: 0.
+    pub(crate) cov_l1: [f32; 4],
 }
 
 impl GrainGpu {
     /// The GPU record of a splat.
     pub(crate) fn of(g: &tails::TailGrain) -> Self {
-        let c = g.cov_m2;
+        let l = tails::cov_factor(g.cov_m2);
         GrainGpu {
             offset: vec4(g.offset_m, g.weight),
-            cov_diag: [c.x_axis.x as f32, c.y_axis.y as f32, c.z_axis.z as f32, 0.0],
-            cov_off: [c.y_axis.x as f32, c.z_axis.x as f32, c.z_axis.y as f32, 0.0],
+            cov_l0: [
+                l.x_axis.x as f32,
+                l.x_axis.y as f32,
+                l.x_axis.z as f32,
+                l.y_axis.y as f32,
+            ],
+            cov_l1: [l.y_axis.z as f32, l.z_axis.z as f32, 0.0, 0.0],
         }
     }
 }
@@ -976,8 +982,9 @@ fn cs_ion(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 }
 
-// C1L. in: four vec4 per case, (cov xx, yy, zz, floor), (cov xy, xz, yz, 0), (right, 0),
-// (up, 0); out[case]: splat_axes's ellipse rebuilt as the projected covariance
+// C1L. in: four vec4 per case, (L00, L10, L20, L11), (L21, L22, floor, 0), (right, 0), (up, 0)
+// (L the covariance's Cholesky factor); out[case]: splat_axes's ellipse rebuilt as the
+// projected covariance
 // (σ₁²c² + σ₂²s², (σ₁² − σ₂²)cs, σ₁²s² + σ₂²c², σ₁σ₂), c, s = cos φ, sin φ.
 @compute @workgroup_size(64, 1, 1)
 fn cs_splat(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -987,7 +994,7 @@ fn cs_splat(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = 4u * gid.x;
     let a = probe_in[i];
     let b = probe_in[i + 1u];
-    let e = splat_axes(a.xyz, b.xyz, probe_in[i + 2u].xyz, probe_in[i + 3u].xyz, a.w);
+    let e = splat_axes(a, b.xy, probe_in[i + 2u].xyz, probe_in[i + 3u].xyz, b.z);
     let c = cos(e.z);
     let s = sin(e.z);
     let l1 = e.x * e.x;
@@ -1104,10 +1111,10 @@ pub(crate) fn phase_probe_inputs() -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// Splat probe inputs (C1L): 64 cases of four vec4 each, (cov diagonal, floor), (cov
-/// off-diagonal, 0), (right, 0), (up, 0): covariances from two tangent vectors and an
-/// ejection spread of 10⁶–10¹⁰ m (round, elongated, flat and edge-on), floors 10⁵–10⁸ m, and
-/// sprite planes at 64 orientations.
+/// Splat probe inputs (C1L): 64 cases of four vec4 each, (L₀₀, L₁₀, L₂₀, L₁₁), (L₂₁, L₂₂,
+/// floor, 0), (right, 0), (up, 0), L the Cholesky factor of covariances from two tangent
+/// vectors and an ejection spread of 10⁶–10⁹ m (round, elongated, needles, flat and edge-on),
+/// floors 10⁵–10⁸ m, and sprite planes at 64 orientations.
 pub(crate) fn splat_probe_inputs() -> Vec<[f32; 4]> {
     let mut out = Vec::with_capacity(256);
     for k in 0..64_u32 {
@@ -1121,10 +1128,16 @@ pub(crate) fn splat_probe_inputs() -> Vec<[f32; 4]> {
         } else {
             10f64.powf(6.0 + 3.0 * ((k * 13) % 64) as f64 / 63.0)
         };
+        let floor = 10f64.powf(5.0 + 3.0 * ((k * 7) % 64) as f64 / 63.0);
+        // Every 8th case a needle (one long axis over a 10⁵ m floor), every 8th a round splat.
+        let (a, b, spread, floor) = match k % 8 {
+            5 => (a.normalize() * 1.0e10, b * 1e-4, 0.0, 1.0e5),
+            6 => (a * 1e-3, b * 1e-3, 1.0e9, floor),
+            _ => (a, b, spread, floor),
+        };
         let cov = tails_outer(a) * 0.25
             + tails_outer(b) * 0.25
             + DMat3::from_diagonal(DVec3::splat(spread * spread));
-        let floor = 10f64.powf(5.0 + 3.0 * ((k * 7) % 64) as f64 / 63.0);
         let (yaw, pitch) = (0.1 + 0.37 * f, -1.2 + 2.4 * ((k * 3) % 64) as f64 / 63.0);
         let dir = DVec3::new(
             pitch.cos() * yaw.cos(),
@@ -1139,18 +1152,14 @@ pub(crate) fn splat_probe_inputs() -> Vec<[f32; 4]> {
         };
         let right = dir.cross(DVec3::Z).normalize_or(DVec3::X);
         let up = right.cross(dir);
+        let l = tails::cov_factor(cov);
         out.push([
-            cov.x_axis.x as f32,
-            cov.y_axis.y as f32,
-            cov.z_axis.z as f32,
-            floor as f32,
+            l.x_axis.x as f32,
+            l.x_axis.y as f32,
+            l.x_axis.z as f32,
+            l.y_axis.y as f32,
         ]);
-        out.push([
-            cov.y_axis.x as f32,
-            cov.z_axis.x as f32,
-            cov.z_axis.y as f32,
-            0.0,
-        ]);
+        out.push([l.y_axis.z as f32, l.z_axis.z as f32, floor as f32, 0.0]);
         out.push([right.x as f32, right.y as f32, right.z as f32, 0.0]);
         out.push([up.x as f32, up.y as f32, up.z as f32, 0.0]);
     }
@@ -1162,18 +1171,19 @@ fn tails_outer(v: DVec3) -> DMat3 {
     DMat3::from_cols(v * v.x, v * v.y, v * v.z)
 }
 
-/// A splat probe case's covariance, floor and plane, as `cs_splat` reads them (f32 → f64).
+/// A splat probe case's covariance factor L, floor and plane, as `cs_splat` reads them
+/// (f32 → f64).
 fn splat_probe_case(c: &[[f32; 4]]) -> (DMat3, f64, DVec3, DVec3) {
     let v = |i: usize| c[i].map(f64::from);
-    let (d, o, r, u) = (v(0), v(1), v(2), v(3));
-    let cov = DMat3::from_cols(
-        DVec3::new(d[0], o[0], o[1]),
-        DVec3::new(o[0], d[1], o[2]),
-        DVec3::new(o[1], o[2], d[2]),
+    let (a, b, r, u) = (v(0), v(1), v(2), v(3));
+    let factor = DMat3::from_cols(
+        DVec3::new(a[0], a[1], a[2]),
+        DVec3::new(0.0, a[3], b[0]),
+        DVec3::new(0.0, 0.0, b[1]),
     );
     (
-        cov,
-        d[3],
+        factor,
+        b[2],
         DVec3::new(r[0], r[1], r[2]),
         DVec3::new(u[0], u[1], u[2]),
     )
@@ -1328,8 +1338,8 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
         let input = splat_probe_inputs();
         let out = run_probe(gpu, lib, "cs_splat", &input)?;
         let err = worst(input.chunks(4).zip(&out).flat_map(|(c, g)| {
-            let (cov, floor, right, up) = splat_probe_case(c);
-            let (s1, s2, phi) = splat_axes(cov, right, up, floor);
+            let (factor, floor, right, up) = splat_probe_case(c);
+            let (s1, s2, phi) = splat_axes(factor, right, up, floor);
             let (cs, sn) = (phi.cos(), phi.sin());
             let (l1, l2) = (s1 * s1, s2 * s2);
             let cpu = [
@@ -1702,8 +1712,8 @@ mod tests {
             size_of::<GrainGpu>(),
             &[
                 ("offset", offset_of!(GrainGpu, offset)),
-                ("cov_diag", offset_of!(GrainGpu, cov_diag)),
-                ("cov_off", offset_of!(GrainGpu, cov_off)),
+                ("cov_l0", offset_of!(GrainGpu, cov_l0)),
+                ("cov_l1", offset_of!(GrainGpu, cov_l1)),
             ],
         );
         assert_eq!(
@@ -1876,14 +1886,17 @@ mod tests {
         assert_eq!(splat.len(), 256);
         let mut ratios = Vec::new();
         for c in splat.chunks(4) {
-            let (cov, floor, right, up) = splat_probe_case(c);
+            let (factor, floor, right, up) = splat_probe_case(c);
             assert!((right.length() - 1.0).abs() < 1e-6 && (up.length() - 1.0).abs() < 1e-6);
             assert!(right.dot(up).abs() < 1e-6 && floor > 0.0);
-            let (s1, s2, _) = splat_axes(cov, right, up, floor);
+            let (s1, s2, _) = splat_axes(factor, right, up, floor);
             assert!(s1.is_finite() && s2 > 0.0);
             ratios.push((s1 / s2, s2 / floor));
         }
-        assert!(ratios.iter().any(|r| r.0 > 100.0) && ratios.iter().any(|r| r.0 < 2.0));
+        assert!(
+            ratios.iter().any(|r| r.0 > 100.0) && ratios.iter().any(|r| r.0 < 2.0),
+            "{ratios:?}"
+        );
         assert!(
             ratios.iter().filter(|r| r.1 < 1.01).count() >= 4,
             "{ratios:?}"

@@ -320,24 +320,46 @@ pub fn dust_ejection_sigma_m(age_s: f64) -> f64 {
     DUST_EJECTION_SPEED_MPS * age_s.max(0.0) / 3.0_f64.sqrt()
 }
 
-/// A splat's screen-plane ellipse (C1L): the grain's 3D covariance `cov` [m²] projected onto
-/// the plane spanned by the unit vectors `right` and `up` (the sprite's plane, facing the
-/// camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`] pixels), then
-/// diagonalised. Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
-/// cos φ·right + sin φ·up and −sin φ·right + cos φ·up. CPU twin of the shader's `splat_axes`
-/// (same order of operations); probed on the GPU.
-pub fn splat_axes(cov: DMat3, right: DVec3, up: DVec3, floor_m: f64) -> (f64, f64, f64) {
-    let floor2 = floor_m * floor_m;
-    let (sr, su) = (cov * right, cov * up);
-    let p = right.dot(sr) + floor2;
-    let q = right.dot(su);
-    let r = up.dot(su) + floor2;
-    let m = 0.5 * (p + r);
-    let h = 0.5 * (p - r);
-    let d = (h * h + q * q).sqrt();
-    let l1 = m + d;
-    // ≥ floor² in exact arithmetic (the floor is added to both axes); kept there under rounding.
-    let l2 = (m - d).max(floor2);
+/// A lower-triangular factor L of a splat's covariance (Σ = L Lᵀ, Cholesky), what the GPU
+/// record carries (C1L): projecting L instead of Σ keeps the ellipse's minor axis exact in f32
+/// ([`splat_axes`]). A jitter of 10⁻¹² of the trace keeps a flat (singular) Σ factorable.
+pub fn cov_factor(cov: DMat3) -> DMat3 {
+    let eps = 1e-12 * (cov.x_axis.x + cov.y_axis.y + cov.z_axis.z).abs() + f64::MIN_POSITIVE;
+    let a = |i: usize, j: usize| cov.col(j)[i] + if i == j { eps } else { 0.0 };
+    let l00 = a(0, 0).max(eps).sqrt();
+    let l10 = a(1, 0) / l00;
+    let l20 = a(2, 0) / l00;
+    let l11 = (a(1, 1) - l10 * l10).max(eps).sqrt();
+    let l21 = (a(2, 1) - l20 * l10) / l11;
+    let l22 = (a(2, 2) - l20 * l20 - l21 * l21).max(eps).sqrt();
+    DMat3::from_cols(
+        DVec3::new(l00, l10, l20),
+        DVec3::new(0.0, l11, l21),
+        DVec3::new(0.0, 0.0, l22),
+    )
+}
+
+/// A splat's screen-plane ellipse (C1L): the 3D covariance L Lᵀ (`factor` = L, [`cov_factor`])
+/// projected onto the plane spanned by the unit vectors `right` and `up` (the sprite's plane,
+/// facing the camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`]
+/// pixels). With uᵢ = (right·Lᵢ, up·Lᵢ) the columns projected, the 2D covariance C has trace
+/// Σ|uᵢ|² + 2f² and determinant Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴ (Cauchy–Binet: a sum of
+/// squares, so an elongated splat's minor axis does not cancel in f32); σ₁² = m + √(m² − det),
+/// m = trace/2, σ₂² = det/σ₁². Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
+/// cos φ·right + sin φ·up and −sin φ·right + cos φ·up, φ = ½ atan2(2C₁₂, C₁₁ − C₂₂). CPU twin of
+/// the shader's `splat_axes` (same order of operations); probed on the GPU.
+pub fn splat_axes(factor: DMat3, right: DVec3, up: DVec3, floor_m: f64) -> (f64, f64, f64) {
+    let f2 = floor_m * floor_m;
+    let u = [factor.x_axis, factor.y_axis, factor.z_axis].map(|c| (right.dot(c), up.dot(c)));
+    let p = u[0].0 * u[0].0 + u[1].0 * u[1].0 + u[2].0 * u[2].0;
+    let q = u[0].0 * u[0].1 + u[1].0 * u[1].1 + u[2].0 * u[2].1;
+    let r = u[0].1 * u[0].1 + u[1].1 * u[1].1 + u[2].1 * u[2].1;
+    let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    let (c01, c02, c12) = (cross(u[0], u[1]), cross(u[0], u[2]), cross(u[1], u[2]));
+    let det = c01 * c01 + c02 * c02 + c12 * c12 + f2 * (p + r) + f2 * f2;
+    let m = 0.5 * (p + r) + f2;
+    let l1 = m + (m * m - det).max(0.0).sqrt();
+    let l2 = det / l1;
     (l1.sqrt(), l2.sqrt(), 0.5 * (2.0 * q).atan2(p - r))
 }
 
@@ -1122,8 +1144,8 @@ mod tests {
             (outer(right * 2.0e9), 1.0e7),
             (DMat3::ZERO, 2.0e6),
         ] {
-            let (s1, s2, phi) = splat_axes(cov, right, up, floor);
-            assert!(s1 >= s2 && s2 >= floor * (1.0 - 1e-12), "{s1} {s2} {floor}");
+            let (s1, s2, phi) = splat_axes(cov_factor(cov), right, up, floor);
+            assert!(s1 >= s2 && s2 >= floor * (1.0 - 1e-9), "{s1} {s2} {floor}");
             let (c, s) = (phi.cos(), phi.sin());
             let p = s1 * s1 * c * c + s2 * s2 * s * s;
             let q = (s1 * s1 - s2 * s2) * c * s;
@@ -1133,14 +1155,14 @@ mod tests {
                 right.dot(cov * up),
                 up.dot(cov * up) + floor * floor,
             ];
-            let tol = 1e-9 * (s1 * s1);
+            let tol = 1e-8 * (s1 * s1);
             assert!(
                 (p - want[0]).abs() <= tol
                     && (q - want[1]).abs() <= tol
                     && (r - want[2]).abs() <= tol
             );
         }
-        let (s1, s2, _) = splat_axes(outer(up * 5.0e8), right, up, 1.0e6);
+        let (s1, s2, _) = splat_axes(cov_factor(outer(up * 5.0e8)), right, up, 1.0e6);
         assert!((s1 / 5.0e8 - 1.0).abs() < 1e-5 && (s2 / 1.0e6 - 1.0).abs() < 1e-6);
     }
 
@@ -1206,7 +1228,8 @@ mod tests {
             let mut i = rate * dust_grain_light(g.offset_m, g.weight, rel, -nucleus);
             light += i;
             let pixel_m = d / f_full;
-            let (mut s1, mut s2, phi) = splat_axes(g.cov_m2, right, up, SPRITE_MIN_PX * pixel_m);
+            let (mut s1, mut s2, phi) =
+                splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * pixel_m);
             let s_max = crate::comet::SPRITE_MAX_PX * pixel_m;
             if s1 > s_max {
                 i *= s_max / s1;

@@ -104,10 +104,10 @@ struct TailGpu {
 struct GrainGpu {
     // xyz: offset from the nucleus [m]; w: the emission weight [s] (tails::TailGrain::weight).
     offset: vec4<f32>,
-    // The 3D covariance [m²]: xx, yy, zz (w: 0)...
-    cov_diag: vec4<f32>,
-    // ...and xy, xz, yz (w: 0).
-    cov_off: vec4<f32>,
+    // The 3D covariance's Cholesky factor L [m] (tails::cov_factor): L00, L10, L20, L11...
+    cov_l0: vec4<f32>,
+    // ...and L21, L22 (zw: 0).
+    cov_l1: vec4<f32>,
 }
 
 @group(1) @binding(0) var<storage, read> nuclei: array<NucleusGpu>;
@@ -213,34 +213,37 @@ fn sprite_profile(r: f32, sigma: f32) -> f32 {
     return (exp(-0.5 * t * t) - edge) / norm;
 }
 
-// A splat's ellipse on the sprite plane (C1L): the symmetric 3D covariance (diag xx yy zz, off
-// xy xz yz) [m²] projected on the unit vectors right and up, plus floor² on both axes, then
-// diagonalised. Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and −sin φ·right +
+// A splat's ellipse on the sprite plane (C1L): the 3D covariance L Lᵀ (l0 = (L00, L10, L20,
+// L11), l1 = (L21, L22)) projected on the unit vectors right and up, plus floor² on both axes.
+// With uᵢ the projected columns of L: trace Σ|uᵢ|² + 2f², determinant Σ_{i<j}(uᵢ × uⱼ)² +
+// f²Σ|uᵢ|² + f⁴ (Cauchy–Binet: no cancellation for elongated splats), σ₁² = m + √(m² − det),
+// σ₂² = det/σ₁². Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and −sin φ·right +
 // cos φ·up. Twin of tails::splat_axes.
 fn splat_axes(
-    cov_diag: vec3<f32>,
-    cov_off: vec3<f32>,
+    l0: vec4<f32>,
+    l1: vec2<f32>,
     right: vec3<f32>,
     up: vec3<f32>,
     floor: f32,
 ) -> vec3<f32> {
-    let c = mat3x3<f32>(
-        vec3<f32>(cov_diag.x, cov_off.x, cov_off.y),
-        vec3<f32>(cov_off.x, cov_diag.y, cov_off.z),
-        vec3<f32>(cov_off.y, cov_off.z, cov_diag.z),
-    );
-    let floor2 = floor * floor;
-    let sr = c * right;
-    let su = c * up;
-    let p = dot(right, sr) + floor2;
-    let q = dot(right, su);
-    let r = dot(up, su) + floor2;
-    let m = 0.5 * (p + r);
-    let h = 0.5 * (p - r);
-    let d = sqrt(h * h + q * q);
-    let l1 = m + d;
-    let l2 = max(m - d, floor2);
-    return vec3<f32>(sqrt(l1), sqrt(l2), 0.5 * atan2(2.0 * q, p - r));
+    let c0 = vec3<f32>(l0.x, l0.y, l0.z);
+    let c1 = vec3<f32>(0.0, l0.w, l1.x);
+    let c2 = vec3<f32>(0.0, 0.0, l1.y);
+    let u0 = vec2<f32>(dot(right, c0), dot(up, c0));
+    let u1 = vec2<f32>(dot(right, c1), dot(up, c1));
+    let u2 = vec2<f32>(dot(right, c2), dot(up, c2));
+    let f2 = floor * floor;
+    let p = u0.x * u0.x + u1.x * u1.x + u2.x * u2.x;
+    let q = u0.x * u0.y + u1.x * u1.y + u2.x * u2.y;
+    let r = u0.y * u0.y + u1.y * u1.y + u2.y * u2.y;
+    let c01 = u0.x * u1.y - u0.y * u1.x;
+    let c02 = u0.x * u2.y - u0.y * u2.x;
+    let c12 = u1.x * u2.y - u1.y * u2.x;
+    let det = c01 * c01 + c02 * c02 + c12 * c12 + f2 * (p + r) + f2 * f2;
+    let m = 0.5 * (p + r) + f2;
+    let l_1 = m + sqrt(max(m * m - det, 0.0));
+    let l_2 = det / l_1;
+    return vec3<f32>(sqrt(l_1), sqrt(l_2), 0.5 * atan2(2.0 * q, p - r));
 }
 
 // Lunar-Lambert reflectance factor (McEwen 1991, Icarus 92, 298), L = NUCLEUS_L:
@@ -502,7 +505,7 @@ fn vs_dust(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> D
     let right = facing_right(dir);
     let up = cross(right, dir);
     let px = pixel_size_at(dist);
-    let axes = splat_axes(grain.cov_diag.xyz, grain.cov_off.xyz, right, up, SPRITE_MIN_PX * px);
+    let axes = splat_axes(grain.cov_l0, grain.cov_l1.xy, right, up, SPRITE_MIN_PX * px);
     var s1 = axes.x;
     var s2 = axes.y;
     let s_max = SPRITE_MAX_PX * px;
