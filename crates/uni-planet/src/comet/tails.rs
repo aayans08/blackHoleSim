@@ -3,20 +3,25 @@
 //! - **Dust** (Task C1L): `uni_physics::dust::finson_probstein` (Finson & Probstein 1968, ApJ 154,
 //!   327) on `CometView::conic` (J2000 ecliptic, as it expects; lead ruling A.1: never rotate it
 //!   to ICRS first), β ∈ [0.001, 0.9] in 16 log steps × ages up to 60 d in 64 steps = 1 024 grains
-//!   ([`DUST_PARAMS`]), dust production ∝ r_h^−max(K1/2.5 − 2, 0) at emission ([`dust_production`]:
-//!   the comet's total visual magnitude law without the sunlight it already contains; C1L fix
-//!   round 1, lead ruling C1L-I1).
+//!   ([`DUST_PARAMS`]). Dust production at emission ∝ r_h^exponent ([`dust_production_exponent`]):
+//!   a comet's measured A(0)fρ slope where [`COMET_DUST_LAWS`] has one (NEOWISE: r_h^−4.0, Biver
+//!   et al. 2022; C1L fix round 2, lead ruling C1L-R1), else −max(K1/2.5 − 2, 0), the total
+//!   visual magnitude law without the sunlight it already contains (C1L fix round 1, ruling
+//!   C1L-I1).
 //!   - *Light.* Each grain stands for the dust emitted in its cell of ln β × age. The dust's light
-//!     production now is the coma's light divided by [`DUST_HEAD_TIME_S`], a time calibrated on
+//!     production now ([`dust_rate_cd_per_s`]) is v·A(0)fρ(r_h)·E☉/(2π) from a comet's dust law,
+//!     else the coma's light divided by [`DUST_HEAD_TIME_S`], a time calibrated on
 //!     C/2020 F3 (NEOWISE) from its measured dust production A(0)fρ (Aravind et al. 2025), its
 //!     measured dust speed (Manzini et al. 2021) and the steady-outflow relation of A'Hearn et al.
-//!     1984 (derivation on the constant). A grain carries that rate × its emission weight
+//!     1984 (derivation on the constant); both agree at that anchor. A grain carries that rate ×
+//!     its emission weight
 //!     [`TailGrain::weight`] (production at emission relative to now × its size class's share ×
 //!     the cell's age span) × the sunlight at its own heliocentric distance × a
 //!     Henyey–Greenstein phase function with g = 0.6 ([`DUST_PHASE_G`]). The tail is therefore
-//!     several times brighter than the coma just after perihelion (3.55 × for row 20's
-//!     NEOWISE, 12 d after it: `neowise_dust_tail_is_long_and_curved` prints it) and fainter on
-//!     the way in; it depends on the viewing phase as the phase function does.
+//!     many times brighter than the coma just after perihelion (11.5 × for row 20's NEOWISE, 12 d
+//!     after it, with its dust law; 3.55 × with the K1 slope: `neowise_dust_tail_is_long_and_curved`
+//!     prints it) and fainter on the way in; it depends on the viewing phase as the phase
+//!     function does.
 //!     The v0 ratio "dust = 0.5 × coma" is gone (C1L: it made NEOWISE's tail short).
 //!   - *Colour.* Sunlight (5 772 K), with no dust reddening (approximate: the C1L brief describes
 //!     NEOWISE's dust tail as yellowish, the render reads whitish; review C1L minor 8, an M2
@@ -57,6 +62,7 @@ use uni_physics::dust::{DustGrain, DustParams, finson_probstein};
 use uni_physics::kepler::Conic;
 use uni_sim::registry::ObjectId;
 use uni_sim::snapshot::{COMET_ACTIVE_AU, CometView};
+use uni_sim::world::PerihelionLeg;
 
 use super::{MAX_TAILED_COMETS, TAIL_REFRESH_WALL_S, line_colour};
 
@@ -154,16 +160,138 @@ pub const NEOWISE_CALIBRATION_AU: [f64; 3] = [0.63, 0.69, 1.0160];
 /// C/2020 F3 (NEOWISE)'s SBDB SPK-ID, whose visual law calibrates [`DUST_HEAD_TIME_S`].
 pub const NEOWISE_SPKID: i32 = 1_003_667;
 
-/// [`DUST_HEAD_TIME_S`] from its inputs (its doc): returns (τ [s], the phase angle α [°] of the
-/// calibration night, Φ_HM(α)). NaN when uni-sim has no visual law for NEOWISE.
-pub fn neowise_calibration() -> (f64, f64, f64) {
+/// A comet's measured dust production (C1L fix round 2, lead ruling R1, 2026-11-24; the dust
+/// counterpart of `uni_sim::world::COMET_VISUAL_LAWS`): the phase-corrected A(0)fρ as a power of
+/// r_h from a primary refereed source, and its absolute level at an anchor.
+///
+/// **Production from Afρ.** A(0)fρ is the dust's scattering cross-section inside the aperture
+/// ρ, A(0)·N(ρ)·σ̄/(πρ²) × ρ, with the r_h⁻² sunlight and the Δ already divided out (A'Hearn et
+/// al. 1984, AJ 89, 579). A steady coma flowing out at v holds, inside ρ, the dust emitted over
+/// the last πρ/(2v) (the relation [`DUST_HEAD_TIME_S`] rests on), so the cross-section emitted
+/// per second is Ṡ = (2v/π)·N(ρ)σ̄/ρ = 2v·A(0)fρ/A(0) ∝ v·A(0)fρ. With one ejection speed for
+/// every r_h ([`DUST_EJECTION_SPEED_MPS`], Manzini et al. 2021) the production goes as A(0)fρ:
+/// P(r_h) ∝ r_h^`afrho_slope` ([`dust_production_exponent`]). The light it carries is lit at
+/// each grain's own distance ([`dust_grain_light`]), so no r_h⁻² is added (lead ruling C1L-I1).
+///
+/// **Light now.** The dust's light production per unit of the phase function is
+/// v·A(0)fρ(r_h)·E☉(r_h)/(2π)·Φ_HM(α₀)/HG(θ₀) ([`dust_rate_cd_per_s`]): A'Hearn's steady
+/// outflow (the [`DUST_HEAD_TIME_S`] derivation) with the Halley–Marcus composite matched to the
+/// renderer's HG(0.6) at the anchor's phase α₀ (θ₀ = 180° − α₀). At the anchor it equals
+/// I_coma/τ exactly, so the two calibrations agree there (`dust_law_matches_tau_at_the_anchor`).
+///
+/// **Range.** The law is used at every r_h. Outside `r_valid_au` on `leg` it is extrapolated
+/// ([`CometDustLaw::covers`], the rule of `CometVisualLaw::covers`). A comet without a row keeps
+/// r_h^−max(K1/2.5 − 2, 0) and I_coma/τ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CometDustLaw {
+    /// SBDB primary SPK-ID: the row applies to the comet with this SPK-ID.
+    pub spkid: i32,
+    /// SBDB name, for readers (the SPK-ID decides).
+    pub name: &'static str,
+    /// The r_h exponent of the phase-corrected A(0)fρ.
+    pub afrho_slope: f64,
+    /// Where the slope comes from.
+    pub slope_source: &'static str,
+    /// The heliocentric distances [AU] the slope's observations span, on `leg`.
+    pub r_valid_au: (f64, f64),
+    /// The leg the slope's observations were made on.
+    pub leg: PerihelionLeg,
+    /// The absolute level: A(0)fρ [m] at `anchor_r_au` [AU] (phase-corrected to 0°).
+    pub anchor_afrho0_m: f64,
+    pub anchor_r_au: f64,
+}
+
+impl CometDustLaw {
+    /// A(0)fρ [m] at heliocentric distance `r_au`: the anchor × (r_h/r_anchor)^slope.
+    pub fn afrho0_m(&self, r_au: f64) -> f64 {
+        self.anchor_afrho0_m * (r_au / self.anchor_r_au).powf(self.afrho_slope)
+    }
+
+    /// Whether the slope rests on observations at `r_au` [AU] on this leg (`outbound`: after
+    /// perihelion); elsewhere it is extrapolated.
+    pub fn covers(&self, r_au: f64, outbound: bool) -> bool {
+        let leg = match self.leg {
+            PerihelionLeg::Both => true,
+            PerihelionLeg::Inbound => !outbound,
+            PerihelionLeg::Outbound => outbound,
+        };
+        leg && (self.r_valid_au.0..=self.r_valid_au.1).contains(&r_au)
+    }
+}
+
+/// The comets with a measured dust-production slope ([`CometDustLaw`]).
+///
+/// **C/2020 F3 (NEOWISE).** Biver et al. 2022 ("Observations of comet C/2020 F3 (NEOWISE) with
+/// IRAM telescopes", A&A 668, A171; read 2026-11-24): "the dust production in comet C/2020 F3
+/// also varied steeply with heliocentric distance (Afρ(0) ∝ r_h^−4.0, Fig. 19)". Their Fig. 19
+/// covers the post-perihelion weeks 13 July – 14 August 2020; its Afρ values come from red-layer
+/// images, phase-corrected with Schleicher 2007 and Marcus 2007. That span is r_h 0.410–1.115 AU
+/// on the SBDB orbit (`neowise_dust_law_range_is_the_papers`). Their absolute values (red band;
+/// 10 000 cm on 21.9 July in their Fig. 2) are not used: the level stays Aravind et al. 2025's
+/// green-continuum A(0)fρ = 34.99 m on 2020-07-22 at r_h 0.63 AU ([`NEOWISE_AFRHO0_M`]), the
+/// anchor [`DUST_HEAD_TIME_S`] is calibrated at, so only the slope is Biver's.
+pub const COMET_DUST_LAWS: [CometDustLaw; 1] = [CometDustLaw {
+    spkid: NEOWISE_SPKID,
+    name: "C/2020 F3 (NEOWISE)",
+    afrho_slope: -4.0,
+    slope_source: "Biver et al. 2022",
+    r_valid_au: (0.410, 1.115),
+    leg: PerihelionLeg::Outbound,
+    anchor_afrho0_m: NEOWISE_AFRHO0_M,
+    anchor_r_au: NEOWISE_CALIBRATION_AU[0],
+}];
+
+/// The [`COMET_DUST_LAWS`] row of the comet with SBDB SPK-ID `spkid`, if it has one.
+pub fn comet_dust_law(spkid: i32) -> Option<&'static CometDustLaw> {
+    COMET_DUST_LAWS.iter().find(|l| l.spkid == spkid)
+}
+
+/// The r_h exponent of a comet's dust production (the weights [`dust_rows`] gives the
+/// emissions): its [`CometDustLaw`]'s A(0)fρ slope where it has one, else −max(K1/2.5 − 2, 0)
+/// from its total visual slope `k1` ([`dust_production`]).
+pub fn dust_production_exponent(spkid: i32, k1: f64) -> f64 {
+    comet_dust_law(spkid).map_or(-(k1 / 2.5 - 2.0).max(0.0), |l| l.afrho_slope)
+}
+
+/// The dust's light production [cd/s per unit of HG] of comet `view` whose coma carries
+/// `coma_cd` [cd] (`TailGpu::sun.w`): from its [`CometDustLaw`] where it has one,
+/// v·A(0)fρ(r_h)·E☉(r_h)/(2π)·Φ_HM(α₀)/HG(θ₀) (the row's doc), else I_coma/τ
+/// ([`dust_emission_cd_per_s`]). 0 for a non-positive or non-finite result.
+pub fn dust_rate_cd_per_s(view: &CometView, coma_cd: f64) -> f64 {
+    let Some(law) = comet_dust_law(view.spkid) else {
+        return dust_emission_cd_per_s(coma_cd);
+    };
+    // The only anchor is NEOWISE's calibration night (an M2 per-comet A(0)fρ table adds others).
+    let (alpha, phi) = neowise_calibration_phase();
+    let phase_match = phi / dust_phase(-alpha.to_radians().cos());
+    let r_m = view.r_au * AU;
+    let sun_lux = super::sun_intensity_cd() / (r_m * r_m);
+    let rate = DUST_EJECTION_SPEED_MPS * law.afrho0_m(view.r_au) * sun_lux * phase_match
+        / std::f64::consts::TAU;
+    if rate > 0.0 && rate.is_finite() {
+        rate
+    } else {
+        0.0
+    }
+}
+
+/// The NEOWISE calibration night's phase angle α [°] (the Sun–comet–Earth angle from
+/// [`NEOWISE_CALIBRATION_AU`]'s three sides) and the Halley–Marcus Φ_HM(α) there.
+fn neowise_calibration_phase() -> (f64, f64) {
     let [r_au, delta_au, earth_au] = NEOWISE_CALIBRATION_AU;
-    // The Sun–comet–Earth angle from the triangle's three sides.
     let cos_alpha =
         (r_au * r_au + delta_au * delta_au - earth_au * earth_au) / (2.0 * r_au * delta_au);
     let alpha = cos_alpha.clamp(-1.0, 1.0).acos().to_degrees();
     let [p100, p101] = HALLEY_MARCUS_100_101;
-    let phi = p100 + (p101 - p100) * (alpha - 100.0);
+    (alpha, p100 + (p101 - p100) * (alpha - 100.0))
+}
+
+/// [`DUST_HEAD_TIME_S`] from its inputs (its doc): returns (τ [s], the phase angle α [°] of the
+/// calibration night, Φ_HM(α)). NaN when uni-sim has no visual law for NEOWISE.
+pub fn neowise_calibration() -> (f64, f64, f64) {
+    let [r_au, delta_au, _] = NEOWISE_CALIBRATION_AU;
+    let (alpha, phi) = neowise_calibration_phase();
+    let cos_alpha = alpha.to_radians().cos();
     let Some(law) = uni_sim::world::comet_visual_law(NEOWISE_SPKID) else {
         return (f64::NAN, alpha, phi);
     };
@@ -216,6 +344,7 @@ pub const NOMINAL_SOLVES_PER_FRAME: usize = 2_000;
 /// CIE 1931 2° colour-matching functions x̄, ȳ, z̄ at 427 nm, the CO⁺ comet-tail band (CIE 2018
 /// data table, DOI 10.25039/CIE.DS.xvudnb9b; read 2026-11-23).
 pub const CO_PLUS_CMF: [f64; 3] = [0.244_879_7, 0.008_908_72, 1.188_497_1];
+
 
 /// Direction of the ion tail (unit, ICRS) from the Sun → nucleus geometry: `sun_rel` is the Sun
 /// relative to the nucleus [m] (`CometView::sun_rel_m`), `helio_vel` the comet's heliocentric
@@ -678,7 +807,7 @@ pub fn dust_tail_luminance(
         ) else {
             continue;
         };
-        let rate = dust_emission_cd_per_s(super::coma::coma_intensity_cd(view));
+        let rate = dust_rate_cd_per_s(view, super::coma::coma_intensity_cd(view));
         for g in &tail.grains {
             let Some(sp) = splat_draw(g, rate, view.nucleus_rel_m, view.sun_rel_m, &cam) else {
                 continue;
@@ -810,11 +939,11 @@ pub fn tail_schedule(
 }
 
 /// The grains of β rows `rows` (indices 0..16 into [`DUST_PARAMS`]'s β grid) of `conic` at
-/// `t_obs`, with dust production ∝ r_h^−max(K1/2.5 − 2, 0) ([`dust_production`]). Row-major as
+/// `t_obs`, with dust production ∝ r_h^`exponent` ([`dust_production_exponent`]). Row-major as
 /// `finson_probstein` (β-major, ages within a row).
 pub(crate) fn dust_rows(
     conic: &Conic,
-    k1: f64,
+    exponent: f64,
     t_obs: Epoch,
     rows: std::ops::Range<u32>,
 ) -> Vec<DustGrain> {
@@ -841,9 +970,9 @@ pub(crate) fn dust_rows(
         n_beta: j1 - j0,
         ..DUST_PARAMS
     };
-    // Production ∝ r_h^−max(K1/2.5 − 2, 0) ([`dust_production`]; plan C1 as amended by lead
-    // ruling C1L-I1).
-    finson_probstein(conic, t_obs, &p, &|r_h| dust_production(r_h, k1))
+    // Production ∝ r_h^exponent ([`dust_production_exponent`]; plan C1 as amended by lead
+    // rulings C1L-I1 and C1L-R1).
+    finson_probstein(conic, t_obs, &p, &|r_h| dust_production(r_h, exponent))
 }
 
 /// One dust splat as the pass draws it (C1L): a grain of the Finson–Probstein grid, or a merged
@@ -1046,9 +1175,11 @@ pub(crate) fn tail_reach_m(grains: &[TailGrain]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The dust production law's value at heliocentric distance `r_au` for the comet's total visual
-/// slope `k1`: r_h^−max(K1/2.5 − 2, 0), the factor `dust_rows` weights the emissions with (C1L
-/// fix round 1, review I1, lead ruling C1L-I1, 2026-11-24).
+/// The dust production law's value at heliocentric distance `r_au`: r_h^`exponent`, the factor
+/// `dust_rows` weights the emissions with. The exponent is a [`CometDustLaw`]'s A(0)fρ slope
+/// where the comet has one (lead ruling C1L-R1), else −max(K1/2.5 − 2, 0) from its total visual
+/// slope K1 ([`dust_production_exponent`]; C1L fix round 1, review I1, lead ruling C1L-I1,
+/// 2026-11-24), explained here.
 ///
 /// - **Why −2.** The magnitude law m = M1 + 5 log₁₀ Δ + K1 log₁₀ r_h (SBDB's total-magnitude law;
 ///   `uni_sim::world::COMET_VISUAL_LAWS` where a comet has a cited one) makes the comet's light
@@ -1064,9 +1195,12 @@ pub(crate) fn tail_reach_m(grains: &[TailGrain]) -> f64 {
 /// - **Approximate.** K1 is the slope of the comet's TOTAL visual light, which for many comets
 ///   is dominated by gas (C₂ Swan bands in the V band), not dust; using it for the dust
 ///   production is the plan's approximation (card note `uni_ui::theme::NOTE_TAILS`). A K1 below
-///   5 would make the production grow with r_h; it is held constant there (exponent floored at 0).
-pub(crate) fn dust_production(r_au: f64, k1: f64) -> f64 {
-    r_au.powf(-(k1 / 2.5 - 2.0).max(0.0))
+///   5 would make the production grow with r_h; it is held constant there (exponent floored at
+///   0). That touches 103 of the 508 SBDB comets in `data/baked/comets.ron` (100 at K1 = 4.5, 2 at
+///   4.8, 1 at 4.0; C1L review r1), whose unfloored exponents would be +0.2 to +0.4
+///   (`dust_production_floors_k1_below_5`).
+pub(crate) fn dust_production(r_au: f64, exponent: f64) -> f64 {
+    r_au.powf(exponent)
 }
 
 /// A conservative reach [m] of a dust tail not computed yet, for culling: 1.5 × the drift
@@ -1098,7 +1232,8 @@ struct TailJob {
     id: ObjectId,
     epoch: Epoch,
     conic: Conic,
-    k1: f64,
+    /// The production's r_h exponent ([`dust_production_exponent`]).
+    exponent: f64,
     sun_rel: DVec3,
     grains: Vec<DustGrain>,
     rows_done: u32,
@@ -1179,7 +1314,7 @@ impl TailManager {
                     id: view.id,
                     epoch,
                     conic: view.conic,
-                    k1,
+                    exponent: dust_production_exponent(view.spkid, k1),
                     sun_rel: view.sun_rel_m,
                     grains: Vec::with_capacity(GRAINS_PER_TAIL),
                     rows_done: 0,
@@ -1198,11 +1333,11 @@ impl TailManager {
             };
             let range = job.rows_done..job.rows_done + rows;
             job.grains
-                .extend(dust_rows(&job.conic, job.k1, job.epoch, range));
+                .extend(dust_rows(&job.conic, job.exponent, job.epoch, range));
             job.rows_done += rows;
             work.solves += (rows as usize + 1) * n_age;
             if let Some(done) = self.job.take_if(|j| j.rows_done >= DUST_PARAMS.n_beta) {
-                let production_now = dust_production(done.sun_rel.length() / AU, done.k1);
+                let production_now = dust_production(done.sun_rel.length() / AU, done.exponent);
                 let grains = tail_grains(&done.grains, production_now);
                 self.next_version += 1;
                 self.tails.insert(
@@ -1236,6 +1371,24 @@ mod tests {
     use super::*;
     use crate::comet::luminance;
     use crate::comet::test_support::{FOV_Y_RAD, HEIGHT_PX, comet_on, static_view};
+
+    /// The production exponent of a comet with K1 = 10 and no dust law: −max(10/2.5 − 2, 0).
+    const K1_10_EXPONENT: f64 = -2.0;
+
+    /// `view`'s dust tail at its conic epoch, as `TailManager` computes it (the exponent from
+    /// its dust law or K1, merged splats).
+    fn tail_of(view: &CometView) -> Vec<TailGrain> {
+        let exponent = dust_production_exponent(view.spkid, view.k1.unwrap_or(0.0));
+        tail_grains(
+            &dust_rows(
+                &view.conic,
+                exponent,
+                view.conic_epoch,
+                0..DUST_PARAMS.n_beta,
+            ),
+            dust_production(view.r_au, exponent),
+        )
+    }
 
     fn angle_deg(a: DVec3, b: DVec3) -> f64 {
         a.cross(b).length().atan2(a.dot(b)).to_degrees()
@@ -1439,7 +1592,7 @@ mod tests {
         for (conic, days) in comets {
             let t = conic.tp.add_seconds(days * DAY);
             let (r, v) = heliocentric_state_icrs(&conic, t);
-            let grains = dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta);
+            let grains = dust_rows(&conic, K1_10_EXPONENT, t, 0..DUST_PARAMS.n_beta);
             assert_eq!(grains.len(), GRAINS_PER_TAIL);
             let mean =
                 grains.iter().map(|g| g.pos_rel_nucleus_m).sum::<DVec3>() / grains.len() as f64;
@@ -1448,7 +1601,7 @@ mod tests {
                 "mean offset {mean} m leads the motion {v}"
             );
             assert!(mean.dot(r) > 0.0, "mean offset {mean} m points sunward");
-            let now = dust_production(r.length() / AU, 10.0);
+            let now = dust_production(r.length() / AU, K1_10_EXPONENT);
             let splats = tail_grains(&grains, now);
             assert!(!splats.is_empty() && splats.len() <= GRAINS_PER_TAIL);
             assert!(
@@ -1481,8 +1634,8 @@ mod tests {
     fn dust_weights_and_merging_keep_the_light() {
         let conic = conic_from_perihelion(0.8, 0.0, 0.0, 0.0, 0.0, 2_451_545.0);
         let t = conic.tp.add_seconds(30.0 * DAY);
-        let grains = dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta);
-        let now = dust_production(0.8, 10.0);
+        let grains = dust_rows(&conic, K1_10_EXPONENT, t, 0..DUST_PARAMS.n_beta);
+        let now = dust_production(0.8, K1_10_EXPONENT);
         let apart = tail_grains_merged_within(&grains, now, 0.0);
         assert_eq!(apart.len(), GRAINS_PER_TAIL);
         let h: f64 = apart.iter().map(|g| g.weight).sum();
@@ -1501,10 +1654,10 @@ mod tests {
             let c = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
             (c, c.tp.add_seconds(20.0 * DAY))
         }] {
-            let g = dust_rows(&conic_t.0, 10.0, conic_t.1, 0..DUST_PARAMS.n_beta);
+            let g = dust_rows(&conic_t.0, K1_10_EXPONENT, conic_t.1, 0..DUST_PARAMS.n_beta);
             let now = dust_production(
                 heliocentric_state_icrs(&conic_t.0, conic_t.1).0.length() / AU,
-                10.0,
+                K1_10_EXPONENT,
             );
             let (w0, a0, b0) = moments(&tail_grains_merged_within(&g, now, 0.0));
             let merged = tail_grains(&g, now);
@@ -1650,27 +1803,104 @@ mod tests {
         }
     }
 
-    /// C/2020 F3 (NEOWISE) at row 20 (`comet-neowise-2020`: 2020-07-15 03:00 UTC from the
-    /// Earth–Moon barycentre, fov 20°, up = ICRS +z, 1 920 × 1 080): its view, the camera, its
-    /// heliocentric velocity, and its coma's light [cd].
-    fn neowise_row_20() -> (CometView, CameraView, DVec3, f64) {
-        use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
-        let conic = conic_from_perihelion(
+    /// C/2020 F3 (NEOWISE)'s SBDB orbit (`comets.ron`: q, e, i, Ω, ω, T_p).
+    fn neowise_conic() -> Conic {
+        conic_from_perihelion(
             0.294_651_249_380_919_6,
             0.999_178_026_253_129_2,
             128.937_502_759_480_9,
             61.010_428_185_369_88,
             37.278_658_448_125_7,
             2_459_034.178_898_044_4,
-        );
+        )
+    }
+
+    /// C/2020 F3 (NEOWISE) at row 20 (`comet-neowise-2020`: 2020-07-15 03:00 UTC from the
+    /// Earth–Moon barycentre, fov 20°, up = ICRS +z, 1 920 × 1 080): its view, the camera, its
+    /// heliocentric velocity, and its coma's light [cd].
+    fn neowise_row_20() -> (CometView, CameraView, DVec3, f64) {
+        use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
+        let conic = neowise_conic();
         let t = Epoch::from_unix_utc(1_594_782_000.0);
         let (_, vel) = heliocentric_state_icrs(&conic, t);
         let (earth, _) = planet_state(Planet::EmBary, t);
         let law = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("NEOWISE's law");
-        let view = comet_on(1, conic, t, earth, law.m1(), law.k1);
+        let mut view = comet_on(1, conic, t, earth, law.m1(), law.k1);
+        // The real SPK-ID, so its dust law ([`COMET_DUST_LAWS`]) applies.
+        view.spkid = NEOWISE_SPKID;
         let camera = look_at(view.nucleus_rel_m, DVec3::Z, 20.0);
         let coma = crate::comet::coma::coma_intensity_cd(&view);
         (view, camera, vel, coma)
+    }
+
+    /// Lead ruling C1L-R1: NEOWISE's dust law's valid range is Biver et al. 2022's Fig. 19 span,
+    /// 2020-07-13 to 2020-08-14 (from the start of the first day to the end of the last), on the
+    /// SBDB orbit, after perihelion.
+    #[test]
+    fn neowise_dust_law_range_is_the_papers() {
+        let conic = neowise_conic();
+        let r_at = |iso: &str| {
+            let t = Epoch::parse_iso_utc(iso).expect("date");
+            heliocentric_state_icrs(&conic, t).0.length() / AU
+        };
+        let (from, to) = (r_at("2020-07-13T00:00:00Z"), r_at("2020-08-15T00:00:00Z"));
+        println!("Biver et al. 2022 Fig. 19 span: r_h {from:.4}–{to:.4} AU");
+        let law = comet_dust_law(NEOWISE_SPKID).expect("NEOWISE's dust law");
+        assert!((law.r_valid_au.0 - from).abs() < 1e-3 && (law.r_valid_au.1 - to).abs() < 1e-3);
+        assert!(law.covers(0.455, true) && !law.covers(0.455, false) && !law.covers(0.3, true));
+        assert_eq!(law.afrho_slope, -4.0);
+        assert!((law.afrho0_m(law.anchor_r_au) - NEOWISE_AFRHO0_M).abs() < 1e-12);
+        assert!((law.afrho0_m(0.5 * law.anchor_r_au) / NEOWISE_AFRHO0_M - 16.0).abs() < 1e-12);
+    }
+
+    /// Lead ruling C1L-R1: at the anchor (NEOWISE on 2020-07-22, r_h 0.63 AU, Δ 0.69 AU) the dust
+    /// law's light production equals the coma's light / τ, the calibration the law-less comets
+    /// keep; away from it the law's r_h⁻⁴ × E☉ ∝ r_h⁻⁶ replaces the coma's r_h^−3.85 (row 20,
+    /// r_h 0.455 AU: × 2.0).
+    #[test]
+    fn dust_law_matches_tau_at_the_anchor() {
+        let visual = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("NEOWISE's law");
+        let [r_au, delta_au, _] = NEOWISE_CALIBRATION_AU;
+        let at = |r: f64, d: f64| {
+            let mut v = static_view(
+                9,
+                DVec3::new(0.0, 0.0, -d * AU),
+                DVec3::new(-r * AU, 0.0, 0.0),
+                Some(visual.m1()),
+                Some(visual.k1),
+            );
+            v.spkid = NEOWISE_SPKID;
+            let coma = crate::comet::coma::comet_total_intensity_cd(visual.m1(), visual.k1, r, d);
+            (dust_rate_cd_per_s(&v, coma), coma / DUST_HEAD_TIME_S)
+        };
+        let (law, tau) = at(r_au, delta_au);
+        assert!((law / tau - 1.0).abs() < 1e-3, "{law:e} vs {tau:e} cd/s");
+        let (law, tau) = at(0.455, 0.784);
+        let want = (0.455_f64 / r_au).powf(-6.0 + visual.k1 / 2.5);
+        println!(
+            "row 20: the dust law's rate is {:.3} × the coma's / τ",
+            law / tau
+        );
+        assert!((law / tau / want - 1.0).abs() < 1e-3);
+        // A comet without a dust law keeps the coma's / τ.
+        let v = static_view(9, DVec3::Z * AU, DVec3::X * AU, Some(8.0), Some(10.0));
+        assert_eq!(dust_rate_cd_per_s(&v, 1.0e15), 1.0e15 / DUST_HEAD_TIME_S);
+    }
+
+    /// Review r1 minor 4: the production exponent is −max(K1/2.5 − 2, 0) without a dust law, so
+    /// K1 ≤ 5 gives a constant production (the 103 SBDB comets at K1 4.0–4.8), and a dust law's
+    /// slope replaces it.
+    #[test]
+    fn dust_production_floors_k1_below_5() {
+        for k1 in [0.0, 4.0, 4.5, 4.8, 5.0] {
+            let e = dust_production_exponent(1, k1);
+            assert_eq!(e, 0.0, "K1 {k1}");
+            assert_eq!(dust_production(0.3, e), 1.0);
+        }
+        assert!((dust_production_exponent(1, 9.63) + 1.852).abs() < 1e-12);
+        assert_eq!(dust_production_exponent(1, 10.0), K1_10_EXPONENT);
+        assert_eq!(dust_production_exponent(NEOWISE_SPKID, 9.63), -4.0);
+        assert!((dust_production(0.5, -4.0) - 16.0).abs() < 1e-12);
     }
 
     /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry
@@ -1694,16 +1924,32 @@ mod tests {
         let tail = raster.tails[0];
         // The light the C1L shader dropped: splats whose f32 `splat_axes` overflowed (review I2).
         let cam = SpriteCamera::new(&camera, size);
-        let grains = tail_grains(
-            &dust_rows(
-                &view.conic,
-                view.k1.unwrap_or(0.0),
-                view.conic_epoch,
-                0..DUST_PARAMS.n_beta,
-            ),
-            dust_production(view.r_au, view.k1.unwrap_or(0.0)),
+        let grains = tail_of(&view);
+        let rate = dust_rate_cd_per_s(&view, coma);
+        // The share of the emission weight emitted where the dust law is extrapolated (lead
+        // ruling C1L-R1: outside Biver et al.'s post-perihelion 0.410–1.115 AU).
+        let law = comet_dust_law(NEOWISE_SPKID).expect("NEOWISE's dust law");
+        let raw = dust_rows(
+            &view.conic,
+            law.afrho_slope,
+            view.conic_epoch,
+            0..DUST_PARAMS.n_beta,
         );
-        let rate = dust_emission_cd_per_s(coma);
+        let (mut w_all, mut w_extra) = (0.0, 0.0);
+        for g in &raw {
+            let t_e = view.conic_epoch.add_seconds(-g.age_s);
+            let r_e = heliocentric_state_icrs(&view.conic, t_e).0.length() / AU;
+            let outbound = t_e.seconds_since(view.conic.tp) > 0.0;
+            w_all += g.weight;
+            if !law.covers(r_e, outbound) {
+                w_extra += g.weight;
+            }
+        }
+        println!(
+            "row 20: {:.1} % of the emission weight comes from where the dust law is \
+             extrapolated (perihelion to 13 July, and before perihelion)",
+            100.0 * w_extra / w_all
+        );
         // The drawn share alone (`dust_light_drawn`, what `plan_frame` adds per tail), averaged.
         let clock = std::time::Instant::now();
         let mut share = 0.0;
@@ -1844,12 +2090,8 @@ mod tests {
         let (view, camera, _, coma) = neowise_row_20();
         let size = UVec2::new(1920, 1080);
         let cam = SpriteCamera::new(&camera, size);
-        let k1 = view.k1.unwrap_or(0.0);
-        let grains = tail_grains(
-            &dust_rows(&view.conic, k1, view.conic_epoch, 0..DUST_PARAMS.n_beta),
-            dust_production(view.r_au, k1),
-        );
-        let rate = dust_emission_cd_per_s(coma);
+        let grains = tail_of(&view);
+        let rate = dust_rate_cd_per_s(&view, coma);
         let splats: Vec<SplatDraw> = grains
             .iter()
             .filter_map(|g| splat_draw(g, rate, view.nucleus_rel_m, view.sun_rel_m, &cam))
@@ -2021,7 +2263,7 @@ mod tests {
         // repeats: the ruling's budget is 0.05 ms per tail in release.
         let (view, tail) = (&scene.comets[0], &manager.tails[&d.id]);
         let cam = SpriteCamera::new(&camera, size);
-        let rate = dust_emission_cd_per_s(crate::comet::coma::coma_intensity_cd(view));
+        let rate = dust_rate_cd_per_s(view, crate::comet::coma::coma_intensity_cd(view));
         let reps = 200;
         let clock = std::time::Instant::now();
         let mut sink = 0.0;

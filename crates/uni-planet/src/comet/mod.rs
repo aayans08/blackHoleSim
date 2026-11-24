@@ -14,9 +14,11 @@
 //! radius ([`nucleus::nucleus_illuminance_lux`], which the app's nucleus point should use too);
 //! the coma carries the total minus that, floored at 0 ([`coma::coma_intensity_cd`]); the ion
 //! tail adds 0.2 × the coma's light (v0 ratio, card note `uni_ui::theme::NOTE_TAILS`); the dust
-//! tail carries the dust emitted over the last 60 days, at the coma's light /
-//! [`tails::DUST_HEAD_TIME_S`] per second of current production (C1L, calibrated on NEOWISE),
-//! lit and phased grain by grain. A dust splat wider than `SPRITE_MAX_PX` (the far tail, or a
+//! tail carries the dust emitted over the last 60 days, at a light production
+//! ([`tails::dust_rate_cd_per_s`]) from the comet's measured A(0)fρ law where it has one
+//! ([`tails::COMET_DUST_LAWS`], C1L fix round 2), else the coma's light /
+//! [`tails::DUST_HEAD_TIME_S`] per second (C1L, calibrated on NEOWISE), lit and phased grain by
+//! grain. A dust splat wider than `SPRITE_MAX_PX` (the far tail, or a
 //! tail seen from close by) and an ion tail seen end-on lose some of that light (approximate;
 //! stated where they are drawn). Glow (coma, ion and dust) fainter than [`GLOW_CULL_PRE`] pre-exposed is not drawn.
 //!
@@ -61,11 +63,10 @@ use self::nucleus::{
 pub use self::tails::DustDrawn;
 use self::tails::{
     DrawnCache, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
-    KEPLER_SOLVE_US, SpriteCamera, TAIL_CPU_SHARE_MS, TailManager, TailWork,
-    dust_emission_cd_per_s, dust_grain_light, dust_light_drawn, dust_phase, dust_reach_estimate_m,
-    ion_colour, ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness, ion_tail_dir,
-    ion_tail_drawn_brightness, ion_tail_length_m, is_active, splat_axes, sprite_profile,
-    tailed_comets,
+    KEPLER_SOLVE_US, SpriteCamera, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light,
+    dust_light_drawn, dust_phase, dust_rate_cd_per_s, dust_reach_estimate_m, ion_colour,
+    ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness,
+    ion_tail_length_m, is_active, splat_axes, sprite_profile, tailed_comets,
 };
 use crate::body::{exposure_weight, lens_mask_target, sphere_in_view};
 
@@ -180,7 +181,8 @@ pub(crate) struct TailGpu {
     /// xyz: nucleus − camera [m], root axes; w: the ion tail's luminous intensity [cd].
     pub(crate) nucleus: [f32; 4],
     /// xyz: Sun − nucleus [m]; w: the dust's light production [cd/s per unit of HG]
-    /// (`tails::dust_emission_cd_per_s`: the coma's light / `DUST_HEAD_TIME_S`).
+    /// (`tails::dust_rate_cd_per_s`: from the comet's dust law, else the coma's light /
+    /// `DUST_HEAD_TIME_S`).
     pub(crate) sun: [f32; 4],
     /// xyz: the ion tail's direction (unit); w: its length [m].
     pub(crate) ion_axis: [f32; 4],
@@ -395,7 +397,7 @@ pub(crate) fn plan_frame(
         // C1L: the dust's light production; each splat's light is this × its emission weight ×
         // (r_h/r)² × HG, evaluated on the GPU.
         let dust_rate = if manager.tails.contains_key(&view.id) {
-            dust_emission_cd_per_s(intensity)
+            dust_rate_cd_per_s(view, intensity)
         } else {
             0.0
         };
@@ -437,7 +439,7 @@ pub(crate) fn plan_frame(
         let (Some(tail), Some(version)) = (manager.tails.get(&draw.id), draw.dust_version) else {
             continue;
         };
-        let rate = dust_emission_cd_per_s(coma_intensity_cd(view));
+        let rate = dust_rate_cd_per_s(view, coma_intensity_cd(view));
         let (light, drawn) = dust_light_drawn(
             &tail.grains,
             rate,

@@ -2100,11 +2100,13 @@ fn comet_view<'a>(world: &World, c: &'a Case, name: &str) -> &'a uni_sim::snapsh
 
 /// Row 20's paper EV, derived with the dust tail (C1L fix round 1, lead ruling C1L-b): the coma
 /// twin (`paper::coma_luminance`, NEOWISE's cited visual law, V 2.1) lights only 44 pixels over
-/// the meter's 10⁻³ cd/m², but the comet pass's dust-tail twin (`uni_planet::dust_tail_luminance`,
-/// after C1L-I1: the tail 3.55 × the coma) lights 1 219, whose 50th–95th percentile average is
-/// EV −5.37 (`intent_20_comet_neowise` prints the paper). Before C1L the paper rested at the night
-/// EV (−4) with the tails left out; the plan's "≈ −2 ± 2" assumed a larger, brighter coma.
-pub const NEOWISE_PAPER_EV: f32 = -5.37;
+/// the meter's 10⁻³ cd/m², but the comet pass's dust-tail twin (`uni_planet::dust_tail_luminance`)
+/// lights 5 550, whose 50th–95th percentile average is EV −5.10 (`intent_20_comet_neowise` prints
+/// the paper). That is with NEOWISE's measured dust law (C1L fix round 2, lead ruling C1L-R1:
+/// A(0)fρ ∝ r_h^−4.0, Biver et al. 2022; the tail 11.5 × the coma); with the K1 slope (fix
+/// round 1) it was 1 219 pixels at −5.37. Before C1L the paper rested at the night EV (−4) with the
+/// tails left out; the plan's "≈ −2 ± 2" assumed a larger, brighter coma.
+pub const NEOWISE_PAPER_EV: f32 = -5.10;
 /// Row 21's re-derived paper EV (Task C6): Halley's coma lights 173 000 pixels at 653 km/px;
 /// the meter's 50th–95th percentile average sits at −4.56 (the plan's "≈ −2 ± 2" was an
 /// estimate before the coma twin existed). With the dust-tail twin (C1L fix round 1) the paper
