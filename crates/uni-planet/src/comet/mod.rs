@@ -235,17 +235,18 @@ pub const SPRITE_MAX_PX: f64 = 256.0;
 pub const COARSE_MAX_PX: f64 = 1024.0;
 pub const COARSER_MAX_PX: f64 = 4096.0;
 /// A dust splat whose minor σ is at least this many pixels is drawn into the coarse target
-/// (twin of `COARSE_MIN_SIGMA_PX` in `comet.wgsl`): there it is ≥ 2 texels wide, so its samples
-/// at texel centres sum to its light within 2·e^(−8π²) (Poisson summation) and the cubic
-/// B-spline upsampling adds a σ of 0.58 texel in quadrature (C1L).
-pub const COARSE_MIN_SIGMA_PX: f64 = 16.0;
+/// (twin of `COARSE_MIN_SIGMA_PX` in `comet.wgsl`): there it is ≥ 3 texels wide, so its samples
+/// at texel centres sum to its light within 2·e^(−18π²) (Poisson summation) and the composite's
+/// bilinear upsampling errs by at most h²/8·|f″| = 1/72 of its peak (C1L).
+pub const COARSE_MIN_SIGMA_PX: f64 = 24.0;
 /// The coarse target has 1/this of the internal lines and columns (C1L): wide, faint dust splats
 /// (the far tail, or a tail seen from close by, row 21) cost 1/64 of their full-resolution fill.
 pub const COARSE_DOWNSAMPLE: u32 = 8;
 /// A dust splat whose minor σ is at least this many pixels goes to the coarser target instead
-/// (twin of `COARSER_MIN_SIGMA_PX`), ≥ 2 of its texels wide: a splat wider than the frame then
-/// costs at most the coarser target's ≈ 500 texels, not the coarse target's 32 000.
-pub const COARSER_MIN_SIGMA_PX: f64 = 128.0;
+/// (twin of `COARSER_MIN_SIGMA_PX`), ≥ 3 of its texels wide: a splat wider than the frame then
+/// costs at most the coarser target's ≈ 500 texels, not the coarse target's 32 000. The coarser
+/// target is folded into the coarse one with a cubic B-spline (C², weights summing to 1).
+pub const COARSER_MIN_SIGMA_PX: f64 = 192.0;
 /// The coarser target has 1/this of the internal lines and columns.
 pub const COARSER_DOWNSAMPLE: u32 = 64;
 
@@ -487,6 +488,7 @@ pub struct CometRenderer {
     dust_pipeline: wgpu::RenderPipeline,
     dust_coarse_pipeline: wgpu::RenderPipeline,
     dust_coarser_pipeline: wgpu::RenderPipeline,
+    fold_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     coarse_bgl: wgpu::BindGroupLayout,
     depth_bgl: wgpu::BindGroupLayout,
@@ -715,16 +717,6 @@ impl CometRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
             ],
         });
         let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -757,6 +749,40 @@ impl CometRenderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // The fold: the coarser target added into the coarse one (in the coarse pass).
+        let fold_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("comets fold layout"),
+            bind_group_layouts: &[Some(camera_bgl), None, Some(&coarse_bgl)],
+            immediate_size: 0,
+        });
+        let fold_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("comet dust fold"),
+            layout: Some(&fold_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_dust_composite"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_dust_fold"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -828,6 +854,7 @@ impl CometRenderer {
             cpu_ms: 0.0,
             dust_coarse_pipeline,
             dust_coarser_pipeline,
+            fold_pipeline,
             composite_pipeline,
             coarse_bgl,
             depth_bgl,
@@ -1092,18 +1119,21 @@ impl RenderFeature for CometRenderer {
                     resource: wgpu::BindingResource::TextureView(&targets.depth_view),
                 }],
             });
-            // The timer's begin goes on the first of the two coarse passes.
+            // The coarser pass first (the timer's begin), then the coarse pass, which folds the
+            // coarser target in before drawing its own splats.
             let mut begin = coarse_writes;
-            for (view, pipeline, label) in [
-                (
-                    &coarse_targets.coarse_view,
-                    &self.dust_coarse_pipeline,
-                    "comets coarse dust",
-                ),
+            for (view, pipeline, label, fold) in [
                 (
                     &coarse_targets.coarser_view,
                     &self.dust_coarser_pipeline,
                     "comets coarser dust",
+                    false,
+                ),
+                (
+                    &coarse_targets.coarse_view,
+                    &self.dust_coarse_pipeline,
+                    "comets coarse dust",
+                    true,
                 ),
             ] {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1123,6 +1153,11 @@ impl RenderFeature for CometRenderer {
                     multiview_mask: None,
                 });
                 pass.set_bind_group(0, frame.camera, &[]);
+                if fold {
+                    pass.set_pipeline(&self.fold_pipeline);
+                    pass.set_bind_group(2, &coarse_targets.fold_bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
                 pass.set_bind_group(1, &self.bind_group, &[]);
                 pass.set_bind_group(3, &depth, &[]);
                 pass.set_pipeline(pipeline);
@@ -1176,7 +1211,7 @@ impl RenderFeature for CometRenderer {
         }
         if let (Some(targets), Some([x, y, w, h])) = (coarse, self.coarse_scissor) {
             pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(2, &targets.bind_group, &[]);
+            pass.set_bind_group(2, &targets.composite_bind_group, &[]);
             pass.set_scissor_rect(x, y, w, h);
             pass.draw(0..3, 0..1);
         }
@@ -1184,13 +1219,14 @@ impl RenderFeature for CometRenderer {
 }
 
 /// The coarse dust targets (C1L): textures at the internal size / [`COARSE_DOWNSAMPLE`] and /
-/// [`COARSER_DOWNSAMPLE`], and the composite's bind group reading both.
+/// [`COARSER_DOWNSAMPLE`]; the fold reads the coarser one, the composite the coarse one.
 struct CoarseTargets {
     /// The internal size they were made for.
     viewport: UVec2,
     coarse_view: wgpu::TextureView,
     coarser_view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
+    fold_bind_group: wgpu::BindGroup,
+    composite_bind_group: wgpu::BindGroup,
 }
 
 impl CometRenderer {
@@ -1226,29 +1262,30 @@ impl CometRenderer {
             "comets coarser dust",
             coarse_size(viewport, COARSER_DOWNSAMPLE),
         );
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("comets coarse bg"),
-            layout: &self.coarse_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&coarse_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.coarse_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&coarser_view),
-                },
-            ],
-        });
+        let reading = |label: &str, view: &wgpu::TextureView| {
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.coarse_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.coarse_sampler),
+                    },
+                ],
+            })
+        };
+        let fold_bind_group = reading("comets fold bg", &coarser_view);
+        let composite_bind_group = reading("comets composite bg", &coarse_view);
         self.coarse = Some(CoarseTargets {
             viewport,
             coarse_view,
             coarser_view,
-            bind_group,
+            fold_bind_group,
+            composite_bind_group,
         });
     }
 }
@@ -2194,6 +2231,8 @@ mod tests {
             assert!(stages.contains(&(&format!("vs_{part}"), naga::ShaderStage::Vertex)));
             assert!(stages.contains(&(&format!("fs_{part}"), naga::ShaderStage::Fragment)));
         }
+        assert!(stages.contains(&("vs_dust_coarser", naga::ShaderStage::Vertex)));
+        assert!(stages.contains(&("fs_dust_fold", naga::ShaderStage::Fragment)));
         let arity = |name: &str| {
             m.functions
                 .iter()
@@ -2237,6 +2276,7 @@ mod tests {
         assert_eq!(scalar("COARSE_MIN_SIGMA_PX"), f32_of(COARSE_MIN_SIGMA_PX));
         assert_eq!(scalar("COARSER_MAX_PX"), f32_of(COARSER_MAX_PX));
         assert_eq!(scalar("COARSER_MIN_SIGMA_PX"), f32_of(COARSER_MIN_SIGMA_PX));
+        assert_eq!(scalar("COARSE_DOWNSAMPLE"), f64::from(COARSE_DOWNSAMPLE));
         assert_eq!(scalar("GLOW_CULL_PRE"), f32_of(GLOW_CULL_PRE));
         assert_eq!(
             scalar("COMA_EXTENT_SCALES"),

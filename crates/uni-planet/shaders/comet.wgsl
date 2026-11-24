@@ -14,8 +14,9 @@
 //   function (dust_grain_light) × the tail's emission weight × the dust's light production
 //   (TailGpu.sun.w = I_coma / DUST_HEAD_TIME_S), additive. Splats at least COARSE_MIN_SIGMA_PX
 //   (COARSER_MIN_SIGMA_PX) wide are drawn into a coarse target of 1/8 (1/64) of the lines
-//   (vs_dust_coarse, vs_dust_coarser / fs_dust_coarse, their own passes before this one) and
-//   added back by fs_dust_composite with a cubic B-spline.
+//   (vs_dust_coarse, vs_dust_coarser / fs_dust_coarse, their own passes before this one); the
+//   1/64 target is folded into the 1/8 one with a cubic B-spline (fs_dust_fold) and that is
+//   added to hdr by fs_dust_composite.
 //
 // Glow (coma, ion, dust) whose brightest point would land below GLOW_CULL_PRE pre-exposed is not
 // drawn: a thousandth of AgX's black point, invisible at the frame's exposure.
@@ -60,10 +61,12 @@ const COARSE_MAX_PX: f32 = 1024.0;
 const COARSER_MAX_PX: f32 = 4096.0;
 // A splat whose minor σ is at least COARSE_MIN_SIGMA_PX pixels is drawn into the coarse target
 // (1/8 of the lines, comet::COARSE_DOWNSAMPLE), one of at least COARSER_MIN_SIGMA_PX into the
-// coarser one (1/64, comet::COARSER_DOWNSAMPLE): both ≥ 2 texels wide there, upsampled with a
-// cubic B-spline.
-const COARSE_MIN_SIGMA_PX: f32 = 16.0;
-const COARSER_MIN_SIGMA_PX: f32 = 128.0;
+// coarser one (1/64, comet::COARSER_DOWNSAMPLE): both ≥ 3 texels wide there. The coarser target
+// is folded into the coarse one with a cubic B-spline, and the coarse one added to hdr bilinearly.
+const COARSE_MIN_SIGMA_PX: f32 = 24.0;
+const COARSER_MIN_SIGMA_PX: f32 = 192.0;
+// The coarse target's downsampling (comet::COARSE_DOWNSAMPLE).
+const COARSE_DOWNSAMPLE: f32 = 8.0;
 // Glow whose brightest point is below this pre-exposed value is not drawn (comet::GLOW_CULL_PRE:
 // AgX's black point 2^-12.47393 / 1000).
 const GLOW_CULL_PRE: f32 = 1.75e-7;
@@ -623,12 +626,12 @@ fn fs_dust_coarse(in: DustOut) -> @location(0) vec4<f32> {
     return vec4<f32>(dust_radiance(in), 0.0);
 }
 
-// The coarse targets, read back into hdr by the composite (group 2 of its own layout).
-@group(2) @binding(0) var dust_coarse: texture_2d<f32>;
+// A coarse target being read (group 2 of the fold's and the composite's layouts): the coarser
+// one by the fold, the coarse one by the composite.
+@group(2) @binding(0) var dust_source: texture_2d<f32>;
 @group(2) @binding(1) var dust_sampler: sampler;
-@group(2) @binding(2) var dust_coarser: texture_2d<f32>;
 
-// The coarse target at uv with a cubic B-spline: four bilinear taps (Sigg & Hadwiger 2005,
+// A target at uv with a cubic B-spline: four bilinear taps (Sigg & Hadwiger 2005,
 // "Fast Third-Order Texture Filtering", GPU Gems 2, ch. 20). The weights sum to 1, so the light
 // is kept; the B-spline is smooth (C²) where bilinear upsampling by 8 would show its facets.
 fn sample_bspline(tex: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
@@ -653,20 +656,29 @@ fn sample_bspline(tex: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
     return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
 }
 
-// The composite: a triangle covering the screen (scissored to the coarse splats' bounds) at depth
-// 0, the far plane, drawn with GreaterEqual: the wide dust shows where no body wrote depth (a
-// tail in front of a body is hidden by it; approximate).
+// A triangle covering its target at depth 0 (the far plane): the fold's and the composite's.
 @vertex
 fn vs_dust_composite(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
     return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// The fold (C1L): the coarser target added into the coarse one with the cubic B-spline (in the
+// coarse pass, at 1/64 of the frame's pixels; the coarse target is ⌈viewport / 8⌉).
+@fragment
+fn fs_dust_fold(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = ceil(camera.viewport.xy / COARSE_DOWNSAMPLE);
+    return vec4<f32>(sample_bspline(dust_source, pos.xy / size), 0.0);
+}
+
+// The composite: the coarse target added to hdr, scissored to the coarse splats' bounds, with one
+// bilinear tap (its splats are ≥ 3 texels wide: linear interpolation errs by at most h²/8·|f''|
+// = 1/72 of a splat's peak). Drawn with GreaterEqual at depth 0: the wide dust shows where no
+// body wrote depth (a tail in front of a body is hidden by it; approximate).
 @fragment
 fn fs_dust_composite(@builtin(position) pos: vec4<f32>) -> GlowOut {
     var out: GlowOut;
-    let uv = pos.xy / camera.viewport.xy;
-    let light = sample_bspline(dust_coarse, uv) + sample_bspline(dust_coarser, uv);
+    let light = textureSampleLevel(dust_source, dust_sampler, pos.xy / camera.viewport.xy, 0.0).rgb;
     out.color = vec4<f32>(min(light, vec3<f32>(HDR_MAX)), 0.0);
     out.mask = vec4<f32>(0.0);
     return out;
