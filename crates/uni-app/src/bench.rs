@@ -26,7 +26,11 @@
 //! (`World::snapshot`), `gpu_frame_ms` (the timer's frame brackets), and per pass the GPU
 //! **duration** (`scene::pass_durations` of `scene::pass_times`; invalid ones stay `null`, never
 //! 0, review I5). Each window also gives `pass_sum_ms`, the per-frame sum of the valid
-//! durations, to set against `gpu_frame_ms` (B9t: the sum should be within 5 % of the frame). `comets_cpu_ms` is `null`: no comet tails are drawn before Wave C.
+//! durations, to set against `gpu_frame_ms` (B9t: the sum should be within 5 % of the frame).
+//! `comets_cpu_ms` is the comet pass's whole `prepare` (C1's `cpu_ms`: culling, the tail work,
+//! the uploads; budget ≤ 1.0 ms) and `asteroids_cpu_ms` the asteroid pass's (C2's `cpu_ms`: the
+//! mean anomalies and their upload; budget ≤ 0.5 ms), per frame (Task C6). Each bookmark's
+//! `target`, `highlight_belt` and `cruise` apply as in a capture.
 //! Windows `all`, `first10s` and `last10s` are cut by the time since the bookmark's first measured
 //! frame; a window with no frame is `null`.
 
@@ -103,6 +107,8 @@ struct Sample {
     interval_ms: Option<f32>,
     cpu_ms: f32,
     snapshot_cpu_ms: f32,
+    comets_cpu_ms: f32,
+    asteroids_cpu_ms: f32,
     /// Filled when the frame's GPU timings arrive.
     gpu_frame_ms: Option<f32>,
     passes: Option<Vec<(&'static str, Option<f32>)>>,
@@ -130,6 +136,7 @@ pub struct WindowStats {
     pub pass_sum_ms: Option<Stats>,
     pub snapshot_cpu_ms: Option<Stats>,
     pub comets_cpu_ms: Option<Stats>,
+    pub asteroids_cpu_ms: Option<Stats>,
 }
 
 /// The statistics of `samples`.
@@ -174,7 +181,8 @@ fn window(samples: &[&Sample]) -> Option<WindowStats> {
                 .map(|p| p.iter().filter_map(|&(_, ms)| ms).sum())
         })),
         snapshot_cpu_ms: stats(&col(&|s| Some(s.snapshot_cpu_ms))),
-        comets_cpu_ms: None,
+        comets_cpu_ms: stats(&col(&|s| Some(s.comets_cpu_ms))),
+        asteroids_cpu_ms: stats(&col(&|s| Some(s.asteroids_cpu_ms))),
     })
 }
 
@@ -250,6 +258,8 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
     let (gm, gp) = pick(w.gpu_frame_ms);
     let (cm, cp) = pick(w.cpu_ms);
     let (sm, _) = pick(w.snapshot_cpu_ms);
+    let (cm_c, _) = pick(w.comets_cpu_ms);
+    let (am, _) = pick(w.asteroids_cpu_ms);
     let (psm, _) = pick(w.pass_sum_ms);
     let share = match (psm, gm) {
         (Some(p), Some(g)) if g > 0.0 => format!(" ({:.0} % of the GPU frame)", 100.0 * p / g),
@@ -278,7 +288,8 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
     format!(
         "bench {} ({}×{}, {} frames, lens scale {}): frame {} ms mean, {} ms p95; interval {} \
          ms mean, {} ms p95 ({fps} fps); GPU frame {} ms mean, {} ms p95; CPU {} ms mean, {} ms \
-         p95 (snapshot {} ms)\n  GPU passes (mean duration ms): {passes}; sum {} ms{share}",
+         p95 (snapshot {} ms, comets {} ms, asteroids {} ms)\n  GPU passes (mean duration ms): \
+         {passes}; sum {} ms{share}",
         r.name,
         size.x,
         size.y,
@@ -293,6 +304,8 @@ fn report(r: &BookmarkResult, size: UVec2) -> String {
         ms_or_na(cm),
         ms_or_na(cp),
         ms_or_na(sm),
+        ms_or_na(cm_c),
+        ms_or_na(am),
         ms_or_na(psm),
     )
 }
@@ -313,6 +326,7 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
         StarCatalog::AtHyg(world.sim.star_data()),
         &assets,
         INTERACTIVE_LENS_SCALE,
+        world.sim.asteroid_records(),
     )?;
     let target = CaptureTarget::new(&gpu.device, args.size);
     if !gpu.has_timestamps() {
@@ -322,9 +336,10 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
     let mut frame_index = 0_u64;
     for b in &bookmarks {
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
+        crate::capture::settle_at_bookmark_epoch(b, &mut world)?;
         let applied = apply_bookmark(b, &mut world, &mut controls)?;
         world.set_time_rate(0.0);
-        world.sim.settle_comets();
+        let ui = crate::capture::bookmark_ui(b, &mut world)?;
         scene.set_lens_scale(controls.lens_scale);
         let mut samples: Vec<Sample> = Vec::new();
         // Submitted frames not yet finished: (sample index for a measured frame, submission,
@@ -361,12 +376,15 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                 args.size,
                 &controls,
                 applied.choice,
+                ui,
                 false,
                 frame_index,
                 BENCH_DT_S,
             );
             let cmd = scene.render(&gpu, &frame, &target.view);
             let cpu_ms = start.elapsed().as_secs_f32() * 1e3;
+            let (comets_cpu_ms, asteroids_cpu_ms) =
+                (scene.comets_cpu_ms(), scene.asteroids_cpu_ms());
             frame_index += 1;
             f += 1;
             let sample_index = measuring.then(|| {
@@ -376,6 +394,8 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
                     interval_ms: prev_start.map(|p| start.duration_since(p).as_secs_f32() * 1e3),
                     cpu_ms,
                     snapshot_cpu_ms: frame.snapshot_cpu_ms,
+                    comets_cpu_ms,
+                    asteroids_cpu_ms,
                     ..Sample::default()
                 });
                 samples.len() - 1
@@ -500,6 +520,8 @@ mod tests {
             interval_ms: (t_s > 0.0).then_some(ms),
             cpu_ms: 1.0,
             snapshot_cpu_ms: 0.5,
+            comets_cpu_ms: 0.25,
+            asteroids_cpu_ms: 0.125,
             gpu_frame_ms: passes.as_ref().map(|_| ms - 1.0),
             passes,
         }
@@ -537,10 +559,11 @@ mod tests {
         );
         assert_eq!(all.passes["stars"].mean, Some(1.0));
         assert_eq!(all.passes["stars"].valid, 150);
-        assert!(all.comets_cpu_ms.is_none());
+        assert_eq!(all.comets_cpu_ms.unwrap().mean, 0.25);
+        assert_eq!(all.asteroids_cpu_ms.unwrap().mean, 0.125);
         let v = serde_json::to_value(all).unwrap();
         assert_eq!(v["passes"]["lens"]["mean"], serde_json::Value::Null);
-        assert_eq!(v["comets_cpu_ms"], serde_json::Value::Null);
+        assert_eq!(v["comets_cpu_ms"]["mean"], 0.25);
         assert_eq!(v["interval_ms"]["count"], 299);
         assert!(windows(&[])["all"].is_none());
     }
@@ -645,6 +668,7 @@ mod tests {
                 "passes",
                 "snapshot_cpu_ms",
                 "comets_cpu_ms",
+                "asteroids_cpu_ms",
             ] {
                 assert!(w[key].get(field).is_some(), "{key}.{field}");
             }

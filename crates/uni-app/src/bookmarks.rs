@@ -203,6 +203,15 @@ fn ron(b: &Bookmark) -> String {
     if let Some(x) = b.lens_env {
         let _ = writeln!(s, "        lens_env: {x:?},");
     }
+    if let Some(x) = &b.target {
+        let _ = writeln!(s, "        target: {x:?},");
+    }
+    if let Some(x) = b.cruise {
+        let _ = writeln!(s, "        cruise: {x:?},");
+    }
+    if let Some(x) = b.highlight_belt {
+        let _ = writeln!(s, "        highlight_belt: {x:?},");
+    }
     let _ = writeln!(s, "    ),");
     s
 }
@@ -840,7 +849,218 @@ fn generate(world: &mut World) -> Vec<Mark> {
             b,
         });
     }
+    marks.extend(generate_wave_c(world, &marks));
     marks
+}
+
+/// The comet the plan's row 20 looks at (SBDB's name in the registry).
+pub const NEOWISE_NAME: &str = "C/2020 F3 (NEOWISE)";
+/// Row 21's comet.
+pub const HALLEY_NAME: &str = "1P/Halley";
+/// Row 23's exoplanet host.
+pub const TRAPPIST_NAME: &str = "TRAPPIST-1";
+/// Row 26's epoch: row 15's date 50 000 years later (ISO 8601 expanded year,
+/// `scene::parse_bookmark_epoch`).
+pub const ORION_50KYR_UTC: &str = "+52026-11-20T00:00:00Z";
+/// The seam bookmark's distance from TestBH-1 [M] and field of view [deg] (lead ruling "row 19
+/// seam"): at fov 100° the lens cone (deflection ≥ ½ px) is 53.6° across from 4 500 M, so the
+/// traced rectangle spans the frame's height and ≈ 64 % of its width, and its left and right
+/// edges are seams; within `uni_rel::TRACE_REACH` (5 000 M). At fov 60° no distance within the
+/// reach gives a partial rectangle (b_max = 7 484 M > 5 000 M).
+pub const SEAM_DISTANCE_M: f64 = 4_500.0;
+pub const SEAM_FOV_DEG: f64 = 100.0;
+
+/// The Wave C bookmarks, rows 20–26 (plan, table "M1 capture bookmarks"), and #27, the seam
+/// bookmark of the lead's ruling "row 19 seam" (`marks` holds rows 1–19).
+fn generate_wave_c(world: &mut World, marks: &[Mark]) -> Vec<Mark> {
+    let mut out = Vec::new();
+    // 20. comet-neowise-2020: 7 000 km from Earth's centre toward the Sun, looking at NEOWISE.
+    {
+        let t = "2020-07-15T03:00:00Z";
+        world.set_epoch(epoch(t));
+        world.sim.settle_comets();
+        let s = rel(world, "Earth", "Sun").normalize();
+        let mut b = blank("comet-neowise-2020", deg(20.0), t);
+        b.anchor = Some("Earth".to_owned());
+        b.view.pos.local = s * 7.0e6;
+        b.look_at = Some(NEOWISE_NAME.to_owned());
+        b.up = Some(DVec3::Z);
+        let cam = pos(world, "Earth").offset(s * 7.0e6);
+        let c = pos(world, NEOWISE_NAME).delta_from(cam);
+        out.push(Mark {
+            comment: format!(
+                "#20 C/2020 F3 (NEOWISE) on 2020-07-15 03:00 UTC from 7 000 km sunward of \
+                 Earth's centre (629 km up, outside the atmosphere), fov 20°, north up; the Sun \
+                 {:.1}° off-axis, the comet {:.3} AU away.",
+                angle(c, s).to_degrees(),
+                c.length() / AU
+            ),
+            b,
+        });
+    }
+    // 21. comet-halley-1986: 2e6 km from 1P, looking along its orbit's normal (phase 90°, the
+    // dust tail's curve face-on), the Sun to the left; fov 20° (653 km/px).
+    {
+        let t = "1986-03-13T00:00:00Z";
+        world.set_epoch(epoch(t));
+        world.sim.settle_comets();
+        let id = world.sim.find(HALLEY_NAME).unwrap();
+        let s = rel(world, HALLEY_NAME, "Sun").normalize();
+        let v = world.sim.velocity(id) - world.sim.velocity(world.sim.find("Sun").unwrap());
+        let n = s.cross(v).normalize();
+        let c = (n - s * n.dot(s)).normalize();
+        let a = -s;
+        let mut b = anchored(
+            "comet-halley-1986",
+            deg(20.0),
+            t,
+            HALLEY_NAME,
+            c * 2.0e9,
+            c.cross(a),
+        );
+        b.look_at = Some(HALLEY_NAME.to_owned());
+        out.push(Mark {
+            comment: format!(
+                "#21 1P/Halley on 1986-03-13 from 2.0e6 km along its orbit's normal (phase \
+                 {:.1}°), the Sun to the left, fov 20° (653 km/px); r_h {:.3} AU.",
+                angle(s, c).to_degrees(),
+                rel(world, HALLEY_NAME, "Sun").length() / AU
+            ),
+            b,
+        });
+    }
+    // 22. asteroid-belt-above: 6 AU above the ecliptic over the Sun, looking at it, fov 70°,
+    // the belt highlighted; the vernal equinox up.
+    world.set_epoch(epoch(SPOT_EPOCH_UTC));
+    world.sim.settle_comets();
+    {
+        let pole = uni_physics::frames::ecliptic_j2000_to_icrs(DVec3::Z);
+        let mut b = anchored(
+            "asteroid-belt-above",
+            deg(70.0),
+            SPOT_EPOCH_UTC,
+            "Sun",
+            pole * 6.0 * AU,
+            DVec3::X,
+        );
+        b.highlight_belt = Some(true);
+        out.push(Mark {
+            comment: "#22 6 AU above the ecliptic over the Sun, looking down at it, fov 70° \
+                      (128.5 px/AU at the Sun), the vernal equinox up; \"Highlight asteroid \
+                      belt\" on (amber label)."
+                .to_owned(),
+            b,
+        });
+    }
+    // 23. exo-trappist1: 0.2 AU from TRAPPIST-1, 30° off its (assumed) orbit normal, `--hud`
+    // with the host as the target.
+    {
+        let id = world.sim.find(TRAPPIST_NAME).unwrap();
+        let host = world.sim.position(id);
+        let dir = host.delta_from(UniversePos::default()).normalize();
+        let Some(uni_sim::world::ObjectDetails::ExoHost { system, .. }) = world.sim.details(id)
+        else {
+            panic!("{TRAPPIST_NAME} is not an exoplanet host");
+        };
+        let (pts, _) = uni_ui::exo_orbit_points(&system, 0, dir, 64);
+        let normal = (pts[16] - pts[0]).cross(pts[32] - pts[0]).normalize();
+        let (e1, _) = basis(normal, dir);
+        let c = (normal * deg(30.0).cos() + e1 * deg(30.0).sin()).normalize();
+        let mut b = anchored(
+            "exo-trappist1",
+            deg(60.0),
+            SPOT_EPOCH_UTC,
+            TRAPPIST_NAME,
+            c * 0.2 * AU,
+            normal,
+        );
+        b.target = Some(TRAPPIST_NAME.to_owned());
+        let sun = pos(world, "Sun").delta_from(host.offset(c * 0.2 * AU));
+        out.push(Mark {
+            comment: format!(
+                "#23 0.2 AU from TRAPPIST-1 ({} planets), 30° off the normal of its (assumed, \
+                 dashed) orbit plane, fov 60°; target TRAPPIST-1 (capture with --hud); the Sun \
+                 {:.1}° off-axis.",
+                system.planets.len(),
+                angle(sun, -c).to_degrees()
+            ),
+            b,
+        });
+    }
+    // 24. hud-target-mars: #5 with Mars as the target (`--hud`).
+    {
+        let mut b = marks
+            .iter()
+            .find(|m| m.b.name == "mars-reference-angle")
+            .unwrap()
+            .b
+            .clone();
+        b.name = "hud-target-mars".to_owned();
+        b.target = Some("Mars".to_owned());
+        out.push(Mark {
+            comment: "#24 #5 (mars-reference-angle) with Mars as the target: the card (capture \
+                      with --hud)."
+                .to_owned(),
+            b,
+        });
+    }
+    // 25. hud-cruise: halfway between Earth and Mars, looking at Mars, cruising (`--hud`).
+    {
+        let half = rel(world, "Earth", "Mars") * 0.5;
+        let mut b = blank("hud-cruise", deg(60.0), SPOT_EPOCH_UTC);
+        b.anchor = Some("Earth".to_owned());
+        b.view.pos.local = half;
+        b.look_at = Some("Mars".to_owned());
+        b.up = Some(DVec3::Z);
+        b.cruise = Some(true);
+        out.push(Mark {
+            comment: format!(
+                "#25 halfway between Earth and Mars ({:.3} AU from each), looking at Mars, \
+                 cruise on: the amber cruise label (capture with --hud).",
+                half.length() / AU
+            ),
+            b,
+        });
+    }
+    // 26. sky-orion-50kyr: #15 at 2026 + 50 000 yr.
+    {
+        let mut b = marks
+            .iter()
+            .find(|m| m.b.name == "sky-orion-3d")
+            .unwrap()
+            .b
+            .clone();
+        b.name = "sky-orion-50kyr".to_owned();
+        b.epoch_utc = Some(ORION_50KYR_UTC.to_owned());
+        out.push(Mark {
+            comment: "#26 #15 (sky-orion-3d) 50 000 years later: proper motion over 50 kyr; the \
+                      planets-extrapolated label, not the stars one (capture with --hud)."
+                .to_owned(),
+            b,
+        });
+    }
+    // 27. bh-lens-seam: TestBH-1's traced rectangle smaller than the frame (lead ruling "row 19
+    // seam"): 4 500 M on the side away from the Galactic Centre, looking through the hole toward
+    // it, fov 100°.
+    {
+        let g = radec_to_icrs(deg(266.405), deg(-28.936));
+        let lens = &world.sim.lenses()[0];
+        let m = gravitational_radius(lens.mass_kg);
+        let mut b = blank("bh-lens-seam", deg(SEAM_FOV_DEG), SPOT_EPOCH_UTC);
+        b.anchor = Some(crate::world::TEST_BH_NAME.to_owned());
+        b.view.pos.local = -g * SEAM_DISTANCE_M * m;
+        b.view.orient = look(g, DVec3::Z);
+        b.lens_scale = Some(1.0);
+        out.push(Mark {
+            comment: "#27 (lead ruling \"row 19 seam\") 4 500 M from TestBH-1 on the side away \
+                      from the Galactic Centre, looking through it, fov 100°: the traced \
+                      rectangle spans the height and the middle 64 % of the width, so its left \
+                      and right edges are seams (HDR ratio inner / outer edge = 1 ± 0.1)."
+                .to_owned(),
+            b,
+        });
+    }
+    out
 }
 
 /// Ruling 10's ceiling [px] for a moon's theory-vs-Horizons error at the Saturn bookmarks
@@ -854,7 +1074,8 @@ pub fn ceiling_px(moon: &str) -> f64 {
 }
 
 const HEADER: &str = "#![enable(implicit_some)]
-// M1 capture bookmarks (plan, table \"M1 capture bookmarks\", entries 1–19; Wave B).
+// M1 capture bookmarks (plan, table \"M1 capture bookmarks\": entries 1–19, Wave B; 20–26, Wave C;
+// 27, the seam bookmark of the lead's ruling \"row 19 seam\").
 // Generated by `cargo test -p uni-app --bins -- --ignored write_m1_bookmarks --nocapture`
 // (crates/uni-app/src/bookmarks.rs) from the World at each epoch; the intent tests there check
 // every placement.
@@ -862,7 +1083,8 @@ const HEADER: &str = "#![enable(implicit_some)]
 // Axes: ICRS/J2000, metres. With `anchor`, `pos` is the offset from that object's centre (cell
 // 0, root axes); `look_at` turns the camera's −Z toward the object with +Y as close as possible
 // to `up` (A6). Fields left out keep their defaults: Auto exposure, eye-adapted stars at
-// star EV100 −6.5, the band behind a lens, lens scale 1.0 in captures.
+// star EV100 −6.5, the band behind a lens, lens scale 1.0 in captures, nothing selected, free
+// flight, the belt not highlighted. Rows 23–26 are drawn with the HUD by the gate's `--hud` run.
 [
 ";
 
@@ -880,20 +1102,11 @@ fn write_m1_bookmarks() {
     }
     m1.push_str("]\n");
     println!("===== m1.ron\n{m1}===== end");
-    let bench = [
-        "start",
-        "earth-limb-dawn",
-        "earth-map-closeup",
-        "mars-reference-angle",
-        "jupiter-galileans",
-        "saturn-ring-plane",
-        "sun-closeup",
-        "sky-orion-3d",
-    ];
+    let bench = BENCH_NAMES;
     let mut b = String::from(
         "#![enable(implicit_some)]
-// M1 bench bookmarks (plan: the Wave B gate's subset of bookmarks/m1.ron, copied unchanged;
-// Wave C adds comet-neowise-2020 and asteroid-belt-above). `universe --bench
+// M1 bench bookmarks (plan: the Wave B gate's subset of bookmarks/m1.ron, plus Wave C's
+// comet-neowise-2020 and asteroid-belt-above, copied unchanged). `universe --bench
 // bookmarks/m1-bench.ron --sustained 60 --json <out>`.
 [
 ",
@@ -907,6 +1120,20 @@ fn write_m1_bookmarks() {
     println!("===== m1-bench.ron\n{b}===== end");
 }
 
+/// `bookmarks/m1-bench.ron`'s bookmarks (plan C6: the Wave B gate's eight and Wave C's two).
+const BENCH_NAMES: [&str; 10] = [
+    "start",
+    "earth-limb-dawn",
+    "earth-map-closeup",
+    "mars-reference-angle",
+    "jupiter-galileans",
+    "saturn-ring-plane",
+    "sun-closeup",
+    "sky-orion-3d",
+    "comet-neowise-2020",
+    "asteroid-belt-above",
+];
+
 /// The committed `bookmarks/m1.ron`.
 fn committed() -> Vec<Bookmark> {
     uni_nav::load_bookmarks(&crate::world::m1_bookmarks_path()).expect("bookmarks/m1.ron loads")
@@ -919,7 +1146,21 @@ fn applied(world: &mut World, name: &str) -> (Bookmark, crate::scene::Applied) {
         .find(|b| b.name == name)
         .unwrap_or_else(|| panic!("no bookmark {name}"));
     let mut controls = crate::scene::default_controls(1.0);
+    // As a capture: the comets settled at the bookmark's epoch first, where the view depends on
+    // a comet (anchor or `look_at`). Elsewhere it changes no geometry these tests check, and a
+    // debug-build settle at row 26's +50 kyr (the 200-year perturbed span of 512 comets) takes
+    // hours.
+    let on_comet = [&b.anchor, &b.look_at].into_iter().flatten().any(|n| {
+        world.sim.find(n).is_some_and(|id| {
+            world.sim.objects()[id as usize].kind == uni_sim::registry::ObjectKind::Comet
+        })
+    });
+    if on_comet {
+        crate::capture::settle_at_bookmark_epoch(&b, world).unwrap();
+    }
     let a = crate::scene::apply_bookmark(&b, world, &mut controls).unwrap();
+    // The selection as a capture sets it (the shared world keeps state between tests).
+    crate::capture::bookmark_ui(&b, world).unwrap();
     (b, a)
 }
 
@@ -1069,24 +1310,20 @@ fn committed_bookmarks_are_the_plan_set() {
             "alpha-cen-sun",
             "bh-shadow-30M-grid",
             "bh-lens-band",
+            "comet-neowise-2020",
+            "comet-halley-1986",
+            "asteroid-belt-above",
+            "exo-trappist1",
+            "hud-target-mars",
+            "hud-cruise",
+            "sky-orion-50kyr",
+            "bh-lens-seam",
         ]
     );
     let bench = uni_nav::load_bookmarks(&crate::world::bookmarks_path("m1-bench.ron")).unwrap();
     let all = committed();
     let bench_names: Vec<&str> = bench.iter().map(|b| b.name.as_str()).collect();
-    assert_eq!(
-        bench_names,
-        [
-            "start",
-            "earth-limb-dawn",
-            "earth-map-closeup",
-            "mars-reference-angle",
-            "jupiter-galileans",
-            "saturn-ring-plane",
-            "sun-closeup",
-            "sky-orion-3d"
-        ]
-    );
+    assert_eq!(bench_names, BENCH_NAMES);
     for b in &bench {
         assert_eq!(Some(b), all.iter().find(|a| a.name == b.name), "{}", b.name);
     }
@@ -1847,13 +2084,473 @@ fn intent_18_19_lens_bookmarks() {
     );
 }
 
+// ---- Wave C intent tests (Task C6) -----------------------------------------------------------
+
+/// The comet `name` of `c`'s snapshot (the comet pass draws it).
+fn comet_view<'a>(world: &World, c: &'a Case, name: &str) -> &'a uni_sim::snapshot::CometView {
+    let id = world.sim.find(name).unwrap();
+    c.snap
+        .comets
+        .iter()
+        .find(|v| v.id == id)
+        .unwrap_or_else(|| panic!("{name} is not in the snapshot's comets"))
+}
+
+/// Row 20's re-derived paper EV (Task C6): with NEOWISE's visual magnitude law (V 2.0 on the
+/// date, `uni_sim::world::VISUAL_MAGNITUDE_LAWS`) the coma twin (`paper::coma_luminance`) puts
+/// 44 pixels over the meter's 10⁻³ cd/m², under `METER_MIN_LIT_PX`, so the paper rests at the
+/// night EV; the capture's tails (left out of the paper) light ≈ 100 more and the GPU meter
+/// settles at −3.39. The plan's "≈ −2 ± 2" assumed a larger, brighter coma on screen.
+pub const NEOWISE_PAPER_EV: f32 = uni_post::NIGHT_EV100;
+/// Row 21's re-derived paper EV (Task C6): Halley's coma lights 173 000 pixels at 653 km/px;
+/// the meter's 50th–95th percentile average sits at −4.56 (the plan's "≈ −2 ± 2" was an
+/// estimate before the coma twin existed).
+pub const HALLEY_PAPER_EV: f32 = -4.56;
+
+/// The paper exposure of a comet bookmark (with the coma twin, `paper::coma_luminance`) against
+/// its re-derived row `row_ev`, ±0.5 EV as every intent test.
+#[track_caller]
+fn assert_comet_paper(world: &World, c: &Case, row_ev: f32) -> crate::paper::Paper {
+    let p = crate::paper::on_paper(world, &c.view, SIZE, None);
+    println!("paper: {p:?}");
+    assert!((p.target_ev - row_ev).abs() <= 0.5, "{p:?} vs {row_ev}");
+    p
+}
+
+#[test]
+fn intent_20_comet_neowise() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    let c = Case::new(world, "comet-neowise-2020");
+    near("fov", c.view.fov_y_rad.to_degrees(), 20.0, 1e-9);
+    // 7 000 km from Earth's centre toward the Sun (629 km up, outside the 100 km atmosphere).
+    let earth = pos(world, "Earth");
+    let off = c.view.pos.delta_from(earth);
+    near("7 000 km", off.length(), 7.0e6, 1e-9);
+    assert!(angle(off, rel(world, "Earth", "Sun")) < 1e-9);
+    let top = world.sim.objects()[world.sim.find("Earth").unwrap() as usize]
+        .atmosphere_top_m
+        .unwrap();
+    assert!(off.length() > top, "outside the atmosphere");
+    // Looking at the settled comet, which the comet pass draws (active, r_h < 5 AU).
+    let v = comet_view(world, &c, NEOWISE_NAME);
+    assert!(angle(c.fwd(), v.nucleus_rel_m) < 1e-9);
+    // Its world position within the check's 5 px of the Horizons RA/Dec (sky_spots.ron).
+    let cam = crate::measure::Cam::new(&c.view, SIZE);
+    let spots =
+        uni_data::load_sky_spots(&uni_data::data_dir().join("golden/sky_spots.ron")).unwrap();
+    let spot = spots.iter().find(|s| s.target == "C/2020 F3").unwrap();
+    let truth = cam
+        .project(radec_to_icrs(deg(spot.ra_deg), deg(spot.dec_deg)))
+        .unwrap();
+    let drawn = cam.project(v.nucleus_rel_m).unwrap();
+    let err = truth.distance(drawn);
+    println!("NEOWISE theory vs Horizons: {err:.3} px");
+    assert!(err < 5.0, "{err}");
+    // The Sun (along `off`, 25.3° away) and Earth (behind) out of frame (half-diagonal 19.8°).
+    assert!(angle(c.fwd(), off) > deg(25.0) && angle(c.fwd(), -off) > deg(90.0));
+    assert_comet_paper(world, &c, NEOWISE_PAPER_EV);
+    // The visual magnitude law (coordinator ruling on row 20): V ≈ 2.0 on the date.
+    let total = v.total_v.expect("NEOWISE has a magnitude law");
+    println!(
+        "NEOWISE total V {total:.2} (r_h {:.3} AU, Δ {:.3} AU)",
+        v.r_au, v.delta_au
+    );
+    assert!((total - 2.0).abs() < 0.1, "{total}");
+}
+
+#[test]
+fn intent_21_comet_halley() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    let c = Case::new(world, "comet-halley-1986");
+    let v = comet_view(world, &c, HALLEY_NAME);
+    near("2e6 km", v.nucleus_rel_m.length(), 2.0e9, 1e-6);
+    // Side view: phase 90° (the camera on the orbit's normal), 653 km/px at fov 20°.
+    let phase = angle(v.sun_rel_m, -v.nucleus_rel_m).to_degrees();
+    near("phase", phase, 90.0, 0.01);
+    let km_per_px = 2.0e6 * 2.0 * deg(10.0).tan() / H;
+    near("km/px", km_per_px, 653.0, 0.01);
+    assert!(angle(c.fwd(), v.nucleus_rel_m) < 1e-9);
+    // The Sun to the left: anti-sunward points to +x on the image.
+    let tail = c.view.orient.conjugate() * -v.sun_rel_m;
+    assert!(tail.x > 0.99 * tail.length(), "{tail}");
+    // The coma's expected slope (−1 − ⟨ρ/ℓ⟩ over 8–40 px) and its feature at the frame centre.
+    let p = crate::measure::Cam::new(&c.view, SIZE)
+        .project(v.nucleus_rel_m)
+        .unwrap();
+    assert!(p.distance(glam::DVec2::new(W / 2.0, H / 2.0)) < 1e-6, "{p}");
+    let scale_km = uni_planet::comet::coma::coma_scale_m(v.r_au) / 1e3;
+    let mean_rho_over_l = 24.0 * km_per_px / scale_km;
+    println!("ℓ = {scale_km:.0} km, ⟨ρ/ℓ⟩ ≈ {mean_rho_over_l:.3}");
+    assert!((0.05..0.5).contains(&mean_rho_over_l));
+    assert_comet_paper(world, &c, HALLEY_PAPER_EV);
+}
+
+#[test]
+fn intent_22_asteroid_belt_above() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    let c = Case::new(world, "asteroid-belt-above");
+    let (b, _) = applied(world, "asteroid-belt-above");
+    assert_eq!(b.highlight_belt, Some(true));
+    near("fov", c.view.fov_y_rad.to_degrees(), 70.0, 1e-9);
+    let sun = pos(world, "Sun").delta_from(c.view.pos);
+    near("6 AU", sun.length() / AU, 6.0, 1e-9);
+    let pole = uni_physics::frames::ecliptic_j2000_to_icrs(DVec3::Z);
+    assert!(angle(-sun, pole) < 1e-9, "above the ecliptic");
+    assert!(angle(c.fwd(), sun) < 1e-9);
+    // 128.5 px/AU at the Sun (rectilinear: f / 6 AU, f = 540 / tan 35°).
+    near("px/AU", 540.0 / deg(35.0).tan() / 6.0, 128.5, 0.01);
+    // The belt from the CPU positions: the 3:1 Kirkwood gap in a, and the Trojan clouds.
+    let belt = uni_sky::BeltModel::from_catalogue(
+        world.sim.asteroid_records(),
+        crate::scene::BELT_MAIN,
+        crate::scene::BELT_KUIPER,
+        uni_sky::belt::BELT_H_CUT,
+        uni_sky::belt::BELT_SEED,
+    );
+    let assets = crate::world::Assets {
+        facts: Vec::new(),
+        rings: None,
+        maps: Vec::new(),
+        map_dir: std::path::PathBuf::new(),
+        warnings: Vec::new(),
+    };
+    let m = measured_with(world, &assets, "asteroid-belt-above", Some(&belt));
+    let h = m
+        .metrics
+        .belt_radial_hist
+        .expect("belt_radial_hist with the highlight");
+    println!(
+        "belt: Kirkwood 3:1 dip by a {:.3}, by projected r {:.3}; L4 {:.1}×, L5 {:.1}× the \
+         background",
+        h.kirkwood_dip_a, h.kirkwood_dip_r, h.l4_over_bg, h.l5_over_bg
+    );
+    assert!(h.kirkwood_dip_a < 0.3, "{}", h.kirkwood_dip_a);
+    assert!(h.l4_over_bg > 3.0 && h.l5_over_bg > 3.0);
+    // Every drawn asteroid within 6 AU: most of the 33 678 records and the belt's
+    // `BELT_MAIN` main-belt and Trojan objects (80 000 since the ladder step, §7 of the report).
+    let within: u64 = h.counts.iter().map(|&n| u64::from(n)).sum();
+    assert!(within > u64::from(crate::scene::BELT_MAIN), "{within}");
+    for r in ["belt_annulus", "belt_outer"] {
+        assert!(m.regions.get(r).is_some_and(|v| !v.is_empty()), "{r}");
+    }
+    // No world light on screen: the night EV, as the plan's row for 22 says.
+    assert_paper(world, None, &c, uni_post::NIGHT_EV100, None);
+}
+
+#[test]
+fn intent_23_exo_trappist1() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    let c = Case::new(world, "exo-trappist1");
+    let id = world.sim.find(TRAPPIST_NAME).unwrap();
+    let host = world.sim.position(id).delta_from(c.view.pos);
+    near("0.2 AU", host.length() / AU, 0.2, 1e-9);
+    assert!(angle(c.fwd(), host) < 1e-9);
+    // The host is drawn (an archive star, review I11): a star surface or a point.
+    let drawn = c.snap.star_surfaces.iter().any(|s| s.id == id)
+        || c.snap.points.iter().any(|p| p.id == Some(id));
+    assert!(drawn, "TRAPPIST-1 not drawn");
+    // Selected (the bookmark's target): seven dashed orbits on the overlay.
+    let (b, _) = applied(world, "exo-trappist1");
+    assert_eq!(b.target.as_deref(), Some(TRAPPIST_NAME));
+    let snap = world.sim.snapshot(&c.view, SIZE);
+    let o = uni_ui::build_overlay(
+        &world.sim,
+        &snap,
+        &c.view,
+        SIZE,
+        SIZE.as_vec2(),
+        Some(id),
+        None,
+        None,
+        &crate::scene::OVERLAY_SETTINGS,
+    );
+    let n = crate::measure::overlay_counts(&o);
+    assert_eq!(n.dashed, 7, "{n:?}");
+    // The Sun out of frame (half-diagonal 49.66°).
+    let sun = pos(world, "Sun").delta_from(c.view.pos);
+    assert!(angle(sun, c.fwd()).to_degrees() > 49.66);
+    // The host's disk is the only world light (2.6 px across): paper against the re-derived row.
+    let p = crate::paper::on_paper(world, &c.view, SIZE, None);
+    println!("paper: {p:?}");
+    assert!((p.target_ev - TRAPPIST_PAPER_EV).abs() <= 0.5, "{p:?}");
+}
+
+/// Row 23's re-derived paper EV (Task C6): TRAPPIST-1's resolved disk (2.6 px in radius, ≈ 76
+/// px over the meter's threshold) is world light, so the meter leaves the night EV and ramps
+/// toward the disk's ev_avg (22.8) between `METER_MIN_LIT_PX` and `METER_FULL_LIT_PX` (the plan's
+/// table lumped row 23 with the sky views at the night EV). A few pixels move it by about an EV
+/// each there (re-review r1 minor 6's ramp), so the capture's EV can differ by more than 0.5.
+pub const TRAPPIST_PAPER_EV: f32 = -1.18;
+
+#[test]
+fn intent_24_25_hud_bookmarks() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    // 24: #5's view with Mars as the target; its card in the mockup's order.
+    let all = committed();
+    let five = all
+        .iter()
+        .find(|b| b.name == "mars-reference-angle")
+        .unwrap();
+    let b24 = all.iter().find(|b| b.name == "hud-target-mars").unwrap();
+    assert_eq!((&b24.view, &b24.epoch_utc), (&five.view, &five.epoch_utc));
+    assert_eq!(b24.target.as_deref(), Some("Mars"));
+    let c = Case::new(world, "hud-target-mars");
+    let mars = world.sim.find("Mars").unwrap();
+    let card = uni_ui::build_card(&world.sim, mars, &c.view).unwrap();
+    let rows: Vec<&str> = card
+        .live
+        .iter()
+        .chain(card.facts.iter())
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(rows, MARS_CARD_ROWS);
+    // 25: halfway between Earth and Mars, looking at Mars, cruising: the cruise label.
+    let c = Case::new(world, "hud-cruise");
+    let e = pos(world, "Earth").delta_from(c.view.pos);
+    let m = pos(world, "Mars").delta_from(c.view.pos);
+    near("halfway", e.length() / m.length(), 1.0, 1e-9);
+    assert!(angle(c.fwd(), m) < 1e-9);
+    let (b, a) = applied(world, "hud-cruise");
+    assert_eq!(b.cruise, Some(true));
+    let ui = crate::capture::bookmark_ui(&b, world).unwrap();
+    assert_eq!(ui.flight, uni_ui::FlightLabel::Cruise);
+    let s = crate::scene::exposure_settings(
+        &crate::scene::default_controls(1.0),
+        a.choice,
+        false,
+        true,
+    );
+    let labels = crate::scene::honesty_labels(
+        world,
+        &c.view,
+        SIZE,
+        &c.snap,
+        &s,
+        &crate::scene::LabelInputs {
+            lens_env: uni_rel::LensEnv::Band,
+            coverage: uni_rel::LensCoverage::Unlensed,
+            band_on: true,
+            scintillation: 0.0,
+            vivid: true,
+            belt_visible: false,
+            ui,
+        },
+    );
+    assert_eq!(
+        labels[0],
+        (
+            uni_ui::CRUISE_LABEL.to_owned(),
+            uni_ui::LabelTone::NonPhysical
+        )
+    );
+}
+
+/// The coordinator's rulings at Task C6 on the `--hud` views: no orbit line without a selection;
+/// the selected planet's orbit and its major moons' only, none over a body's disk; markers for
+/// the Sun, the planets, the Moon (from Earth) and TestBH-1 always, and at most three "others"
+/// (dwarf planets, comets, asteroids, hosts), with no two labels overlapping.
+#[test]
+fn hud_overlay_is_soft_and_uncluttered() {
+    let mut g = full_world();
+    let (world, _) = &mut *g;
+    use uni_sim::registry::ObjectKind;
+    let overlay = |world: &World, c: &Case, selected| {
+        uni_ui::build_overlay(
+            &world.sim,
+            &c.snap,
+            &c.view,
+            SIZE,
+            SIZE.as_vec2(),
+            selected,
+            None,
+            None,
+            &crate::scene::OVERLAY_SETTINGS,
+        )
+    };
+    // `start`: Earth from 60 000 km, nothing selected.
+    let c = Case::new(world, "start");
+    let o = overlay(world, &c, None);
+    assert!(o.orbits.is_empty(), "{} orbit lines", o.orbits.len());
+    let kinds: Vec<ObjectKind> = o
+        .markers
+        .iter()
+        .map(|m| world.sim.objects()[m.id as usize].kind)
+        .collect();
+    let others = kinds
+        .iter()
+        .filter(|k| {
+            matches!(
+                k,
+                ObjectKind::DwarfPlanet
+                    | ObjectKind::Comet
+                    | ObjectKind::Asteroid
+                    | ObjectKind::ExoHost
+                    | ObjectKind::Star
+            )
+        })
+        .count();
+    println!(
+        "start: {} markers ({others} others): {kinds:?}",
+        o.markers.len()
+    );
+    assert!(others <= uni_sim::snapshot::MAX_BRIGHT_DESTINATIONS);
+    let labels: Vec<(f32, f32, String)> = o
+        .markers
+        .iter()
+        .filter_map(|m| m.label.clone().map(|l| (m.pt.x, m.pt.y, l)))
+        .collect();
+    for (i, a) in labels.iter().enumerate() {
+        for b in &labels[i + 1..] {
+            // Same row band and horizontally close: labels would overlap.
+            assert!(
+                (a.1 - b.1).abs() > 12.0 || (a.0 - b.0).abs() > 30.0,
+                "{a:?} and {b:?}"
+            );
+        }
+    }
+    // `hud-target-mars`: Mars selected; its orbit and Phobos's and Deimos's, none over the disk.
+    let c = Case::new(world, "hud-target-mars");
+    let mars = world.sim.find("Mars").unwrap();
+    let o = overlay(world, &c, Some(mars));
+    assert!(!o.orbits.is_empty());
+    let b = c.body(world, "Mars");
+    let centre = crate::measure::Cam::new(&c.view, SIZE)
+        .project(b.rel_pos_m)
+        .unwrap()
+        .as_vec2();
+    let r = b.proj_radius_px as f32;
+    for l in &o.orbits {
+        assert!(
+            l.pts.iter().all(|p| p.distance(centre) >= r),
+            "an orbit point over Mars's disk"
+        );
+    }
+}
+
+/// The mockup's Mars card rows in order (C4's `mars_card_rows_in_mockup_order`): the live rows,
+/// then the facts.
+pub const MARS_CARD_ROWS: [&str; 15] = [
+    "Distance",
+    "Closing speed",
+    "Light time",
+    "Mean radius",
+    "Mass",
+    "Surface gravity",
+    "Escape velocity",
+    "Sidereal day",
+    "Orbital period",
+    "Semi-major axis",
+    "Axial tilt",
+    "Surface pressure",
+    "Atmosphere",
+    "Mean temperature",
+    "Moons",
+];
+
+#[test]
+fn intent_26_sky_orion_50kyr() {
+    let mut g = full_world();
+    let (world, assets) = &mut *g;
+    let all = committed();
+    let fifteen = all.iter().find(|b| b.name == "sky-orion-3d").unwrap();
+    let b26 = all.iter().find(|b| b.name == "sky-orion-50kyr").unwrap();
+    assert_eq!(b26.view, fifteen.view);
+    // 50 000 Gregorian years after row 15's date: 50 000 × 365.2425 days.
+    let t15 = epoch(SPOT_EPOCH_UTC);
+    let t26 = crate::scene::parse_bookmark_epoch(ORION_50KYR_UTC).unwrap();
+    near(
+        "50 kyr [days]",
+        t26.seconds_since(t15) / uni_core::DAY,
+        50_000.0 * 365.2425,
+        1e-12,
+    );
+    let c = Case::new(world, "sky-orion-50kyr");
+    assert_eq!(world.epoch(), t26);
+    // The four stars in frame at their +50 kyr positions.
+    let m = measured(world, assets, "sky-orion-50kyr");
+    for n in ["Betelgeuse", "Rigel", "Bellatrix", "Alnilam"] {
+        let p = m.projected.iter().find(|p| p.name == n);
+        assert!(
+            p.is_some_and(|p| (0.0..W).contains(&p.x) && (0.0..H).contains(&p.y)),
+            "{n}"
+        );
+    }
+    // Planets extrapolated (outside 3000 BC – AD 3000), stars not (|Δt| < 100 kyr).
+    let flags = world.sim.honesty(&c.view, SIZE);
+    use uni_sim::honesty::HonestyFlag;
+    assert!(flags.contains(&HonestyFlag::PlanetsExtrapolated));
+    assert!(!flags.contains(&HonestyFlag::StarsExtrapolated));
+    assert_paper(world, None, &c, uni_post::NIGHT_EV100, None);
+}
+
+#[test]
+fn intent_27_bh_lens_seam() {
+    let mut g = full_world();
+    let (world, assets) = &mut *g;
+    let c = Case::new(world, "bh-lens-seam");
+    let lens = &world.sim.lenses()[0];
+    let m_len = gravitational_radius(lens.mass_kg);
+    let hole = lens.pos.delta_from(c.view.pos);
+    near("4 500 M", hole.length() / m_len, SEAM_DISTANCE_M, 1e-6);
+    assert!(angle(hole, c.fwd()) < 1e-7);
+    near("fov", c.view.fov_y_rad.to_degrees(), SEAM_FOV_DEG, 1e-9);
+    // Traced, and the rectangle is smaller than the frame: the full height, part of the width.
+    let ctx = crate::scene::frame_ctx(
+        world,
+        &c.view,
+        SIZE,
+        SIZE,
+        uni_gfx::Exposure {
+            scene_ev100: 0.0,
+            star_ev100: -6.5,
+        },
+        0,
+        0.0,
+        &c.snap,
+    );
+    assert_eq!(uni_rel::lens_coverage(&ctx), uni_rel::LensCoverage::Traced);
+    let cam = crate::measure::Cam::new(&c.view, SIZE);
+    let (lo, hi) = crate::measure::lens_rect(&cam, &ctx.lenses[0]).unwrap();
+    println!("lens rectangle: x {}–{}, y {}–{}", lo.x, hi.x, lo.y, hi.y);
+    // 1 234 of 1 920 columns (64 %): both side edges well inside the frame.
+    assert!(
+        lo.x > 0.1 * W && hi.x < 0.9 * W && hi.x - lo.x > 0.5 * W,
+        "{lo} {hi}"
+    );
+    assert_eq!((lo.y, hi.y), (0.0, H));
+    let m = measured(world, assets, "bh-lens-seam");
+    for r in ["lens_rect_inner_edge", "lens_rect_outer_edge"] {
+        let n = m.regions.get(r).map_or(0, Vec::len);
+        assert!(n > 0 && n <= crate::measure::MAX_REGION_SAMPLES, "{r}: {n}");
+    }
+    // The Sun out of frame (half-diagonal 67.7° at fov 100°).
+    let sun = pos(world, "Sun").delta_from(c.view.pos);
+    assert!(angle(sun, c.fwd()).to_degrees() > 70.0);
+    assert_paper(world, None, &c, uni_post::NIGHT_EV100, None);
+}
+
 /// The capture JSON's CPU-side measurements for bookmark `name` (no GPU: no taps).
 fn measured(
     world: &mut World,
     assets: &crate::world::Assets,
     name: &str,
 ) -> crate::measure::Measurements {
-    let (_, a) = applied(world, name);
+    measured_with(world, assets, name, None)
+}
+
+/// [`measured`] with the procedural belt `belt` (for `belt_radial_hist`).
+fn measured_with(
+    world: &mut World,
+    assets: &crate::world::Assets,
+    name: &str,
+    belt: Option<&uni_sky::BeltModel>,
+) -> crate::measure::Measurements {
+    let (b, a) = applied(world, name);
     let controls = crate::scene::default_controls(1.0);
     let settings = crate::scene::exposure_settings(&controls, a.choice, false, true);
     let snapshot = world.sim.snapshot(&a.view, SIZE);
@@ -1873,6 +2570,7 @@ fn measured(
         snapshot,
         settings,
         labels: Vec::new(),
+        ui: crate::capture::bookmark_ui(&b, world).unwrap(),
         snapshot_cpu_ms: 0.0,
         reflected_scale: 1.0,
     };
@@ -1887,6 +2585,11 @@ fn measured(
         rings: assets.rings.as_ref(),
         maps: &assets.maps,
         map_dir: &assets.map_dir,
+        belt,
+        overlay: None,
+        comets_cpu_ms: None,
+        asteroids_cpu_ms: None,
+        asteroid_counts: None,
     })
 }
 
@@ -1988,7 +2691,20 @@ fn capture_measurements_cover_the_plan_checks() {
     assert!(!m.regions.contains_key("night_limb_haze"));
     // Row 19 (lead ruling "row 19 shadow"): visual and seam checks only, so the JSON carries no
     // regions, samples or flux for it (the `lens_rect_*_edge` regions cannot exist either: at
-    // 30 M the traced rectangle is the whole frame).
+    // 30 M the traced rectangle is the whole frame; #27 `bh-lens-seam` has them).
     let m = measured(world, assets, "bh-lens-band");
     assert!(m.regions.is_empty() && m.samples.is_empty() && m.flux.is_empty());
+    // Wave C: the comets' features (row 20's ion-tail direction, row 21's coma profile) and
+    // NEOWISE's Horizons position.
+    let m = measured(world, assets, "comet-neowise-2020");
+    let f = &m.features["ion_tail"];
+    assert!(f.angle_deg.is_some_and(f64::is_finite) && f.r_max > f.r_min);
+    assert!(m.projected.iter().any(|p| p.name == "C/2020 F3 Horizons"));
+    let m = measured(world, assets, "comet-halley-1986");
+    let f = &m.features["coma"];
+    assert!((f.r_min, f.r_max) == (8.0, 40.0));
+    assert!(
+        f.expected_slope.is_some_and(|s| (-1.6..-1.0).contains(&s)),
+        "{f:?}"
+    );
 }

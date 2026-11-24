@@ -12,6 +12,15 @@
 //!   points with B4L's halo, B5's band with B4L's galaxy detail), uni-post (B6) and uni-rel
 //!   (B7). A crate that returns no probe fails, so a probe hook cannot silently go missing.
 //!
+//! - then `depth_writers_write_g` (Task C6, the B9c carry: every pass with a depth attachment
+//!   also writes `lens_mask.g` with Max): the whole scene renders four views (Earth and the
+//!   Moon: bodies; the Sun close up: star surfaces; Saturn with its rings across the globe: the
+//!   ring pass's `g` over the globe's; 1P/Halley's nucleus from 40 km: the comet pass), and the
+//!   mask tap after the comet pass reads depth and `g` back: no pixel with depth may have
+//!   `g` < 1/255 (a body writes depth only where its coverage is ≥ 1/255, and `g` = coverage),
+//!   and every interior pixel of a depth writer (every pixel within 2 px has depth too: coverage
+//!   1) must have `g` = 1, which a ring over the globe keeps only with a Max blend.
+//!
 //! Every check runs through `uni_gfx::probe::run_compute`, the same runner the crates'
 //! `gpu_probes` use. The three probes' buffers sit in bind group 2 (`post/tonemap.wgsl` claims
 //! groups 0 and 1); `run_compute` finds that group from the shader.
@@ -187,6 +196,14 @@ pub fn run() -> bool {
             tally.line(&probe.name, probe.pass, &probe.detail);
         }
     }
+    match check_depth_writers(&gpu) {
+        Ok(lines) => {
+            for (name, pass, detail) in lines {
+                tally.line(&name, pass, &detail);
+            }
+        }
+        Err(e) => tally.line("depth_writers_write_g", false, &format!("{e:#}")),
+    }
     // An uncaptured GPU error during the probes fails the run (review m6).
     let errors = gpu.take_errors();
     if !errors.is_empty() {
@@ -194,6 +211,134 @@ pub fn run() -> bool {
     }
     println!("selftest: {}/{} PASS", tally.passed, tally.total);
     tally.passed == tally.total
+}
+
+/// Size of the depth-writer check's frames.
+const DEPTH_CHECK_SIZE: glam::UVec2 = glam::UVec2::new(1024, 576);
+/// `g` at or above this counts as written (an 8-bit coverage step).
+const MIN_G: f32 = 1.0 / 255.0;
+/// Fewest depth pixels a view must have for its check to mean anything.
+const MIN_DEPTH_PX: usize = 200;
+
+/// The depth-writer check (module docs): one line per view (name, pass, detail).
+fn check_depth_writers(gpu: &GpuContext) -> anyhow::Result<Vec<(String, bool, String)>> {
+    let start =
+        uni_core::Epoch::parse_iso_utc("2026-11-20T00:00:00Z").context("internal: start epoch")?;
+    let (mut world, assets) = crate::world::load(&crate::world::baked_dir(), start);
+    anyhow::ensure!(!assets.athyg_missing(), "AT-HYG missing");
+    let mut scene = crate::scene::Scene::new(
+        gpu,
+        DEPTH_CHECK_SIZE,
+        uni_gfx::CAPTURE_FORMAT,
+        crate::scene::StarCatalog::AtHyg(world.sim.star_data()),
+        &assets,
+        1.0,
+        world.sim.asteroid_records(),
+    )?;
+    scene.set_settle_tails(true);
+    let target = uni_gfx::CaptureTarget::new(&gpu.device, DEPTH_CHECK_SIZE);
+    let marks = uni_nav::load_bookmarks(&crate::world::m1_bookmarks_path())?;
+    let mut views = Vec::new();
+    for (label, name) in [
+        ("depth/g bodies (start)", "start"),
+        ("depth/g star surface (sun-closeup)", "sun-closeup"),
+        (
+            "depth/g rings over the globe (saturn-ring-plane)",
+            "saturn-ring-plane",
+        ),
+    ] {
+        let b = marks
+            .iter()
+            .find(|b| b.name == name)
+            .with_context(|| format!("no bookmark {name}"))?;
+        let mut controls = crate::scene::default_controls(1.0);
+        let a = crate::scene::apply_bookmark(b, &mut world, &mut controls)?;
+        views.push((label, a.view, world.epoch()));
+    }
+    // 1P/Halley's nucleus (R ≈ 5.5 km) from 40 km, at the start date.
+    world.set_epoch(start);
+    let halley = world
+        .sim
+        .find("1P/Halley")
+        .context("no 1P/Halley in the registry")?;
+    let dir = DVec3::new(0.4, -0.3, 0.866).normalize();
+    let view = uni_core::CameraView {
+        pos: world.sim.position(halley).offset(-dir * 40.0e3),
+        orient: glam::DQuat::from_rotation_arc(DVec3::NEG_Z, dir),
+        fov_y_rad: 60_f64.to_radians(),
+        velocity_mps: DVec3::ZERO,
+    };
+    views.push(("depth/g comet nucleus (1P/Halley from 40 km)", view, start));
+
+    let controls = crate::scene::default_controls(1.0);
+    let mut out = Vec::new();
+    for (k, (label, view, epoch)) in views.into_iter().enumerate() {
+        world.set_epoch(epoch);
+        world.set_time_rate(0.0);
+        let mut img = None;
+        // Two frames: the comet pass builds a resolved nucleus's mesh in its first `prepare`.
+        for f in 0..2 {
+            let frame = scene.prepare(
+                &world,
+                &view,
+                DEPTH_CHECK_SIZE,
+                DEPTH_CHECK_SIZE,
+                &controls,
+                crate::scene::ViewChoices::default(),
+                crate::scene::UiState::default(),
+                true,
+                (2 * k + f) as u64,
+                1.0 / 60.0,
+            );
+            scene.mask_tap.arm(f == 1);
+            let cmd = scene.render(gpu, &frame, &target.view);
+            scene.mask_tap.arm(false);
+            crate::capture::submit_and_wait(gpu, vec![cmd], label)?;
+            img = scene.mask_tap.take(gpu)?;
+        }
+        let img = img.context("the mask tap took no copy")?;
+        out.push(judge_depth_g(label, &img));
+    }
+    Ok(out)
+}
+
+/// One view's verdict from the mask tap's (depth, g, a, 0) image.
+fn judge_depth_g(label: &str, img: &crate::tap::HdrImage) -> (String, bool, String) {
+    let (w, h) = (i64::from(img.size.x), i64::from(img.size.y));
+    let depth = |x: i64, y: i64| img.at(x, y).is_some_and(|t| t[0] > 0.0);
+    let (mut depth_px, mut unwritten, mut interior, mut interior_low) = (0, 0, 0, 0);
+    let mut worst = f32::INFINITY;
+    for y in 0..h {
+        for x in 0..w {
+            let Some(t) = img.at(x, y) else { continue };
+            if t[0] <= 0.0 {
+                continue;
+            }
+            depth_px += 1;
+            if t[1] < MIN_G * 0.99 {
+                unwritten += 1;
+            }
+            // Interior: every pixel within 2 px has depth too. (A limb pixel of coverage 0.7
+            // can have four neighbours with depth: edge coverage is antialiased over ≈ 1.5 px.)
+            let inside = (-2..=2).all(|dy| (-2..=2).all(|dx| depth(x + dx, y + dy)));
+            if inside {
+                interior += 1;
+                worst = worst.min(t[1]);
+                if t[1] < 0.999 {
+                    interior_low += 1;
+                }
+            }
+        }
+    }
+    let pass = depth_px >= MIN_DEPTH_PX && unwritten == 0 && interior_low == 0;
+    (
+        label.to_owned(),
+        pass,
+        format!(
+            "{depth_px} px with depth (≥ {MIN_DEPTH_PX}): {unwritten} with g < 1/255; {interior} \
+             interior px, {interior_low} with g < 0.999 (lowest {worst:.4})"
+        ),
+    )
 }
 
 /// Counts and prints the checks.

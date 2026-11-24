@@ -40,6 +40,10 @@ use uni_gfx::{FrameBindings, FrameCtx, FrameTargets, GpuContext, PassTimer, Rend
 
 /// Timer label and pass name of the tap after the meter (the world light, `lit_px`).
 pub const TAP_WORLD: &str = "tap-world";
+/// Timer label and pass name of the mask tap after the last depth writer (the comet pass) and
+/// before the atmosphere (Task C6, B9c carry): per pixel (depth, `lens_mask.g`, `lens_mask.a`,
+/// 0), for `--selftest`'s check that every depth writer also writes `g` with Max.
+pub const TAP_MASK: &str = "tap-mask";
 /// Timer label and pass name of the tap before bloom (the `--hdr` sidecar).
 pub const TAP_PREBLOOM: &str = "tap-prebloom";
 
@@ -70,6 +74,40 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4<f32>(0.0);
 }
 "#;
+
+/// The mask tap's shader: a fullscreen triangle; each fragment writes (depth, lens_mask.g,
+/// lens_mask.a, 0) of its texel into `texels` (row-major, rows top-down).
+pub const MASK_TAP_WGSL: &str = r#"// mask_tap.wgsl: copies depth and lens_mask.g/.a into a storage buffer (uni-app mask tap).
+@group(0) @binding(0) var depth: texture_depth_2d;
+@group(0) @binding(1) var<storage, read_write> texels: array<vec4<f32>>;
+@group(0) @binding(2) var lens_mask: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = textureDimensions(lens_mask);
+    let p = vec2<u32>(pos.xy);
+    if (p.x < size.x && p.y < size.y) {
+        let m = textureLoad(lens_mask, p, 0);
+        texels[p.y * size.x + p.x] = vec4<f32>(textureLoad(depth, p, 0), m.g, m.a, 0.0);
+    }
+    return vec4<f32>(0.0);
+}
+"#;
+
+/// What a tap copies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TapSource {
+    /// The pre-exposed `hdr` target, RGBA.
+    Hdr,
+    /// (depth, `lens_mask.g`, `lens_mask.a`, 0).
+    DepthMask,
+}
 
 /// A copy of `hdr` taken during a frame: linear pre-exposed RGBA, rows top-down.
 #[derive(Clone, Debug, PartialEq)]
@@ -136,7 +174,15 @@ impl HdrTap {
     /// renderer at its place in the pass order.
     pub fn new(gpu: &GpuContext, name: &'static str) -> anyhow::Result<(Self, TapFeature)> {
         let state = Rc::new(RefCell::new(TapState::default()));
-        let feature = TapFeature::new(gpu, name, Rc::clone(&state))?;
+        let feature = TapFeature::new(gpu, name, TapSource::Hdr, Rc::clone(&state))?;
+        Ok((Self { state }, feature))
+    }
+
+    /// The mask tap ([`TAP_MASK`]): its copy is (depth, `lens_mask.g`, `lens_mask.a`, 0) per
+    /// pixel, read back as an [`HdrImage`].
+    pub fn new_mask(gpu: &GpuContext) -> anyhow::Result<(Self, TapFeature)> {
+        let state = Rc::new(RefCell::new(TapState::default()));
+        let feature = TapFeature::new(gpu, TAP_MASK, TapSource::DepthMask, Rc::clone(&state))?;
         Ok((Self { state }, feature))
     }
 
@@ -191,6 +237,7 @@ impl HdrTap {
 /// The render feature of an [`HdrTap`]: the timed copy pass (module docs).
 pub struct TapFeature {
     name: &'static str,
+    source: TapSource,
     state: Rc<RefCell<TapState>>,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -224,22 +271,64 @@ fn tap_layout_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
     ]
 }
 
+/// Group 0 of the mask tap: depth (binding 0), the packed texels (binding 1), `lens_mask`
+/// (binding 2).
+fn mask_layout_entries() -> [wgpu::BindGroupLayoutEntry; 3] {
+    let [_, texels] = tap_layout_entries();
+    [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        texels,
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+    ]
+}
+
 impl TapFeature {
     fn new(
         gpu: &GpuContext,
         name: &'static str,
+        source: TapSource,
         state: Rc<RefCell<TapState>>,
     ) -> anyhow::Result<Self> {
         let device = &gpu.device;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let wgsl = match source {
+            TapSource::Hdr => TAP_WGSL,
+            TapSource::DepthMask => MASK_TAP_WGSL,
+        };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(TAP_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("hdr tap bgl"),
-            entries: &tap_layout_entries(),
-        });
+        let layout = match source {
+            TapSource::Hdr => device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("hdr tap bgl"),
+                entries: &tap_layout_entries(),
+            }),
+            TapSource::DepthMask => {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("mask tap bgl"),
+                    entries: &mask_layout_entries(),
+                })
+            }
+        };
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("hdr tap layout"),
             bind_group_layouts: &[Some(&layout)],
@@ -275,6 +364,7 @@ impl TapFeature {
         }
         Ok(Self {
             name,
+            source,
             state,
             pipeline,
             layout,
@@ -340,20 +430,38 @@ impl RenderFeature for TapFeature {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("hdr tap bg"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: storage.as_entire_binding(),
-                },
-            ],
-        });
+        let texels = wgpu::BindGroupEntry {
+            binding: 1,
+            resource: storage.as_entire_binding(),
+        };
+        let bind_group = match self.source {
+            TapSource::Hdr => gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hdr tap bg"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&targets.hdr_view),
+                    },
+                    texels,
+                ],
+            }),
+            TapSource::DepthMask => gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mask tap bg"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+                    },
+                    texels,
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&targets.lens_mask_view),
+                    },
+                ],
+            }),
+        };
         let dummy = self.dummy_view(&gpu.device, size);
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -683,6 +791,29 @@ mod tests {
         assert_eq!(tag.0.get(), Some(3));
         tag.set(None);
         assert_eq!(tag.0.get(), None);
+    }
+
+    /// CLAUDE.md §3: the mask tap's shader validates with naga and reads a depth texture at
+    /// binding 0, `lens_mask` at 2 and writes the texels at 1 (`mask_layout_entries`).
+    #[test]
+    fn mask_tap_shader_validates_and_matches_its_layout() {
+        let module = uni_gfx::validate_wgsl(MASK_TAP_WGSL).expect("mask_tap.wgsl validates");
+        let mut bindings: Vec<u32> = module
+            .global_variables
+            .iter()
+            .filter_map(|(_, v)| v.binding.as_ref().map(|b| b.binding))
+            .collect();
+        bindings.sort_unstable();
+        assert_eq!(bindings, [0, 1, 2]);
+        let entries = mask_layout_entries();
+        assert!(matches!(
+            entries[0].ty,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                ..
+            }
+        ));
+        assert_eq!(entries.map(|e| e.binding), [0, 1, 2]);
     }
 
     /// CLAUDE.md §3: the copy shader validates with naga, and its group 0 is the layout the

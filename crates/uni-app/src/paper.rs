@@ -21,6 +21,11 @@
 //!   of haze, and the haze's dim twilight glow beyond the hard crescent (≥ 10⁻³ cd/m², lit to
 //!   the meter) fills the 50th–95th percentile band the meter averages.
 //!
+//! Comets (Task C6, rows 20–21): each listed comet's coma is C1's drawn Haser profile
+//! (`uni_planet::comet::coma::coma_drawn_brightness` with `coma_intensity_cd`, softened over a
+//! pixel at the nucleus), added to the pixel's world light; the tails (0.5× and 0.2× the coma's
+//! light, spread along them) and the km-sized nucleus are left out.
+//!
 //! Points (unresolved bodies) are sky light at star exposure and are not metered.
 //!
 //! The luminances go through B6's CPU meter (`Histogram::from_luminances(...).meter`,
@@ -191,6 +196,29 @@ pub struct HazeRay {
 /// The luminance [cd/m²] of world light along unit `dir` from the camera (0 for sky). With
 /// `venus`, Venus is drawn with B3's haze ([`VenusAtmo::luminance`]); without, as a bare
 /// Lambert deck with ρ from p_V (the plan's row).
+/// The comae of `snap.comets` along the ray `dir` [cd/m²] (module docs): at the ray's
+/// perpendicular distance from each nucleus in front of the camera, with one pixel
+/// (`pixel_angle` [rad] across) of softening at the nucleus's distance.
+pub fn coma_luminance(snap: &Snapshot, dir: DVec3, pixel_angle: f64) -> f64 {
+    snap.comets
+        .iter()
+        .filter(|c| c.nucleus_rel_m.dot(dir) > 0.0)
+        .map(|c| {
+            let d = c.nucleus_rel_m.length();
+            let rho = c.nucleus_rel_m.cross(dir).length();
+            // The radius of a disk with one pixel's area at the nucleus (C1's softening).
+            let a = d * pixel_angle / std::f64::consts::PI.sqrt();
+            uni_planet::comet::coma::coma_drawn_brightness(
+                rho,
+                uni_planet::comet::coma::coma_intensity_cd(c),
+                uni_planet::comet::coma::coma_scale_m(c.r_au),
+                a,
+            )
+        })
+        .filter(|l| l.is_finite())
+        .sum()
+}
+
 pub fn world_luminance(
     snap: &Snapshot,
     dir: DVec3,
@@ -361,7 +389,9 @@ pub fn on_paper_model(
     for y in (0..size.y).step_by(STRIDE as usize) {
         for x in (0..size.x).step_by(STRIDE as usize) {
             let p = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
-            let l = world_luminance(&snap, cam.ray(p), rings, earth_k, venus);
+            let ray = cam.ray(p);
+            let l = world_luminance(&snap, ray, rings, earth_k, venus)
+                + coma_luminance(&snap, ray, cam.pixel_angle());
             if l > 0.0 {
                 for _ in 0..w {
                     lums.push(l as f32);

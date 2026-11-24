@@ -17,6 +17,15 @@
 //!   bookmarks" names them (see [`measure`]); `limbs` (lead ruling "row 13 Venus haze"): the
 //!   light across a limb, pixel by pixel with its CPU twin, for B8's `limb` check.
 //!
+//! - Wave C (Task C6): `metrics.comets_cpu_ms` and `asteroids_cpu_ms` (the passes' `prepare`),
+//!   `asteroid_counts` (real, procedural submitted), `overlay_orbits` (the overlay's orbit lines,
+//!   dashed ones and exoplanet dots), and with the belt highlight `belt_radial_hist` (every drawn
+//!   asteroid's heliocentric distance projected on the ecliptic, its semi-major axis, and the
+//!   Trojans' λ − λ_J, from the CPU positions); the features `ion_tail` (`comet-neowise-2020`)
+//!   and `coma` (`comet-halley-1986`); the regions `belt_annulus`, `belt_outer`
+//!   (`asteroid-belt-above`) and `lens_rect_inner_edge`, `lens_rect_outer_edge`
+//!   (`bh-lens-seam`, lead ruling "row 19 seam").
+//!
 //! Pixel coordinates are framebuffer pixels (x right, y down, pixel k spanning [k, k + 1]),
 //! the convention of `uni_sim::snapshot` and B8.
 
@@ -129,6 +138,44 @@ pub struct EarthFlux {
     pub gap_mag: f64,
 }
 
+/// `metrics.belt_radial_hist` (plan row 22): every asteroid the asteroid pass draws (the real
+/// records and the procedural belt) and the registry asteroids drawn as points, from their CPU
+/// positions at the frame's epoch.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BeltHist {
+    /// Bin width of `counts` and `a_counts` [AU]; bin k is [k·bin, (k + 1)·bin).
+    pub bin_au: f64,
+    /// Heliocentric distance projected on the J2000 ecliptic (the image plane of the view from
+    /// above), 0–6 AU. The Kirkwood gaps are in a, so eccentricities blur them here.
+    pub counts: Vec<u32>,
+    /// Semi-major axis, 0–6 AU.
+    pub a_counts: Vec<u32>,
+    /// Bin width of `trojan_counts` [deg]; bin k is [−180° + k·bin, …).
+    pub bin_deg: f64,
+    /// λ − λ_J (ecliptic longitude minus Jupiter's mean longitude) of the objects at a
+    /// projected 4.8–5.6 AU: the L4 (+60°) and L5 (−60°) clouds.
+    pub trojan_counts: Vec<u32>,
+    /// The Kirkwood 3:1 dip at 2.50 AU: the count per AU in [2.48, 2.52) over that in
+    /// [2.38, 2.46) ∪ [2.54, 2.62), by a and by projected r.
+    pub kirkwood_dip_a: f64,
+    pub kirkwood_dip_r: f64,
+    /// The mean λ − λ_J count within ±15° of +60° (L4) and of −60° (L5) over the mean at
+    /// |λ − λ_J| ≥ 150°.
+    pub l4_over_bg: f64,
+    pub l5_over_bg: f64,
+}
+
+/// `metrics.overlay_orbits`: the overlay's orbit polylines (C5).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct OverlayCounts {
+    /// Lines of two or more points.
+    pub lines: u32,
+    /// Of them, the dashed ones (assumed orientation: every M1 exoplanet orbit).
+    pub dashed: u32,
+    /// One-point lines (exoplanet positions drawn as dots).
+    pub dots: u32,
+}
+
 /// `metrics`.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct Metrics {
@@ -138,6 +185,15 @@ pub struct Metrics {
     pub snapshot_cpu_ms: f32,
     pub comets_cpu_ms: Option<f32>,
     pub comets_settle_ms: f32,
+    /// The asteroid pass's `prepare` in the captured frame [ms] (C2's `cpu_ms`).
+    pub asteroids_cpu_ms: Option<f32>,
+    /// (real, procedural) asteroids the asteroid pass submitted (C2's `counts`).
+    pub asteroid_counts: Option<[u32; 2]>,
+    /// With the belt highlight: the belt's histograms from the CPU positions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belt_radial_hist: Option<BeltHist>,
+    /// The overlay's orbit lines (C5).
+    pub overlay_orbits: Option<OverlayCounts>,
     pub lit_px: Option<u32>,
     pub earth_flux: Option<EarthFlux>,
     /// The view's "Exposure on paper" with the CPU twins (`crate::paper`): the EV and lit
@@ -174,6 +230,14 @@ pub struct Input<'a> {
     /// The map index and directory, for the map samples' CPU twin.
     pub maps: &'a [uni_data::MapInfo],
     pub map_dir: &'a std::path::Path,
+    /// The procedural belt the asteroid pass draws (for `belt_radial_hist`).
+    pub belt: Option<&'a uni_sky::BeltModel>,
+    /// The overlay built for the frame (for `overlay_orbits`).
+    pub overlay: Option<&'a uni_ui::Overlay>,
+    /// The comet and asteroid passes' CPU times and the asteroid counts of the captured frame.
+    pub comets_cpu_ms: Option<f32>,
+    pub asteroids_cpu_ms: Option<f32>,
+    pub asteroid_counts: Option<(u32, u32)>,
 }
 
 /// The capture camera: projection to framebuffer pixels and back.
@@ -397,6 +461,40 @@ pub fn measure(input: &Input<'_>) -> Measurements {
                 for (k, v) in r {
                     add(k, v);
                 }
+            }
+        }
+        "asteroid-belt-above" => {
+            if let Some(sun) = &snap.sun {
+                let (annulus, outer) = belt_regions(&cam, sun.rel_pos_m);
+                add("belt_annulus", annulus);
+                add("belt_outer", outer);
+            }
+        }
+        "bh-lens-seam" => {
+            if let Some(lens) = frame.ctx.lenses.first()
+                && let Some(rect) = lens_rect(&cam, lens)
+            {
+                let (inner, outer) = lens_rect_edges(&cam, rect);
+                add("lens_rect_inner_edge", inner);
+                add("lens_rect_outer_edge", outer);
+            }
+        }
+        _ => {}
+    }
+    match input.name {
+        "comet-neowise-2020" => {
+            if let Some((name, f)) =
+                comet_feature(world, snap, &cam, NEOWISE, CometFeature::IonTail)
+            {
+                m.features.insert(name, f);
+            }
+            if let Some(p) = horizons_projected(&cam, NEOWISE_SPOT, frame.ctx.epoch) {
+                m.projected.push(p);
+            }
+        }
+        "comet-halley-1986" => {
+            if let Some((name, f)) = comet_feature(world, snap, &cam, HALLEY, CometFeature::Coma) {
+                m.features.insert(name, f);
             }
         }
         _ => {}
@@ -656,8 +754,15 @@ fn metrics(input: &Input<'_>, cam: &Cam) -> Metrics {
         sun_v_mag_from_camera: uni_core::M_V_SUN + 5.0 * (sun_d / (10.0 * PC)).log10(),
         band_gc_over_anticentre: ratio,
         snapshot_cpu_ms: frame.snapshot_cpu_ms,
-        comets_cpu_ms: None,
+        comets_cpu_ms: input.comets_cpu_ms,
         comets_settle_ms: input.comets_settle_ms,
+        asteroids_cpu_ms: input.asteroids_cpu_ms,
+        asteroid_counts: input.asteroid_counts.map(|(r, p)| [r, p]),
+        belt_radial_hist: input
+            .belt
+            .filter(|_| frame.ui.highlight_belt)
+            .map(|b| belt_hist(world, b, frame)),
+        overlay_orbits: input.overlay.map(overlay_counts),
         lit_px: input.world_hdr.map(|img| lit_px(img, input.ev100)),
         earth_flux: input
             .world_hdr
@@ -669,6 +774,356 @@ fn metrics(input: &Input<'_>, cam: &Cam) -> Metrics {
             input.rings,
         )),
     }
+}
+
+/// The overlay's orbit lines by kind ([`OverlayCounts`]).
+pub fn overlay_counts(o: &uni_ui::Overlay) -> OverlayCounts {
+    let n =
+        |f: &dyn Fn(&uni_ui::OrbitLine) -> bool| o.orbits.iter().filter(|l| f(l)).count() as u32;
+    OverlayCounts {
+        lines: n(&|l| l.pts.len() >= 2),
+        dashed: n(&|l| l.pts.len() >= 2 && l.dashed),
+        dots: n(&|l| l.pts.len() == 1),
+    }
+}
+
+/// Histogram bin width of `belt_radial_hist` [AU].
+const BELT_BIN_AU: f64 = 0.02;
+/// The histograms reach this far [AU].
+const BELT_HIST_AU: f64 = 6.0;
+/// Bin width of the Trojans' λ − λ_J histogram [deg].
+const TROJAN_BIN_DEG: f64 = 5.0;
+
+/// `metrics.belt_radial_hist` from the CPU positions at the frame's epoch: the real records
+/// (`uni_physics::smallbody` two-body from each record's own epoch, as the asteroid pass and the
+/// registry propagate them) and the procedural belt (`BeltObject::heliocentric_icrs_m`).
+pub fn belt_hist(world: &World, belt: &uni_sky::BeltModel, frame: &Frame) -> BeltHist {
+    let t = frame.ctx.epoch;
+    let nbins = (BELT_HIST_AU / BELT_BIN_AU).round() as usize;
+    let nlon = (360.0 / TROJAN_BIN_DEG).round() as usize;
+    let (mut counts, mut a_counts, mut trojans) =
+        (vec![0_u32; nbins], vec![0_u32; nbins], vec![0_u32; nlon]);
+    let lambda_j = uni_sky::belt::jupiter_mean_longitude_rad(t);
+    let to_ecl = |p: DVec3| {
+        // ICRS → J2000 ecliptic: the rotation about +x by −ε (inverse of
+        // `ecliptic_j2000_to_icrs`).
+        let (s, c) = uni_physics::frames::OBLIQUITY_J2000_RAD.sin_cos();
+        DVec3::new(p.x, c * p.y + s * p.z, -s * p.y + c * p.z)
+    };
+    let mut add = |p_icrs: DVec3, a_au: f64| {
+        let e = to_ecl(p_icrs) / uni_core::AU;
+        let r = e.truncate().length();
+        if let Some(c) = counts.get_mut((r / BELT_BIN_AU) as usize) {
+            *c += 1;
+        }
+        if a_au >= 0.0
+            && let Some(c) = a_counts.get_mut((a_au / BELT_BIN_AU) as usize)
+        {
+            *c += 1;
+        }
+        if (4.8..5.6).contains(&r) {
+            let dl = (e.y.atan2(e.x) - lambda_j + std::f64::consts::PI)
+                .rem_euclid(std::f64::consts::TAU);
+            let k = ((dl.to_degrees() / TROJAN_BIN_DEG) as usize).min(nlon - 1);
+            trojans[k] += 1;
+        }
+    };
+    for rec in world.sim.asteroid_records() {
+        if !(rec.e < 1.0 && rec.a_au > 0.0) {
+            continue;
+        }
+        let conic = uni_physics::smallbody::conic_from_mean_anomaly(
+            rec.a_au,
+            rec.e,
+            rec.i_deg,
+            rec.node_deg,
+            rec.argp_deg,
+            rec.m0_deg,
+            rec.epoch_jd_tdb,
+        );
+        let (p, _) = uni_physics::smallbody::heliocentric_state_icrs(&conic, t);
+        if p.is_finite() {
+            add(p, rec.a_au);
+        }
+    }
+    for o in belt.objects() {
+        add(o.heliocentric_icrs_m(t), o.a_au);
+    }
+    let per_au = |c: &[u32], lo: f64, hi: f64| {
+        let (i, j) = (
+            (lo / BELT_BIN_AU).round() as usize,
+            (hi / BELT_BIN_AU).round() as usize,
+        );
+        f64::from(c[i..j].iter().sum::<u32>()) / (hi - lo)
+    };
+    let dip = |c: &[u32]| {
+        let side = (per_au(c, 2.38, 2.46) * 0.08 + per_au(c, 2.54, 2.62) * 0.08) / 0.16;
+        per_au(c, 2.48, 2.52) / side
+    };
+    let mean_lon = |lo: f64, hi: f64| {
+        let (i, j) = (
+            ((lo + 180.0) / TROJAN_BIN_DEG).round() as usize,
+            ((hi + 180.0) / TROJAN_BIN_DEG).round() as usize,
+        );
+        f64::from(trojans[i..j].iter().sum::<u32>()) / (j - i) as f64
+    };
+    let bg = 0.5 * (mean_lon(-180.0, -150.0) + mean_lon(150.0, 180.0));
+    BeltHist {
+        bin_au: BELT_BIN_AU,
+        kirkwood_dip_a: dip(&a_counts),
+        kirkwood_dip_r: dip(&counts),
+        l4_over_bg: mean_lon(45.0, 75.0) / bg,
+        l5_over_bg: mean_lon(-75.0, -45.0) / bg,
+        counts,
+        a_counts,
+        bin_deg: TROJAN_BIN_DEG,
+        trojan_counts: trojans,
+    }
+}
+
+/// Row 22's regions around the Sun at `sun_rel` [m from the camera] (plan: `belt_annulus`
+/// 2.1–3.3 AU, `belt_outer` 3.6–4.6 AU from the Sun, rectilinear from 6 AU above the ecliptic:
+/// 128.5 px/AU at fov 70°): every on-screen pixel whose ray meets the plane through the Sun
+/// perpendicular to the view axis within those distances of the Sun, thinned to
+/// [`MAX_REGION_SAMPLES`] (the outer ring is partly off screen: only on-screen pixels).
+pub fn belt_regions(cam: &Cam, sun_rel: DVec3) -> (Vec<DVec2>, Vec<DVec2>) {
+    let au = uni_core::AU;
+    let fwd = cam.forward();
+    let depth = sun_rel.dot(fwd);
+    let (mut annulus, mut outer) = (Vec::new(), Vec::new());
+    if !(depth > 0.0) {
+        return (annulus, outer);
+    }
+    for p in cam.pixels() {
+        let ray = cam.ray(p);
+        let along = ray.dot(fwd);
+        if !(along > 0.0) {
+            continue;
+        }
+        let hit = ray * (depth / along);
+        let r = (hit - sun_rel).length() / au;
+        if (2.1..3.3).contains(&r) {
+            annulus.push(p);
+        } else if (3.6..4.6).contains(&r) {
+            outer.push(p);
+        }
+    }
+    (annulus, outer)
+}
+
+/// The lens pass's traced rectangle for `lens` seen by `cam` at its size, [min, max) in pixels:
+/// uni-rel's plan (`tracer.rs`, `frame_params` and `cone_rect`, which are private there),
+/// reproduced: the cone around the hole's direction inside which the weak-field deflection
+/// 4M/b (Einstein 1915) is at least half a pixel, b_max = 8M/pixel angle, seen at
+/// sin δ = b_max·√(1 − 2/r)/r by a static camera at r [M] (CLAUDE.md §6); its bounding box
+/// padded by one pixel and clamped to the screen. `None` when the lens is not traced (inside the
+/// horizon, beyond `uni_rel::TRACE_REACH`, or covering nothing).
+pub fn lens_rect(cam: &Cam, lens: &uni_gfx::LensView) -> Option<(DVec2, DVec2)> {
+    let m = uni_core::gravitational_radius(lens.mass_kg);
+    let r = lens.rel_pos_m.length() / m;
+    if !(r > uni_rel::binet::CAPTURE_RADIUS && r <= uni_rel::TRACE_REACH) {
+        return None;
+    }
+    let proj_y = 1.0 / cam.tan_half_y;
+    let proj_x = proj_y / cam.aspect;
+    let pixel_angle = 2.0 / (proj_y * cam.size.y);
+    let s = 8.0 / pixel_angle * (1.0 - 2.0 / r).sqrt() / r;
+    if s >= 1.0 {
+        return Some((DVec2::ZERO, cam.size));
+    }
+    let theta = s.asin();
+    let axis = cam.to_cam * lens.rel_pos_m.normalize();
+    let radius = theta.sin();
+    let ahead = -axis.z;
+    if ahead <= radius {
+        return None;
+    }
+    let slopes = |c: f64| {
+        let centre = c.atan2(ahead);
+        let half = (radius / c.hypot(ahead)).asin();
+        ((centre - half).tan(), (centre + half).tan())
+    };
+    let (x_lo, x_hi) = slopes(axis.x);
+    let (y_lo, y_hi) = slopes(axis.y);
+    let (w, h) = (cam.size.x, cam.size.y);
+    let left = (((x_lo * proj_x + 1.0) * 0.5 * w).floor() - 1.0).clamp(0.0, w);
+    let right = (((x_hi * proj_x + 1.0) * 0.5 * w).ceil() + 1.0).clamp(0.0, w);
+    let top = (((1.0 - y_hi * proj_y) * 0.5 * h).floor() - 1.0).clamp(0.0, h);
+    let bottom = (((1.0 - y_lo * proj_y) * 0.5 * h).ceil() + 1.0).clamp(0.0, h);
+    (right > left && bottom > top).then(|| (DVec2::new(left, top), DVec2::new(right, bottom)))
+}
+
+/// Pixels just inside and just outside the edges of the lens rectangle `rect` that lie inside
+/// the frame: strips from [`SEAM_GAP_PX`] to [`SEAM_GAP_PX`] + [`SEAM_STRIP_PX`] from each edge
+/// that is not the frame's own (lead ruling "row 19 seam": the lensed band inside against the
+/// band pass's outside, 1 ± 0.1).
+pub fn lens_rect_edges(cam: &Cam, rect: (DVec2, DVec2)) -> (Vec<DVec2>, Vec<DVec2>) {
+    let (lo, hi) = rect;
+    let (mut inner, mut outer) = (Vec::new(), Vec::new());
+    let band = |d: f64| (SEAM_GAP_PX..SEAM_GAP_PX + SEAM_STRIP_PX).contains(&d);
+    for p in cam.pixels() {
+        let inside = p.x >= lo.x && p.x < hi.x && p.y >= lo.y && p.y < hi.y;
+        // Distance to each edge that is inside the frame (not on its border).
+        let mut ds = Vec::with_capacity(4);
+        if lo.x > 0.0 {
+            ds.push((p.x - lo.x).abs());
+        }
+        if hi.x < cam.size.x {
+            ds.push((p.x - hi.x).abs());
+        }
+        if lo.y > 0.0 {
+            ds.push((p.y - lo.y).abs());
+        }
+        if hi.y < cam.size.y {
+            ds.push((p.y - hi.y).abs());
+        }
+        let near_edge = ds.iter().copied().fold(f64::INFINITY, f64::min);
+        if !band(near_edge) {
+            continue;
+        }
+        if inside {
+            inner.push(p);
+        } else {
+            outer.push(p);
+        }
+    }
+    (inner, outer)
+}
+
+/// The seam strips start this far from the lens rectangle's edge [px] (its one-pixel padding
+/// and the bilinear footprint at the edge stay out).
+pub const SEAM_GAP_PX: f64 = 3.0;
+/// The seam strips' width [px].
+pub const SEAM_STRIP_PX: f64 = 8.0;
+
+/// Registry name of C/2020 F3 (NEOWISE) (SBDB's).
+const NEOWISE: &str = "C/2020 F3 (NEOWISE)";
+/// Its Horizons spot's target in `data/golden/sky_spots.ron`.
+const NEOWISE_SPOT: &str = "C/2020 F3";
+/// Registry name of 1P/Halley (SBDB's).
+const HALLEY: &str = "1P/Halley";
+
+/// Which comet feature [`comet_feature`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CometFeature {
+    /// `ion_tail`: the projected direction of `uni_planet`'s `ion_tail_dir` (row 20).
+    IonTail,
+    /// `coma`: the Haser profile's log–log slope over 8–40 px (row 21).
+    Coma,
+}
+
+/// Inner radius of the `ion_tail` annulus [px]: past the coma and the nucleus's glare.
+const ION_ANNULUS_MIN_PX: f64 = 12.0;
+/// Outer radius of the `ion_tail` annulus [px], at most the nucleus's distance to the frame's
+/// edge (so a uniform background cancels in the direction sum).
+const ION_ANNULUS_MAX_PX: f64 = 400.0;
+/// Row 21's fit range [px] (plan).
+const COMA_FIT_PX: (f64, f64) = (8.0, 40.0);
+
+/// The feature of comet `name` in `snap.comets` (module docs), named as the plan's check reads
+/// it.
+fn comet_feature(
+    world: &World,
+    snap: &Snapshot,
+    cam: &Cam,
+    name: &str,
+    which: CometFeature,
+) -> Option<(String, Feature)> {
+    let id = world.sim.find(name)?;
+    let c = snap.comets.iter().find(|c| c.id == id)?;
+    let centre = cam.project(c.nucleus_rel_m)?;
+    match which {
+        CometFeature::IonTail => {
+            let dir = uni_planet::comet::tails::ion_tail_dir(c.sun_rel_m, c.helio_vel_mps);
+            let step = 1e-3 * c.nucleus_rel_m.length();
+            let tip = cam.project(c.nucleus_rel_m + dir * step)?;
+            let d = tip - centre;
+            // Image y points down; angles are counter-clockwise from +x with y up (B8).
+            let angle_deg = (-d.y).atan2(d.x).to_degrees();
+            let to_edge = centre
+                .x
+                .min(cam.size.x - centre.x)
+                .min(centre.y)
+                .min(cam.size.y - centre.y);
+            Some((
+                "ion_tail".to_owned(),
+                Feature {
+                    x: centre.x,
+                    y: centre.y,
+                    r_min: ION_ANNULUS_MIN_PX,
+                    r_max: ION_ANNULUS_MAX_PX.min(to_edge),
+                    angle_deg: Some(angle_deg),
+                    expected_slope: None,
+                },
+            ))
+        }
+        CometFeature::Coma => {
+            let scale = uni_planet::comet::coma::coma_scale_m(c.r_au);
+            // Metres per pixel at the nucleus (small angle at its distance).
+            let m_per_px = c.nucleus_rel_m.length() * cam.pixel_angle();
+            let (lo, hi) = COMA_FIT_PX;
+            // The model's least-squares slope over the same 1-px annuli B8's `profile` fits:
+            // d ln S/d ln ρ = −1 − ρ/ℓ for the Haser profile S ∝ e^(−ρ/ℓ)/ρ (Haser 1957),
+            // averaged as the fit averages it.
+            let pts: Vec<(f64, f64)> = (0..(hi - lo) as usize)
+                .map(|k| {
+                    let rho_px = lo + k as f64 + 0.5;
+                    let s = uni_planet::comet::coma::coma_surface_brightness(
+                        rho_px * m_per_px,
+                        1.0,
+                        scale,
+                    );
+                    (rho_px.ln(), s.ln())
+                })
+                .collect();
+            let slope = ols_slope(&pts);
+            Some((
+                "coma".to_owned(),
+                Feature {
+                    x: centre.x,
+                    y: centre.y,
+                    r_min: lo,
+                    r_max: hi,
+                    angle_deg: None,
+                    expected_slope: Some(slope),
+                },
+            ))
+        }
+    }
+}
+
+/// Ordinary least-squares slope of `pts` (x, y).
+fn ols_slope(pts: &[(f64, f64)]) -> f64 {
+    let n = pts.len() as f64;
+    let (mx, my) = (
+        pts.iter().map(|p| p.0).sum::<f64>() / n,
+        pts.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let sxy: f64 = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum();
+    let sxx: f64 = pts.iter().map(|p| (p.0 - mx).powi(2)).sum();
+    sxy / sxx
+}
+
+/// A `projected` entry "<target> Horizons" at the Horizons geocentric RA/Dec of `target`
+/// (`data/golden/sky_spots.ron`, observer the geocentre) at `epoch` (within a minute), as seen
+/// in `cam`'s direction (the camera's 7 000 km offset from the geocentre is a parallax of
+/// 0.2 px at row 20; plan "points: nucleus at the Horizons RA/Dec projected").
+fn horizons_projected(cam: &Cam, target: &str, epoch: uni_core::Epoch) -> Option<Projected> {
+    let path = uni_data::data_dir().join("golden/sky_spots.ron");
+    let spots = uni_data::load_sky_spots(&path).ok()?;
+    // JD (UTC) of the Unix epoch 1970-01-01T00:00Z is 2 440 587.5 (by definition of both).
+    let jd_utc = epoch.to_unix_utc() / 86_400.0 + 2_440_587.5;
+    let spot = spots.iter().find(|s| {
+        s.target == target && s.observer == 399 && (s.jd_utc - jd_utc).abs() < 1.0 / 1440.0
+    })?;
+    let dir = uni_core::radec_to_icrs(spot.ra_deg.to_radians(), spot.dec_deg.to_radians());
+    let p = cam.project(dir)?;
+    Some(Projected {
+        name: format!("{target} Horizons"),
+        x: p.x,
+        y: p.y,
+        radius_px: 0.0,
+    })
 }
 
 /// Pixels of world light at or above the meter's threshold in the world tap: luminance ÷

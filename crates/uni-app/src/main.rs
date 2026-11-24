@@ -27,7 +27,8 @@ use crate::capture::{CaptureArgs, CaptureError, DEFAULT_FRAMES, DEFAULT_SIZE};
 
 const USAGE: &str = "\
 usage:
-  universe                         open the window at bookmark \"start\" of bookmarks/m1.ron
+  universe [--start <name>]        open the window at bookmark <name> (default \"start\") of
+                                   bookmarks/m1.ron
   universe --capture <bookmarks.ron> --out <dir> [--size 1920x1080] [--frames 4] [--hud] [--hdr]
                                    render each bookmark headless to <dir>/<name>.png + .json
                                    (--hdr: also <name>.hdr.bin, the pre-bloom HDR target)
@@ -47,7 +48,8 @@ const EXIT_FAILURE: u8 = 1;
 /// What the command line asks for.
 #[derive(Debug, PartialEq)]
 enum Command {
-    Window,
+    /// The window, at the named bookmark of `bookmarks/m1.ron` (`None`: "start").
+    Window(Option<String>),
     Capture(CaptureArgs),
     Bench(BenchArgs),
     Selftest,
@@ -77,7 +79,7 @@ fn main() -> ExitCode {
         }
         Command::Capture(args) => headless_exit("--capture", capture::run(&args)),
         Command::Bench(args) => headless_exit("--bench", bench::run(&args)),
-        Command::Window => match app::run() {
+        Command::Window(start) => match app::run(start.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("universe: {e:#}");
@@ -145,9 +147,16 @@ fn take_sky(args: impl IntoIterator<Item = String>) -> Result<(bool, Vec<String>
 fn parse_command(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let Some(first) = args.next() else {
-        return Ok(Command::Window);
+        return Ok(Command::Window(None));
     };
     match first.as_str() {
+        "--start" => {
+            let name = args.next().ok_or("--start needs a bookmark name")?;
+            match args.next() {
+                None => Ok(Command::Window(Some(name))),
+                Some(extra) => Err(format!("--start takes one bookmark name (got {extra:?})")),
+            }
+        }
         "-h" | "--help" => Ok(Command::Help),
         "--selftest" => match args.next() {
             None => Ok(Command::Selftest),
@@ -273,7 +282,13 @@ mod tests {
 
     #[test]
     fn no_arguments_opens_the_window() {
-        assert_eq!(parse(&[]), Ok(Command::Window));
+        assert_eq!(parse(&[]), Ok(Command::Window(None)));
+        assert_eq!(
+            parse(&["--start", "saturn-ring-plane"]),
+            Ok(Command::Window(Some("saturn-ring-plane".to_owned())))
+        );
+        assert!(parse(&["--start"]).is_err());
+        assert!(parse(&["--start", "a", "b"]).is_err());
         assert_eq!(parse(&["--selftest"]), Ok(Command::Selftest));
         assert_eq!(parse(&["--help"]), Ok(Command::Help));
     }
@@ -339,7 +354,7 @@ mod tests {
     /// B9: `--sky v1` stays accepted as a no-op alias anywhere on the line.
     #[test]
     fn sky_v1_is_a_no_op_alias() {
-        assert_eq!(parse(&["--sky", "v1"]), Ok(Command::Window));
+        assert_eq!(parse(&["--sky", "v1"]), Ok(Command::Window(None)));
         let plain = parse(&["--capture", "b.ron", "--out", "o"]);
         for line in [
             &["--capture", "b.ron", "--out", "o", "--sky", "v1"][..],

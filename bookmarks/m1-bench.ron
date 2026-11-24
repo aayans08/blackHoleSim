@@ -1,6 +1,6 @@
 #![enable(implicit_some)]
-// M1 bench bookmarks (plan: the Wave B gate's subset of bookmarks/m1.ron, copied unchanged;
-// Wave C adds comet-neowise-2020 and asteroid-belt-above). `universe --bench
+// M1 bench bookmarks (plan: the Wave B gate's subset of bookmarks/m1.ron, plus Wave C's
+// comet-neowise-2020 and asteroid-belt-above, copied unchanged). `universe --bench
 // bookmarks/m1-bench.ron --sustained 60 --json <out>`.
 [
     // #1 Earth from 60 000 km (99.9 px), phase 60°, north up; the Moon in frame and clear of the disk (margin 222 px). Window start.
@@ -100,5 +100,32 @@
         ),
         epoch_utc: "2026-11-20T00:00:00Z",
         anchor: "Sun",
+    ),
+    // #20 C/2020 F3 (NEOWISE) on 2020-07-15 03:00 UTC from 7 000 km sunward of Earth's centre (629 km up, outside the atmosphere), fov 20°, north up; the Sun 25.3° off-axis, the comet 0.784 AU away.
+    (
+        name: "comet-neowise-2020",
+        view: (
+            pos: (cell: (0, 0, 0), local: (-2714592.3758001477, 5919910.380131602, 2566251.999406492)),
+            orient: (0.0, 0.0, 0.0, 1.0),
+            fov_y_rad: 0.3490658503988659, // 20°
+        ),
+        epoch_utc: "2020-07-15T03:00:00Z",
+        anchor: "Earth",
+        look_at: "C/2020 F3 (NEOWISE)",
+        up: (0.0, 0.0, 1.0),
+    ),
+    // #22 6 AU above the ecliptic over the Sun, looking down at it, fov 70° (128.5 px/AU at the Sun), the vernal equinox up; "Highlight asteroid belt" on (amber label).
+    (
+        name: "asteroid-belt-above",
+        view: (
+            pos: (cell: (0, 0, 0), local: (0.0, -357039693243.0969, 823520177345.969)),
+            orient: (0.0, 0.0, 0.0, 1.0),
+            fov_y_rad: 1.2217304763960306, // 70°
+        ),
+        epoch_utc: "2026-11-20T00:00:00Z",
+        anchor: "Sun",
+        look_at: "Sun",
+        up: (1.0, 0.0, 0.0),
+        highlight_belt: true,
     ),
 ]

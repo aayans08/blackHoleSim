@@ -6,18 +6,25 @@
 //! window's aspect ([`internal_size`]); the tonemap upscales it to the swapchain and the HUD
 //! draws at full resolution on top (review I6).
 //!
-//! Each frame (B9 Step 1): the camera moves (relative to its anchor body); the world notes any
-//! unnamed star the camera is now within 0.1 pc of and ticks (time, comet catch-up, and the
-//! star's registration, so the snapshot draws it with its id: A4 parked item); the camera
-//! follows its anchor to the new epoch (`FlyCamera::sync`) and joins the dominant frame
-//! (`reanchor` to `World::dominant_frame`, A6); then the scene takes the snapshot, sets every
-//! shared input and renders.
+//! Each frame (B9 Step 1, Task C6 with the navigator; uni-nav `nav` module docs, "the app's
+//! frame"): a click picks with the last snapshot (`Navigator::pick`; the cursor scaled from the
+//! window to the internal resolution); the navigator moves the camera in free flight, cruise or
+//! a goto (`Navigator::update`, with the last snapshot's destinations for the aim ring); the time
+//! keys (P, `.`, `,`); any Esc the navigator left closes the card, else the notes list, else
+//! deselects (the cancel chain: aim → goto → card → notes → selection); the selection and the
+//! goto target go to the world; the world notes any unnamed star the camera is now within 0.1 pc
+//! of and ticks with the same dt the navigator used (a goto predicts that tick); the camera
+//! follows its anchor (`FlyCamera::sync`) and joins the dominant frame, or during a goto the
+//! navigator's anchor (none for a frameless target: it keeps its own); then the scene takes the
+//! snapshot, sets every shared input and renders, and the HUD draws the overlay (markers, the
+//! target bracket, orbits) and the panels, whose buttons act after the draw.
 //!
-//! Tab hides the HUD, F1 shows the controls list, F12 saves the current view as an anchored
-//! Bookmark v2 (A6 ruling I2: the offset from the anchor body, so a reload lands where the
-//! camera was relative to the body), and Esc quits. GPU errors are logged and shown on the HUD
-//! instead of aborting the app. Without AT-HYG the window falls back to the BSC5 stars with a
-//! HUD notice.
+//! Tab hides the HUD, F1 shows the controls list, I opens the card, T the time-warp buttons,
+//! F12 saves the current view as an anchored Bookmark v2 (A6 ruling I2: the offset from the
+//! anchor body, so a reload lands where the camera was relative to the body). The window closes
+//! on Cmd+Q or its close button (Esc is the cancel chain now). GPU errors are logged and shown on
+//! the HUD instead of aborting the app. Without AT-HYG the window falls back to the BSC5 stars
+//! with a HUD notice.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,22 +34,27 @@ use anyhow::Context as _;
 use glam::{DQuat, DVec3, UVec2};
 use uni_core::{CameraView, Epoch, UniversePos};
 use uni_gfx::GpuContext;
-use uni_nav::{Action, Bookmark, ExposureChoice, FlyCamera, InputState, LensEnvChoice};
+use uni_nav::{
+    Action, Bookmark, ExposureChoice, FlightMode, FlyCamera, InputState, LensEnvChoice, NavStatus,
+    Navigator,
+};
 use uni_post::ExposureMode;
 use uni_rel::LensEnv;
-use uni_ui::{Hud, HudControls};
+use uni_sim::snapshot::Snapshot;
+use uni_ui::{CardAction, Hud, HudControls, HudOutput};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
 
 use crate::scene::{
-    INTERACTIVE_LENS_SCALE, Perf, Scene, StarCatalog, ViewChoices, apply_bookmark,
-    default_controls, hud_data, internal_size,
+    HudExtras, INTERACTIVE_LENS_SCALE, OVERLAY_SETTINGS, Perf, Scene, StarCatalog, UiState,
+    ViewChoices, absolute_view, apply_bookmark, default_controls, flight_label, hud_data,
+    internal_size, nav_hud,
 };
 use crate::world::{self, Assets, World, baked_dir, bsc5_path, iso_utc, m1_bookmarks_path};
 
@@ -59,14 +71,18 @@ const FALLBACK_FOV_Y_RAD: f64 = std::f64::consts::FRAC_PI_3;
 const FLASH_DURATION: Duration = Duration::from_secs(5);
 /// Weight of the newest frame in the smoothed FPS readout.
 const FPS_SMOOTHING: f32 = 0.1;
+/// How often the window logs its frame rate at `info` level (the HUD's perf line, for runs read
+/// from the terminal: `RUST_LOG=info`).
+const FPS_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// Longest frame time the camera moves by [s]. After a stall (a minimised window, a debugger)
 /// a held key moves the camera one short step instead of speed × the stall.
 const MAX_CAMERA_DT_S: f64 = 0.1;
 /// GPU error lines kept on the HUD (the most recent ones; review m6).
 const MAX_GPU_ERROR_NOTICES: usize = 3;
 
-/// Opens the window and runs until it is closed.
-pub fn run() -> anyhow::Result<()> {
+/// Opens the window at bookmark `start` of `bookmarks/m1.ron` ([`START_BOOKMARK`] when `None`)
+/// and runs until it is closed.
+pub fn run(start: Option<&str>) -> anyhow::Result<()> {
     let start_epoch = Epoch::parse_iso_utc(START_EPOCH_UTC).context("internal: start epoch")?;
     let (mut world, assets) = world::load(&baked_dir(), start_epoch);
     let mut notices = assets.warnings.clone();
@@ -83,7 +99,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
     let (camera, choice) = start_view(
         &m1_bookmarks_path(),
-        START_BOOKMARK,
+        start.unwrap_or(START_BOOKMARK),
         &mut world,
         &mut controls,
         &mut notices,
@@ -105,13 +121,18 @@ pub fn run() -> anyhow::Result<()> {
         world,
         controls,
         camera,
+        nav: Navigator::new(),
+        last_snap: Snapshot::default(),
         input: InputState::new(),
+        modifiers: ModifiersState::empty(),
+        last_nav: None,
         gfx: None,
         error: None,
         gpu_errors: Vec::new(),
         frame_index: 0,
         last_frame: None,
         fps: 0.0,
+        last_fps_log: None,
         cpu_ms: 0.0,
         cursor_grabbed: false,
     };
@@ -137,7 +158,13 @@ fn start_view(
             .find(|b| b.name == name)
             .with_context(|| format!("no bookmark {name:?} in {}", path.display()))
     });
-    match start.and_then(|b| apply_bookmark(&b, world, controls)) {
+    // As a capture: the comets settled at the bookmark's epoch before it is resolved (a no-op
+    // at the baked data's 2026-11-20).
+    let applied = start.and_then(|b| {
+        crate::capture::settle_at_bookmark_epoch(&b, world)?;
+        apply_bookmark(&b, world, controls)
+    });
+    match applied {
         Ok(applied) => {
             let mut camera = FlyCamera::new(applied.view);
             camera.reanchor(world.sim.frames(), world.epoch(), applied.anchor);
@@ -195,7 +222,15 @@ struct App {
     world: World,
     controls: HudControls,
     camera: FlyCamera,
+    /// Selection, the aim ring, cruise and the goto (C3).
+    nav: Navigator,
+    /// The last frame's snapshot: the navigator's pick items and destinations.
+    last_snap: Snapshot,
     input: InputState,
+    /// The keyboard modifiers held (for Cmd+Q).
+    modifiers: ModifiersState,
+    /// The navigator's last logged state (mode, aim candidate, selection).
+    last_nav: Option<NavLog>,
     gfx: Option<Gfx>,
     /// Set if the window or GPU could not be created; `run` returns it.
     error: Option<anyhow::Error>,
@@ -204,6 +239,8 @@ struct App {
     frame_index: u64,
     last_frame: Option<Instant>,
     fps: f32,
+    /// When the frame rate was last logged.
+    last_fps_log: Option<Instant>,
     /// CPU time of the previous frame's update and encode [ms].
     cpu_ms: f32,
     /// The cursor is hidden and locked for mouse look.
@@ -244,6 +281,7 @@ impl App {
             catalog,
             &self.assets,
             self.controls.lens_scale,
+            self.world.sim.asteroid_records(),
         )?;
         self.bsc5 = None;
         let hud = Hud::new(&window, &gpu, plain_format);
@@ -269,6 +307,18 @@ impl App {
         let dt = self.last_frame.map_or(0.0, |t| (now - t).as_secs_f64());
         self.last_frame = Some(now);
         self.fps = smoothed_fps(self.fps, dt);
+        if self
+            .last_fps_log
+            .is_none_or(|t| now - t >= FPS_LOG_INTERVAL)
+        {
+            self.last_fps_log = Some(now);
+            log::info!(
+                "window: {:.1} fps, CPU {:.2} ms, frame {} (the HUD's perf line)",
+                self.fps,
+                self.cpu_ms,
+                self.frame_index
+            );
+        }
 
         let Some(surface) = g.gpu.surface.as_ref() else {
             return;
@@ -291,6 +341,12 @@ impl App {
         if self.input.take_pressed_once(Action::Help) {
             self.controls.show_help = !self.controls.show_help;
         }
+        if self.input.take_pressed_once(Action::TimePanel) {
+            self.controls.show_warp = !self.controls.show_warp;
+        }
+        if self.input.take_pressed_once(Action::ToggleCard) {
+            self.controls.card_expanded = !self.controls.card_expanded;
+        }
         if self.input.take_pressed_once(Action::Screenshot) {
             let saved = save_view(
                 &views_dir(),
@@ -306,30 +362,75 @@ impl App {
             log::info!("{msg}");
             self.flash = Some((msg, now + FLASH_DURATION));
         }
-        // Move, note near stars at the new place, tick, follow the anchor, join the dominant
-        // frame (module docs).
-        self.camera.update(&mut self.input, dt.min(MAX_CAMERA_DT_S));
+        let output = UVec2::new(frame.texture.width(), frame.texture.height());
+        let internal = internal_size(output);
+        // The navigator's frame (module docs). One dt for the navigator and the world's tick:
+        // a goto predicts that tick (uni-nav `nav` docs, C3 report §6.1).
+        let dt_frame = dt.min(MAX_CAMERA_DT_S);
+        if self.input.take_pressed_once(Action::Select)
+            && let Some(cursor) = self.input.cursor_px()
+        {
+            let to_internal = internal.as_dvec2() / output.as_dvec2();
+            let at = (cursor * to_internal).as_vec2();
+            let radius = uni_nav::pick_radius_px(internal.y);
+            self.nav.pick(&self.last_snap, at, radius);
+        }
+        let status = self.nav.update(
+            &mut self.camera,
+            &self.world.sim,
+            &self.last_snap,
+            &mut self.input,
+            dt_frame,
+        );
+        uni_nav::handle_time_keys(&mut self.input, &mut self.world.sim.time);
+        if self.input.take_pressed_once(Action::Deselect) {
+            esc_after_navigator(&mut self.controls, &mut self.nav);
+        }
+        log_navigation(
+            &self.world,
+            &self.nav,
+            &self.controls,
+            &mut self.last_nav,
+            &status,
+        );
+        let goto_target = goto_target(&status);
+        self.world.sim.set_goto_target(goto_target);
+        self.world.sim.set_selected(self.nav.selected);
+        // Note near stars at the new place, tick, follow the anchor, join the dominant frame
+        // (or the goto's anchor).
         let _ = self.world.sim.nearest_surface(&self.camera.view.pos);
-        self.world.advance(dt);
+        self.world.advance(dt_frame);
         let (frames, epoch) = (self.world.sim.frames(), self.world.epoch());
         self.camera.sync(frames, epoch);
-        let dominant = self.world.sim.dominant_frame(&self.camera.view.pos);
-        self.camera.reanchor(frames, epoch, dominant);
+        let anchor = match status.mode {
+            FlightMode::Goto { .. } => status.anchor,
+            FlightMode::Free | FlightMode::Cruise => {
+                Some(self.world.sim.dominant_frame(&self.camera.view.pos))
+            }
+        };
+        if let Some(anchor) = anchor {
+            self.camera.reanchor(frames, epoch, anchor);
+        }
         if self.input.is_looking() != self.cursor_grabbed {
             self.cursor_grabbed = self.input.is_looking();
             grab_cursor(&g.window, self.cursor_grabbed);
         }
 
         g.scene.set_lens_scale(self.controls.lens_scale);
-        let output = UVec2::new(frame.texture.width(), frame.texture.height());
+        let ui = UiState {
+            flight: flight_label(&status),
+            highlight_belt: self.controls.highlight_belt,
+            selected: self.nav.selected,
+        };
         // The window adapts its exposure over time (no settle).
         let f = g.scene.prepare(
             &self.world,
             &self.camera.view,
-            internal_size(output),
+            internal,
             output,
             &self.controls,
             self.choice,
+            ui,
             false,
             self.frame_index,
             dt,
@@ -351,44 +452,154 @@ impl App {
             g.gpu.take_errors(),
             MAX_GPU_ERROR_NOTICES,
         );
-        let mut notices = self.notices.clone();
-        notices.extend(g.scene.notices.iter().cloned());
-        notices.extend(g.scene.pass_warnings());
-        notices.extend(self.gpu_errors.iter().cloned());
-        notices.extend(self.flash.iter().map(|(msg, _)| msg.clone()));
+        let mut warnings = self.notices.clone();
+        warnings.extend(g.scene.notices.iter().cloned());
+        warnings.extend(self.gpu_errors.iter().cloned());
+        warnings.extend(self.flash.iter().map(|(msg, _)| msg.clone()));
+        let statuses = g.scene.pass_warnings();
         let perf = Perf::from_renderer(&g.scene.renderer, &g.gpu, self.fps, self.cpu_ms);
+        let seen = absolute_view(&self.world, &self.camera.view, self.camera.anchor);
+        let nav = nav_hud(&self.world, &seen, &status, |n| g.scene.has_map(n));
         let data = hud_data(
             &self.world,
             &f,
-            perf,
-            self.camera.speed_mps(),
-            g.scene.star_count,
-            &notices,
+            nav,
+            HudExtras {
+                perf,
+                star_count: g.scene.star_count,
+                warnings: &warnings,
+                statuses: &statuses,
+            },
+        );
+        // The overlay in egui points: the window's physical size over its scale factor (C5:
+        // `output_pt` equals egui's content rectangle).
+        let scale = g.window.scale_factor() as f32;
+        let output_pt = output.as_vec2() / scale.max(f32::MIN_POSITIVE);
+        let overlay = uni_ui::build_overlay(
+            &self.world.sim,
+            &f.snapshot,
+            &seen,
+            internal,
+            output_pt,
+            self.nav.selected,
+            status.aim.map(|a| (a.target, a.fill)),
+            goto_target,
+            &OVERLAY_SETTINGS,
         );
         let mut enc = g
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("hud") });
         let size_px = [frame.texture.width(), frame.texture.height()];
-        // No overlay and no HUD actions until C6 wires them (Task C0: call site only).
-        let (hud_cmds, _hud_out) = g.hud.draw(
+        let (hud_cmds, hud_out) = g.hud.draw(
             &g.window,
             &g.gpu,
             &mut enc,
             &plain_view,
             size_px,
             &data,
-            &uni_ui::Overlay::default(),
+            &overlay,
             &mut self.controls,
         );
         cmds.extend(hud_cmds);
         cmds.push(enc.finish());
+        apply_hud_output(&hud_out, &mut self.nav, &mut self.world, &mut self.controls);
+        self.last_snap = f.snapshot;
         self.cpu_ms = start.elapsed().as_secs_f32() * 1e3;
 
         g.gpu.queue.submit(cmds);
         g.window.pre_present_notify();
         g.gpu.queue.present(frame);
         self.frame_index += 1;
+    }
+}
+
+/// The navigator state [`log_navigation`] compares: mode, aim candidate, selection.
+type NavLog = (FlightMode, Option<uni_sim::registry::ObjectId>, Option<uni_sim::registry::ObjectId>);
+
+/// Logs the navigator's changes at `info` (mode, aim candidate, selection, drop-outs), so a
+/// window run can be followed from the terminal (`RUST_LOG=universe=info`).
+fn log_navigation(
+    world: &World,
+    nav: &Navigator,
+    controls: &HudControls,
+    last: &mut Option<NavLog>,
+    status: &NavStatus,
+) {
+    let name = |id| world.name(id).to_owned();
+    let now = (status.mode, status.aim.map(|a| a.target), nav.selected);
+    if *last != Some(now) {
+        log::info!(
+            "navigation: mode {}, aim {:?}, selected {:?}, card {}, speed {:.3e} m/s",
+            match status.mode {
+                FlightMode::Goto { target } => format!("goto {}", name(target)),
+                m => format!("{m:?}"),
+            },
+            status.aim.map(|a| name(a.target)),
+            nav.selected.map(name),
+            controls.card_expanded,
+            status.speed_mps
+        );
+        *last = Some(now);
+    }
+    if let Some(d) = status.dropout {
+        log::info!("navigation: drop-out {d:?}");
+    }
+}
+
+/// The goto target of `status`, if a goto is running.
+fn goto_target(status: &NavStatus) -> Option<uni_sim::registry::ObjectId> {
+    match status.mode {
+        FlightMode::Goto { target } => Some(target),
+        FlightMode::Free | FlightMode::Cruise => None,
+    }
+}
+
+/// An Esc press the navigator left (it cancels an aim, else a goto, and takes the press only
+/// then): closes the card, else the notes list, else deselects (Task C6, the cancel chain).
+fn esc_after_navigator(controls: &mut HudControls, nav: &mut Navigator) {
+    if controls.card_expanded {
+        controls.card_expanded = false;
+    } else if controls.notes_expanded {
+        controls.notes_expanded = false;
+    } else {
+        nav.deselect();
+    }
+}
+
+/// Acts on the HUD's buttons (C4's `HudOutput`): Go to flies to the selection, Close closes the
+/// card, a moon from the Moons list becomes the selection, a warp preset sets the rate (and
+/// unpauses: a rate pressed while paused means "run at this rate"; C4 review m4), Pause toggles
+/// the clock. The Moons button's list is the HUD's own state.
+fn apply_hud_output(
+    out: &HudOutput,
+    nav: &mut Navigator,
+    world: &mut World,
+    controls: &mut HudControls,
+) {
+    for a in &out.actions {
+        match a {
+            CardAction::Goto => {
+                nav.goto_selected();
+            }
+            CardAction::Close => controls.card_expanded = false,
+            CardAction::Moons => {}
+        }
+    }
+    if let Some(id) = out.selected_moon.as_deref().and_then(|n| world.sim.find(n)) {
+        nav.selected = Some(id);
+    }
+    if let Some(&rate) = out
+        .warp_preset
+        .and_then(|i| uni_sim::time::WARP_PRESETS.get(i))
+    {
+        world.sim.time.set_rate(rate);
+        if world.sim.time.is_paused() {
+            world.sim.time.toggle_pause();
+        }
+    }
+    if out.toggle_pause {
+        world.sim.time.toggle_pause();
     }
 }
 
@@ -417,16 +628,19 @@ impl ApplicationHandler for App {
             return;
         };
         let consumed = g.hud.on_window_event(&g.window, &event);
-        // Releases always reach the camera input, so a key or mouse look cannot stick.
-        if !consumed || is_release(&event) {
+        // Releases always reach the camera input, so a key or mouse look cannot stick; the
+        // cursor's moves too, so the click picks where the cursor is (C3 report §6.2).
+        if !consumed || is_release(&event) || is_cursor(&event) {
             self.input.on_window_event(&event);
         }
         match event {
             WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            // Cmd+Q quits (Esc is the cancel chain: module docs).
             WindowEvent::KeyboardInput { event: key, .. }
-                if !consumed
-                    && key.state == ElementState::Pressed
-                    && key.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
+                if key.state == ElementState::Pressed
+                    && self.modifiers.super_key()
+                    && key.physical_key == PhysicalKey::Code(KeyCode::KeyQ) =>
             {
                 el.exit();
             }
@@ -445,6 +659,14 @@ impl ApplicationHandler for App {
             g.window.request_redraw();
         }
     }
+}
+
+/// Whether `e` moves the cursor or takes it out of the window.
+fn is_cursor(e: &WindowEvent) -> bool {
+    matches!(
+        e,
+        WindowEvent::CursorMoved { .. } | WindowEvent::CursorLeft { .. }
+    )
 }
 
 /// Whether `e` releases a key or a mouse button.
@@ -667,6 +889,65 @@ mod tests {
         let b = view_bookmark("r", &root, &world, &controls, choice);
         assert_eq!(b.anchor, None);
         assert_eq!(b.view.pos, root.view.pos);
+    }
+
+    /// Task C6: the Esc the navigator leaves (it took the aim and the goto) closes the card,
+    /// then the notes list, then deselects.
+    #[test]
+    fn esc_closes_the_card_then_the_notes_then_deselects() {
+        let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
+        controls.card_expanded = true;
+        controls.notes_expanded = true;
+        let mut nav = Navigator::new();
+        nav.selected = Some(3);
+        esc_after_navigator(&mut controls, &mut nav);
+        assert!(!controls.card_expanded && controls.notes_expanded);
+        assert_eq!(nav.selected, Some(3));
+        esc_after_navigator(&mut controls, &mut nav);
+        assert!(!controls.notes_expanded);
+        assert_eq!(nav.selected, Some(3));
+        esc_after_navigator(&mut controls, &mut nav);
+        assert_eq!(nav.selected, None);
+    }
+
+    /// The HUD's buttons (C4's `HudOutput`): a warp preset sets the rate and, pressed while
+    /// paused, unpauses (C4 review m4); Pause toggles; Close closes the card; a moon from the
+    /// list becomes the selection; Go to flies to the selection.
+    #[test]
+    fn hud_buttons_act_and_a_rate_unpauses() {
+        let mut world = World::bare(Epoch::J2000);
+        let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
+        controls.card_expanded = true;
+        let mut nav = Navigator::new();
+        world.sim.time.toggle_pause();
+        assert!(world.sim.time.is_paused());
+        let out = HudOutput {
+            actions: vec![CardAction::Close],
+            selected_moon: Some("Moon".to_owned()),
+            warp_preset: Some(2),
+            toggle_pause: false,
+        };
+        apply_hud_output(&out, &mut nav, &mut world, &mut controls);
+        assert!(
+            !world.sim.time.is_paused(),
+            "a rate pressed while paused runs"
+        );
+        assert_eq!(world.sim.time.rate(), uni_sim::time::WARP_PRESETS[2]);
+        assert!(!controls.card_expanded);
+        assert_eq!(nav.selected, world.sim.find("Moon"));
+        let out = HudOutput {
+            actions: vec![CardAction::Goto],
+            toggle_pause: true,
+            ..HudOutput::default()
+        };
+        apply_hud_output(&out, &mut nav, &mut world, &mut controls);
+        assert!(world.sim.time.is_paused());
+        assert_eq!(
+            nav.mode,
+            FlightMode::Goto {
+                target: world.sim.find("Moon").unwrap()
+            }
+        );
     }
 
     #[test]

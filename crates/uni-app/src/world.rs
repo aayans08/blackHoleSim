@@ -445,6 +445,8 @@ pub(crate) mod tests {
         let m0 = uni_nav::load_bookmarks(&m0_bookmarks_path()).expect("bookmarks/m0.ron loads");
         assert_eq!(m0.len(), 6);
         let m1 = uni_nav::load_bookmarks(&m1_bookmarks_path()).expect("bookmarks/m1.ron loads");
-        assert_eq!(m1.len(), 19);
+        assert_eq!(m1.len(), 27);
+        let bench = uni_nav::load_bookmarks(&bookmarks_path("m1-bench.ron")).expect("bench loads");
+        assert_eq!(bench.len(), 10);
     }
 }

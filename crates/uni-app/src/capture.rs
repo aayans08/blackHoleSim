@@ -3,8 +3,16 @@
 //!
 //! Per bookmark: the world goes to its epoch, every comet is settled there (A4 ruling: captures
 //! settle per bookmark, so they do not depend on the frames before), the camera is placed (its
-//! anchor and `look_at` resolved, A6), a snapshot notes any unnamed near star and a zero tick
-//! registers it (A4 parked item; the frames then draw it with its id).
+//! anchor and `look_at` resolved, A6), the bookmark's `target` is selected, its
+//! `highlight_belt` and `cruise` set the belt highlight and the flight label (Task C6), a
+//! snapshot notes any unnamed near star and a zero tick registers it (A4 parked item; the frames
+//! then draw it with its id). The comet pass finishes every due tail within the frame (C1's
+//! settle mode), and is rebuilt whenever a bookmark changes the epoch, so no tail survives from
+//! another date (C1 review m2).
+//! - **`--hud`**: the HUD with the overlay (markers, the target's bracket, orbits) is drawn on
+//!   the captured frame, with the card open when the bookmark has a target and the notes list
+//!   always open, so every label is readable (lead ruling on the C0 context, owner point 4);
+//!   `hud.card_rows` lists the card's row labels in order.
 //! - **Auto exposure** (review I16, round 2): frames render with `settle` until the resolved
 //!   scene and star EV each move less than [`SETTLE_EV`] between frames (at least
 //!   `--frames` − 2 frames, at most [`MAX_SETTLE_FRAMES`]), then [`MANUAL_FRAMES`] frames in
@@ -34,8 +42,9 @@ use uni_ui::Hud;
 
 use crate::measure::{self, Measurements};
 use crate::scene::{
-    CAPTURE_LENS_SCALE, Frame, Perf, Scene, StarCatalog, ViewChoices, apply_bookmark,
-    default_controls, frame_durations, hud_data,
+    CAPTURE_LENS_SCALE, Frame, HudExtras, OVERLAY_SETTINGS, Perf, Scene, StarCatalog, UiState,
+    ViewChoices, apply_bookmark, default_controls, frame_durations, hud_data, label_texts, nav_hud,
+    still_status,
 };
 use crate::world::{self, Assets, World, baked_dir, iso_utc};
 
@@ -103,11 +112,18 @@ pub struct HdrHeader {
     pub layout: &'static str,
 }
 
-/// `hud` (with `--hud`): what the HUD showed. HUD v0 has no cards (C4).
+/// `hud` (with `--hud`): what the HUD showed (C4's HUD v2).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct HudInfo {
+    /// The target card's row labels in order (its live rows, then its facts); empty without a
+    /// card.
     pub card_rows: Vec<String>,
+    /// The card's kicker and title ("TARGET", "Mars"), when there is one.
+    pub card: Option<[String; 2]>,
+    /// The panels drawn: the collapsed lines, or the expanded panels and the card.
     pub panels: Vec<String>,
+    /// The notes the HUD showed, in order.
+    pub notes: Vec<String>,
 }
 
 /// `<name>.json`: the capture's metrics (JSON v2).
@@ -212,7 +228,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         StarCatalog::AtHyg(world.sim.star_data()),
         &assets,
         CAPTURE_LENS_SCALE,
+        world.sim.asteroid_records(),
     )?;
+    scene.set_settle_tails(true);
     let target = CaptureTarget::new(&gpu.device, args.size);
     let mut hud = args
         .hud
@@ -220,13 +238,23 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
     let size = scene.renderer.targets().size;
 
     let mut frame_index = 0_u64;
+    let mut last_epoch: Option<Epoch> = None;
     for b in &bookmarks {
         let mut controls = default_controls(CAPTURE_LENS_SCALE);
+        // The comets are settled at the bookmark's epoch before its anchor and `look_at` are
+        // resolved, so a view of a comet is placed against where the comet is drawn.
+        let comets_settle_ms = settle_at_bookmark_epoch(b, &mut world)?;
         let applied = apply_bookmark(b, &mut world, &mut controls)?;
         world.set_time_rate(0.0); // a capture is a still frame
-        let settle_start = Instant::now();
-        world.sim.settle_comets();
-        let comets_settle_ms = settle_start.elapsed().as_secs_f32() * 1e3;
+        if last_epoch.is_some_and(|e| e != world.epoch()) {
+            scene.reset_comets(&gpu)?;
+        }
+        last_epoch = Some(world.epoch());
+        let ui = bookmark_ui(b, &mut world)?;
+        if args.hud {
+            controls.card_expanded = ui.selected.is_some();
+            controls.notes_expanded = true;
+        }
         // Note any unnamed near star, then register it (one zero tick) before the frames.
         let _ = world.sim.snapshot(&applied.view, size);
         world.advance(0.0);
@@ -242,6 +270,9 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             size,
             name: &b.name,
             hdr: args.hdr,
+            ui,
+            cruise: b.cruise == Some(true),
+            anchor: applied.anchor,
         };
 
         let mut settle_frames = 0;
@@ -322,7 +353,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             }
             last
         };
-        let (frame, cpu_ms) = last.context("no frame rendered")?;
+        let (frame, cpu_ms, hud_info) = last.context("no frame rendered")?;
 
         let png = args.out.join(format!("{}.png", b.name));
         target.save_png(&gpu, &png)?;
@@ -352,6 +383,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             }
             None => None,
         };
+        let overlay = capture_overlay(&world, &frame, &frame.ctx.camera, args.size);
         let measured = measure::measure(&measure::Input {
             name: &b.name,
             world: &world,
@@ -363,6 +395,11 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             rings: assets.rings.as_ref(),
             maps: &assets.maps,
             map_dir: &assets.map_dir,
+            belt: Some(&scene.belt),
+            overlay: Some(&overlay),
+            comets_cpu_ms: Some(scene.comets_cpu_ms()),
+            asteroids_cpu_ms: Some(scene.asteroids_cpu_ms()),
+            asteroid_counts: Some(scene.asteroid_counts()),
         });
         let mut notes = assets.warnings.clone();
         notes.extend(scene.notices.iter().cloned());
@@ -389,14 +426,11 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
             exposure: if auto { "auto" } else { "manual" },
             settle_frames,
             settled,
-            honesty: frame.labels.clone(),
+            honesty: label_texts(&frame.labels),
             measured,
             notes,
             hdr,
-            hud: args.hud.then(|| HudInfo {
-                card_rows: Vec::new(),
-                panels: vec!["status".to_owned(), "warnings".to_owned()],
-            }),
+            hud: hud_info,
         };
         let json_path = args.out.join(format!("{}.json", b.name));
         write_metrics(&json_path, &metrics)?;
@@ -414,10 +448,81 @@ struct FrameJob<'a> {
     size: UVec2,
     name: &'a str,
     hdr: bool,
+    ui: UiState,
+    /// The bookmark asks for cruise (the HUD's Speed panel and flight label).
+    cruise: bool,
+    /// The frame the camera is anchored to (its absolute velocity for closing speeds).
+    anchor: uni_core::FrameId,
+}
+
+/// Moves `world` to bookmark `b`'s epoch (if it names one) and settles every comet there
+/// (`World::settle_comets`); returns the settle's wall time [ms]. Captures and the bench call it
+/// before `apply_bookmark`, so a bookmark anchored on or looking at a comet resolves against
+/// the comet's settled position (Task C6: resolved first, the 1986 Halley view missed Halley by
+/// the 40 years of perturbations between its 2026 conic and its settled one).
+pub fn settle_at_bookmark_epoch(b: &uni_nav::Bookmark, world: &mut World) -> anyhow::Result<f32> {
+    if let Some(s) = &b.epoch_utc {
+        let e = crate::scene::parse_bookmark_epoch(s)
+            .with_context(|| format!("bookmark {:?}: bad epoch_utc {s:?}", b.name))?;
+        world.set_epoch(e);
+    }
+    let start = Instant::now();
+    world.sim.settle_comets();
+    Ok(start.elapsed().as_secs_f32() * 1e3)
+}
+
+/// The bookmark's UI state (Task C6): its `target` selected in `world` (an unknown name is an
+/// error naming the bookmark), its `highlight_belt`, and its flight label (`cruise`: the cruise
+/// label; otherwise free flight). Captures and the bench apply it.
+pub fn bookmark_ui(b: &uni_nav::Bookmark, world: &mut World) -> anyhow::Result<UiState> {
+    let selected = match &b.target {
+        Some(name) => Some(
+            world
+                .sim
+                .find(name)
+                .with_context(|| format!("bookmark {:?}: no target object {name:?}", b.name))?,
+        ),
+        None => None,
+    };
+    world.sim.set_selected(selected);
+    world.sim.set_goto_target(None);
+    // Cruise carries its label at any speed (plan table): no view is needed for the label.
+    let flight = if b.cruise == Some(true) {
+        uni_ui::FlightLabel::Cruise
+    } else {
+        uni_ui::FlightLabel::Free
+    };
+    Ok(UiState {
+        flight,
+        highlight_belt: b.highlight_belt == Some(true),
+        selected,
+    })
+}
+
+/// The overlay of a captured frame (built for every capture: the JSON's `overlay_orbits`; drawn
+/// only with `--hud`), at 1 pt per pixel (`HEADLESS_HUD_PIXELS_PER_POINT`).
+fn capture_overlay(
+    world: &World,
+    frame: &Frame,
+    view: &uni_core::CameraView,
+    size: UVec2,
+) -> uni_ui::Overlay {
+    uni_ui::build_overlay(
+        &world.sim,
+        &frame.snapshot,
+        view,
+        size,
+        size.as_vec2() / HEADLESS_HUD_PIXELS_PER_POINT,
+        frame.ui.selected,
+        None,
+        None,
+        &OVERLAY_SETTINGS,
+    )
 }
 
 /// One capture frame: build, render (the HUD and the taps on the `captured` one), wait for the
-/// GPU and read the frame's timings. Returns the frame and its CPU time [ms].
+/// GPU and read the frame's timings. Returns the frame, its CPU time [ms] and, with the HUD on
+/// the captured frame, what the HUD showed.
 #[allow(clippy::too_many_arguments)]
 fn render_one(
     job: &FrameJob<'_>,
@@ -429,7 +534,7 @@ fn render_one(
     settle: bool,
     captured: bool,
     frame_index: u64,
-) -> anyhow::Result<(Frame, f32)> {
+) -> anyhow::Result<(Frame, f32, Option<HudInfo>)> {
     let gpu = job.gpu;
     let start = Instant::now();
     let frame = scene.prepare(
@@ -439,6 +544,7 @@ fn render_one(
         job.size,
         controls,
         choice,
+        job.ui,
         settle,
         frame_index,
         CAPTURE_DT_S,
@@ -448,39 +554,87 @@ fn render_one(
     let mut cmds = vec![scene.render(gpu, &frame, &job.target.view)];
     scene.world_tap.arm(false);
     scene.hdr_tap.arm(false);
+    let mut info = None;
     if let Some(hud) = hud.filter(|_| captured) {
         // The HUD shows this frame's measured CPU time so far (snapshot, inputs and the
         // renderer's encode; review B9 r0 minor 2: it showed 0.00). fps 0 leaves the fps part
         // out: a capture has no frame rate.
         let cpu_so_far_ms = start.elapsed().as_secs_f32() * 1e3;
         let perf = Perf::from_renderer(&scene.renderer, gpu, 0.0, cpu_so_far_ms);
-        let mut notices = job.assets.warnings.clone();
-        notices.extend(scene.notices.iter().cloned());
-        notices.extend(scene.pass_warnings());
-        let data = hud_data(world, &frame, perf, 0.0, scene.star_count, &notices);
+        let mut warnings = job.assets.warnings.clone();
+        warnings.extend(scene.notices.iter().cloned());
+        let statuses = scene.pass_warnings();
+        let status = still_status(world, job.view, job.cruise, job.ui.selected);
+        let seen = crate::scene::absolute_view(world, job.view, job.anchor);
+        let nav = nav_hud(world, &seen, &status, |n| scene.has_map(n));
+        let data = hud_data(
+            world,
+            &frame,
+            nav,
+            HudExtras {
+                perf,
+                star_count: scene.star_count,
+                warnings: &warnings,
+                statuses: &statuses,
+            },
+        );
+        let overlay = capture_overlay(world, &frame, &seen, job.size);
         let mut enc = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("capture hud"),
             });
         let mut c = *controls;
-        // No overlay until C6 wires it (Task C0: call site only).
         let (hud_cmds, _hud_out) = hud.draw_headless(
             gpu,
             &mut enc,
             &job.target.view,
             job.target.size.to_array(),
             &data,
-            &uni_ui::Overlay::default(),
+            &overlay,
             &mut c,
         );
         cmds.extend(hud_cmds);
         cmds.push(enc.finish());
+        info = Some(hud_info(&data, &c));
     }
     let cpu_ms = start.elapsed().as_secs_f32() * 1e3;
     submit_and_wait(gpu, cmds, &format!("capture frame of {:?}", job.name))?;
     scene.renderer.poll_timings(gpu);
-    Ok((frame, cpu_ms))
+    Ok((frame, cpu_ms, info))
+}
+
+/// The capture JSON's `hud` block for what the HUD drew from `data` with `controls`.
+fn hud_info(data: &uni_ui::HudData, controls: &uni_ui::HudControls) -> HudInfo {
+    let card_rows = data
+        .target
+        .iter()
+        .flat_map(|c| c.live.iter().chain(c.facts.iter()))
+        .map(|r| r.label.clone())
+        .collect();
+    let mut panels = Vec::new();
+    if controls.card_expanded {
+        panels.extend(["location", "gravity", "speed"].map(str::to_owned));
+        if data.target.is_some() {
+            panels.push("card".to_owned());
+        }
+    } else {
+        panels.extend(["place line", "time line", "perf line"].map(str::to_owned));
+    }
+    panels.push(if controls.notes_expanded {
+        "notes list".to_owned()
+    } else {
+        "notes line".to_owned()
+    });
+    HudInfo {
+        card_rows,
+        card: data
+            .target
+            .as_ref()
+            .map(|c| [c.kicker.clone(), c.title.clone()]),
+        panels,
+        notes: data.notes.iter().map(|(t, _)| t.clone()).collect(),
+    }
 }
 
 /// The `notes` line of a capture whose Auto exposure did not settle in [`MAX_SETTLE_FRAMES`].
@@ -642,7 +796,9 @@ mod tests {
         });
         m.hud = Some(HudInfo {
             card_rows: Vec::new(),
-            panels: vec!["status".to_owned()],
+            card: None,
+            panels: vec!["place line".to_owned()],
+            notes: Vec::new(),
         });
         let v: serde_json::Value = serde_json::to_value(&m).unwrap();
         assert_eq!(v["hdr"]["file"], "x.hdr.bin");

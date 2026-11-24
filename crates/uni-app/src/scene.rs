@@ -6,9 +6,15 @@
 //! 1. `exposure` (B6 resolve) → 2. `band-update` (B5) → 3. `background` (B7, the M0 debug grid,
 //!    only with `LensEnv::DebugGrid` and a traced lens) → 4. `sun` (B2 star surfaces) →
 //!    5. `bodies` (B1) → 6. `rings` (B2; only when Saturn's ring profile loaded, ruling A.3) →
-//!    (7. comets: Wave C) → 8. `atmosphere` (B3) → 9. `histogram` (B6 meter) → 10. `lens` (B7)
+//!    7. `comets` (C1) → 8. `atmosphere` (B3) → 9. `histogram` (B6 meter) → 10. `lens` (B7)
 //!    → 11. `band` (B5) → 12. `stars` (B4 AT-HYG in 3-D, or M0's BSC5 field without AT-HYG) →
-//!    13. `points` (B4) → (14. asteroids: Wave C) → 15. `bloom` (B6) → 16. `tonemap`.
+//!    13. `points` (B4) → 14. `asteroids` (C2: the real asteroids and the procedural belt) →
+//!    15. `bloom` (B6) → 16. `tonemap`.
+//!
+//! Task C6 wired Wave C: the comet pass gets `Snapshot::comets`, the asteroid pass the epoch,
+//! the Sun, the suppressed registry records, the belt highlight and the reflected-point factor;
+//! [`UiState`] carries what the navigator and the HUD decide (the flight label, the belt
+//! highlight, the selection) into the frame's labels and passes.
 //!
 //! Two capture taps ([`crate::tap`]) sit after the meter and before bloom; they encode nothing
 //! unless a capture arms them.
@@ -35,15 +41,17 @@ use uni_gfx::{
     Exposure, FrameBindings, FrameCtx, FrameTargets, GpuContext, LightView, PassTimer,
     RenderFeature, Renderer, ShaderLib, SharedInput, reversed_z_infinite_proj,
 };
-use uni_nav::{Bookmark, ExposureChoice, LensEnvChoice};
-use uni_planet::{BodyRenderer, BodyScene, RingRenderer, StarSurfaceRenderer};
+use uni_nav::{Bookmark, ExposureChoice, FlightMode, LensEnvChoice, NavStatus};
+use uni_planet::{
+    BodyRenderer, BodyScene, CometRenderer, CometScene, RingRenderer, StarSurfaceRenderer,
+};
 use uni_post::{ExposureMode, ExposureReadback, ExposureSettings};
 use uni_rel::{DebugSkyBackground, LensCoverage, LensEnv, LensScale, LensTracer};
 use uni_sim::honesty::HonestyFlag;
-use uni_sim::registry::ObjectKind;
+use uni_sim::registry::{ObjectId, ObjectKind};
 use uni_sim::snapshot::{PointView, Snapshot};
-use uni_sky::{BandInput, PointSprite, StarInput};
-use uni_ui::{HudControls, HudData};
+use uni_sky::{AsteroidField, AsteroidInput, BandInput, BeltModel, PointSprite, StarInput};
+use uni_ui::{FlightLabel, HudControls, HudData, LabelTone, NavLine, OverlaySettings, TargetCard};
 
 use crate::tap::HdrTap;
 use crate::world::{Assets, World};
@@ -82,6 +90,77 @@ pub use uni_ui::theme::{
 };
 /// NAIF ids of Saturn's eight major moons (Mimas … Iapetus), Meeus ch. 46's.
 pub const SATURN_MAJOR_MOONS: [i32; 8] = [601, 602, 603, 604, 605, 606, 607, 608];
+/// Procedural main-belt (and Trojan) objects the asteroid pass draws: the gate's belt ladder,
+/// step 1 (plan "Performance budget": belt 250 k → 100 k → 50 k in all, applied at C6, review
+/// m18): at C2's 200 k + 50 k the asteroid pass measured 1.91 ms (serial `--bench`, 120 frames,
+/// `asteroid-belt-above`, 2026-11-24) against its 1.0 ms budget (1.25 × = 1.25), so the belt
+/// is 100 k in all, in C2's 4 : 1 main : Kuiper split. C2's "next n beyond the cut" draw keeps
+/// the same orbits and completes the H law to a brighter limit.
+pub const BELT_MAIN: u32 = 80_000;
+/// Procedural Kuiper-belt objects (ruling 11's 50 k, scaled by the same ladder step).
+pub const BELT_KUIPER: u32 = 20_000;
+/// The procedural belt is "visible" (its grey label is raised, plan table "Honesty labels in
+/// M1") while the highlight is on or the camera is within this distance of the Sun [AU].
+pub const PROCEDURAL_BELT_NEAR_AU: f64 = 6.0;
+/// What the overlay shows in the window and in `--hud` captures (coordinator ruling at Task C6:
+/// soft and uncluttered, orbit lines off by default): marker labels on; no orbit lines but the
+/// selected object's and the goto target's (with a planet's major moons), which the overlay
+/// draws whatever these switches say.
+pub const OVERLAY_SETTINGS: OverlaySettings = OverlaySettings {
+    planet_orbits: false,
+    labels: true,
+    exo_orbits: false,
+};
+
+/// `view` with its velocity in root axes relative to the SSB: the anchor body's velocity plus
+/// the camera's own (`CameraView::velocity_mps` is relative to the anchor, C3), so a closing
+/// speed (card, bracket, place line) is the true one: a camera at rest beside Mars closes on
+/// Mars at 0, not at Mars's orbital speed (Task C6).
+pub fn absolute_view(world: &World, view: &CameraView, anchor: uni_core::FrameId) -> CameraView {
+    let frame_velocity = world
+        .sim
+        .objects()
+        .iter()
+        .find(|o| anchor != uni_core::ROOT_FRAME && o.frame == Some(anchor))
+        .map_or(DVec3::ZERO, |o| world.sim.velocity(o.id));
+    CameraView {
+        velocity_mps: view.velocity_mps + frame_velocity,
+        ..view.clone()
+    }
+}
+/// The Speed panel's note while cruising (C4's example wording).
+pub const CRUISE_NOTE: &str = "auto drop-out near stars, atmospheres and black holes";
+
+/// What the navigator and the HUD decide that a frame's passes and labels depend on (Task C6):
+/// the flight label (ruling 6), the "Highlight asteroid belt" toggle and the selection (Saturn's
+/// moons' label also follows a selected moon).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiState {
+    pub flight: FlightLabel,
+    pub highlight_belt: bool,
+    pub selected: Option<ObjectId>,
+}
+
+impl Default for UiState {
+    /// Free flight, no highlight, nothing selected.
+    fn default() -> Self {
+        Self {
+            flight: FlightLabel::Free,
+            highlight_belt: false,
+            selected: None,
+        }
+    }
+}
+
+/// The flight label of a navigator state (plan table, ruling 6): `CRUISE · FTL · …` while
+/// cruising at any speed, or in a goto above c; free flight otherwise.
+pub fn flight_label(status: &NavStatus) -> FlightLabel {
+    match status.mode {
+        FlightMode::Cruise => FlightLabel::Cruise,
+        FlightMode::Goto { .. } if status.ftl => FlightLabel::Cruise,
+        FlightMode::Free | FlightMode::Goto { .. } => FlightLabel::Free,
+    }
+}
 
 /// The star catalogue a scene draws.
 pub enum StarCatalog<'a> {
@@ -225,8 +304,11 @@ pub struct Frame {
     pub ctx: FrameCtx,
     pub snapshot: Snapshot,
     pub settings: ExposureSettings,
-    /// The honesty labels in effect (HUD and capture JSON `honesty`), in a fixed order.
-    pub labels: Vec<String>,
+    /// The honesty labels in effect with their tones, in a fixed order: one list for the HUD's
+    /// notes and the capture JSON's `honesty` (Task C6, ruling C.5).
+    pub labels: Vec<(String, LabelTone)>,
+    /// The navigator's and the HUD's state the frame was built with.
+    pub ui: UiState,
     /// CPU time of `World::snapshot` [ms].
     pub snapshot_cpu_ms: f32,
     /// The lens coverage this frame.
@@ -296,12 +378,26 @@ pub struct Scene {
     presets: Vec<(i32, uni_atmo::AtmosphereParams)>,
     bodies_pass: Rc<RefCell<BodyRenderer>>,
     sun_pass: Rc<RefCell<StarSurfaceRenderer>>,
+    /// The comet pass (C1), shared so a capture can rebuild it when the epoch jumps.
+    comets: SharedInput<CometScene>,
+    comet_pass: Rc<RefCell<CometRenderer>>,
+    /// Whether the comet pass finishes every due tail within the frame (captures).
+    settle_tails: bool,
+    /// The asteroid pass (C2).
+    asteroids: SharedInput<AsteroidInput>,
+    asteroid_pass: Rc<RefCell<AsteroidField>>,
+    /// The procedural belt the asteroid pass draws (kept for the capture's `belt_radial_hist`).
+    pub belt: BeltModel,
+    /// The shader library the stack was built from (the comet pass is rebuilt from it).
+    lib: ShaderLib,
     /// Warnings from building the stack (no ring pass, a fallback catalogue, ...).
     pub notices: Vec<String>,
     /// The pre-bloom HDR tap (the `--hdr` sidecar).
     pub hdr_tap: HdrTap,
     /// The HDR tap right after the meter (world light only, for `lit_px`).
     pub world_tap: HdrTap,
+    /// The mask tap after the last depth writer (`--selftest`'s depth-writers check).
+    pub mask_tap: HdrTap,
     /// The frame tag (sustained bench only; [`crate::tap::FrameTag`]).
     pub frame_tag: crate::tap::FrameTag,
 }
@@ -309,7 +405,10 @@ pub struct Scene {
 impl Scene {
     /// Builds the stack at the internal resolution `internal_size` (see the module docs).
     /// `output_format` is the sRGB format the tonemap writes (the window's sRGB view, or
-    /// `uni_gfx::CAPTURE_FORMAT`).
+    /// `uni_gfx::CAPTURE_FORMAT`). `asteroids` are the world's asteroid records
+    /// (`World::asteroid_records`), from which the procedural belt ([`BELT_MAIN`],
+    /// [`BELT_KUIPER`]) is also drawn.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpu: &GpuContext,
         internal_size: UVec2,
@@ -317,6 +416,7 @@ impl Scene {
         catalog: StarCatalog<'_>,
         assets: &Assets,
         lens_scale: f32,
+        asteroids: &[uni_data::AsteroidRecord],
     ) -> anyhow::Result<Self> {
         let mut renderer = Renderer::new(gpu, internal_size);
         let mut lib = ShaderLib::with_common();
@@ -455,6 +555,32 @@ impl Scene {
         let point_pass = uni_sky::PointSprites::new(gpu, &mut lib, camera_bgl, points.clone())
             .context("creating the point-sprite pass")?
             .with_star_input(stars.clone());
+        // 7, 14: comets and asteroids (Wave C).
+        let comets = SharedInput::new(CometScene::default());
+        let comet_pass = Rc::new(RefCell::new(
+            CometRenderer::new(gpu, &mut lib, camera_bgl, comets.clone())
+                .context("creating the comet pass")?,
+        ));
+        let belt = BeltModel::from_catalogue(
+            asteroids,
+            BELT_MAIN,
+            BELT_KUIPER,
+            uni_sky::belt::BELT_H_CUT,
+            uni_sky::belt::BELT_SEED,
+        );
+        let asteroid_in = SharedInput::new(AsteroidInput::default());
+        let asteroid_pass = Rc::new(RefCell::new(
+            AsteroidField::new(
+                gpu,
+                &mut lib,
+                camera_bgl,
+                asteroids,
+                &belt,
+                asteroid_in.clone(),
+            )
+            .context("creating the asteroid pass")?
+            .with_star_input(stars.clone()),
+        ));
         // 15, 16.
         let bloom_strength = SharedInput::new(uni_post::DEFAULT_BLOOM_STRENGTH);
         let bloom = uni_post::Bloom::new(gpu, &mut lib, camera_bgl, bloom_strength.clone())
@@ -465,6 +591,8 @@ impl Scene {
             HdrTap::new(gpu, crate::tap::TAP_WORLD).context("creating the world HDR tap")?;
         let (hdr_tap, hdr_tap_pass) =
             HdrTap::new(gpu, crate::tap::TAP_PREBLOOM).context("creating the pre-bloom HDR tap")?;
+        let (mask_tap, mask_tap_pass) =
+            HdrTap::new_mask(gpu).context("creating the depth and lens-mask tap")?;
 
         // 0: the clear mark and the bench's frame tag (B9t; uni-app's own, untimed work: none).
         renderer.push(Box::new(
@@ -480,6 +608,8 @@ impl Scene {
         if let Some(r) = rings {
             renderer.push(Box::new(r));
         }
+        renderer.push(Box::new(Shared(Rc::clone(&comet_pass))));
+        renderer.push(Box::new(mask_tap_pass));
         renderer.push(Box::new(atmosphere));
         renderer.push(Box::new(meter));
         renderer.push(Box::new(world_tap_pass));
@@ -487,6 +617,7 @@ impl Scene {
         renderer.push(Box::new(band_draw));
         renderer.push(star_field);
         renderer.push(Box::new(point_pass));
+        renderer.push(Box::new(Shared(Rc::clone(&asteroid_pass))));
         renderer.push(Box::new(hdr_tap_pass));
         renderer.push(Box::new(bloom));
         renderer.push(Box::new(tonemap));
@@ -509,9 +640,17 @@ impl Scene {
             presets,
             bodies_pass,
             sun_pass,
+            comets,
+            comet_pass,
+            settle_tails: false,
+            asteroids: asteroid_in,
+            asteroid_pass,
+            belt,
+            lib,
             notices,
             hdr_tap,
             world_tap,
+            mask_tap,
             frame_tag,
         })
     }
@@ -545,8 +684,53 @@ impl Scene {
         w
     }
 
-    /// Builds the frame for `view` and sets every shared input (see the module docs). Call it
-    /// right before [`Scene::render`].
+    /// The comet pass's CPU time in the last rendered frame [ms] (C1's `cpu_ms`: culling, the
+    /// tail work and the uploads; `--bench` reports it as `comets_cpu_ms`).
+    pub fn comets_cpu_ms(&self) -> f32 {
+        self.comet_pass.borrow().cpu_ms()
+    }
+
+    /// The asteroid pass's CPU time in the last rendered frame [ms] (C2's `cpu_ms`: the mean
+    /// anomalies, their upload and the uniform).
+    pub fn asteroids_cpu_ms(&self) -> f32 {
+        self.asteroid_pass.borrow().cpu_ms()
+    }
+
+    /// (real, procedural) asteroids the asteroid pass submitted last frame (C2's `counts`).
+    pub fn asteroid_counts(&self) -> (u32, u32) {
+        self.asteroid_pass.borrow().counts()
+    }
+
+    /// With `on`, the comet pass finishes every due tail refresh within the frame (C1's
+    /// `set_settle_tails`; captures, so their first frames already show complete tails). It
+    /// stays set when [`Scene::reset_comets`] rebuilds the pass.
+    pub fn set_settle_tails(&mut self, on: bool) {
+        self.settle_tails = on;
+        self.comet_pass.borrow_mut().set_settle_tails(on);
+    }
+
+    /// Rebuilds the comet pass, so no tail survives from an earlier epoch (Task C6, C1 review
+    /// m2: two bookmarks of the same comet at different epochs within the 0.25 s wall-time
+    /// refresh rule would otherwise draw the first bookmark's dust tail at the second's
+    /// position). Captures call it whenever a bookmark changes the epoch.
+    pub fn reset_comets(&mut self, gpu: &GpuContext) -> anyhow::Result<()> {
+        let camera_bgl = self.renderer.camera_bind_group_layout();
+        let mut pass = CometRenderer::new(gpu, &mut self.lib, camera_bgl, self.comets.clone())
+            .context("rebuilding the comet pass")?;
+        pass.set_settle_tails(self.settle_tails);
+        *self.comet_pass.borrow_mut() = pass;
+        Ok(())
+    }
+
+    /// Whether the bodies pass has a surface map for NAIF body `naif` (the app adds the card
+    /// note "No surface map: uniform albedo" otherwise; C4: the card cannot know which maps
+    /// loaded).
+    pub fn has_map(&self, naif: i32) -> bool {
+        self.albedo_rgb.contains_key(&naif)
+    }
+
+    /// Builds the frame for `view` and sets every shared input (see the module docs), with the
+    /// navigator's and the HUD's state `ui`. Call it right before [`Scene::render`].
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
@@ -556,6 +740,7 @@ impl Scene {
         output_size: UVec2,
         controls: &HudControls,
         choice: ViewChoices,
+        ui: UiState,
         settle: bool,
         frame_index: u64,
         dt_real_s: f64,
@@ -649,13 +834,32 @@ impl Scene {
             scintillation,
         });
         let reflected_scale = self.reflected_point_scale(&snapshot, &settings);
-        self.points.set(
-            snapshot
-                .points
-                .iter()
-                .map(|p| self.point_sprite(world, p, vivid, reflected_scale))
-                .collect(),
-        );
+        self.points.set(point_sprites(
+            world,
+            &snapshot,
+            &self.albedo_rgb,
+            vivid,
+            reflected_scale,
+            ui.highlight_belt,
+        ));
+        self.comets.set(CometScene {
+            comets: snapshot.comets.clone(),
+            epoch: ctx.epoch,
+            eye_adapted: eye,
+        });
+        // The procedural belt is always drawn (real photometry: invisible from afar, plan
+        // round 2, I12); the pass multiplies by BELT_HIGHLIGHT_GAIN itself while `highlight`.
+        let sun_rel = snapshot.sun.as_ref().map_or(DVec3::NAN, |s| s.rel_pos_m);
+        self.asteroids.set(AsteroidInput {
+            epoch: ctx.epoch,
+            sun_rel_m: sun_rel,
+            show_belt: true,
+            highlight: ui.highlight_belt,
+            suppressed: snapshot.suppressed_asteroids.clone(),
+            exposure_scale: reflected_scale,
+        });
+        let belt_visible =
+            ui.highlight_belt || sun_rel.length() <= PROCEDURAL_BELT_NEAR_AU * uni_core::AU;
         self.band.set(BandInput {
             camera_icrs_pc: camera_icrs_pc(&view.pos),
             enabled: band_on,
@@ -677,17 +881,22 @@ impl Scene {
             viewport,
             &snapshot,
             &settings,
-            lens_env,
-            coverage,
-            band_on,
-            scintillation,
-            vivid,
+            &LabelInputs {
+                lens_env,
+                coverage,
+                band_on,
+                scintillation,
+                vivid,
+                belt_visible,
+                ui,
+            },
         );
         Frame {
             ctx,
             snapshot,
             settings,
             labels,
+            ui,
             snapshot_cpu_ms,
             coverage,
             reflected_scale,
@@ -720,60 +929,6 @@ impl Scene {
         point_exposure_factor(w, settings.eye_star_ev100, scene_ev)
     }
 
-    /// The point sprite of `p`: reflected light (a body) tinted by its map's mean albedo colour
-    /// with its luminance kept (carry-over 6); starlight (the Sun, catalogue stars) in the star
-    /// pass's colour and through `vivid_color` while vivid colours are on (B4 notes for B9).
-    fn point_sprite(
-        &self,
-        world: &World,
-        p: &PointView,
-        vivid: bool,
-        reflected_scale: f64,
-    ) -> PointSprite {
-        let info = p.id.and_then(|id| world.sim.objects().get(id as usize));
-        let scale = if info.is_some_and(|o| is_reflected(o.kind)) {
-            reflected_scale
-        } else {
-            1.0
-        };
-        let solar = unit_luminance(p.color);
-        let color = match info {
-            Some(o) if matches!(o.kind, ObjectKind::Sun) => {
-                if vivid {
-                    uni_sky::vivid_color(solar)
-                } else {
-                    solar
-                }
-            }
-            Some(o) if matches!(o.kind, ObjectKind::Star | ObjectKind::ExoHost) => {
-                let c = o
-                    .catalog_index
-                    .and_then(|i| world.sim.star_data().get(i as usize))
-                    .map(|s| s.bv())
-                    .filter(|bv| bv.is_finite())
-                    .map_or(solar, uni_sky::stars3d::bv_colour);
-                if vivid { uni_sky::vivid_color(c) } else { c }
-            }
-            Some(o) => o
-                .naif
-                .and_then(|n| self.albedo_rgb.get(&n))
-                .map_or(solar, |a| unit_luminance(solar * *a)),
-            // An unnamed near star in its first frame (A4: no id yet).
-            None => {
-                if vivid {
-                    uni_sky::vivid_color(solar)
-                } else {
-                    solar
-                }
-            }
-        };
-        PointSprite {
-            rel_pos_m: p.rel_pos_m,
-            illuminance_lux: p.illuminance_lux * scale,
-            color,
-        }
-    }
-
     /// Records `frame` into `output` (see [`Renderer::render`]).
     pub fn render(
         &mut self,
@@ -785,61 +940,210 @@ impl Scene {
     }
 }
 
-/// The honesty labels in effect for a frame (`view` at internal size `viewport`), in a fixed
-/// order: uni-sim's world-state labels (the band's two, which uni-sim raises together, only
-/// while the band is drawn: ruling, B4L), the eye-adapted and vivid-colour labels, the lens
-/// labels, the twinkle label and Saturn's moons' label.
-#[allow(clippy::too_many_arguments)]
+/// The point sprites of `snapshot`'s points (see [`point_sprite`]).
+pub fn point_sprites(
+    world: &World,
+    snapshot: &Snapshot,
+    albedo_rgb: &HashMap<i32, Vec3>,
+    vivid: bool,
+    reflected_scale: f64,
+    highlight_belt: bool,
+) -> Vec<PointSprite> {
+    snapshot
+        .points
+        .iter()
+        .map(|p| point_sprite(world, p, albedo_rgb, vivid, reflected_scale, highlight_belt))
+        .collect()
+}
+
+/// The factor on point `id`'s illuminance: `reflected_scale` for reflected light (the
+/// reflected-point rule beside a resolved body), times `uni_sky::BELT_HIGHLIGHT_GAIN` for a
+/// registry object made from an asteroid record (Ceres included, whatever its kind; ruling
+/// A.4c) while "Highlight asteroid belt" is on, so the registry asteroids (H ≤ 10 or named)
+/// brighten with the belt the asteroid pass draws (plan C6 Step 1, re-review r2 minor 1).
+/// Starlight (the Sun, catalogue stars) and an id-less point get 1. A registry asteroid
+/// resolved as a body is not a point, so it is not boosted: it dims by the gain as it crosses
+/// into a disk with the highlight on, which the amber belt label already covers.
+pub fn point_scale(
+    world: &World,
+    id: Option<ObjectId>,
+    reflected_scale: f64,
+    highlight_belt: bool,
+) -> f64 {
+    let Some(info) = id.and_then(|id| world.sim.objects().get(id as usize)) else {
+        return 1.0;
+    };
+    let mut scale = if is_reflected(info.kind) {
+        reflected_scale
+    } else {
+        1.0
+    };
+    if highlight_belt && world.sim.asteroid_record_of(info.id).is_some() {
+        scale *= uni_sky::BELT_HIGHLIGHT_GAIN;
+    }
+    scale
+}
+
+/// The point sprite of `p`: reflected light (a body) tinted by its map's mean albedo colour
+/// (`albedo_rgb`, NAIF id → colour) with its luminance kept (carry-over 6); starlight (the Sun,
+/// catalogue stars) in the star pass's colour and through `vivid_color` while vivid colours are
+/// on (B4 notes for B9). The illuminance carries [`point_scale`].
+fn point_sprite(
+    world: &World,
+    p: &PointView,
+    albedo_rgb: &HashMap<i32, Vec3>,
+    vivid: bool,
+    reflected_scale: f64,
+    highlight_belt: bool,
+) -> PointSprite {
+    let info = p.id.and_then(|id| world.sim.objects().get(id as usize));
+    let scale = point_scale(world, p.id, reflected_scale, highlight_belt);
+    let solar = unit_luminance(p.color);
+    let color = match info {
+        Some(o) if matches!(o.kind, ObjectKind::Sun) => {
+            if vivid {
+                uni_sky::vivid_color(solar)
+            } else {
+                solar
+            }
+        }
+        Some(o) if matches!(o.kind, ObjectKind::Star | ObjectKind::ExoHost) => {
+            let c = o
+                .catalog_index
+                .and_then(|i| world.sim.star_data().get(i as usize))
+                .map(|s| s.bv())
+                .filter(|bv| bv.is_finite())
+                .map_or(solar, uni_sky::stars3d::bv_colour);
+            if vivid { uni_sky::vivid_color(c) } else { c }
+        }
+        Some(o) => o
+            .naif
+            .and_then(|n| albedo_rgb.get(&n))
+            .map_or(solar, |a| unit_luminance(solar * *a)),
+        // An unnamed near star in its first frame (A4: no id yet).
+        None => {
+            if vivid {
+                uni_sky::vivid_color(solar)
+            } else {
+                solar
+            }
+        }
+    };
+    PointSprite {
+        rel_pos_m: p.rel_pos_m,
+        illuminance_lux: p.illuminance_lux * scale,
+        color,
+    }
+}
+
+/// What [`honesty_labels`] needs beside the world and the view.
+#[derive(Clone, Copy, Debug)]
+pub struct LabelInputs {
+    pub lens_env: LensEnv,
+    pub coverage: LensCoverage,
+    /// The band is drawn (its two labels show only then: ruling, B4L).
+    pub band_on: bool,
+    /// The camera's twinkle strength (> 0 inside an atmosphere).
+    pub scintillation: f32,
+    pub vivid: bool,
+    /// The procedural belt is drawn and visible: the highlight is on or the camera is within
+    /// [`PROCEDURAL_BELT_NEAR_AU`] of the Sun (plan table; C6 owns the condition).
+    pub belt_visible: bool,
+    pub ui: UiState,
+}
+
+/// The tone of world-state label `f`: amber for the non-physical ones
+/// (`uni_sim::honesty::is_non_physical`), grey otherwise.
+fn flag_tone(f: HonestyFlag) -> LabelTone {
+    if uni_sim::honesty::is_non_physical(f) {
+        LabelTone::NonPhysical
+    } else {
+        LabelTone::Neutral
+    }
+}
+
+/// The honesty labels in effect for a frame (`view` at internal size `viewport`) with their
+/// tones, in a fixed order: the flight label (`uni_ui::theme::ui_labels`; ruling 6), uni-sim's
+/// world-state labels (the band's two, which uni-sim raises together, only while the band is
+/// drawn: ruling, B4L), the procedural belt's (grey) while it is visible, the belt-highlight and
+/// eye-adapted labels (`ui_labels`), the vivid-colour label, the lens labels, the twinkle label
+/// (grey) and Saturn's moons' (grey: approximate positions, ruling 10) while one of Saturn's
+/// major moons is resolved (≥ `POINT_LOD_PX`) or selected (Task C6: a faint point is not
+/// enough). One list for the HUD's notes and the capture JSON's `honesty` (ruling C.5).
 pub fn honesty_labels(
     world: &World,
     view: &CameraView,
     viewport: UVec2,
     snapshot: &Snapshot,
     settings: &ExposureSettings,
-    lens_env: LensEnv,
-    coverage: LensCoverage,
-    band_on: bool,
-    scintillation: f32,
-    vivid: bool,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    inputs: &LabelInputs,
+) -> Vec<(String, LabelTone)> {
+    let ui = uni_ui::ui_labels(
+        inputs.ui.flight,
+        inputs.ui.highlight_belt,
+        settings.eye_adapted_in_effect(),
+    );
+    let mut out: Vec<(String, LabelTone)> = Vec::new();
+    let mut push = |text: &str, tone: LabelTone| {
+        if !out.iter().any(|(t, _)| t == text) {
+            out.push((text.to_owned(), tone));
+        }
+    };
+    let (flight, rest) = ui
+        .split_first()
+        .map_or((None, &ui[..]), |(f, r)| (Some(f), r));
+    if let Some((text, tone)) = flight {
+        push(text, *tone);
+    }
     for f in world.sim.honesty(view, viewport) {
         let band_label = matches!(
             f,
             HonestyFlag::BandModel | HonestyFlag::MilkyWayDetailProcedural
         );
-        if band_label && !band_on {
+        if band_label && !inputs.band_on {
             continue;
         }
-        out.push(uni_sim::honesty::label(f).to_owned());
+        push(uni_sim::honesty::label(f), flag_tone(f));
     }
-    if settings.eye_adapted_in_effect() {
-        out.push(uni_ui::EYE_ADAPTED_STARS_LABEL.to_owned());
+    if inputs.belt_visible {
+        let f = HonestyFlag::ProceduralBelt;
+        push(uni_sim::honesty::label(f), flag_tone(f));
     }
-    if vivid {
-        out.push(uni_ui::VIVID_STAR_COLOURS_LABEL.to_owned());
+    for (text, tone) in rest {
+        push(text, *tone);
     }
-    let (grid, unlensed) = uni_rel::lens_labels(coverage, lens_env);
+    if inputs.vivid {
+        push(uni_ui::VIVID_STAR_COLOURS_LABEL, LabelTone::NonPhysical);
+    }
+    let (grid, unlensed) = uni_rel::lens_labels(inputs.coverage, inputs.lens_env);
     if grid {
-        out.push(DEBUG_GRID_LABEL.to_owned());
+        push(DEBUG_GRID_LABEL, LabelTone::NonPhysical);
     }
     if unlensed {
-        out.push(UNLENSED_STARS_LABEL.to_owned());
+        push(UNLENSED_STARS_LABEL, LabelTone::NonPhysical);
     }
-    if scintillation > 0.0 {
-        out.push(TWINKLE_LABEL.to_owned());
+    if inputs.scintillation > 0.0 {
+        push(TWINKLE_LABEL, LabelTone::Neutral);
     }
-    let saturn_moon_shown = snapshot
-        .bodies
-        .iter()
-        .map(|b| b.id)
-        .chain(snapshot.points.iter().filter_map(|p| p.id))
-        .filter_map(|id| world.sim.objects().get(id as usize)?.naif)
-        .any(|n| SATURN_MAJOR_MOONS.contains(&n));
+    let saturn_moon = |id: ObjectId| {
+        world
+            .sim
+            .objects()
+            .get(id as usize)
+            .and_then(|o| o.naif)
+            .is_some_and(|n| SATURN_MAJOR_MOONS.contains(&n))
+    };
+    let saturn_moon_shown = snapshot.bodies.iter().any(|b| saturn_moon(b.id))
+        || inputs.ui.selected.is_some_and(saturn_moon);
     if saturn_moon_shown {
-        out.push(SATURN_MOONS_LABEL.to_owned());
+        push(SATURN_MOONS_LABEL, LabelTone::Neutral);
     }
     out
+}
+
+/// The label texts of `labels` (the capture JSON's `honesty`).
+pub fn label_texts(labels: &[(String, LabelTone)]) -> Vec<String> {
+    labels.iter().map(|(t, _)| t.clone()).collect()
 }
 
 /// The internal render resolution for an output (window) of `output` pixels: about
@@ -950,9 +1254,9 @@ pub fn apply_bookmark(
     controls: &mut HudControls,
 ) -> anyhow::Result<Applied> {
     if let Some(s) = &b.epoch_utc {
-        let e = Epoch::parse_iso_utc(s).with_context(|| {
+        let e = parse_bookmark_epoch(s).with_context(|| {
             format!(
-                "bookmark {:?}: epoch_utc {s:?} is not YYYY-MM-DDThh:mm:ss[.fff]Z",
+                "bookmark {:?}: epoch_utc {s:?} is not [±YYYYY]YYYY-MM-DDThh:mm:ss[.fff]Z",
                 b.name
             )
         })?;
@@ -1085,41 +1389,212 @@ impl Perf {
     }
 }
 
-/// What the HUD shows for this frame: `notices` (data and GPU warnings) first, then the lens
-/// coverage warning, then the frame's honesty labels. The amber eye-adapted label follows the
-/// resolve's own condition (frame contract, review m13); uni-ui's own lens lines stay off
-/// (`lens_on_screen` false), since the lens labels are in the frame's labels. The v2 fields
-/// (Task C0) hold plain defaults until C6 wires the navigator, the card and the notes: the
-/// place line and the Location panel name the nearest body, the Time panel the clock, the Speed
-/// panel free flight; no Gravity panel, card or notes (the labels stay in `warnings`).
-pub fn hud_data(
+/// The navigator's part of the HUD (Task C6): the place line, the target card, the Speed
+/// panel's speed and flight label.
+#[derive(Clone, Debug)]
+pub struct NavHud {
+    pub line: NavLine,
+    pub target: Option<TargetCard>,
+    pub speed_mps: f64,
+    pub flight: FlightLabel,
+    /// The Speed panel's note (cruise's drop-out rule, a goto's compressed travel time).
+    pub note: Option<String>,
+}
+
+/// The navigator's HUD part for `status` seen from `view` (C4's wiring notes): the card of the
+/// goto target, else of the selection (`uni_ui::build_card`), with the kicker "EN ROUTE TO"
+/// during a goto and the note "No surface map: uniform albedo" for a body without a map
+/// (`has_map`, NAIF id); the place line en route, aiming (a filling ring), on a selection
+/// (distance and closing speed) or else at the nearest body.
+pub fn nav_hud(
     world: &World,
-    frame: &Frame,
-    perf: Perf,
-    speed_mps: f64,
-    star_count: u32,
-    notices: &[String],
-) -> HudData {
+    view: &CameraView,
+    status: &NavStatus,
+    has_map: impl Fn(i32) -> bool,
+) -> NavHud {
+    let name = |id: ObjectId| world.name(id).to_owned();
+    let rel = |id: ObjectId| world.sim.position(id).delta_from(view.pos);
+    let goto = match status.mode {
+        FlightMode::Goto { target } => Some(target),
+        FlightMode::Free | FlightMode::Cruise => None,
+    };
+    let line = if let Some(target) = goto {
+        NavLine::EnRoute {
+            name: name(target),
+            to_go_m: status.to_go_m.unwrap_or_else(|| rel(target).length()),
+        }
+    } else if let Some(aim) = status.aim.filter(|a| a.fill > 0.0) {
+        NavLine::Aiming {
+            name: name(aim.target),
+            dist_m: rel(aim.target).length(),
+            fill: aim.fill,
+        }
+    } else if let Some(id) = status.selected {
+        let r = rel(id);
+        let d = r.length();
+        // Range rate d|r|/dt = r̂ · (v_object − v_camera); closing is its negative.
+        let closing = if d > 0.0 {
+            -(r / d).dot(world.sim.velocity(id) - view.velocity_mps)
+        } else {
+            0.0
+        };
+        NavLine::Selected {
+            name: name(id),
+            dist_m: d,
+            closing_mps: closing,
+        }
+    } else {
+        let (name, dist_m) = world.nearest(&view.pos);
+        NavLine::Here { name, dist_m }
+    };
+    let target = goto.or(status.selected).and_then(|id| {
+        let mut card = uni_ui::build_card(&world.sim, id, view)?;
+        if goto.is_some() {
+            card.kicker = "EN ROUTE TO".to_owned();
+        }
+        let info = world.sim.objects().get(id as usize)?;
+        let surface = matches!(
+            info.kind,
+            ObjectKind::Planet | ObjectKind::DwarfPlanet | ObjectKind::Moon | ObjectKind::Asteroid
+        );
+        let no_map = info.naif.is_none_or(|n| !has_map(n));
+        if surface
+            && no_map
+            && !card
+                .notes
+                .iter()
+                .any(|n| n == uni_ui::theme::NOTE_NO_SURFACE_MAP)
+        {
+            card.notes
+                .push(uni_ui::theme::NOTE_NO_SURFACE_MAP.to_owned());
+        }
+        Some(card)
+    });
+    let note = match status.mode {
+        FlightMode::Cruise => Some(CRUISE_NOTE.to_owned()),
+        FlightMode::Goto { .. } => Some("travel time compressed".to_owned()),
+        FlightMode::Free => None,
+    };
+    NavHud {
+        line,
+        target,
+        speed_mps: status.speed_mps,
+        flight: flight_label(status),
+        note,
+    }
+}
+
+/// A navigator status for a still view (captures): free flight, or cruise with `cruise` at the
+/// default cruise setting (the speed cruise would fly at from `view`), with `selected`.
+pub fn still_status(
+    world: &World,
+    view: &CameraView,
+    cruise: bool,
+    selected: Option<ObjectId>,
+) -> NavStatus {
+    let speed_mps = if cruise {
+        let d_surface = world
+            .sim
+            .nearest_surface(&view.pos)
+            .map_or(f64::INFINITY, |(_, d)| d);
+        uni_nav::cruise_speed(d_surface, uni_nav::cruise::CRUISE_LOG10_DEFAULT)
+    } else {
+        0.0
+    };
+    NavStatus {
+        mode: if cruise {
+            FlightMode::Cruise
+        } else {
+            FlightMode::Free
+        },
+        speed_mps,
+        ftl: speed_mps > uni_core::C,
+        dropout: None,
+        eta_s: None,
+        selected,
+        aim: None,
+        goto_progress: None,
+        to_go_m: None,
+        anchor: None,
+    }
+}
+
+/// What the HUD shows besides the frame and the navigator.
+pub struct HudExtras<'a> {
+    pub perf: Perf,
+    pub star_count: u32,
+    /// Warnings in amber: data, GPU errors, a flash message.
+    pub warnings: &'a [String],
+    /// Renderer status lines ("Inside Earth", "No surface map: uniform albedo (…)"): grey notes
+    /// (plan table: approximate, not non-physical; Task C6).
+    pub statuses: &'a [String],
+}
+
+/// The Gravity panel of the body whose frame the camera is in (calculators only, never applied:
+/// ruling 6), at the camera's distance from its centre; `None` in the root frame.
+pub fn gravity_panel(
+    world: &World,
+    view: &CameraView,
+    frame: uni_core::FrameId,
+) -> Option<uni_ui::GravityPanel> {
+    let id = world
+        .sim
+        .objects()
+        .iter()
+        .find(|o| o.frame == Some(frame) && frame != uni_core::ROOT_FRAME)?;
+    let gm = id.gm_m3s2;
+    let r = view.pos.delta_from(world.sim.position(id.id)).length();
+    (gm > 0.0 && r > 0.0).then(|| uni_ui::GravityPanel {
+        body: id.name.clone(),
+        local_g: uni_physics::calc::local_g(gm, r),
+        escape_mps: uni_physics::calc::escape_speed(gm, r),
+        circular_mps: uni_physics::calc::circular_speed(gm, r),
+    })
+}
+
+/// The Location panel's region: "Near <body>" in a body's frame, "Solar System" within
+/// [`SOLAR_SYSTEM_AU`] of the Sun, "Interstellar space" beyond.
+fn region(world: &World, frame: uni_core::FrameId, from_sun_m: f64) -> String {
+    match world.frame_body_name(frame) {
+        Some(body) if body != "Sun" => format!("Near {body}"),
+        _ if from_sun_m <= SOLAR_SYSTEM_AU * uni_core::AU => "Solar System".to_owned(),
+        _ => "Interstellar space".to_owned(),
+    }
+}
+
+/// The Location panel says "Solar System" within this distance of the Sun [AU]: about the
+/// heliopause (Voyager 1 crossed it at 121.6 AU; Stone et al. 2013, Science 341, 150).
+pub const SOLAR_SYSTEM_AU: f64 = 120.0;
+
+/// What the HUD shows for this frame (C4's wiring notes): the notes are the frame's honesty
+/// labels with their tones (one list with the capture JSON's `honesty`), then the renderer's
+/// status lines in grey; `warnings` (data, GPU errors, the lens coverage warning) stay amber.
+/// The panels come from the world and `nav`.
+pub fn hud_data(world: &World, frame: &Frame, nav: NavHud, extras: HudExtras<'_>) -> HudData {
     let ctx = &frame.ctx;
     let (nearest_name, nearest_dist_m) = world.nearest(&ctx.camera.pos);
-    let mut warnings = notices.to_vec();
+    let mut warnings = extras.warnings.to_vec();
     warnings.extend(frame.coverage.warning().map(str::to_owned));
-    warnings.extend(
-        frame
-            .labels
-            .iter()
-            .filter(|l| l.as_str() != uni_ui::EYE_ADAPTED_STARS_LABEL)
-            .cloned(),
-    );
+    let mut notes = frame.labels.clone();
+    for s in extras.statuses {
+        if !notes.iter().any(|(t, _)| t == s) {
+            notes.push((s.clone(), LabelTone::Neutral));
+        }
+    }
     let dist_from_sun_m = world
         .position_of("Sun")
         .map_or(f64::NAN, |s| ctx.camera.pos.delta_from(s).length());
+    let dominant = frame.snapshot.dominant_frame;
     let frame_name = world
-        .frame_body_name(frame.snapshot.dominant_frame)
+        .frame_body_name(dominant)
         .unwrap_or_else(|| "SSB".to_owned());
+    let (header, tone) = match nav.flight {
+        FlightLabel::Free => (uni_ui::FREE_FLIGHT_LABEL, LabelTone::NonPhysical),
+        FlightLabel::Cruise => (uni_ui::CRUISE_LABEL, LabelTone::NonPhysical),
+    };
     HudData {
         location: uni_ui::LocationPanel {
-            region: nearest_name.clone(),
+            region: region(world, dominant, dist_from_sun_m),
             from_sun_m: dist_from_sun_m,
             light_time_s: dist_from_sun_m / uni_core::C,
             frame: frame_name,
@@ -1129,38 +1604,64 @@ pub fn hud_data(
             rate: world.sim.time.rate(),
             paused: world.sim.time.is_paused(),
         },
-        gravity: None,
+        gravity: gravity_panel(world, &ctx.camera, dominant),
         speed: uni_ui::SpeedPanel {
-            header: uni_ui::FREE_FLIGHT_LABEL.to_owned(),
-            tone: uni_ui::LabelTone::NonPhysical,
-            speed_mps,
-            note: None,
+            header: header.to_owned(),
+            tone,
+            speed_mps: nav.speed_mps,
+            note: nav.note,
         },
-        target: None,
-        notes: Vec::new(),
-        nav_line: uni_ui::NavLine::Here {
-            name: nearest_name.clone(),
-            dist_m: nearest_dist_m,
-        },
-        fps: perf.fps,
-        cpu_ms: perf.cpu_ms,
-        gpu_ms: perf.gpu_ms,
-        gpu_frame_ms: perf.gpu_frame_ms,
-        gpu_timing_available: perf.gpu_timing_available,
+        target: nav.target,
+        notes,
+        nav_line: nav.line,
+        fps: extras.perf.fps,
+        cpu_ms: extras.perf.cpu_ms,
+        gpu_ms: extras.perf.gpu_ms,
+        gpu_frame_ms: extras.perf.gpu_frame_ms,
+        gpu_timing_available: extras.perf.gpu_timing_available,
         render_size: ctx.viewport.to_array(),
         output_size: ctx.output_size.to_array(),
         dist_from_sun_m,
         nearest_name,
         nearest_dist_m,
-        speed_mps,
+        speed_mps: nav.speed_mps,
         epoch: world.epoch(),
         time_rate: world.time_rate(),
-        star_count,
+        star_count: extras.star_count,
         warnings,
         inside_horizon: frame.coverage == LensCoverage::InsideHorizon,
+        // The lens labels are in the frame's labels (`notes`), in their tones.
         lens_on_screen: false,
         eye_adapted_stars: frame.settings.eye_adapted_in_effect(),
     }
+}
+
+/// Bookmark epochs: `Epoch::parse_iso_utc`'s `YYYY-MM-DDThh:mm:ss[.fff]Z`, or ISO 8601's
+/// expanded year form `±YYYYY…-MM-DDThh:mm:ss[.fff]Z` (ISO 8601-1:2019 §4.3.2.2) for dates
+/// beyond year 9999 or before year 0 (`sky-orion-50kyr`, plan C6). An expanded date is the same
+/// day and time in the proleptic Gregorian year within 400 years of 2000, shifted by whole
+/// 400-year Gregorian cycles of 146 097 days (the calendar repeats exactly every cycle).
+pub fn parse_bookmark_epoch(s: &str) -> Option<Epoch> {
+    let Some(sign) = s
+        .strip_prefix('+')
+        .map(|_| 1)
+        .or_else(|| s.strip_prefix('-').map(|_| -1))
+    else {
+        return Epoch::parse_iso_utc(s);
+    };
+    let body = &s[1..];
+    let dash = body.find('-')?;
+    let digits = &body[..dash];
+    if digits.len() < 4 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = sign * digits.parse::<i64>().ok()?;
+    // The same calendar year within [2000, 2400), and the cycles between.
+    let cycles = (year - 2000).div_euclid(400);
+    let base_year = year - 400 * cycles;
+    let base = Epoch::parse_iso_utc(&format!("{base_year:04}{}", &body[dash..]))?;
+    const CYCLE_S: f64 = 146_097.0 * DAY;
+    Some(base.add_seconds(cycles as f64 * CYCLE_S))
 }
 
 #[cfg(test)]
@@ -1465,7 +1966,7 @@ mod tests {
     /// test below: `gpu_ms` in the capture JSON is keyed by label, so two passes with one label
     /// would share one entry. A tap times its copy only on the frames it is armed for (captures).
     /// The live check is `duplicate_pass_names` on the timer's own list, run on every capture.
-    const TIMED_PASSES: [&str; 19] = [
+    const TIMED_PASSES: [&str; 22] = [
         crate::tap::CLEAR_MARK,
         "exposure",
         "band-update",
@@ -1473,6 +1974,8 @@ mod tests {
         "sun",
         "bodies",
         "rings",
+        "comets",
+        crate::tap::TAP_MASK,
         "atmosphere",
         "atmosphere mask",
         "histogram",
@@ -1481,6 +1984,7 @@ mod tests {
         "band",
         "stars",
         "points",
+        "asteroids",
         crate::tap::TAP_PREBLOOM,
         "bloom",
         "bloom composite",
@@ -1551,7 +2055,9 @@ mod tests {
         assert_eq!(at(crate::tap::TAP_WORLD), at("histogram") + 1);
         assert_eq!(at(crate::tap::TAP_WORLD) + 1, at("lens"));
         assert_eq!(at(crate::tap::TAP_PREBLOOM) + 1, at("bloom"));
-        assert_eq!(at(crate::tap::TAP_PREBLOOM), at("points") + 1);
+        assert_eq!(at(crate::tap::TAP_PREBLOOM), at("asteroids") + 1);
+        assert_eq!(at(crate::tap::TAP_MASK), at("comets") + 1);
+        assert_eq!(at(crate::tap::TAP_MASK) + 1, at("atmosphere"));
         assert_eq!(crate::tap::TAP_WORLD, "tap-world");
         assert_eq!(crate::tap::TAP_PREBLOOM, "tap-prebloom");
         let all: Vec<(&'static str, Option<f32>)> =
@@ -1597,18 +2103,23 @@ mod tests {
                 ..ViewChoices::default()
             };
             let s = exposure_settings(&default_controls(1.0), choice, false, false);
-            let labels = honesty_labels(
+            let tones = honesty_labels(
                 &world,
                 &c.camera,
                 c.viewport,
                 &snap,
                 &s,
-                env,
-                LensCoverage::Traced,
-                env == LensEnv::Band,
-                0.0,
-                true,
+                &LabelInputs {
+                    lens_env: env,
+                    coverage: LensCoverage::Traced,
+                    band_on: env == LensEnv::Band,
+                    scintillation: 0.0,
+                    vivid: true,
+                    belt_visible: false,
+                    ui: UiState::default(),
+                },
             );
+            let labels = label_texts(&tones);
             assert!(labels.contains(&UNLENSED_STARS_LABEL.to_owned()));
             assert_eq!(labels.contains(&DEBUG_GRID_LABEL.to_owned()), grid);
             let band = uni_sim::honesty::label(HonestyFlag::BandModel).to_owned();
@@ -1617,6 +2128,11 @@ mod tests {
             assert_eq!(labels.contains(&band), !grid, "{labels:?}");
             assert_eq!(labels.contains(&detail), !grid, "{labels:?}");
             assert!(labels.contains(&uni_ui::VIVID_STAR_COLOURS_LABEL.to_owned()));
+            // Task C6: the flight label leads, and the lens labels are amber.
+            assert_eq!(labels[0], uni_ui::FREE_FLIGHT_LABEL);
+            let tone = |t: &str| tones.iter().find(|(l, _)| l == t).map(|(_, tone)| *tone);
+            assert_eq!(tone(UNLENSED_STARS_LABEL), Some(LabelTone::NonPhysical));
+            assert_eq!(tone(&band), (!grid).then_some(LabelTone::Neutral));
         }
     }
 
@@ -1641,6 +2157,297 @@ mod tests {
             );
             assert!(c.view_rot.is_finite());
         }
+    }
+
+    /// Plan C6 Step 1 (re-review r2 minor 1): with "Highlight asteroid belt" on, the point of a
+    /// registry asteroid (Ceres, a dwarf planet made from an asteroid record) is BELT_HIGHLIGHT_GAIN
+    /// brighter, and unchanged with it off; planets', the Sun's and stars' points never change.
+    #[test]
+    fn belt_highlight_boosts_registry_points() {
+        let mut g = crate::world::tests::full_world();
+        let (world, _) = &mut *g;
+        world.set_epoch(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        let id = |n: &str| world.sim.find(n).unwrap_or_else(|| panic!("{n}"));
+        let ceres = id("Ceres");
+        assert!(world.sim.asteroid_record_of(ceres).is_some());
+        assert_eq!(
+            world.sim.objects()[ceres as usize].kind,
+            ObjectKind::DwarfPlanet
+        );
+        for (who, boosted) in [
+            (ceres, true),
+            (id("Mars"), false),
+            (id("Sun"), false),
+            (id("Sirius"), false),
+        ] {
+            let off = point_scale(world, Some(who), 0.25, false);
+            let on = point_scale(world, Some(who), 0.25, true);
+            let want = if boosted {
+                uni_sky::BELT_HIGHLIGHT_GAIN
+            } else {
+                1.0
+            };
+            assert_eq!(on / off, want, "{}", world.name(who));
+        }
+        assert_eq!(point_scale(world, None, 0.25, true), 1.0);
+        // Through the sprites of a real frame: Ceres seen 0.5 AU away with Mars and stars.
+        let c = world.sim.position(ceres);
+        let dir = DVec3::new(0.3, -0.4, 0.2).normalize();
+        let view = view_at(
+            c.offset(-dir * 0.5 * uni_core::AU),
+            DQuat::from_rotation_arc(DVec3::NEG_Z, dir),
+        );
+        let snap = world.sim.snapshot(&view, UVec2::new(1920, 1080));
+        let albedo = HashMap::new();
+        let off = point_sprites(world, &snap, &albedo, true, 1.0, false);
+        let on = point_sprites(world, &snap, &albedo, true, 1.0, true);
+        let at = snap
+            .points
+            .iter()
+            .position(|p| p.id == Some(ceres))
+            .unwrap();
+        for (k, p) in snap.points.iter().enumerate() {
+            let ratio = on[k].illuminance_lux / off[k].illuminance_lux;
+            let registry =
+                p.id.is_some_and(|i| world.sim.asteroid_record_of(i).is_some());
+            let want = if registry {
+                uni_sky::BELT_HIGHLIGHT_GAIN
+            } else {
+                1.0
+            };
+            assert!((ratio / want - 1.0).abs() < 1e-12, "point {k}: {ratio}");
+        }
+        assert!((on[at].illuminance_lux / off[at].illuminance_lux - 1e6).abs() < 1e-3);
+        // Catalogue stars are drawn by the star pass, not as points (only stars within 0.1 pc
+        // are points); their factor, and the Sun's and Mars's, is checked through
+        // `point_scale` above.
+    }
+
+    /// Lead ruling "comet double light" (Task C6, C1 review m8): a comet point carries its
+    /// nucleus alone, exactly C1's `nucleus_illuminance_lux` (so the comet pass's coma adds the
+    /// rest, not a second total), fainter than SBDB's total magnitude; and C1's Sun intensity is
+    /// uni-sim's, recovered from a zero-phase nucleus (p_V·E·(R/Δ)², ρ·[L + 2(1 − L)/3] = p_V).
+    #[test]
+    fn comet_point_is_the_nucleus_alone() {
+        let mut g = crate::world::tests::full_world();
+        let (world, _) = &mut *g;
+        world.set_epoch(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        let vp = UVec2::new(1920, 1080);
+        let all = world
+            .sim
+            .snapshot(&view_at(UniversePos::default(), DQuat::IDENTITY), vp);
+        let c0 = all.comets.iter().find(|c| c.total_v.is_some()).unwrap();
+        let dir = DVec3::new(0.3, 0.2, 0.9).normalize();
+        let pos = world.sim.position(c0.id).offset(-dir * 0.3 * uni_core::AU);
+        let snap = world.sim.snapshot(
+            &view_at(pos, DQuat::from_rotation_arc(DVec3::NEG_Z, dir)),
+            vp,
+        );
+        let v = snap.comets.iter().find(|c| c.id == c0.id).unwrap();
+        let point = snap.points.iter().find(|q| q.id == Some(c0.id)).unwrap();
+        let nucleus = uni_planet::comet::nucleus::nucleus_illuminance_lux(v);
+        assert!(
+            (point.illuminance_lux / nucleus - 1.0).abs() < 1e-9,
+            "{} vs {nucleus}",
+            point.illuminance_lux
+        );
+        let total = uni_core::star_illuminance_lux(v.total_v.unwrap());
+        assert!(
+            point.illuminance_lux < total,
+            "{} vs {total}",
+            point.illuminance_lux
+        );
+        // C1's Sun intensity: Δ = 10⁷ km, r = 1 AU, the Sun behind the camera (phase 0).
+        let mut z = v.clone();
+        let (d, r) = (1.0e10, uni_core::AU);
+        z.nucleus_rel_m = DVec3::new(0.0, 0.0, -d);
+        z.sun_rel_m = DVec3::new(0.0, 0.0, r);
+        let e = uni_planet::comet::nucleus::nucleus_illuminance_lux(&z);
+        let ratio = z.nucleus_radius_m / d;
+        let c1_sun_cd = e * r * r / (uni_sim::COMET_ALBEDO * ratio * ratio);
+        let sim_sun_cd = uni_sim::world::sun_intensity_cd();
+        assert!(
+            (c1_sun_cd / sim_sun_cd - 1.0).abs() < 1e-12,
+            "{c1_sun_cd} vs {sim_sun_cd}"
+        );
+    }
+
+    /// Bookmark epochs: ISO 8601's expanded years shift by whole Gregorian cycles; the plain
+    /// form is `Epoch::parse_iso_utc`'s.
+    #[test]
+    fn bookmark_epochs_take_expanded_years() {
+        let plain = "2026-11-20T00:00:00Z";
+        assert_eq!(parse_bookmark_epoch(plain), Epoch::parse_iso_utc(plain));
+        let t = Epoch::parse_iso_utc(plain).unwrap();
+        let far = parse_bookmark_epoch("+52026-11-20T00:00:00Z").unwrap();
+        assert_eq!(far.seconds_since(t), 125.0 * 146_097.0 * DAY);
+        let past = parse_bookmark_epoch("-0400-03-01T12:00:00Z").unwrap();
+        let base = Epoch::parse_iso_utc("2000-03-01T12:00:00Z").unwrap();
+        assert_eq!(base.seconds_since(past), 6.0 * 146_097.0 * DAY);
+        assert_eq!(
+            parse_bookmark_epoch("+2026-11-20T00:00:00Z"),
+            Some(t),
+            "a four-digit expanded year is the plain date"
+        );
+        for bad in [
+            "+5a026-11-20T00:00:00Z",
+            "+202-11-20T00:00:00Z",
+            "+52026",
+            "yesterday",
+        ] {
+            assert_eq!(parse_bookmark_epoch(bad), None, "{bad}");
+        }
+    }
+
+    /// Task C6 (lead note, Wave B sheet): Saturn's moons' label shows while one of Saturn's major
+    /// moons is resolved or selected, not while they are faint points; the procedural belt's
+    /// label follows `belt_visible`; the tones are the plan table's.
+    #[test]
+    fn saturn_moon_and_belt_labels_follow_the_rule() {
+        let mut g = crate::world::tests::full_world();
+        let (world, _) = &mut *g;
+        world.set_epoch(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        world.sim.set_selected(None);
+        let vp = UVec2::new(1920, 1080);
+        let titan = world.sim.find("Titan").unwrap();
+        let saturn = world.sim.position(world.sim.find("Saturn").unwrap());
+        let labels = |view: &CameraView, ui: UiState, belt: bool| {
+            let snap = world.sim.snapshot(view, vp);
+            let s = exposure_settings(&default_controls(1.0), ViewChoices::default(), false, true);
+            honesty_labels(
+                world,
+                view,
+                vp,
+                &snap,
+                &s,
+                &LabelInputs {
+                    lens_env: LensEnv::Band,
+                    coverage: LensCoverage::Unlensed,
+                    band_on: true,
+                    scintillation: 0.0,
+                    vivid: true,
+                    belt_visible: belt,
+                    ui,
+                },
+            )
+        };
+        let has = |l: &[(String, LabelTone)], t: &str| l.iter().find(|(x, _)| x == t).map(|x| x.1);
+        // Saturn from 2 AU: its moons are faint points at most.
+        let dir = DVec3::new(0.2, 0.9, 0.1).normalize();
+        let far = view_at(
+            saturn.offset(-dir * 2.0 * uni_core::AU),
+            DQuat::from_rotation_arc(DVec3::NEG_Z, dir),
+        );
+        let snap = world.sim.snapshot(&far, vp);
+        assert!(snap.bodies.iter().all(|b| b.id != titan));
+        let l = labels(&far, UiState::default(), false);
+        assert_eq!(has(&l, SATURN_MOONS_LABEL), None, "{l:?}");
+        let belt = uni_sim::honesty::label(HonestyFlag::ProceduralBelt);
+        assert_eq!(has(&l, belt), None);
+        // Selected: shown, grey; with the belt visible, its grey label too.
+        let picked = UiState {
+            selected: Some(titan),
+            ..UiState::default()
+        };
+        let l = labels(&far, picked, true);
+        assert_eq!(has(&l, SATURN_MOONS_LABEL), Some(LabelTone::Neutral));
+        assert_eq!(has(&l, belt), Some(LabelTone::Neutral));
+        // Titan resolved (60 000 km away): shown.
+        let tpos = world.sim.position(titan);
+        let near = view_at(
+            tpos.offset(-dir * 6.0e7),
+            DQuat::from_rotation_arc(DVec3::NEG_Z, dir),
+        );
+        assert!(
+            world
+                .sim
+                .snapshot(&near, vp)
+                .bodies
+                .iter()
+                .any(|b| b.id == titan)
+        );
+        let l = labels(&near, UiState::default(), false);
+        assert_eq!(has(&l, SATURN_MOONS_LABEL), Some(LabelTone::Neutral));
+        assert_eq!(
+            l[0],
+            (uni_ui::FREE_FLIGHT_LABEL.to_owned(), LabelTone::NonPhysical)
+        );
+        let cruise = UiState {
+            flight: FlightLabel::Cruise,
+            highlight_belt: true,
+            ..UiState::default()
+        };
+        let l = labels(&near, cruise, true);
+        assert_eq!(
+            l[0],
+            (uni_ui::CRUISE_LABEL.to_owned(), LabelTone::NonPhysical)
+        );
+        assert_eq!(
+            has(&l, uni_ui::BELT_HIGHLIGHT_LABEL),
+            Some(LabelTone::NonPhysical)
+        );
+        assert_eq!(
+            has(&l, uni_ui::VIVID_STAR_COLOURS_LABEL),
+            Some(LabelTone::NonPhysical)
+        );
+    }
+
+    /// The navigator's HUD part (C4's wiring notes): en route, the kicker "EN ROUTE TO" and the
+    /// target's card; a body without a map gets the "No surface map" note; cruise has the cruise
+    /// label and its note; a goto over c is labelled as cruise (plan table), one under c is not.
+    #[test]
+    fn nav_hud_follows_the_navigator() {
+        let mut g = crate::world::tests::full_world();
+        let (world, _) = &mut *g;
+        world.set_epoch(Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap());
+        let mars = world.sim.find("Mars").unwrap();
+        let view = view_at(
+            world.sim.position(mars).offset(DVec3::new(2.0e7, 0.0, 0.0)),
+            DQuat::IDENTITY,
+        );
+        let mut status = still_status(world, &view, false, Some(mars));
+        let h = nav_hud(world, &view, &status, |_| true);
+        assert!(matches!(h.line, NavLine::Selected { .. }));
+        let card = h.target.unwrap();
+        assert_eq!(card.kicker, "TARGET");
+        assert!(
+            !card
+                .notes
+                .iter()
+                .any(|n| n == uni_ui::theme::NOTE_NO_SURFACE_MAP)
+        );
+        assert_eq!((h.flight, h.note), (FlightLabel::Free, None));
+        status.mode = FlightMode::Goto { target: mars };
+        status.to_go_m = Some(1.0e7);
+        status.speed_mps = 1.0e9;
+        status.ftl = true;
+        let h = nav_hud(world, &view, &status, |_| false);
+        assert_eq!(
+            h.line,
+            NavLine::EnRoute {
+                name: "Mars".to_owned(),
+                to_go_m: 1.0e7
+            }
+        );
+        let card = h.target.unwrap();
+        assert_eq!(card.kicker, "EN ROUTE TO");
+        assert!(
+            card.notes
+                .iter()
+                .any(|n| n == uni_ui::theme::NOTE_NO_SURFACE_MAP)
+        );
+        assert_eq!(h.flight, FlightLabel::Cruise, "a goto above c");
+        status.ftl = false;
+        assert_eq!(
+            nav_hud(world, &view, &status, |_| true).flight,
+            FlightLabel::Free
+        );
+        let cruise = still_status(world, &view, true, None);
+        assert!(cruise.speed_mps > 0.0);
+        let h = nav_hud(world, &view, &cruise, |_| true);
+        assert_eq!(h.flight, FlightLabel::Cruise);
+        assert_eq!(h.note.as_deref(), Some(CRUISE_NOTE));
+        assert!(h.target.is_none() && matches!(h.line, NavLine::Here { .. }));
     }
 
     #[test]
