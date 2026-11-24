@@ -33,12 +33,14 @@
 //!   (Task C6). For each ray from the centre (every 0.25°) the median of the blue excess B − R
 //!   over the 1-px steps from `r_min` to `r_max`; the feature is the ray whose median stands
 //!   highest above the median of all rays (the CO⁺ ion tail is bluer than the solar-coloured
-//!   dust, coma and band), refined by the excess-weighted mean of the rays within 1.5° of it. A
-//!   field star crosses a ray at a few radii only, so the median ignores it; B8's first
-//!   estimator, the direction of Σ Y·ρ̂ over the annulus's B > R pixels, is still printed, but at
-//!   `comet-neowise-2020` the field's blue stars (9 000 pixels) outweighed the 1.5-px ion tail
-//!   and put it 40° off. Angles are degrees counter-clockwise from the image's +x axis with y
-//!   up.
+//!   dust, coma and band), refined by the excess-weighted mean of the rays within 1.5° of it. It
+//!   counts only when it stands at least 5 robust standard deviations (1.4826 × the rays' median
+//!   absolute deviation) above that median; otherwise the check FAILs with "no feature" (C6 fix
+//!   round 1, minor 1). A field star crosses a ray at a few radii only, so the median ignores
+//!   it; B8's first estimator, the direction of Σ Y·ρ̂ over the annulus's B > R pixels, is still
+//!   printed, but at `comet-neowise-2020` the field's blue stars (9 000 pixels) outweighed the
+//!   1.5-px ion tail and put it 40° off. Angles are degrees counter-clockwise from the image's +x
+//!   axis with y up.
 //! - `flux`: E = Σ_{ρ_i < R} (Y_i − Y_bg)·Ω_i ÷ `pre[1]` against `expected_lux` (re-review r2
 //!   NPA). Ω_i = Ω_c·cos³θ_i is the solid angle of pixel i, the `uni_sky::stars` convention
 //!   (Ω_c = s², s = 2·tan(fov_y/2)/H; cos θ_i = 1/√(1 + (s·d_i)²), d_i the pixel centre's distance
@@ -803,22 +805,32 @@ pub fn check_profile(cap: &HdrCapture, feature: &str, tol: f64) -> anyhow::Resul
     })
 }
 
-/// A feature's brightness-weighted direction [deg] and how many pixels passed the colour test
-/// (none: NaN).
+/// A feature's direction [deg] and how many pixels (samples) support it (none: NaN and 0).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AngleResult {
     pub angle_deg: f64,
     pub pixels: usize,
+    /// [`feature_angle`]: the best ray's excess over the rays' median in robust standard
+    /// deviations (1.4826 × the rays' median absolute deviation; infinite when that is 0 and
+    /// the excess is not); NaN for [`weighted_angle`] and when no ray has a median.
+    pub significance: f64,
 }
 
 /// Ray step of [`feature_angle`] [deg].
 const RAY_STEP_DEG: f64 = 0.25;
 /// Half-width of the refinement around the best ray [deg].
 const RAY_REFINE_DEG: f64 = 1.5;
+/// The significance [robust σ] the best ray needs to count as a feature (Task C6 fix round 1,
+/// minor 1): 5σ, the usual detection threshold. Pure noise over the 1 440 rays (fewer
+/// independent ones, as neighbours share pixels near the centre) peaks near 3.5σ.
+pub const MIN_RAY_SIGNIFICANCE: f64 = 5.0;
+/// 1.4826 × the median absolute deviation is the standard deviation of normal noise (Rousseeuw
+/// & Croux 1993, J. Am. Stat. Assoc. 88, 1273).
+const MAD_TO_SIGMA: f64 = 1.4826;
 
 /// The direction of the straight blue feature `feature` (module docs: the ray-median
-/// estimator) and the number of samples on its ray that stand above the rays' median; NaN and 0
-/// when no ray stands above it.
+/// estimator), the number of samples on its ray that stand above the rays' median, and the
+/// ray's significance; NaN and 0 when no ray stands [`MIN_RAY_SIGNIFICANCE`] above it.
 pub fn feature_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleResult> {
     let f = cap.feature(feature)?;
     let n = (360.0 / RAY_STEP_DEG).round() as usize;
@@ -848,6 +860,7 @@ pub fn feature_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleRes
         return Ok(AngleResult {
             angle_deg: f64::NAN,
             pixels: 0,
+            significance: f64::NAN,
         });
     }
     valid.sort_by(f64::total_cmp);
@@ -862,12 +875,26 @@ pub fn feature_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleRes
         return Ok(AngleResult {
             angle_deg: f64::NAN,
             pixels: 0,
+            significance: f64::NAN,
         });
     };
-    if !(peak > 0.0) {
+    // The best ray's significance against the spread of all rays' medians (robust: the feature's
+    // own rays and a few stray ones do not move the median absolute deviation).
+    let mut dev: Vec<f64> = valid.iter().map(|s| (s - base).abs()).collect();
+    dev.sort_by(f64::total_cmp);
+    let sigma = MAD_TO_SIGMA * dev[dev.len() / 2];
+    let significance = if sigma > 0.0 {
+        peak / sigma
+    } else if peak > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    if !(peak > 0.0 && significance >= MIN_RAY_SIGNIFICANCE) {
         return Ok(AngleResult {
             angle_deg: f64::NAN,
             pixels: 0,
+            significance,
         });
     }
     // Excess-weighted mean of the rays near the best one (on the circle, about it).
@@ -886,6 +913,7 @@ pub fn feature_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleRes
     Ok(AngleResult {
         angle_deg: (angle + 180.0).rem_euclid(360.0) - 180.0,
         pixels,
+        significance,
     })
 }
 
@@ -912,7 +940,11 @@ pub fn weighted_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleRe
     } else {
         f64::NAN
     };
-    Ok(AngleResult { angle_deg, pixels })
+    Ok(AngleResult {
+        angle_deg,
+        pixels,
+        significance: f64::NAN,
+    })
 }
 
 /// `angle`: the direction within `tol_deg` of the feature's `angle_deg`.
@@ -932,9 +964,9 @@ pub fn check_angle(cap: &HdrCapture, feature: &str, tol_deg: f64) -> anyhow::Res
             lines: vec![
                 first,
                 format!(
-                    "angle {feature}: no ray between {} and {} px stands above the rays' median \
-                     blue excess FAIL",
-                    f.r_min, f.r_max
+                    "angle {feature}: no ray between {} and {} px stands {MIN_RAY_SIGNIFICANCE}σ \
+                     above the rays' median blue excess (best {:.1}σ): no feature FAIL",
+                    f.r_min, f.r_max, a.significance
                 ),
             ],
             pass: false,
@@ -946,9 +978,10 @@ pub fn check_angle(cap: &HdrCapture, feature: &str, tol_deg: f64) -> anyhow::Res
         lines: vec![
             first,
             format!(
-                "angle {feature}: {:.3}° (ray median of B − R, {} samples above the field, {}–{} \
-                 px) vs {expected}° ± {tol_deg}° (error {error:+.3}°) {}",
+                "angle {feature}: {:.3}° (ray median of B − R, {:.1}σ, {} samples above the field, \
+                 {}–{} px) vs {expected}° ± {tol_deg}° (error {error:+.3}°) {}",
                 a.angle_deg,
+                a.significance,
                 a.pixels,
                 f.r_min,
                 f.r_max,
@@ -1497,11 +1530,37 @@ pub(crate) mod tests {
             let b = 0.05 + 0.5 * rnd();
             add(&mut field, x, y, [0.2 * b, 0.5 * b, b]);
         }
+        // Fix round 1 (minor 1): pixel noise in the band (σ 3e-4 per channel, 23 % of its
+        // B − R), so the rays' medians spread and one of them always tops the rest. Without the
+        // line, no ray reaches 5σ: "no feature", FAIL. With it, found as before.
+        let mut gauss = || (0..12).map(|_| rnd()).sum::<f64>() - 6.0; // Irwin–Hall, σ 1
+        for p in field.pixels.iter_mut() {
+            p[0] += (3.0e-4 * gauss()) as f32;
+            p[2] += (3.0e-4 * gauss()) as f32;
+        }
+        let no_line = field.clone();
+        let none = feature_angle(&no_line, "ion_tail").expect("angle");
+        assert!(none.angle_deg.is_nan() && none.pixels == 0, "{none:?}");
+        assert!(none.significance < MIN_RAY_SIGNIFICANCE, "{none:?}");
+        println!("no line: best ray {:.2}σ", none.significance);
+        let v = check_angle(&no_line, "ion_tail", 1.0).expect("check");
+        assert!(
+            !v.pass && v.lines[1].contains("no feature"),
+            "{:?}",
+            v.lines
+        );
         streak(37.0, [0.0002, 0.0004, 0.0015], &mut field);
         let a = feature_angle(&field, "ion_tail").expect("angle");
         close(a.angle_deg, 37.0, 0.5, "faint ion tail among blue stars");
+        assert!(a.significance > 2.0 * MIN_RAY_SIGNIFICANCE, "{a:?}");
+        assert!(check_angle(&field, "ion_tail", 1.0).expect("check").pass);
         let old = weighted_angle(&field, "ion_tail").expect("weighted");
         assert!((old.angle_deg - 37.0).abs() > 1.0, "{}", old.angle_deg);
+        // A tail 3° from where it should be fails the ±1° check.
+        let mut off = field.clone();
+        off.features.get_mut("ion_tail").expect("feature").angle_deg = Some(40.0);
+        let v = check_angle(&off, "ion_tail", 1.0).expect("check");
+        assert!(!v.pass && v.lines[1].ends_with("FAIL"), "{:?}", v.lines);
     }
 
     // ---- Test fixture: a copy of uni-sky's PSF CPU twin (crates/uni-sky/src/psf.rs at
