@@ -1704,6 +1704,19 @@ mod tests {
             dust_production(view.r_au, view.k1.unwrap_or(0.0)),
         );
         let rate = dust_emission_cd_per_s(coma);
+        // The drawn share alone (`dust_light_drawn`, what `plan_frame` adds per tail), averaged.
+        let clock = std::time::Instant::now();
+        let mut share = 0.0;
+        for _ in 0..200 {
+            let (l, d) = dust_light_drawn(&grains, rate, view.nucleus_rel_m, view.sun_rel_m, &cam);
+            share += d / l / 200.0;
+        }
+        let share_ms = clock.elapsed().as_secs_f64() * 1e3 / 200.0;
+        assert!(
+            (share - tail.drawn_fraction).abs() < 1e-9,
+            "{share} vs {tail:?}"
+        );
+        println!("row 20: the drawn share alone {share_ms:.4} ms per tail (this build)");
         let (mut overflow_light, mut overflow_n) = (0.0, 0);
         // The quads' fill [px] that pass the GPU's visibility cull at the capture's auto
         // exposure (EV −5.29, C1L report; pre = 1/(1.2·2^EV), CLAUDE.md §2), with and without
@@ -2004,9 +2017,24 @@ mod tests {
         assert_eq!(plan.dust_drawn.len(), 1);
         let d = plan.dust_drawn[0];
         let note = crate::comet::dust_partly_drawn_note(d.drawn_fraction);
+        // The share alone, per tail (`dust_light_drawn`, what `plan_frame` adds), averaged over
+        // repeats: the ruling's budget is 0.05 ms per tail in release.
+        let (view, tail) = (&scene.comets[0], &manager.tails[&d.id]);
+        let cam = SpriteCamera::new(&camera, size);
+        let rate = dust_emission_cd_per_s(crate::comet::coma::coma_intensity_cd(view));
+        let reps = 200;
+        let clock = std::time::Instant::now();
+        let mut sink = 0.0;
+        for _ in 0..reps {
+            let (l, dr) =
+                dust_light_drawn(&tail.grains, rate, view.nucleus_rel_m, view.sun_rel_m, &cam);
+            sink += dr / l;
+        }
+        let share_ms = clock.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
+        assert!((sink / f64::from(reps) - d.drawn_fraction).abs() < 1e-12);
         println!(
             "row 21: {} splats, tail {:.3e} cd, drawn {:.2} % ({ms:.2} ms for plan_frame with the \
-             share, test build); note: {note}",
+             share; the share alone {share_ms:.4} ms per tail; this build); note: {note}",
             d.splats,
             d.light_cd,
             100.0 * d.drawn_fraction
