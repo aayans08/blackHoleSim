@@ -215,10 +215,13 @@ fn sprite_profile(r: f32, sigma: f32) -> f32 {
 
 // A splat's ellipse on the sprite plane (C1L): the 3D covariance L Lᵀ (l0 = (L00, L10, L20,
 // L11), l1 = (L21, L22)) projected on the unit vectors right and up, plus floor² on both axes.
-// With uᵢ the projected columns of L: trace Σ|uᵢ|² + 2f², determinant Σ_{i<j}(uᵢ × uⱼ)² +
-// f²Σ|uᵢ|² + f⁴ (Cauchy–Binet: no cancellation for elongated splats), σ₁² = m + √(m² − det),
-// σ₂² = det/σ₁². Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and −sin φ·right +
-// cos φ·up. Twin of tails::splat_axes.
+// Every length is first divided by k, the largest projected component or the floor (C1L fix
+// round 1, review I2: squaring metres overflowed f32 above σ₁ ≈ 6.1e9 m and the splat
+// vanished; now nothing squared exceeds 9). With uᵢ the scaled projected columns of L and
+// f = floor/k: trace Σ|uᵢ|² + 2f², determinant Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴
+// (Cauchy–Binet: no cancellation for elongated splats), σ₁² = k²(m + √(m² − det)),
+// σ₂ = k √(det/(m + √(m² − det))). Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and
+// −sin φ·right + cos φ·up; 0 for a zero covariance and floor. Twin of tails::splat_axes.
 fn splat_axes(
     l0: vec4<f32>,
     l1: vec2<f32>,
@@ -229,10 +232,21 @@ fn splat_axes(
     let c0 = vec3<f32>(l0.x, l0.y, l0.z);
     let c1 = vec3<f32>(0.0, l0.w, l1.x);
     let c2 = vec3<f32>(0.0, 0.0, l1.y);
-    let u0 = vec2<f32>(dot(right, c0), dot(up, c0));
-    let u1 = vec2<f32>(dot(right, c1), dot(up, c1));
-    let u2 = vec2<f32>(dot(right, c2), dot(up, c2));
-    let f2 = floor * floor;
+    let v0 = vec2<f32>(dot(right, c0), dot(up, c0));
+    let v1 = vec2<f32>(dot(right, c1), dot(up, c1));
+    let v2 = vec2<f32>(dot(right, c2), dot(up, c2));
+    let k = max(
+        max(max(abs(floor), abs(v0.x)), max(abs(v0.y), abs(v1.x))),
+        max(abs(v1.y), max(abs(v2.x), abs(v2.y))),
+    );
+    if (!(k > 0.0)) {
+        return vec3<f32>(0.0);
+    }
+    let u0 = v0 / k;
+    let u1 = v1 / k;
+    let u2 = v2 / k;
+    let f = floor / k;
+    let f2 = f * f;
     let p = u0.x * u0.x + u1.x * u1.x + u2.x * u2.x;
     let q = u0.x * u0.y + u1.x * u1.y + u2.x * u2.y;
     let r = u0.y * u0.y + u1.y * u1.y + u2.y * u2.y;
@@ -243,7 +257,7 @@ fn splat_axes(
     let m = 0.5 * (p + r) + f2;
     let l_1 = m + sqrt(max(m * m - det, 0.0));
     let l_2 = det / l_1;
-    return vec3<f32>(sqrt(l_1), sqrt(l_2), 0.5 * atan2(2.0 * q, p - r));
+    return vec3<f32>(sqrt(l_1) * k, sqrt(l_2) * k, 0.5 * atan2(2.0 * q, p - r));
 }
 
 // Lunar-Lambert reflectance factor (McEwen 1991, Icarus 92, 298), L = NUCLEUS_L:

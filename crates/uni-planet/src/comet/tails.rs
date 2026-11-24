@@ -45,8 +45,8 @@
 
 use std::collections::HashMap;
 
-use glam::{DMat3, DVec3, Vec3};
-use uni_core::{AU, Epoch};
+use glam::{DMat3, DVec3, UVec2, Vec3};
+use uni_core::{AU, CameraView, Epoch};
 use uni_physics::dust::{DustGrain, DustParams, finson_probstein};
 use uni_physics::kepler::Conic;
 use uni_sim::registry::ObjectId;
@@ -339,22 +339,79 @@ pub fn cov_factor(cov: DMat3) -> DMat3 {
     )
 }
 
-/// A splat's screen-plane ellipse (C1L): the 3D covariance L Lᵀ (`factor` = L, [`cov_factor`])
-/// projected onto the plane spanned by the unit vectors `right` and `up` (the sprite's plane,
-/// facing the camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`]
-/// pixels). With uᵢ = (right·Lᵢ, up·Lᵢ) the columns projected, the 2D covariance C has trace
-/// Σ|uᵢ|² + 2f² and determinant Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴ (Cauchy–Binet: a sum of
-/// squares, so an elongated splat's minor axis does not cancel in f32); σ₁² = m + √(m² − det),
-/// m = trace/2, σ₂² = det/σ₁². Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
-/// cos φ·right + sin φ·up and −sin φ·right + cos φ·up, φ = ½ atan2(2C₁₂, C₁₁ − C₂₂). CPU twin of
-/// the shader's `splat_axes` (same order of operations); probed on the GPU.
-pub fn splat_axes(factor: DMat3, right: DVec3, up: DVec3, floor_m: f64) -> (f64, f64, f64) {
+/// [`splat_axes`]'s body for one float type: written once, so the f64 CPU twin and the f32
+/// copy the range tests run ([`splat_axes_f32`], the shader's arithmetic) do the same operations
+/// in the same order as `splat_axes` in `comet.wgsl`.
+macro_rules! splat_axes_in {
+    ($(#[$attr:meta])* $vis:vis fn $name:ident($f:ty, $v3:ty, $m3:ty)) => {
+        $(#[$attr])*
+        $vis fn $name(factor: $m3, right: $v3, up: $v3, floor_m: $f) -> ($f, $f, $f) {
+            let v = [factor.x_axis, factor.y_axis, factor.z_axis]
+                .map(|c| (right.dot(c), up.dot(c)));
+            // C1L fix round 1 (review I2): every length is divided by the largest projected
+            // component or the floor, k, before it is squared, so no square exceeds 9 and the
+            // f32 shader cannot overflow (squaring metres overflowed f32 above σ₁ ≈ 6.1 × 10⁹ m,
+            // and the splat vanished); σ₁ and σ₂ are scaled back by k.
+            let k = v.iter().fold(floor_m.abs(), |a, c| a.max(c.0.abs()).max(c.1.abs()));
+            if !(k > 0.0) {
+                return (0.0, 0.0, 0.0);
+            }
+            let u = v.map(|c| (c.0 / k, c.1 / k));
+            let f = floor_m / k;
+            let f2 = f * f;
+            let p = u[0].0 * u[0].0 + u[1].0 * u[1].0 + u[2].0 * u[2].0;
+            let q = u[0].0 * u[0].1 + u[1].0 * u[1].1 + u[2].0 * u[2].1;
+            let r = u[0].1 * u[0].1 + u[1].1 * u[1].1 + u[2].1 * u[2].1;
+            let c01 = u[0].0 * u[1].1 - u[0].1 * u[1].0;
+            let c02 = u[0].0 * u[2].1 - u[0].1 * u[2].0;
+            let c12 = u[1].0 * u[2].1 - u[1].1 * u[2].0;
+            let det = c01 * c01 + c02 * c02 + c12 * c12 + f2 * (p + r) + f2 * f2;
+            let m = 0.5 * (p + r) + f2;
+            let l1 = m + (m * m - det).max(0.0).sqrt();
+            let l2 = det / l1;
+            (l1.sqrt() * k, l2.sqrt() * k, 0.5 * (2.0 * q).atan2(p - r))
+        }
+    };
+}
+
+splat_axes_in!(
+    /// A splat's screen-plane ellipse (C1L): the 3D covariance L Lᵀ (`factor` = L, [`cov_factor`])
+    /// projected onto the plane spanned by the unit vectors `right` and `up` (the sprite's plane,
+    /// facing the camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`]
+    /// pixels). With uᵢ = (right·Lᵢ, up·Lᵢ)/k the columns projected and divided by k, the
+    /// largest |component| or the floor (so nothing squared exceeds 9: no f32 overflow at any
+    /// size, fix round 1), the 2D covariance C/k² has trace Σ|uᵢ|² + 2f² and determinant
+    /// Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴, f = floor/k (Cauchy–Binet: a sum of squares, so an
+    /// elongated splat's minor axis does not cancel in f32); σ₁² = k²(m + √(m² − det)),
+    /// m = trace/2, σ₂² = k⁴det/σ₁². Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
+    /// cos φ·right + sin φ·up and −sin φ·right + cos φ·up, φ = ½ atan2(2C₁₂, C₁₁ − C₂₂); (0, 0, 0)
+    /// for a zero covariance and floor. CPU twin of the shader's `splat_axes` (same order of
+    /// operations); probed on the GPU for σ from 10⁶ to 10¹² m.
+    pub fn splat_axes(f64, DVec3, DMat3)
+);
+
+splat_axes_in!(
+    /// [`splat_axes`] in f32, as the shader computes it (the range tests: it must stay finite
+    /// and agree with the f64 twin for splats of 10⁸–10¹² m, review I2).
+    #[cfg(test)]
+    pub(crate) fn splat_axes_f32(f32, glam::Vec3, glam::Mat3)
+);
+
+/// The C1L shader's `splat_axes` before fix round 1, in f32 (metres squared unscaled): kept for
+/// the tests that show where it overflowed (review I2: σ₁ above ≈ 6.1 × 10⁹ m).
+#[cfg(test)]
+pub(crate) fn splat_axes_unscaled_f32(
+    factor: glam::Mat3,
+    right: glam::Vec3,
+    up: glam::Vec3,
+    floor_m: f32,
+) -> (f32, f32, f32) {
     let f2 = floor_m * floor_m;
     let u = [factor.x_axis, factor.y_axis, factor.z_axis].map(|c| (right.dot(c), up.dot(c)));
     let p = u[0].0 * u[0].0 + u[1].0 * u[1].0 + u[2].0 * u[2].0;
     let q = u[0].0 * u[0].1 + u[1].0 * u[1].1 + u[2].0 * u[2].1;
     let r = u[0].1 * u[0].1 + u[1].1 * u[1].1 + u[2].1 * u[2].1;
-    let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    let cross = |a: (f32, f32), b: (f32, f32)| a.0 * b.1 - a.1 * b.0;
     let (c01, c02, c12) = (cross(u[0], u[1]), cross(u[0], u[2]), cross(u[1], u[2]));
     let det = c01 * c01 + c02 * c02 + c12 * c12 + f2 * (p + r) + f2 * f2;
     let m = 0.5 * (p + r) + f2;
@@ -380,6 +437,305 @@ pub fn sprite_profile(r: f64, sigma: f64) -> f64 {
     let norm = std::f64::consts::TAU * sigma * sigma * (1.0 - edge * (1.0 + 0.5 * cut2));
     let t = r / sigma;
     ((-0.5 * t * t).exp() - edge) / norm
+}
+
+/// The camera as `vs_dust` sees it (C1L fix round 1): its right and up axes [root axes]
+/// (`camera_right()`, `camera_up()` in `comet.wgsl`) and one pixel's size at unit distance
+/// [rad], 2·tan(fov/2)/height (`pixel_size_at(d)/d`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpriteCamera {
+    pub(crate) right: DVec3,
+    pub(crate) up: DVec3,
+    pub(crate) pixel_rad: f64,
+}
+
+impl SpriteCamera {
+    /// `camera` at internal size `viewport`.
+    pub(crate) fn new(camera: &CameraView, viewport: UVec2) -> Self {
+        let orient = camera.orient.normalize();
+        SpriteCamera {
+            right: orient * DVec3::X,
+            up: orient * DVec3::Y,
+            pixel_rad: 2.0 * (0.5 * camera.fov_y_rad).tan() / f64::from(viewport.y.max(1)),
+        }
+    }
+}
+
+/// One dust splat as `vs_dust` draws it (C1L fix round 1; [`splat_draw`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SplatDraw {
+    /// The splat's centre relative to the camera [m].
+    pub(crate) rel: DVec3,
+    /// The ellipse's unit axes on the sprite plane (which faces the camera across `rel`)...
+    pub(crate) e1: DVec3,
+    pub(crate) e2: DVec3,
+    /// ...and their σ [m] after the `SPRITE_MAX_PX` cap.
+    pub(crate) s1: f64,
+    pub(crate) s2: f64,
+    /// The luminous intensity drawn [cd], after the cap.
+    pub(crate) drawn_cd: f64,
+    /// The splat's light before the cap [cd]: the dust's light production `rate` × its
+    /// [`dust_grain_light`].
+    pub(crate) light_cd: f64,
+}
+
+impl SplatDraw {
+    /// The splat's brightest point [cd/m²], its centre: what `vs_dust`'s visibility cull compares
+    /// with `GLOW_CULL_PRE` after `scene_pre()` (the tests' twin of that cull).
+    #[cfg(test)]
+    pub(crate) fn peak_cd_m2(&self) -> f64 {
+        self.drawn_cd * sprite_profile(0.0, 1.0) / (self.s1 * self.s2)
+    }
+}
+
+/// The CPU twin of `vs_dust`'s per-splat maths (C1L fix round 1): grain `g` of a tail whose dust
+/// light production is `rate` [cd/s per unit of HG] ([`dust_emission_cd_per_s`]), nucleus at
+/// `nucleus_rel` from the camera, the Sun at `sun_rel` from the nucleus [m], seen by `cam`. The
+/// sprite plane faces the camera across the splat's line of sight (`facing_right`), the ellipse
+/// is [`splat_axes`] with a floor of `SPRITE_MIN_PX` pixels, and each axis wider than
+/// `SPRITE_MAX_PX` pixels is cut to it with the light scaled by the same ratio (the surface
+/// brightness is kept; the light beyond is lost). `None` with the camera within 1 m of the
+/// splat (the pass draws nothing there). The pass's visibility cull ([`SplatDraw::peak_cd_m2`]
+/// below `GLOW_CULL_PRE` at the frame's exposure) is left to the caller.
+pub(crate) fn splat_draw(
+    g: &TailGrain,
+    rate: f64,
+    nucleus_rel: DVec3,
+    sun_rel: DVec3,
+    cam: &SpriteCamera,
+) -> Option<SplatDraw> {
+    let rel = nucleus_rel + g.offset_m;
+    let dist = rel.length();
+    if !(dist > 1.0) {
+        return None;
+    }
+    let dir = rel / dist;
+    let light = rate * dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel);
+    // `facing_right` in comet.wgsl.
+    let r = dir.cross(cam.up);
+    let right = if r.length_squared() < 1e-8 {
+        cam.right
+    } else {
+        r.normalize()
+    };
+    let up = right.cross(dir);
+    let px = dist * cam.pixel_rad;
+    let (mut s1, mut s2, phi) = splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * px);
+    let s_max = super::SPRITE_MAX_PX * px;
+    let mut drawn = light;
+    if s1 > s_max {
+        drawn *= s_max / s1;
+        s1 = s_max;
+    }
+    if s2 > s_max {
+        drawn *= s_max / s2;
+        s2 = s_max;
+    }
+    let (c, s) = (phi.cos(), phi.sin());
+    Some(SplatDraw {
+        rel,
+        e1: c * right + s * up,
+        e2: c * up - s * right,
+        s1,
+        s2,
+        drawn_cd: drawn,
+        light_cd: light,
+    })
+}
+
+/// One dust tail the comet pass draws, seen from the frame's camera (C1L fix round 1, lead
+/// ruling C1L-I3): its light and the share of it the pass draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DustDrawn {
+    /// The comet.
+    pub id: ObjectId,
+    /// The tail's dust light [cd]: Σ over its splats of the dust's light production × each
+    /// splat's [`dust_grain_light`] (the light before `SPRITE_MAX_PX` cuts it).
+    pub light_cd: f64,
+    /// The share of that light the pass draws, 0–1: a splat wider than `SPRITE_MAX_PX` pixels on
+    /// an axis keeps its surface brightness and loses the light beyond, so a tail seen from
+    /// close by draws little of its light (row 21: 1P/Halley from 2 × 10⁶ km). The pass's
+    /// visibility cull (light below a thousandth of black) is not counted.
+    pub drawn_fraction: f64,
+    /// The tail's splats.
+    pub splats: usize,
+}
+
+/// The light of `grains` (a tail's splats) [cd] and the part of it the pass draws [cd], from
+/// [`splat_draw`] (arguments as there).
+pub(crate) fn dust_light_drawn(
+    grains: &[TailGrain],
+    rate: f64,
+    nucleus_rel: DVec3,
+    sun_rel: DVec3,
+    cam: &SpriteCamera,
+) -> (f64, f64) {
+    grains
+        .iter()
+        .filter_map(|g| splat_draw(g, rate, nucleus_rel, sun_rel, cam))
+        .fold((0.0, 0.0), |(l, d), s| (l + s.light_cd, d + s.drawn_cd))
+}
+
+/// The dust tails' luminance on a frame, pixel by pixel (C1L fix round 1, lead ruling C1L-b;
+/// [`dust_tail_luminance`]).
+#[derive(Clone, Debug, Default)]
+pub struct DustRaster {
+    /// The frame's size [px].
+    pub size: UVec2,
+    /// Luminance [cd/m²], not pre-exposed, row-major from the top-left pixel: pixel (x, y) is
+    /// `luminance[y · width + x]`, sampled at its centre (x + ½, y + ½) as `pixel_dir` and
+    /// `measure::Cam::ray` do.
+    pub luminance: Vec<f64>,
+    /// The tails drawn, their light and the share drawn ([`DustDrawn`]).
+    pub tails: Vec<DustDrawn>,
+}
+
+impl DustRaster {
+    /// The luminance [cd/m²] of pixel (x, y); 0 outside the frame.
+    pub fn at(&self, x: u32, y: u32) -> f64 {
+        if x < self.size.x && y < self.size.y {
+            self.luminance[y as usize * self.size.x as usize + x as usize]
+        } else {
+            0.0
+        }
+    }
+}
+
+/// The CPU twin of the comet pass's dust tails (C1L fix round 1, lead ruling C1L-b: the paper's
+/// "Exposure on paper" adds it to its world light): the luminance [cd/m²] each pixel of a
+/// frame of `size` internal pixels gets from the dust splats of `comets` (`Snapshot::comets`)
+/// at `epoch`, seen from `camera`.
+///
+/// - **Which tails:** what a capture's first frame draws: the comets `plan_frame` picks (on
+///   screen, active, at most `MAX_TAILED_COMETS`), each tail computed in full at `epoch`.
+/// - **Each splat:** [`splat_draw`], so the `SPRITE_MAX_PX` cap and the `SPRITE_MIN_PX` floor
+///   act as on the GPU, and its profile [`sprite_profile`] where each pixel's ray meets the
+///   splat's plane (the GPU's perspective-correct interpolation over the quad), sampled at the
+///   pixel's centre.
+/// - **Left out:** the visibility cull (light below a thousandth of black at the frame's
+///   exposure), occlusion by bodies and nuclei (the pass is depth-tested), the coma and the ion
+///   tail (the paper's own coma twin adds the coma), and f32 rounding.
+///
+/// Cost: the splats' pixel area (each at most (4 × 64)² pixels); row 20 at 1 920 × 1 080 is
+/// about 10⁶ pixel samples.
+pub fn dust_tail_luminance(
+    comets: &[CometView],
+    epoch: Epoch,
+    camera: &CameraView,
+    size: UVec2,
+) -> DustRaster {
+    let size = size.max(UVec2::ONE);
+    let scene = super::CometScene {
+        comets: comets.to_vec(),
+        epoch,
+        eye_adapted: false,
+    };
+    let mut manager = TailManager::default();
+    let plan = super::plan_frame(
+        &scene,
+        camera,
+        size,
+        0.0,
+        &mut manager,
+        usize::MAX,
+        usize::MAX,
+    );
+    let cam = SpriteCamera::new(camera, size);
+    let (w, h) = (size.x as usize, size.y as usize);
+    let mut luminance = vec![0.0_f64; w * h];
+    let orient = camera.orient.normalize();
+    let (cr, cu, cf) = (orient * DVec3::X, orient * DVec3::Y, orient * DVec3::NEG_Z);
+    let tan_y = (0.5 * camera.fov_y_rad).tan();
+    let tan_x = tan_y * w as f64 / h as f64;
+    for draw in &plan.tails {
+        let (Some(view), Some(tail)) = (
+            comets.iter().find(|c| c.id == draw.id),
+            manager.tails.get(&draw.id),
+        ) else {
+            continue;
+        };
+        let rate = dust_emission_cd_per_s(super::coma::coma_intensity_cd(view));
+        for g in &tail.grains {
+            let Some(sp) = splat_draw(g, rate, view.nucleus_rel_m, view.sun_rel_m, &cam) else {
+                continue;
+            };
+            if !(sp.drawn_cd > 0.0 && sp.s1 > 0.0 && sp.s2 > 0.0) {
+                continue;
+            }
+            rasterise_splat(&sp, (cr, cu, cf), (tan_x, tan_y), size, &mut luminance);
+        }
+    }
+    DustRaster {
+        size,
+        luminance,
+        tails: plan.dust_drawn,
+    }
+}
+
+/// Adds splat `sp`'s luminance to `out` (a `size` frame, row-major from the top left) for the
+/// camera with axes `axes` = (right, up, forward) [root axes] and half-angle tangents `tan_xy`
+/// ([`dust_tail_luminance`]).
+fn rasterise_splat(
+    sp: &SplatDraw,
+    axes: (DVec3, DVec3, DVec3),
+    tan_xy: (f64, f64),
+    size: UVec2,
+    out: &mut [f64],
+) {
+    let (cr, cu, cf) = axes;
+    let (tan_x, tan_y) = tan_xy;
+    let (w, h) = (f64::from(size.x), f64::from(size.y));
+    let dist = sp.rel.length();
+    let n = sp.rel / dist;
+    // The quad's corners (±SPRITE_SIGMAS σ on both axes) on screen: their bounding box, or the
+    // whole frame when one is behind the camera.
+    let corners = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(a, b)| {
+        sp.rel + sp.e1 * (a * SPRITE_SIGMAS * sp.s1) + sp.e2 * (b * SPRITE_SIGMAS * sp.s2)
+    });
+    let (mut x0, mut x1, mut y0, mut y1) = (0.0, w, 0.0, h);
+    if corners.iter().all(|p| p.dot(cf) > 0.0) {
+        let screen = corners.map(|p| {
+            let z = p.dot(cf);
+            (
+                0.5 * (p.dot(cr) / (z * tan_x) + 1.0) * w,
+                0.5 * (1.0 - p.dot(cu) / (z * tan_y)) * h,
+            )
+        });
+        x0 = screen.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+        x1 = screen.iter().map(|s| s.0).fold(f64::NEG_INFINITY, f64::max);
+        y0 = screen.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+        y1 = screen.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
+    }
+    let px0 = (x0 - 0.5).floor().max(0.0) as usize;
+    let px1 = ((x1 - 0.5).ceil() + 1.0).clamp(0.0, w) as usize;
+    let py0 = (y0 - 0.5).floor().max(0.0) as usize;
+    let py1 = ((y1 - 0.5).ceil() + 1.0).clamp(0.0, h) as usize;
+    // A pixel's ray is d = forward + a·right + b·up; it meets the plane through the centre
+    // facing the camera at t·d, t = dist/(d·n), where its coordinates are (t·d − rel)·eᵢ.
+    let dots = |v: DVec3| (cf.dot(v), cr.dot(v), cu.dot(v));
+    let (n0, n1, n2) = dots(n);
+    let (a0, a1, a2) = dots(sp.e1);
+    let (b0, b1, b2) = dots(sp.e2);
+    let (r1, r2) = (sp.rel.dot(sp.e1), sp.rel.dot(sp.e2));
+    let scale = sp.drawn_cd / (sp.s1 * sp.s2);
+    let row = size.x as usize;
+    for y in py0..py1 {
+        let b = (1.0 - 2.0 * (y as f64 + 0.5) / h) * tan_y;
+        for x in px0..px1 {
+            let a = (2.0 * (x as f64 + 0.5) / w - 1.0) * tan_x;
+            let dn = n0 + a * n1 + b * n2;
+            if !(dn > 0.0) {
+                continue;
+            }
+            let t = dist / dn;
+            let q1 = (t * (a0 + a * a1 + b * a2) - r1) / sp.s1;
+            let q2 = (t * (b0 + a * b1 + b * b2) - r2) / sp.s2;
+            let q = q1.hypot(q2);
+            if q < SPRITE_SIGMAS {
+                out[y * row + x] += scale * sprite_profile(q, 1.0);
+            }
+        }
+    }
 }
 
 /// Whether `view` can carry a coma and tails: active (r_h < 5 AU) with SBDB's M1 and K1.
@@ -708,14 +1064,29 @@ struct TailJob {
 }
 
 /// The dust tails' CPU side (no GPU objects, so it is tested on its own): per-comet tails keyed
-/// by id, the schedule's refresh times, and the refresh in progress.
+/// by id, the schedule's refresh times, the refresh in progress, and each drawn tail's last
+/// [`DustDrawn`].
 #[derive(Debug, Default)]
 pub(crate) struct TailManager {
     pub(crate) tails: HashMap<ObjectId, TailState>,
     pub(crate) last_refresh: HashMap<ObjectId, f64>,
+    pub(crate) drawn: HashMap<ObjectId, DrawnCache>,
     job: Option<TailJob>,
     next_version: u64,
 }
+
+/// A tail's last [`DustDrawn`], the dust version and wall time [s] it was computed at
+/// (`plan_frame` recomputes it at most every [`DRAWN_REFRESH_WALL_S`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DrawnCache {
+    pub(crate) version: u64,
+    pub(crate) wall_s: f64,
+    pub(crate) drawn: DustDrawn,
+}
+
+/// A drawn tail's [`DustDrawn`] is recomputed once it is this old [s of wall time] or its tail
+/// was refreshed (C1L fix round 1; the tail's own wall-time rule, `TAIL_REFRESH_WALL_S`).
+pub(crate) const DRAWN_REFRESH_WALL_S: f64 = TAIL_REFRESH_WALL_S;
 
 /// A tail not drawn for this long [wall s] is dropped (memory; it is recomputed on return).
 pub(crate) const TAIL_EVICT_WALL_S: f64 = 30.0;
@@ -811,6 +1182,7 @@ impl TailManager {
         let tails = &self.tails;
         self.last_refresh
             .retain(|id, t| tails.contains_key(id) || wall_s - *t <= TAIL_EVICT_WALL_S);
+        self.drawn.retain(|id, _| tails.contains_key(id));
         work
     }
 }
@@ -1127,7 +1499,10 @@ mod tests {
 
     /// The splat ellipse (CPU twin of `splat_axes` in comet.wgsl): σ₁² cos²φ + σ₂² sin²φ etc.
     /// rebuild the covariance projected on (right, up) plus the floor; a flat (rank-1)
-    /// covariance seen edge-on still gets the floor on its minor axis.
+    /// covariance seen edge-on still gets the floor on its minor axis. Fix round 1 (review I2):
+    /// also for splats of 10⁸–10¹² m, with the camera inside a tail (an 802 m floor under a
+    /// 10¹⁰ m splat), where the f32 copy (`splat_axes_f32`, the shader's arithmetic) stays finite
+    /// and within 10⁻³ of the f64 twin while the C1L f32 maths overflowed.
     #[test]
     fn splat_axes_rebuild_the_projected_covariance() {
         let right = DVec3::new(0.6, 0.8, 0.0);
@@ -1135,14 +1510,19 @@ mod tests {
         assert!(right.dot(up).abs() < 1e-12);
         let a = DVec3::new(3.0e9, -1.0e9, 2.0e8);
         let b = DVec3::new(2.0e8, 5.0e8, -7.0e8);
+        let spread = |s: f64| DMat3::from_diagonal(DVec3::splat(s * s));
+        let mut f32_report = Vec::new();
         for (cov, floor) in [
             (outer(a) + outer(b), 1.0e6),
-            (
-                outer(a) * 0.25 + DMat3::from_diagonal(DVec3::splat(4.0e16)),
-                3.0e7,
-            ),
+            (outer(a) * 0.25 + spread(2.0e8), 3.0e7),
             (outer(right * 2.0e9), 1.0e7),
             (DMat3::ZERO, 2.0e6),
+            // Fix round 1: 10⁸–10¹² m.
+            (outer(a * 300.0) + outer(b * 30.0) + spread(3.3e9), 8.0e9),
+            (outer(a * 30.0) * 0.25 + spread(5.2e7), 802.0),
+            (outer(up * 1.0e12) + spread(1.0e8), 1.0e3),
+            (spread(1.0e12), 1.0e9),
+            (outer(b * 100.0) + spread(1.0e8), 802.0),
         ] {
             let (s1, s2, phi) = splat_axes(cov_factor(cov), right, up, floor);
             assert!(s1 >= s2 && s2 >= floor * (1.0 - 1e-9), "{s1} {s2} {floor}");
@@ -1155,15 +1535,45 @@ mod tests {
                 right.dot(cov * up),
                 up.dot(cov * up) + floor * floor,
             ];
-            let tol = 1e-8 * (s1 * s1);
+            // √(m² − det) splits a round splat's axes only to √ε ≈ 10⁻⁸ of σ² in f64.
+            let tol = 1e-7 * (s1 * s1);
             assert!(
                 (p - want[0]).abs() <= tol
                     && (q - want[1]).abs() <= tol
-                    && (r - want[2]).abs() <= tol
+                    && (r - want[2]).abs() <= tol,
+                "σ₁ {s1:e} σ₂ {s2:e}: rebuilt {:?} vs {want:?} (tol {tol:e})",
+                [p, q, r]
             );
+            if s1 == 0.0 {
+                continue;
+            }
+            // The shader's f32 arithmetic, before and after fix round 1.
+            let l = cov_factor(cov);
+            let l32 =
+                glam::Mat3::from_cols(l.x_axis.as_vec3(), l.y_axis.as_vec3(), l.z_axis.as_vec3());
+            let (r32, u32_, f32_) = (right.as_vec3(), up.as_vec3(), floor as f32);
+            let new = splat_axes_f32(l32, r32, u32_, f32_);
+            let old = splat_axes_unscaled_f32(l32, r32, u32_, f32_);
+            let err = (f64::from(new.0) / s1 - 1.0)
+                .abs()
+                .max((f64::from(new.1) / s2 - 1.0).abs());
+            assert!(err < 1e-3, "σ₁ {s1:e}: f32 {new:?} vs {s1:e}, {s2:e}");
+            f32_report.push(format!(
+                "σ₁ {s1:.1e} σ₂ {s2:.1e}: f32 rel {err:.0e}, C1L f32 {}",
+                if old.0.is_finite() && old.1.is_finite() && old.1 > 0.0 {
+                    "ok"
+                } else {
+                    "overflowed"
+                }
+            ));
+            if s1 > 1.0e10 {
+                assert!(!(old.0.is_finite() && old.1.is_finite()), "{old:?}");
+            }
         }
+        println!("splat_axes in f32: {}", f32_report.join("; "));
         let (s1, s2, _) = splat_axes(cov_factor(outer(up * 5.0e8)), right, up, 1.0e6);
         assert!((s1 / 5.0e8 - 1.0).abs() < 1e-5 && (s2 / 1.0e6 - 1.0).abs() < 1e-6);
+        assert_eq!(splat_axes(DMat3::ZERO, right, up, 0.0), (0.0, 0.0, 0.0));
     }
 
     /// C1L: `DUST_HEAD_TIME_S` is what its documented inputs give: NEOWISE's visual law at Aravind
@@ -1185,15 +1595,24 @@ mod tests {
         );
     }
 
-    /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry
-    /// (2020-07-15 03:00 UTC from the Earth, fov 20°, 1 080 lines, up = ICRS +z) the splats,
-    /// rasterised on the CPU at 1/4 of the lines, give a dust tail brighter than 10⁻⁴ cd/m²
-    /// (22.6 mag/arcsec², about the natural night sky) at 3° from the nucleus, whose centre line's
-    /// direction from the nucleus turns by more than 4° between 1° and 4° (a tangent turn of more
-    /// than 8°: curved, not a straight streak), on the side of the ion tail away from the comet's
-    /// motion. Prints the peak luminance and centre line by radius.
-    #[test]
-    fn neowise_dust_tail_is_long_and_curved() {
+    /// A camera looking from `cam_helio` [m] at `target_rel` (target − camera) with `up_hint`
+    /// up, at fov `fov_deg` (the bookmarks' `look_at` and `up`).
+    fn look_at(target_rel: DVec3, up_hint: DVec3, fov_deg: f64) -> CameraView {
+        let fwd = target_rel.normalize();
+        let right = fwd.cross(up_hint).normalize();
+        let up = right.cross(fwd);
+        CameraView {
+            pos: uni_core::UniversePos::from_meters(DVec3::ZERO),
+            orient: glam::DQuat::from_mat3(&DMat3::from_cols(right, up, -fwd)),
+            fov_y_rad: fov_deg.to_radians(),
+            velocity_mps: DVec3::ZERO,
+        }
+    }
+
+    /// C/2020 F3 (NEOWISE) at row 20 (`comet-neowise-2020`: 2020-07-15 03:00 UTC from the
+    /// Earth–Moon barycentre, fov 20°, up = ICRS +z, 1 920 × 1 080): its view, the camera, its
+    /// heliocentric velocity, and its coma's light [cd].
+    fn neowise_row_20() -> (CometView, CameraView, DVec3, f64) {
         use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
         let conic = conic_from_perihelion(
             0.294_651_249_380_919_6,
@@ -1204,78 +1623,100 @@ mod tests {
             2_459_034.178_898_044_4,
         );
         let t = Epoch::from_unix_utc(1_594_782_000.0);
-        let (nucleus, vel) = heliocentric_state_icrs(&conic, t);
+        let (_, vel) = heliocentric_state_icrs(&conic, t);
         let (earth, _) = planet_state(Planet::EmBary, t);
-        let rel = nucleus - earth;
-        let (r_au, delta_au) = (nucleus.length() / AU, rel.length() / AU);
         let law = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("NEOWISE's law");
-        let coma = crate::comet::coma::comet_total_intensity_cd(law.m1(), law.k1, r_au, delta_au);
-        let grains = dust_rows(&conic, law.k1, t, 0..DUST_PARAMS.n_beta);
-        let splats = tail_grains(&grains, dust_production(r_au, law.k1));
+        let view = comet_on(1, conic, t, earth, law.m1(), law.k1);
+        let camera = look_at(view.nucleus_rel_m, DVec3::Z, 20.0);
+        let coma = crate::comet::coma::coma_intensity_cd(&view);
+        (view, camera, vel, coma)
+    }
+
+    /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry
+    /// ([`neowise_row_20`]) the pub CPU twin of the dust pass ([`dust_tail_luminance`], fix
+    /// round 1: the rasteriser this test had inside, now what the paper uses) gives a dust tail
+    /// brighter than 10⁻⁴ cd/m² (22.6 mag/arcsec², about the natural night sky) at 3° from the
+    /// nucleus, whose centre line's direction from the nucleus turns by more than 4° between 1°
+    /// and 4° (a tangent turn of more than 8°: curved, not a straight streak), on the side of the
+    /// ion tail away from the comet's motion. Prints the tail's light, the share the
+    /// `SPRITE_MAX_PX` cap draws, the light the C1L shader's f32 `splat_axes` dropped (review
+    /// I2), and the peak luminance and centre line by radius.
+    #[test]
+    fn neowise_dust_tail_is_long_and_curved() {
+        let (view, camera, vel, coma) = neowise_row_20();
+        let size = UVec2::new(1920, 1080);
+        let clock = std::time::Instant::now();
+        let raster =
+            dust_tail_luminance(std::slice::from_ref(&view), view.conic_epoch, &camera, size);
+        let raster_ms = clock.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(raster.tails.len(), 1);
+        let tail = raster.tails[0];
+        // The light the C1L shader dropped: splats whose f32 `splat_axes` overflowed (review I2).
+        let cam = SpriteCamera::new(&camera, size);
+        let grains = tail_grains(
+            &dust_rows(
+                &view.conic,
+                view.k1.unwrap_or(0.0),
+                view.conic_epoch,
+                0..DUST_PARAMS.n_beta,
+            ),
+            dust_production(view.r_au, view.k1.unwrap_or(0.0)),
+        );
         let rate = dust_emission_cd_per_s(coma);
-        let fwd = rel.normalize();
-        let right = fwd.cross(DVec3::Z).normalize();
-        let up = right.cross(fwd);
-        // Row 20's pixel, and the test's 4 × coarser grid.
-        let f_full = 540.0 / 10.0_f64.to_radians().tan();
-        let (w, h, k) = (480_usize, 270_usize, 4.0);
-        let f = f_full / k;
-        let mut img = vec![0.0_f64; w * h];
-        let (mut light, mut drawn) = (0.0, 0.0);
-        for g in &splats {
-            let p = rel + g.offset_m;
-            let d = p.length();
-            let mut i = rate * dust_grain_light(g.offset_m, g.weight, rel, -nucleus);
-            light += i;
-            let pixel_m = d / f_full;
-            let (mut s1, mut s2, phi) =
-                splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * pixel_m);
-            let s_max = crate::comet::SPRITE_MAX_PX * pixel_m;
-            if s1 > s_max {
-                i *= s_max / s1;
-                s1 = s_max;
-            }
-            if s2 > s_max {
-                i *= s_max / s2;
-                s2 = s_max;
-            }
-            drawn += i;
-            let z = p.dot(fwd);
-            let (cx, cy) = (
-                0.5 * w as f64 + f * p.dot(right) / z,
-                0.5 * h as f64 - f * p.dot(up) / z,
-            );
-            let m_per_px = d / f;
-            let reach = SPRITE_SIGMAS * s1 / m_per_px + 1.0;
-            let (e1, e2) = (
-                DVec3::new(phi.cos(), phi.sin(), 0.0),
-                DVec3::new(-phi.sin(), phi.cos(), 0.0),
-            );
-            let x0 = (cx - reach).floor().max(0.0) as usize;
-            let y0 = (cy - reach).floor().max(0.0) as usize;
-            let x1 = ((cx + reach).ceil().max(0.0) as usize).min(w);
-            let y1 = ((cy + reach).ceil().max(0.0) as usize).min(h);
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    // Screen offset → metres on the sprite plane (x right, y up).
-                    let v = DVec3::new(x as f64 + 0.5 - cx, cy - (y as f64 + 0.5), 0.0) * m_per_px;
-                    let q = (v.dot(e1) / s1).hypot(v.dot(e2) / s2);
-                    img[y * w + x] += i * sprite_profile(q, 1.0) / (s1 * s2);
-                }
+        let (mut overflow_light, mut overflow_n) = (0.0, 0);
+        // The quads' fill [px] that pass the GPU's visibility cull at the capture's auto
+        // exposure (EV −5.29, C1L report; pre = 1/(1.2·2^EV), CLAUDE.md §2), with and without
+        // the splats the C1L f32 maths dropped.
+        let pre = 1.0 / (1.2 * 2.0_f64.powf(-5.29));
+        let (mut fill_all, mut fill_dropped) = (0.0, 0.0);
+        for g in &grains {
+            let Some(sp) = splat_draw(g, rate, view.nucleus_rel_m, view.sun_rel_m, &cam) else {
+                continue;
+            };
+            let dir = sp.rel.normalize();
+            let r = dir.cross(cam.up).normalize();
+            let u = r.cross(dir);
+            let l = cov_factor(g.cov_m2);
+            let l32 =
+                glam::Mat3::from_cols(l.x_axis.as_vec3(), l.y_axis.as_vec3(), l.z_axis.as_vec3());
+            let floor = (SPRITE_MIN_PX * sp.rel.length() * cam.pixel_rad) as f32;
+            let old = splat_axes_unscaled_f32(l32, r.as_vec3(), u.as_vec3(), floor);
+            let px = sp.rel.length() * cam.pixel_rad;
+            let fill = if sp.peak_cd_m2() * pre >= crate::comet::GLOW_CULL_PRE {
+                (2.0 * SPRITE_SIGMAS).powi(2) * sp.s1 * sp.s2 / (px * px)
+            } else {
+                0.0
+            };
+            fill_all += fill;
+            if !(old.0.is_finite() && old.1.is_finite() && old.1 > 0.0) {
+                overflow_light += sp.drawn_cd;
+                overflow_n += 1;
+                fill_dropped += fill;
             }
         }
-        // On circles about the nucleus, by radius in degrees: the brightest pixel, and the
-        // tail's centre line (the luminance-weighted mean direction).
+        println!(
+            "row 20 quad fill past the cull at EV −5.29: {:.2} Mpx with the fix round 1 maths, \
+             {:.2} Mpx with the C1L f32 maths (which dropped {:.2} Mpx)",
+            fill_all * 1e-6,
+            (fill_all - fill_dropped) * 1e-6,
+            fill_dropped * 1e-6
+        );
+        // On circles about the nucleus (the frame's centre), by radius in degrees: the brightest
+        // pixel, and the tail's centre line (the luminance-weighted mean direction).
+        let f = 540.0 / 10.0_f64.to_radians().tan();
         let px_per_deg = f * 1.0_f64.to_radians().tan();
+        let (cx, cy) = (960.0, 540.0);
+        let right = camera.orient * DVec3::X;
+        let up = camera.orient * DVec3::Y;
         let angle = |v: DVec3| v.dot(up).atan2(v.dot(right)).to_degrees();
         let circle = |deg: f64| {
             let r = deg * px_per_deg;
             let (mut peak, mut sx, mut sy) = (0.0_f64, 0.0, 0.0);
             for a in 0..1440 {
                 let az = (f64::from(a) * 0.25).to_radians();
-                let (x, y) = (0.5 * w as f64 + r * az.cos(), 0.5 * h as f64 - r * az.sin());
-                if x >= 0.0 && y >= 0.0 && (x as usize) < w && (y as usize) < h {
-                    let l = img[y as usize * w + x as usize];
+                let (x, y) = (cx + r * az.cos(), cy - r * az.sin());
+                if x >= 0.0 && y >= 0.0 {
+                    let l = raster.at(x as u32, y as u32);
                     peak = peak.max(l);
                     (sx, sy) = (sx + l * az.cos(), sy + l * az.sin());
                 }
@@ -1288,15 +1729,21 @@ mod tests {
                 (d, peak, centre)
             })
             .to_vec();
-        let ion = angle(ion_tail_dir(-nucleus, vel));
+        let ion = angle(ion_tail_dir(view.sun_rel_m, vel));
         let motion = angle(vel);
+        let lit = raster.luminance.iter().filter(|&&l| l >= 1e-3).count();
         println!(
-            "row 20: {} splats, tail {:.3e} cd = {:.2} × the coma ({:.2} % cut by SPRITE_MAX_PX); \
-             ion {ion:.1}°, motion {motion:.1}°; by radius (deg, peak cd/m², centre line °):",
-            splats.len(),
-            light,
-            light / coma,
-            100.0 * (1.0 - drawn / light),
+            "row 20: {} splats, tail {:.3e} cd = {:.2} × the coma, drawn {:.2} % \
+             ({:.2} % cut by SPRITE_MAX_PX); C1L f32 maths dropped {overflow_n} splats, \
+             {:.2} % of the drawn light; {lit} px ≥ 10⁻³ cd/m²; ion {ion:.1}°, motion \
+             {motion:.1}°; raster {raster_ms:.0} ms (test build); by radius (deg, peak cd/m², \
+             centre line °):",
+            tail.splats,
+            tail.light_cd,
+            tail.light_cd / coma,
+            100.0 * tail.drawn_fraction,
+            100.0 * (1.0 - tail.drawn_fraction),
+            100.0 * overflow_light / (tail.light_cd * tail.drawn_fraction),
         );
         for r in &rows {
             println!("  {:.1}°  {:.3e}  {:.1}°", r.0, r.1, r.2);
@@ -1325,6 +1772,209 @@ mod tests {
             "centre line {:.1}° vs ion {ion:.1}°, motion {motion:.1}°",
             at(2.0).1
         );
+        // Row 20 keeps most of its light (the far tail's widest splats are cut).
+        assert!(
+            tail.drawn_fraction > crate::comet::DUST_DRAWN_NOTE_BELOW,
+            "{tail:?}"
+        );
+    }
+
+    /// Fix round 1 (review I2 lets the far tail's wide splats draw again): row 20's dust quad
+    /// fill [Mpx] past `vs_dust`'s visibility cull at the capture's auto exposure, for the cull
+    /// at 1, 10 and 100 × `GLOW_CULL_PRE`, and the brightest pixel the culled splats would have
+    /// added, against AgX's black point at that exposure (2^−12.47393 pre-exposed, uni-post
+    /// `agx`). Prints only (the budget is measured on the GPU); asserts that the cull at
+    /// `GLOW_CULL_PRE` hides less than 1/100 of black anywhere.
+    #[test]
+    fn row_20_dust_fill_by_cull() {
+        let (view, camera, _, coma) = neowise_row_20();
+        let size = UVec2::new(1920, 1080);
+        let cam = SpriteCamera::new(&camera, size);
+        let k1 = view.k1.unwrap_or(0.0);
+        let grains = tail_grains(
+            &dust_rows(&view.conic, k1, view.conic_epoch, 0..DUST_PARAMS.n_beta),
+            dust_production(view.r_au, k1),
+        );
+        let rate = dust_emission_cd_per_s(coma);
+        let splats: Vec<SplatDraw> = grains
+            .iter()
+            .filter_map(|g| splat_draw(g, rate, view.nucleus_rel_m, view.sun_rel_m, &cam))
+            .collect();
+        let orient = camera.orient;
+        let axes = (orient * DVec3::X, orient * DVec3::Y, orient * DVec3::NEG_Z);
+        let tan_y = 10.0_f64.to_radians().tan();
+        let tan_xy = (tan_y * 1920.0 / 1080.0, tan_y);
+        for ev in [-5.29, -5.8] {
+            // pre = 1/(1.2·2^EV) (CLAUDE.md §2); AgX's black point in cd/m² at that exposure.
+            let pre = 1.0 / (1.2 * 2.0_f64.powf(ev));
+            let black = 2.0_f64.powf(-12.47393) / pre;
+            let mut report = Vec::new();
+            for mult in [1.0, 10.0, 100.0] {
+                let cut = mult * crate::comet::GLOW_CULL_PRE;
+                let (mut fill, mut drawn_light, mut culled) = (0.0, 0.0, Vec::new());
+                for sp in &splats {
+                    let px = sp.rel.length() * cam.pixel_rad;
+                    if sp.peak_cd_m2() * pre >= cut {
+                        fill += (2.0 * SPRITE_SIGMAS).powi(2) * sp.s1 * sp.s2 / (px * px);
+                        drawn_light += sp.drawn_cd;
+                    } else {
+                        culled.push(*sp);
+                    }
+                }
+                let mut img = vec![0.0; 1920 * 1080];
+                for sp in &culled {
+                    rasterise_splat(sp, axes, tan_xy, size, &mut img);
+                }
+                let worst = img.iter().copied().fold(0.0, f64::max);
+                if mult == 1.0 {
+                    assert!(worst < 0.01 * black, "{worst:e} vs black {black:e}");
+                }
+                report.push(format!(
+                    "× {mult}: {:.2} Mpx, {} splats culled, light kept {:.2} %, culled light at \
+                     most {:.1e} of black",
+                    fill * 1e-6,
+                    culled.len(),
+                    100.0 * drawn_light / splats.iter().map(|s| s.drawn_cd).sum::<f64>(),
+                    worst / black
+                ));
+            }
+            println!("row 20 at EV {ev}, cull {}", report.join("; "));
+        }
+    }
+
+    /// Fix round 1: the pub twin's rasteriser keeps a splat's drawn light (Σ L·A_px over its
+    /// pixels, A_px = (d·pixel)² the pixel's footprint on the sprite plane, matches `drawn_cd`
+    /// within 1 % for splats of 1.5–60 px), its brightest pixel is at most the splat's centre
+    /// ([`SplatDraw::peak_cd_m2`], which `vs_dust`'s visibility cull reads), and a splat wider
+    /// than `SPRITE_MAX_PX` is cut to it on that axis with its light scaled by the same ratio.
+    #[test]
+    fn dust_raster_keeps_the_drawn_light() {
+        let size = UVec2::new(480, 270);
+        let camera = look_at(DVec3::new(0.0, 0.0, -1.0), DVec3::Y, 20.0);
+        let cam = SpriteCamera::new(&camera, size);
+        let orient = camera.orient;
+        let axes = (orient * DVec3::X, orient * DVec3::Y, orient * DVec3::NEG_Z);
+        let tan_y = 10.0_f64.to_radians().tan();
+        let tan_xy = (tan_y * 480.0 / 270.0, tan_y);
+        let dist = 1.0e11;
+        let px = dist * cam.pixel_rad;
+        let nucleus_rel = DVec3::new(0.0, 0.0, -dist);
+        let sun_rel = DVec3::new(-AU, 0.2 * AU, 0.0);
+        for (sigma_px, axis) in [
+            (1.5, DVec3::X),
+            (8.0, DVec3::new(0.6, 0.8, 0.0)),
+            (60.0, DVec3::Y),
+            (200.0, DVec3::X),
+        ] {
+            let sigma = sigma_px * px;
+            let g = TailGrain {
+                offset_m: DVec3::ZERO,
+                cov_m2: outer(axis * sigma)
+                    + DMat3::from_diagonal(DVec3::splat((0.4 * sigma).powi(2))),
+                weight: 1.0e5,
+            };
+            let sp = splat_draw(&g, 1.0e9, nucleus_rel, sun_rel, &cam).expect("in front");
+            let mut img = vec![0.0; 480 * 270];
+            rasterise_splat(&sp, axes, tan_xy, size, &mut img);
+            let sum: f64 = img.iter().sum::<f64>() * px * px;
+            let max = img.iter().copied().fold(0.0, f64::max);
+            println!(
+                "σ {sigma_px} px: drawn {:.4e} of {:.4e} cd, raster {:.4e} cd, peak {:.3e} vs \
+                 max {:.3e} cd/m²",
+                sp.drawn_cd,
+                sp.light_cd,
+                sum,
+                sp.peak_cd_m2(),
+                max
+            );
+            assert!(max <= sp.peak_cd_m2() * (1.0 + 1e-9));
+            assert!(
+                (sum / sp.drawn_cd - 1.0).abs() < 0.01,
+                "{sum} vs {}",
+                sp.drawn_cd
+            );
+            // The cap: each axis at most SPRITE_MAX_PX, the light scaled by the same ratios.
+            let (right, up) = (cam.right, cam.up);
+            let (u1, u2, _) = splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * px);
+            let cap = crate::comet::SPRITE_MAX_PX * px;
+            let want = (cap / u1).min(1.0) * (cap / u2).min(1.0);
+            assert!((sp.drawn_cd / sp.light_cd / want - 1.0).abs() < 1e-9);
+            assert!(sp.s1 <= cap * (1.0 + 1e-12) && sp.s2 <= cap * (1.0 + 1e-12));
+            if sigma_px > 100.0 {
+                assert!(want < 0.5 && (sp.s1 / cap - 1.0).abs() < 1e-12);
+            } else if sigma_px < 10.0 {
+                assert_eq!(sp.drawn_cd, sp.light_cd);
+            }
+        }
+    }
+
+    /// Review minor 5 and lead ruling C1L-I3: at row 21 (`comet-halley-1986`: 1P/Halley on
+    /// 1986-03-13 from 2.0 × 10⁶ km along its orbit's normal, fov 20°, 1 920 × 1 080) the
+    /// `SPRITE_MAX_PX` cap draws only a few per cent of the dust tail's light, so the renderer's
+    /// grey note is raised; the share is computed within the CPU budget (printed in this test
+    /// build, which is unoptimised).
+    #[test]
+    fn halley_row_21_draws_a_small_share_of_its_dust() {
+        let conic = conic_from_perihelion(
+            0.574_863_831_374_341_3,
+            0.967_935_995_695_321_1,
+            162.190_530_043_912_9,
+            59.098_947_206_124_37,
+            112.241_431_463_776_4,
+            2_446_469.973_616_146_5,
+        );
+        let t = Epoch::parse_iso_utc("1986-03-13T00:00:00Z").expect("date");
+        let (nucleus, vel) = heliocentric_state_icrs(&conic, t);
+        // bookmarks/m1.ron row 21: the camera relative to the nucleus [m] and its up.
+        let cam_rel = DVec3::new(
+            -522_087_931.581_177_4,
+            -468_233_681.906_447_8,
+            1_873_013_991.091_796_4,
+        );
+        let up = DVec3::new(
+            0.779_875_156_652_241_4,
+            -0.622_889_856_613_611_8,
+            0.061_668_197_350_952_75,
+        );
+        println!(
+            "row 21: camera {:.3e} m from the nucleus, {:.1}° from the orbit's normal",
+            cam_rel.length(),
+            angle_deg(cam_rel, nucleus.cross(vel))
+        );
+        // SBDB's M1 5.5, K1 8.0 (no cited visual law for Halley).
+        let view = comet_on(2, conic, t, nucleus + cam_rel, 5.5, 8.0);
+        let size = UVec2::new(1920, 1080);
+        let camera = look_at(view.nucleus_rel_m, up, 20.0);
+        let scene = crate::comet::CometScene {
+            comets: vec![view],
+            epoch: t,
+            eye_adapted: false,
+        };
+        let mut manager = TailManager::default();
+        let plan =
+            crate::comet::plan_frame(&scene, &camera, size, 0.0, &mut manager, usize::MAX, 0);
+        assert!(
+            plan.dust_drawn.is_empty(),
+            "computed with drawn_per_frame 0"
+        );
+        let clock = std::time::Instant::now();
+        let plan = crate::comet::plan_frame(&scene, &camera, size, 0.1, &mut manager, 0, 1);
+        let ms = clock.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(plan.dust_drawn.len(), 1);
+        let d = plan.dust_drawn[0];
+        let note = crate::comet::dust_partly_drawn_note(d.drawn_fraction);
+        println!(
+            "row 21: {} splats, tail {:.3e} cd, drawn {:.2} % ({ms:.2} ms for plan_frame with the \
+             share, test build); note: {note}",
+            d.splats,
+            d.light_cd,
+            100.0 * d.drawn_fraction
+        );
+        assert!(d.drawn_fraction > 0.0 && d.drawn_fraction < 0.1, "{d:?}");
+        assert!(d.drawn_fraction < crate::comet::DUST_DRAWN_NOTE_BELOW);
+        // Not due again for DRAWN_REFRESH_WALL_S: the cached value is reported.
+        let again = crate::comet::plan_frame(&scene, &camera, size, 0.2, &mut manager, 0, 1);
+        assert_eq!(again.dust_drawn, plan.dust_drawn);
     }
 
     /// Review I13: with 20 active comets on screen only the 8 brightest by `total_v` get tails;

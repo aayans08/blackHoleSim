@@ -58,12 +58,14 @@ use self::nucleus::{
     Icosphere, NUCLEUS_ALBEDO, NUCLEUS_BRDF, NUCLEUS_SUBDIVISIONS, icosphere, nucleus_orientation,
     nucleus_vertices, vertex_normals,
 };
+pub use self::tails::DustDrawn;
 use self::tails::{
-    GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT, KEPLER_SOLVE_US,
-    TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_emission_cd_per_s, dust_grain_light, dust_phase,
-    dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness,
-    ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m, is_active, splat_axes,
-    sprite_profile, tailed_comets,
+    DrawnCache, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
+    KEPLER_SOLVE_US, SpriteCamera, TAIL_CPU_SHARE_MS, TailManager, TailWork,
+    dust_emission_cd_per_s, dust_grain_light, dust_light_drawn, dust_phase, dust_reach_estimate_m,
+    ion_colour, ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness, ion_tail_dir,
+    ion_tail_drawn_brightness, ion_tail_length_m, is_active, splat_axes, sprite_profile,
+    tailed_comets,
 };
 use crate::body::{exposure_weight, lens_mask_target, sphere_in_view};
 
@@ -269,6 +271,10 @@ pub(crate) struct FramePlan {
     pub(crate) comae: Vec<ComaGpu>,
     pub(crate) tails: Vec<TailDraw>,
     pub(crate) work: TailWork,
+    /// The drawn dust tails' light and the share of it the pass draws (C1L fix round 1), as last
+    /// computed (at most [`tails::DRAWN_REFRESH_WALL_S`] old, or older than the tail's last
+    /// refresh while it waits its turn); a tail not computed yet is missing.
+    pub(crate) dust_drawn: Vec<DustDrawn>,
 }
 
 /// Builds this frame's draws from `scene` for `camera` at internal size `viewport`: culls every
@@ -283,6 +289,12 @@ pub(crate) struct FramePlan {
 ///   coma, the ion tail and the dust tail (the last refresh's reach, or
 ///   `tails::dust_reach_estimate_m` before the first) can be on screen; the
 ///   [`MAX_TAILED_COMETS`] brightest candidates draw them.
+/// - **Drawn share (C1L fix round 1, lead ruling C1L-I3):** for each drawn dust tail, the share
+///   of its light the `SPRITE_MAX_PX` cap lets through ([`DustDrawn`], from the CPU twin
+///   `tails::splat_draw`, about 10³ splats per tail). A tail's value is recomputed when it has
+///   none, its tail was refreshed, or it is [`tails::DRAWN_REFRESH_WALL_S`] old: at most
+///   `drawn_per_frame` tails per frame, those without a value first, then the oldest (the
+///   renderer passes 1, or every one while it settles tails for a capture).
 pub(crate) fn plan_frame(
     scene: &CometScene,
     camera: &CameraView,
@@ -290,6 +302,7 @@ pub(crate) fn plan_frame(
     wall_s: f64,
     manager: &mut TailManager,
     max_solves: usize,
+    drawn_per_frame: usize,
 ) -> FramePlan {
     let mut plan = FramePlan::default();
     let height = f64::from(viewport.y.max(1));
@@ -363,7 +376,10 @@ pub(crate) fn plan_frame(
     }
     plan.work = manager.update(&candidates, scene.epoch, wall_s, max_solves);
     let ion_rgb = ion_colour();
+    // The candidate each drawn tail comes from.
+    let mut tail_views: Vec<usize> = Vec::new();
     for i in tailed_comets(&candidates) {
+        tail_views.push(i);
         let view = &candidates[i];
         let intensity = coma_intensity_cd(view);
         let axis = ion_tail_dir(view.sun_rel_m, view.helio_vel_mps);
@@ -391,7 +407,84 @@ pub(crate) fn plan_frame(
             dust_version: manager.tails.get(&view.id).map(|t| t.version),
         });
     }
+    // The drawn share of each dust tail (C1L fix round 1): due ones, missing first, then oldest.
+    let mut due: Vec<(f64, usize)> = plan
+        .tails
+        .iter()
+        .enumerate()
+        .filter_map(|(k, draw)| {
+            let version = draw.dust_version?;
+            match manager.drawn.get(&draw.id) {
+                Some(c)
+                    if c.version == version && wall_s - c.wall_s < tails::DRAWN_REFRESH_WALL_S =>
+                {
+                    None
+                }
+                Some(c) => Some((c.wall_s, k)),
+                None => Some((f64::NEG_INFINITY, k)),
+            }
+        })
+        .collect();
+    due.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sprite_camera = SpriteCamera::new(camera, viewport);
+    for &(_, k) in due.iter().take(drawn_per_frame) {
+        let draw = &plan.tails[k];
+        let view = &candidates[tail_views[k]];
+        let (Some(tail), Some(version)) = (manager.tails.get(&draw.id), draw.dust_version) else {
+            continue;
+        };
+        let rate = dust_emission_cd_per_s(coma_intensity_cd(view));
+        let (light, drawn) = dust_light_drawn(
+            &tail.grains,
+            rate,
+            view.nucleus_rel_m,
+            view.sun_rel_m,
+            &sprite_camera,
+        );
+        let fraction = if light > 0.0 {
+            (drawn / light).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        manager.drawn.insert(
+            draw.id,
+            DrawnCache {
+                version,
+                wall_s,
+                drawn: DustDrawn {
+                    id: draw.id,
+                    light_cd: light,
+                    drawn_fraction: fraction,
+                    splats: tail.grains.len(),
+                },
+            },
+        );
+    }
+    plan.dust_drawn = plan
+        .tails
+        .iter()
+        .filter(|d| d.dust_version.is_some())
+        .filter_map(|d| manager.drawn.get(&d.id).map(|c| c.drawn))
+        .collect();
     plan
+}
+
+/// A drawn dust tail that keeps less than this share of its light ([`DustDrawn::drawn_fraction`])
+/// raises the grey HUD note [`dust_partly_drawn_note`] (lead ruling C1L-I3, 2026-11-24).
+pub const DUST_DRAWN_NOTE_BELOW: f64 = 0.8;
+
+/// The grey HUD note for a dust tail drawn with `fraction` of its light (lead ruling C1L-I3):
+/// "Comet dust tail partly drawn at this range ({pct} % of its light; renderer limit)", the
+/// percentage rounded down to a whole number ("< 1" below 1 %). The real fix (the light the cap
+/// removes drawn as one residual ellipse per tail, or a coarse-resolution path) is an M2 item.
+pub fn dust_partly_drawn_note(fraction: f64) -> String {
+    let pct = (100.0 * fraction.clamp(0.0, 1.0)).floor();
+    let pct = if pct < 1.0 {
+        "< 1".to_owned()
+    } else {
+        format!("{pct:.0}")
+    };
+    format!("Comet dust tail partly drawn at this range ({pct} % of its light; renderer limit)")
 }
 
 /// Comets whose nucleus mesh was not drawn for this many frames lose it (rebuilt on return).
@@ -493,6 +586,8 @@ pub struct CometRenderer {
     us_per_solve: f64,
     settle: bool,
     cpu_ms: f32,
+    /// The last prepared frame's drawn dust tails ([`DustDrawn`], C1L fix round 1).
+    dust_drawn: Vec<DustDrawn>,
 }
 
 impl CometRenderer {
@@ -673,6 +768,7 @@ impl CometRenderer {
             us_per_solve: KEPLER_SOLVE_US,
             settle: false,
             cpu_ms: 0.0,
+            dust_drawn: Vec::new(),
         })
     }
 
@@ -688,6 +784,29 @@ impl CometRenderer {
     /// still apply.
     pub fn set_settle_tails(&mut self, on: bool) {
         self.settle = on;
+    }
+
+    /// The dust tails drawn in the last prepared frame, each with its light and the share of it
+    /// the pass draws (C1L fix round 1, lead ruling C1L-I3; [`DustDrawn`]). Each value is at most
+    /// `tails::DRAWN_REFRESH_WALL_S` old (one tail is recomputed per frame, every due one while
+    /// tails settle for a capture); a tail not computed yet is missing.
+    pub fn dust_drawn(&self) -> &[DustDrawn] {
+        &self.dust_drawn
+    }
+
+    /// Grey notes for the HUD from the last prepared frame (as `BodyRenderer::warnings`; the app
+    /// shows them with the other renderer statuses): [`dust_partly_drawn_note`] of the
+    /// least-drawn tail when a drawn dust tail keeps less than [`DUST_DRAWN_NOTE_BELOW`] of its
+    /// light (lead ruling C1L-I3), otherwise none.
+    pub fn warnings(&self) -> Vec<String> {
+        self.dust_drawn
+            .iter()
+            .map(|d| d.drawn_fraction)
+            .filter(|&f| f < DUST_DRAWN_NOTE_BELOW)
+            .min_by(f64::total_cmp)
+            .map(dust_partly_drawn_note)
+            .into_iter()
+            .collect()
     }
 
     /// Uploads `plan`'s records, builds the nucleus meshes it needs, and assigns tail slots.
@@ -838,6 +957,7 @@ impl RenderFeature for CometRenderer {
         } else {
             (1_000.0 * TAIL_CPU_SHARE_MS / self.us_per_solve) as usize
         };
+        let drawn_per_frame = if self.settle { usize::MAX } else { 1 };
         let input = self.input.clone();
         let manager = &mut self.manager;
         let plan = input.with(|scene| {
@@ -848,6 +968,7 @@ impl RenderFeature for CometRenderer {
                 wall_s,
                 manager,
                 max_solves,
+                drawn_per_frame,
             )
         });
         if plan.work.solves > 0 && !self.settle {
@@ -856,6 +977,7 @@ impl RenderFeature for CometRenderer {
             self.us_per_solve = 0.8 * self.us_per_solve + 0.2 * us.clamp(0.01, 1_000.0);
         }
         self.upload(gpu, &plan);
+        self.dust_drawn = plan.dust_drawn;
         self.cpu_ms = (start.elapsed().as_secs_f64() * 1e3) as f32;
     }
 
@@ -1113,28 +1235,57 @@ pub(crate) fn phase_probe_inputs() -> Vec<[f32; 4]> {
         .collect()
 }
 
-/// Splat probe inputs (C1L): 64 cases of four vec4 each, (L₀₀, L₁₀, L₂₀, L₁₁), (L₂₁, L₂₂,
+/// The floor of a splat seen with the camera inside a tail [m]: [`tails::SPRITE_MIN_PX`] pixels
+/// 10⁶ m from the camera at 1 080 lines and 60° (802 m), the splat probe's smallest.
+const SPLAT_PROBE_INSIDE_FLOOR_M: f64 = 802.0;
+/// The youngest grain's ejection spread [m] (age 60 d / 64 at 1.11 km/s, /√3), the smallest σ a
+/// real splat has on any axis.
+const SPLAT_PROBE_YOUNGEST_SPREAD_M: f64 = 5.2e7;
+
+/// Splat probe inputs (C1L): 128 cases of four vec4 each, (L₀₀, L₁₀, L₂₀, L₁₁), (L₂₁, L₂₂,
 /// floor, 0), (right, 0), (up, 0), L the Cholesky factor of covariances from two tangent
-/// vectors and an ejection spread of 10⁶–10⁹ m (round, elongated, needles, flat and edge-on),
-/// floors 10⁵–10⁸ m, and sprite planes at 64 orientations.
+/// vectors and an ejection spread (round, elongated, needles, flat and edge-on), and sprite
+/// planes at 128 orientations:
+/// - cases 0–63: axes and spreads of 10⁶–10⁹ m, floors 10⁵–10⁸ m (C1L);
+/// - cases 64–127 (fix round 1, review I2): σ of 10⁸–10¹² m, where the f32 maths overflowed
+///   before the fix (σ₁ above ≈ 6.1 × 10⁹ m), floors 10³–10⁹ m, and every 8th case a splat seen
+///   with the camera inside the tail (σ of 10¹⁰ m over an 802 m floor).
 pub(crate) fn splat_probe_inputs() -> Vec<[f32; 4]> {
-    let mut out = Vec::with_capacity(256);
-    for k in 0..64_u32 {
+    let mut out = Vec::with_capacity(512);
+    for k in 0..128_u32 {
         let f = f64::from(k);
+        // Exponents of the two tangent vectors, the spread and the floor; the second block is
+        // larger (|a| up to 2 × 10¹², so σ = |a|/2 up to 10¹²).
+        let big = k >= 64;
+        let (ea, eb, es, ef, wf) = if big {
+            (9.3, 8.3, 8.0, 3.0, 6.0)
+        } else {
+            (7.0, 6.0, 6.0, 5.0, 3.0)
+        };
+        let step = |mult: u32| ((k * mult) % 64) as f64 / 63.0;
         let a = DVec3::new((0.7 * f).cos(), (1.3 * f).sin(), (0.4 * f).cos())
-            * 10f64.powf(7.0 + 3.0 * ((k * 5) % 64) as f64 / 63.0);
+            * 10f64.powf(ea + 3.0 * step(5));
         let b = DVec3::new((2.1 * f).sin(), (0.5 * f).cos(), (1.7 * f).sin())
-            * 10f64.powf(6.0 + 3.0 * ((k * 11) % 64) as f64 / 63.0);
+            * 10f64.powf(eb + 3.0 * step(11));
         let spread = if k % 4 == 0 {
             0.0
         } else {
-            10f64.powf(6.0 + 3.0 * ((k * 13) % 64) as f64 / 63.0)
+            10f64.powf(es + 3.0 * step(13))
         };
-        let floor = 10f64.powf(5.0 + 3.0 * ((k * 7) % 64) as f64 / 63.0);
-        // Every 8th case a needle (one long axis over a 10⁵ m floor), every 8th a round splat.
-        let (a, b, spread, floor) = match k % 8 {
-            5 => (a.normalize() * 1.0e10, b * 1e-4, 0.0, 1.0e5),
-            6 => (a * 1e-3, b * 1e-3, 1.0e9, floor),
+        let floor = 10f64.powf(ef + wf * step(7));
+        // Every 8th case a needle (one long axis over a small floor), every 8th a round splat;
+        // in the second block every 8th one seen from inside the tail.
+        let (a, b, spread, floor) = match (k % 8, big) {
+            (5, false) => (a.normalize() * 1.0e10, b * 1e-4, 0.0, 1.0e5),
+            (5, true) => (a.normalize() * 2.0e12, b * 1e-4, 0.0, 1.0e3),
+            (6, false) => (a * 1e-3, b * 1e-3, 1.0e9, floor),
+            (6, true) => (a * 1e-3, b * 1e-3, 1.0e11, floor),
+            (7, true) => (
+                a.normalize() * 2.0e10,
+                b.normalize() * 6.0e9,
+                SPLAT_PROBE_YOUNGEST_SPREAD_M,
+                SPLAT_PROBE_INSIDE_FLOOR_M,
+            ),
             _ => (a, b, spread, floor),
         };
         let cov = tails_outer(a) * 0.25
@@ -1500,6 +1651,7 @@ mod tests {
                 0.0,
                 &mut manager,
                 usize::MAX,
+                usize::MAX,
             );
             assert!(
                 plan.nuclei.is_empty(),
@@ -1542,7 +1694,15 @@ mod tests {
             );
             let px = view.proj_radius_px;
             let mut m = TailManager::default();
-            let plan = plan_frame(&scene(vec![view], eye), &camera(), VIEWPORT, 0.0, &mut m, 0);
+            let plan = plan_frame(
+                &scene(vec![view], eye),
+                &camera(),
+                VIEWPORT,
+                0.0,
+                &mut m,
+                0,
+                usize::MAX,
+            );
             assert_eq!(
                 plan.nuclei.len(),
                 usize::from(drawn),
@@ -1570,6 +1730,7 @@ mod tests {
             0.0,
             &mut m,
             0,
+            usize::MAX,
         );
         assert!(plan.comae.is_empty() && plan.tails.is_empty());
     }
@@ -1602,7 +1763,15 @@ mod tests {
                 eye_adapted: false,
             };
             let mut manager = TailManager::default();
-            let plan = plan_frame(&scene, &look, VIEWPORT, 0.0, &mut manager, usize::MAX);
+            let plan = plan_frame(
+                &scene,
+                &look,
+                VIEWPORT,
+                0.0,
+                &mut manager,
+                usize::MAX,
+                usize::MAX,
+            );
             assert_eq!(plan.tails.len(), 1, "phase {phase_deg}°");
             assert!(plan.tails[0].dust_version.is_some());
             let gpu = plan.tails[0].gpu;
@@ -1885,8 +2054,9 @@ mod tests {
         // The splat cases (C1L): orthonormal planes, finite positive floors, round and very
         // elongated ellipses, and edge-on ones whose minor axis is the floor.
         let splat = splat_probe_inputs();
-        assert_eq!(splat.len(), 256);
+        assert_eq!(splat.len(), 512);
         let mut ratios = Vec::new();
+        let mut sigma1 = Vec::new();
         for c in splat.chunks(4) {
             let (factor, floor, right, up) = splat_probe_case(c);
             assert!((right.length() - 1.0).abs() < 1e-6 && (up.length() - 1.0).abs() < 1e-6);
@@ -1894,6 +2064,7 @@ mod tests {
             let (s1, s2, _) = splat_axes(factor, right, up, floor);
             assert!(s1.is_finite() && s2 > 0.0);
             ratios.push((s1 / s2, s2 / floor));
+            sigma1.push((s1, floor));
         }
         assert!(
             ratios.iter().any(|r| r.0 > 100.0) && ratios.iter().any(|r| r.0 < 2.0),
@@ -1903,5 +2074,79 @@ mod tests {
             ratios.iter().filter(|r| r.1 < 1.01).count() >= 4,
             "{ratios:?}"
         );
+        // Fix round 1 (review I2): σ₁ from below 10⁸ m to 10¹² m, at least 32 cases above
+        // 6.1 × 10⁹ m (where squaring metres overflowed f32), and the camera inside a tail.
+        let (lo, hi) = sigma1.iter().fold((f64::MAX, 0.0_f64), |(lo, hi), s| {
+            (lo.min(s.0), hi.max(s.0))
+        });
+        assert!(lo < 1.0e8 && hi > 0.99e12, "σ₁ from {lo:e} to {hi:e} m");
+        assert!(sigma1.iter().filter(|s| s.0 > 6.1e9).count() >= 32);
+        assert!(
+            sigma1
+                .iter()
+                .filter(|s| s.1 <= SPLAT_PROBE_INSIDE_FLOOR_M && s.0 >= 5.0e9)
+                .count()
+                >= 8,
+            "{sigma1:?}"
+        );
+    }
+
+    /// Review I2: the splat probe's cases in f32, as the shader computes them
+    /// (`tails::splat_axes_f32`), agree with the f64 twin within the probe's tolerance over the
+    /// whole range (10⁶–10¹² m, the camera inside a tail), while the C1L code (squaring metres)
+    /// overflowed on the large ones and dropped the splat.
+    #[test]
+    fn splat_axes_f32_covers_the_probe_range() {
+        let input = splat_probe_inputs();
+        let (mut worst_err, mut overflowed, mut big) = (0.0_f64, 0, 0);
+        for c in input.chunks(4) {
+            let (factor, floor, right, up) = splat_probe_case(c);
+            let (s1, s2, phi) = splat_axes(factor, right, up, floor);
+            let m32 = glam::Mat3::from_cols(
+                factor.x_axis.as_vec3(),
+                factor.y_axis.as_vec3(),
+                factor.z_axis.as_vec3(),
+            );
+            let g = tails::splat_axes_f32(m32, right.as_vec3(), up.as_vec3(), floor as f32);
+            assert!(
+                g.0.is_finite() && g.1.is_finite() && g.1 > 0.0,
+                "{g:?} for σ₁ {s1:e}"
+            );
+            // The probe's metric: the rebuilt covariance / σ₁² and the area σ₁σ₂.
+            let rebuilt = |a: f64, b: f64, p: f64| {
+                let (cs, sn) = (p.cos(), p.sin());
+                [
+                    a * a * cs * cs + b * b * sn * sn,
+                    (a * a - b * b) * cs * sn,
+                    a * a * sn * sn + b * b * cs * cs,
+                ]
+            };
+            let want = rebuilt(s1, s2, phi);
+            let got = rebuilt(f64::from(g.0), f64::from(g.1), f64::from(g.2));
+            for (x, y) in got.iter().zip(&want) {
+                worst_err = worst_err.max((x - y).abs() / (s1 * s1));
+            }
+            let area = f64::from(g.0) * f64::from(g.1);
+            worst_err = worst_err.max((area - s1 * s2).abs() / (s1 * s2));
+            if s1 > 6.1e9 {
+                big += 1;
+                let old = tails::splat_axes_unscaled_f32(
+                    m32,
+                    right.as_vec3(),
+                    up.as_vec3(),
+                    floor as f32,
+                );
+                if !(old.0.is_finite() && old.1.is_finite() && old.1 > 0.0) {
+                    overflowed += 1;
+                }
+            }
+        }
+        println!(
+            "splat probe cases in f32: max |f32 − f64| {worst_err:.1e} (tolerance \
+             {SPLAT_PROBE_TOLERANCE:.0e}); the C1L f32 maths failed on {overflowed} of the {big} \
+             cases with σ₁ > 6.1e9 m"
+        );
+        assert!(worst_err <= SPLAT_PROBE_TOLERANCE, "{worst_err:e}");
+        assert!(overflowed >= 16, "{overflowed} of {big}");
     }
 }
