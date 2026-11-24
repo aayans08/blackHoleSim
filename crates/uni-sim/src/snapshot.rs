@@ -202,8 +202,9 @@ pub struct CometView {
     pub r_au: f64,
     /// Distance from the camera Δ [au].
     pub delta_au: f64,
-    /// Total (nucleus + coma) V from the camera, m = M1 + 5 log₁₀Δ + K1 log₁₀r (SBDB's law,
-    /// `photometry::comet_total_v`); `None` unless SBDB gives both M1 and K1.
+    /// Total (nucleus + coma) V from the camera, m = M1 + 5 log₁₀Δ + K1 log₁₀r
+    /// (`photometry::comet_total_v`; the comet's cited visual law where
+    /// `world::COMET_VISUAL_LAWS` has a row, else SBDB's); `None` without M1 and K1.
     pub total_v: Option<f64>,
     pub m1: Option<f64>,
     pub k1: Option<f64>,
@@ -965,8 +966,9 @@ pub(crate) fn reflected_lux(
         * correction
 }
 
-/// A comet's prominence [lx] at the camera: its total (nucleus + coma) magnitude from SBDB's
-/// M1, K1 (`photometry::comet_total_v`), or its nucleus ([`reflected_lux`]) without them. It
+/// A comet's prominence [lx] at the camera: its total (nucleus + coma) magnitude from its M1, K1
+/// (`photometry::comet_total_v`; cited visual law or SBDB's, as `CometView::total_v`), or its
+/// nucleus ([`reflected_lux`]) without them. It
 /// ranks comets (destinations by brightness, the catch-up order); the drawn point is the
 /// nucleus alone.
 pub(crate) fn comet_prominence_lux(

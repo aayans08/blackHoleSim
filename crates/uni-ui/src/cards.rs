@@ -12,17 +12,17 @@ use uni_data::{
 };
 use uni_physics::kepler::Conic;
 use uni_sim::registry::{ObjectId, ObjectInfo, ObjectKind};
-use uni_sim::world::{ObjectDetails, World};
+use uni_sim::world::{ObjectDetails, PerihelionLeg, VisualM1, World, comet_visual_law};
 
 use crate::format::{
     format_date_tdb, format_distance, format_grouped, format_hms, format_mass_kg,
     format_period_days, format_sig, format_speed, subscript_digits,
 };
 use crate::theme::{
-    self, LabelTone, NOTE_ARCHIVE_HOST, NOTE_BLACK_HOLE_M3, NOTE_EARTH_CLOUDS, NOTE_GRANULATION,
-    NOTE_HAZE, NOTE_INCLINATION_UNKNOWN, NOTE_NODE_UNKNOWN, NOTE_NUCLEUS_SHAPE,
-    NOTE_ORBIT_MEAN_ELEMENTS, NOTE_PERIASTRON_CONVENTION, NOTE_RINGS, NOTE_TAILS,
-    NOTE_TANGENTIAL_MOTION, NOTE_VENUS_CLOUD_TOPS, SATURN_MOONS_LABEL,
+    self, LabelTone, NOTE_ARCHIVE_HOST, NOTE_BLACK_HOLE_M3, NOTE_BRIGHTNESS_SBDB,
+    NOTE_EARTH_CLOUDS, NOTE_GRANULATION, NOTE_HAZE, NOTE_INCLINATION_UNKNOWN, NOTE_NODE_UNKNOWN,
+    NOTE_NUCLEUS_SHAPE, NOTE_ORBIT_MEAN_ELEMENTS, NOTE_PERIASTRON_CONVENTION, NOTE_RINGS,
+    NOTE_TAILS, NOTE_TANGENTIAL_MOTION, NOTE_VENUS_CLOUD_TOPS, SATURN_MOONS_LABEL,
 };
 
 /// One label–value row.
@@ -186,6 +186,8 @@ fn describe(info: &ObjectInfo, details: &ObjectDetails, ctx: &Ctx) -> TargetCard
         } => {
             card.subtitle = comet_subtitle(conic);
             card.facts = comet_rows(record, conic, ctx);
+            card.notes
+                .extend(comet_brightness_notes(record, conic, ctx));
             card.sources = "Data: JPL Small-Body Database · orbit re-osculated near the shown \
                             date with planetary perturbations"
                 .into();
@@ -795,7 +797,9 @@ fn comet_rows(record: &Comet, conic: &Conic, ctx: &Ctx) -> Vec<CardRow> {
     if let Some(r) = r_h {
         rows.push(number_row("Distance from Sun", format_distance(r)));
     }
-    // Total magnitude m = M1 + 5 log₁₀ Δ + K1 log₁₀ r [AU] (JPL SBDB's comet parameters).
+    // Total magnitude m = M1 + 5 log₁₀ Δ + K1 log₁₀ r [AU]: the comet's cited total visual law
+    // where `uni_sim::world::COMET_VISUAL_LAWS` has a row, else JPL SBDB's M1, K1 (the world
+    // applies the table on load; the notes say which, `comet_brightness_notes`).
     let magnitude = match (record.m1, record.k1, r_h) {
         (Some(m1), Some(k1), Some(r)) if ctx.cam_dist_m > 0.0 && r > 0.0 => {
             let m = m1 + 5.0 * (ctx.cam_dist_m / AU).log10() + k1 * (r / AU).log10();
@@ -812,6 +816,40 @@ fn comet_rows(record: &Comet, conic: &Conic, ctx: &Ctx) -> Vec<CardRow> {
         ),
     ));
     rows
+}
+
+/// A comet's brightness notes (Task C6 fix round 1, I1): its cited total visual law, plus a note
+/// when the shown date lies outside the law's observations (distance from the Sun or leg); or,
+/// without a row in `uni_sim::world::COMET_VISUAL_LAWS`, SBDB's law (none when SBDB has no M1, K1).
+fn comet_brightness_notes(record: &Comet, conic: &Conic, ctx: &Ctx) -> Vec<String> {
+    let Some(law) = comet_visual_law(record.spkid) else {
+        return match (record.m1, record.k1) {
+            (Some(_), Some(_)) => vec![NOTE_BRIGHTNESS_SBDB.into()],
+            _ => Vec::new(),
+        };
+    };
+    let mut notes = vec![match law.m1 {
+        VisualM1::Observed {
+            v, date, source, ..
+        } => theme::note_brightness_observed(v, date, source, law.k1, law.k1_source),
+        VisualM1::Fit { source, .. } => theme::note_brightness_fit(source),
+    }];
+    // The leg from the conic (outbound when r · v > 0), the distance as the rows give it.
+    let (r, v) = conic.state(ctx.epoch);
+    let r_au = ctx.from_sun_m.map_or(r.length(), |d| d.length()) / AU;
+    if !law.covers(r_au, r.dot(v) > 0.0) {
+        let after_perihelion = match law.leg {
+            PerihelionLeg::Outbound => Some(true),
+            PerihelionLeg::Inbound => Some(false),
+            PerihelionLeg::Both => None,
+        };
+        notes.push(theme::note_brightness_extrapolated(
+            law.r_valid_au.0,
+            law.r_valid_au.1,
+            after_perihelion,
+        ));
+    }
+    notes
 }
 
 /// An asteroid's rows: a, e, i, H, diameter, albedo and the period (Kepler's third law).
@@ -1119,6 +1157,48 @@ mod tests {
         );
         // The Mars card has no Earth note and vice versa.
         assert!(!has(&card_of(&world, "Mars"), NOTE_EARTH_CLOUDS));
+    }
+
+    /// Task C6 fix round 1 (I1): a comet without a cited visual law says its brightness is
+    /// SBDB's law; NEOWISE names its observation, and says "extrapolated" away from the dates it
+    /// rests on (later and farther out, or at a like distance before perihelion).
+    #[test]
+    fn comet_brightness_notes_name_their_law() {
+        let has = |card: &TargetCard, note: &str| card.notes.iter().any(|n| n == note);
+        let starts = |card: &TargetCard, head: &str| card.notes.iter().any(|n| n.starts_with(head));
+        let test = card_of(&test_world(), "9P/Test");
+        assert!(has(&test, NOTE_BRIGHTNESS_SBDB), "{:?}", test.notes);
+        assert!(
+            !starts(&test, "Brightness extrapolated"),
+            "{:?}",
+            test.notes
+        );
+
+        let observed = theme::note_brightness_observed(
+            2.1,
+            "2020-07-14\u{2013}16",
+            "COBS, median of 63 visual estimates",
+            9.63,
+            "Aravind et al. 2025",
+        );
+        let extrapolated = theme::note_brightness_extrapolated(0.431, 0.494, Some(true));
+        let neowise_on = |iso: &str| {
+            let data = uni_sim::world::load_world_data(&uni_data::data_dir().join("baked"));
+            let world = World::new(data, Epoch::parse_iso_utc(iso).expect("date"));
+            card_of(&world, "C/2020 F3 (NEOWISE)")
+        };
+        // Plan row 20's date: r_h 0.455 AU after perihelion, inside the observations.
+        let row20 = neowise_on("2020-07-15T03:00:00Z");
+        assert!(has(&row20, &observed), "{:?}", row20.notes);
+        assert!(!has(&row20, NOTE_BRIGHTNESS_SBDB), "{:?}", row20.notes);
+        assert!(!has(&row20, &extrapolated), "{:?}", row20.notes);
+        // A month later (r_h ≈ 1 AU), and 11 days before perihelion: r_h ≈ 0.46 AU as on the
+        // observed dates, but inbound.
+        for iso in ["2020-08-15T00:00:00Z", "2020-06-22T12:00:00Z"] {
+            let card = neowise_on(iso);
+            assert!(has(&card, &observed), "{iso}: {:?}", card.notes);
+            assert!(has(&card, &extrapolated), "{iso}: {:?}", card.notes);
+        }
     }
 
     /// Ruling 13: the archive has no Ω, so every exoplanet orbit is drawn with Ω = 0°; a planet

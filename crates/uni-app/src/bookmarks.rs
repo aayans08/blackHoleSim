@@ -2096,11 +2096,12 @@ fn comet_view<'a>(world: &World, c: &'a Case, name: &str) -> &'a uni_sim::snapsh
         .unwrap_or_else(|| panic!("{name} is not in the snapshot's comets"))
 }
 
-/// Row 20's re-derived paper EV (Task C6): with NEOWISE's visual magnitude law (V 2.0 on the
-/// date, `uni_sim::world::VISUAL_MAGNITUDE_LAWS`) the coma twin (`paper::coma_luminance`) puts
-/// 44 pixels over the meter's 10⁻³ cd/m², under `METER_MIN_LIT_PX`, so the paper rests at the
-/// night EV; the capture's tails (left out of the paper) light ≈ 100 more and the GPU meter
-/// settles at −3.39. The plan's "≈ −2 ± 2" assumed a larger, brighter coma on screen.
+/// Row 20's re-derived paper EV (Task C6): with NEOWISE's cited visual law (the observed V 2.1
+/// on the date, `uni_sim::world::COMET_VISUAL_LAWS`) the coma twin (`paper::coma_luminance`) puts
+/// 44 pixels over the meter's 10⁻³ cd/m² (as at the earlier V 2.0), under `METER_MIN_LIT_PX`, so
+/// the paper rests at the night EV; the capture's tails (left out of the paper) light ≈ 100 more
+/// and the GPU meter settled at −3.39 (captured at V 2.0; not re-captured at V 2.1). The plan's
+/// "≈ −2 ± 2" assumed a larger, brighter coma on screen.
 pub const NEOWISE_PAPER_EV: f32 = uni_post::NIGHT_EV100;
 /// Row 21's re-derived paper EV (Task C6): Halley's coma lights 173 000 pixels at 653 km/px;
 /// the meter's 50th–95th percentile average sits at −4.56 (the plan's "≈ −2 ± 2" was an
@@ -2150,13 +2151,14 @@ fn intent_20_comet_neowise() {
     // The Sun (along `off`, 25.3° away) and Earth (behind) out of frame (half-diagonal 19.8°).
     assert!(angle(c.fwd(), off) > deg(25.0) && angle(c.fwd(), -off) > deg(90.0));
     assert_comet_paper(world, &c, NEOWISE_PAPER_EV);
-    // The visual magnitude law (coordinator ruling on row 20): V ≈ 2.0 on the date.
+    // The cited visual law (`uni_sim::world::COMET_VISUAL_LAWS`, fix round 1 I1): the observed
+    // V 2.1 on the date (COBS median, 2020-07-14–16).
     let total = v.total_v.expect("NEOWISE has a magnitude law");
     println!(
         "NEOWISE total V {total:.2} (r_h {:.3} AU, Δ {:.3} AU)",
         v.r_au, v.delta_au
     );
-    assert!((total - 2.0).abs() < 0.1, "{total}");
+    assert!((total - 2.1).abs() < 0.05, "{total}");
 }
 
 #[test]

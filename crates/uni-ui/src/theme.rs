@@ -253,6 +253,47 @@ pub const NOTE_NO_SURFACE_MAP: &str = "No surface map: uniform albedo";
 pub const NOTE_TAILS: &str = "Tails: Finson\u{2013}Probstein dust model; brightness approximate";
 /// A comet's nucleus (review m11).
 pub const NOTE_NUCLEUS_SHAPE: &str = "Nucleus shape: procedural";
+/// A comet's brightness from SBDB's M1, K1: every comet without a cited total visual light curve
+/// (`uni_sim::world::COMET_VISUAL_LAWS`; Task C6 fix round 1, I1).
+pub const NOTE_BRIGHTNESS_SBDB: &str = "Brightness: SBDB magnitude law (may be aperture-limited; \
+                                        coma can look fainter than seen visually)";
+
+/// A comet whose total visual law is calibrated to one observed magnitude `v` on `date`
+/// (`source`), with its activity slope `k1` from `k1_source` (`uni_sim::world::VisualM1::Observed`).
+pub fn note_brightness_observed(
+    v: f64,
+    date: &str,
+    source: &str,
+    k1: f64,
+    k1_source: &str,
+) -> String {
+    format!(
+        "Brightness: calibrated to the observed V {v:.1} on {date} ({source}); K1 {k1:.2} from {k1_source}"
+    )
+}
+
+/// A comet with a published total visual light-curve fit (`uni_sim::world::VisualM1::Fit`).
+pub fn note_brightness_fit(source: &str) -> String {
+    format!("Brightness: total visual magnitude law from {source}")
+}
+
+/// A comet outside its visual law's observations: `lo_au`–`hi_au` from the Sun, on the leg
+/// `after_perihelion` (`None`: both legs).
+pub fn note_brightness_extrapolated(
+    lo_au: f64,
+    hi_au: f64,
+    after_perihelion: Option<bool>,
+) -> String {
+    let leg = match after_perihelion {
+        Some(true) => " after perihelion",
+        Some(false) => " before perihelion",
+        None => "",
+    };
+    format!(
+        "Brightness extrapolated: the law rests on observations {lo_au:.2}\u{2013}{hi_au:.2} AU from the Sun{leg}"
+    )
+}
+
 /// An exoplanet orbit with no Ω (every M1 orbit: the archive has no Ω; ruling 13), drawn dashed.
 pub const NOTE_NODE_UNKNOWN: &str =
     "Orbit orientation on the sky unknown: drawn with \u{3a9} = 0\u{b0}";
@@ -933,6 +974,30 @@ mod tests {
         assert_eq!(
             NOTE_TAILS,
             "Tails: Finson–Probstein dust model; brightness approximate"
+        );
+        // Task C6 fix round 1 (I1): the comet brightness notes.
+        assert_eq!(
+            NOTE_BRIGHTNESS_SBDB,
+            "Brightness: SBDB magnitude law (may be aperture-limited; coma can look fainter than \
+             seen visually)"
+        );
+        assert_eq!(
+            note_brightness_observed(2.1, "2020-07-14–16", "COBS", 9.63, "Aravind et al. 2025"),
+            "Brightness: calibrated to the observed V 2.1 on 2020-07-14–16 (COBS); K1 9.63 from \
+             Aravind et al. 2025"
+        );
+        assert_eq!(
+            note_brightness_fit("a paper"),
+            "Brightness: total visual magnitude law from a paper"
+        );
+        assert_eq!(
+            note_brightness_extrapolated(0.431, 0.494, Some(true)),
+            "Brightness extrapolated: the law rests on observations 0.43–0.49 AU from the Sun \
+             after perihelion"
+        );
+        assert_eq!(
+            note_brightness_extrapolated(0.5, 2.0, None),
+            "Brightness extrapolated: the law rests on observations 0.50–2.00 AU from the Sun"
         );
     }
 }

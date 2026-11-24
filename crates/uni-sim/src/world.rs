@@ -556,26 +556,125 @@ pub(crate) fn luminous_intensity_cd(abs_mag_v: f64) -> f64 {
     star_illuminance_lux(abs_mag_v) * ten_pc * ten_pc
 }
 
-/// Total visual magnitude laws (M1, K1) that replace SBDB's for comets whose SBDB parameters
-/// are aperture (nuclear) magnitudes, by SBDB SPK-ID (Task C6, coordinator ruling on row 20).
-///
-/// SBDB gives C/2020 F3 (NEOWISE) M1 = 12.1, K1 = 12.25: on 2020-07-15 (r_h 0.455 AU, Δ 0.784 AU)
-/// that is V ≈ 7.4, while observers saw a naked-eye comet of total visual magnitude about 2.0 in
-/// mid-July 2020 (N. James, British Astronomical Association Comet Section, visual observations,
-/// as cited by Wikipedia "Comet NEOWISE", read 2026-11-24). SBDB's fit matches 5″-aperture
-/// photometry instead: Aravind et al. 2025 (A&A 701, A161, §3.1.1) fit the V magnitude within a
-/// 5″ aperture after perihelion with M0 = 11.92, n = 3.85. The law here keeps that activity index
-/// (K1 = 2.5 n = 9.63, Aravind et al.'s V fit) and sets M1 so the total magnitude is 2.0 on
-/// 2020-07-15 03:00 UTC: M1 = 2.0 − 5 log₁₀ 0.784 − 9.63 log₁₀ 0.455 = 5.82. One observed point,
-/// so approximate away from mid-July (the card's "brightness approximate" note,
-/// `uni_ui::theme::NOTE_TAILS`).
-pub const VISUAL_MAGNITUDE_LAWS: [(i32, f64, f64); 1] = [(1_003_667, 5.82, 9.63)];
+/// Which leg of its orbit a comet was on for a [`CometVisualLaw`]'s observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerihelionLeg {
+    /// Before perihelion (moving toward the Sun).
+    Inbound,
+    /// After perihelion (moving away from the Sun).
+    Outbound,
+    /// Both legs.
+    Both,
+}
 
-/// Replaces `c`'s SBDB magnitude parameters by its [`VISUAL_MAGNITUDE_LAWS`] entry, if any.
-fn apply_visual_magnitudes(c: &mut Comet) {
-    if let Some(&(_, m1, k1)) = VISUAL_MAGNITUDE_LAWS.iter().find(|l| l.0 == c.spkid) {
-        c.m1 = Some(m1);
-        c.k1 = Some(k1);
+/// Where a [`CometVisualLaw`]'s M1 comes from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VisualM1 {
+    /// A published total visual light-curve fit's M1; `source` names it on the card.
+    Fit { m1: f64, source: &'static str },
+    /// The M1 that gives the observed total visual magnitude `v` at heliocentric distance `r_au`
+    /// and geocentric distance `delta_au` [AU]; `date` and `source` name the observation on the
+    /// card.
+    Observed {
+        v: f64,
+        date: &'static str,
+        source: &'static str,
+        r_au: f64,
+        delta_au: f64,
+    },
+}
+
+/// A comet's total visual light curve m = M1 + 5 log₁₀ Δ + K1 log₁₀ r_h [AU] from a cited
+/// primary source, which replaces SBDB's (M1, K1) for that comet (Task C6 fix round 1, I1).
+///
+/// SBDB's comet magnitude parameters may be fitted to small-aperture photometry, which misses
+/// much of a bright comet's coma. A comet without a row keeps them, and its card says so
+/// (`uni_ui::theme::NOTE_BRIGHTNESS_SBDB`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CometVisualLaw {
+    /// SBDB primary SPK-ID: the row applies to the comet with this SPK-ID.
+    pub spkid: i32,
+    /// SBDB name, for readers (the SPK-ID decides).
+    pub name: &'static str,
+    /// M1 [mag].
+    pub m1: VisualM1,
+    /// Activity slope K1 = 2.5 n.
+    pub k1: f64,
+    /// Where K1 comes from (card text).
+    pub k1_source: &'static str,
+    /// The heliocentric distances [AU] the law's observations span. Elsewhere, or on the other
+    /// leg, the card says the brightness is extrapolated.
+    pub r_valid_au: (f64, f64),
+    /// The leg the observations were made on.
+    pub leg: PerihelionLeg,
+}
+
+impl CometVisualLaw {
+    /// M1 [mag]: the fit's, or the one that reproduces the observation.
+    pub fn m1(&self) -> f64 {
+        match self.m1 {
+            VisualM1::Fit { m1, .. } => m1,
+            // M1 = V − 5 log₁₀ Δ − K1 log₁₀ r_h: the law solved for M1.
+            VisualM1::Observed {
+                v, r_au, delta_au, ..
+            } => v - 5.0 * delta_au.log10() - self.k1 * r_au.log10(),
+        }
+    }
+
+    /// Whether the law rests on observations at heliocentric distance `r_au` [AU] on this leg
+    /// (`outbound`: after perihelion).
+    pub fn covers(&self, r_au: f64, outbound: bool) -> bool {
+        let leg = match self.leg {
+            PerihelionLeg::Both => true,
+            PerihelionLeg::Inbound => !outbound,
+            PerihelionLeg::Outbound => outbound,
+        };
+        leg && (self.r_valid_au.0..=self.r_valid_au.1).contains(&r_au)
+    }
+}
+
+/// The comets with a cited total visual light curve (Task C6 fix round 1, I1). Every source is
+/// primary: a refereed paper or an observation database.
+///
+/// **C/2020 F3 (NEOWISE).** SBDB's M1 = 12.1, K1 = 12.25 give V ≈ 7.4 on 2020-07-15, when the
+/// comet was a naked-eye object. They match small-aperture photometry: Aravind et al. 2025
+/// (A&A 701, A161, §3.1.1) fit the V magnitude in a 5″ aperture after perihelion (2020-07-22 to
+/// 09-10, r_h 0.63–1.61 AU) with M0 = 11.92, n = 3.85. No published total visual light-curve fit
+/// was found, so M1 is calibrated to one observation: the median of the 63 visual total-magnitude
+/// estimates (ICQ methods S, M, B, I) in COBS, the Comet Observation Database (cobs.si,
+/// `api/obs_list.api?des=2020F3`, 2020-07-14.00 to 16.95 UTC, median epoch 07-15.15; read
+/// 2026-11-24), is V 2.1. The slope keeps Aravind et al.'s n (K1 = 2.5 n = 9.63). That is an
+/// assumption: they fitted aperture photometry, farther from the Sun. The geometry at the median
+/// epoch: r_h 0.455 AU (SBDB orbit) and Δ 0.784 AU (JPL Horizons, 2020-07-15 03:00 UTC), so
+/// M1 = 2.1 − 5 log₁₀ 0.784 − 9.63 log₁₀ 0.455 = 5.92. The estimates span r_h 0.431–0.494 AU after
+/// perihelion (SBDB orbit at 07-14.00 and 07-16.95 UTC): the law's valid range.
+pub const COMET_VISUAL_LAWS: [CometVisualLaw; 1] = [CometVisualLaw {
+    spkid: 1_003_667,
+    name: "C/2020 F3 (NEOWISE)",
+    m1: VisualM1::Observed {
+        v: 2.1,
+        date: "2020-07-14\u{2013}16",
+        source: "COBS, median of 63 visual estimates",
+        r_au: 0.455,
+        delta_au: 0.784,
+    },
+    k1: 9.63,
+    k1_source: "Aravind et al. 2025",
+    r_valid_au: (0.431, 0.494),
+    leg: PerihelionLeg::Outbound,
+}];
+
+/// The [`COMET_VISUAL_LAWS`] row of the comet with SBDB SPK-ID `spkid`, if it has one.
+pub fn comet_visual_law(spkid: i32) -> Option<&'static CometVisualLaw> {
+    COMET_VISUAL_LAWS.iter().find(|l| l.spkid == spkid)
+}
+
+/// Replaces `c`'s SBDB magnitude parameters by its row in `laws`, if it has one. A comet
+/// without a row keeps SBDB's.
+fn apply_visual_law(c: &mut Comet, laws: &[CometVisualLaw]) {
+    if let Some(law) = laws.iter().find(|l| l.spkid == c.spkid) {
+        c.m1 = Some(law.m1());
+        c.k1 = Some(law.k1);
     }
 }
 
@@ -1027,7 +1126,7 @@ impl World {
         let sheets: HashSet<i32> = facts.iter().map(|f| f.naif).collect();
         world.add_ephemeris_bodies(&sats, &albedos);
         for c in &mut comets {
-            apply_visual_magnitudes(c);
+            apply_visual_law(c, &COMET_VISUAL_LAWS);
         }
         world.add_comets(&comets);
         world.add_asteroids(&asteroids, &asteroid_names, &sheets);
@@ -4986,9 +5085,9 @@ mod tests {
         assert!(world.honesty(&ahead, VIEWPORT).contains(&flag));
     }
 
-    /// Task C6 (coordinator ruling on row 20): C/2020 F3 (NEOWISE) carries its total visual
-    /// magnitude law, not SBDB's aperture fit: V = 2.0 ± 0.1 on 2020-07-15 03:00 UTC at the
-    /// geometry of the plan's row 20 (r_h 0.455 AU, Δ 0.784 AU).
+    /// Task C6 fix round 1 (I1): C/2020 F3 (NEOWISE) carries its cited total visual law, not
+    /// SBDB's aperture fit. On 2020-07-15 03:00 UTC (plan row 20: r_h 0.455 AU, Δ 0.784 AU) it
+    /// gives the observed V 2.1 (COBS), and the law covers that date's leg and distance.
     #[test]
     fn neowise_has_its_visual_magnitude_law() {
         let data = load_world_data(&uni_data::data_dir().join("baked"));
@@ -4998,19 +5097,139 @@ mod tests {
             .find(|c| c.spkid == 1_003_667)
             .expect("NEOWISE");
         assert_eq!((raw.m1, raw.k1), (Some(12.1), Some(12.25)), "SBDB's values");
+        let law = comet_visual_law(1_003_667).expect("NEOWISE has a row");
+        assert_eq!(law.name, raw.name);
+        assert!((law.m1() - 5.92).abs() < 0.005, "{}", law.m1());
+        assert!(law.covers(0.455, true));
+        assert!(!law.covers(0.455, false), "observed after perihelion only");
+        assert!(
+            !law.covers(0.63, true),
+            "beyond the observations: extrapolated"
+        );
         let world = World::new(data, date("2026-11-20T00:00:00Z"));
         let id = id_of(&world, "C/2020 F3 (NEOWISE)");
         let (m1, k1) = world.comet_magnitude(id).expect("magnitude law");
-        assert_eq!((m1, k1), (5.82, 9.63));
+        assert_eq!((m1, k1), (law.m1(), 9.63));
         let v = uni_physics::photometry::comet_total_v(m1, k1, 0.455, 0.784);
-        assert!((v - 2.0).abs() < 0.1, "{v}");
+        assert!((v - 2.1).abs() < 0.005, "{v}");
         let ObjectDetails::Comet { record, .. } = world.details(id).expect("details") else {
             panic!("not a comet");
         };
         assert_eq!(
             (record.m1, record.k1),
-            (Some(5.82), Some(9.63)),
+            (Some(law.m1()), Some(9.63)),
             "the card agrees"
+        );
+    }
+
+    /// Task C6 fix round 1 (I1): the table applies by rule. Any comet whose SPK-ID has a row
+    /// takes the row's law (a fitted row and an observed one alike); a comet without a row keeps
+    /// SBDB's parameters, missing ones included. The loaded world applies the shipped table to
+    /// every comet with a row and to no other.
+    #[test]
+    fn visual_laws_apply_by_rule() {
+        let comet = |spkid: i32, m1: Option<f64>, k1: Option<f64>| Comet {
+            name: format!("C/Test {spkid}"),
+            spkid,
+            q_au: 1.0,
+            e: 0.5,
+            i_deg: 10.0,
+            node_deg: 0.0,
+            argp_deg: 0.0,
+            tp_jd_tdb: 2_451_545.0,
+            epoch_jd_tdb: 2_451_545.0,
+            m1,
+            k1,
+            diameter_km: None,
+        };
+        let laws = [
+            CometVisualLaw {
+                spkid: 7,
+                name: "C/Test 7",
+                m1: VisualM1::Fit {
+                    m1: 4.5,
+                    source: "a paper",
+                },
+                k1: 8.0,
+                k1_source: "a paper",
+                r_valid_au: (0.5, 2.0),
+                leg: PerihelionLeg::Both,
+            },
+            CometVisualLaw {
+                spkid: 8,
+                name: "C/Test 8",
+                m1: VisualM1::Observed {
+                    v: 3.0,
+                    date: "2000-01-01",
+                    source: "a database",
+                    r_au: 0.5,
+                    delta_au: 2.0,
+                },
+                k1: 10.0,
+                k1_source: "a paper",
+                r_valid_au: (0.4, 0.6),
+                leg: PerihelionLeg::Inbound,
+            },
+        ];
+        let mut fitted = comet(7, Some(12.0), Some(12.0));
+        apply_visual_law(&mut fitted, &laws);
+        assert_eq!((fitted.m1, fitted.k1), (Some(4.5), Some(8.0)));
+        let mut observed = comet(8, None, None);
+        apply_visual_law(&mut observed, &laws);
+        let (m1, k1) = (observed.m1.unwrap(), observed.k1.unwrap());
+        let v = uni_physics::photometry::comet_total_v(m1, k1, 0.5, 2.0);
+        assert!(
+            (v - 3.0).abs() < 1e-12,
+            "the observation is reproduced: {v}"
+        );
+        assert!(laws[1].covers(0.5, false) && !laws[1].covers(0.5, true));
+        assert!(!laws[1].covers(0.7, false));
+        for (m1, k1) in [(Some(11.0), Some(9.0)), (None, None), (Some(9.0), None)] {
+            let mut other = comet(9, m1, k1);
+            apply_visual_law(&mut other, &laws);
+            assert_eq!(
+                (other.m1, other.k1),
+                (m1, k1),
+                "no row: SBDB's law unchanged"
+            );
+        }
+        // The loaded world: rows applied, every other comet as SBDB gives it.
+        let data = load_world_data(&uni_data::data_dir().join("baked"));
+        let raw: HashMap<i32, (Option<f64>, Option<f64>)> = data
+            .comets
+            .iter()
+            .map(|c| (c.spkid, (c.m1, c.k1)))
+            .collect();
+        let names: Vec<(String, i32)> = data
+            .comets
+            .iter()
+            .map(|c| (c.name.clone(), c.spkid))
+            .collect();
+        let world = World::new(data, date("2026-11-20T00:00:00Z"));
+        let mut with_row = 0;
+        for (name, spkid) in names {
+            let Some(id) = world.find(&name) else {
+                continue;
+            };
+            let ObjectDetails::Comet { record, .. } = world.details(id).expect("details") else {
+                continue;
+            };
+            match comet_visual_law(spkid) {
+                Some(law) => {
+                    with_row += 1;
+                    assert_eq!(
+                        (record.m1, record.k1),
+                        (Some(law.m1()), Some(law.k1)),
+                        "{name}"
+                    );
+                }
+                None => assert_eq!((record.m1, record.k1), raw[&spkid], "{name}"),
+            }
+        }
+        assert_eq!(
+            with_row,
+            COMET_VISUAL_LAWS.len(),
+            "every row reaches its comet"
         );
     }
 
