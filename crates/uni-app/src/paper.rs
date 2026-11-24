@@ -42,7 +42,7 @@ use uni_physics::photometry::{
     lambert_phase, planet_phase_correction, reflectance, rho_from_geometric_albedo,
 };
 use uni_post::histogram::Histogram;
-use uni_sim::snapshot::{BodyView, Snapshot};
+use uni_sim::snapshot::{BodyView, CometView, Snapshot};
 
 use crate::measure::{Cam, hit_body, hit_ellipsoid};
 use crate::world::World;
@@ -196,32 +196,160 @@ pub struct HazeRay {
     pub sky_t: f64,
 }
 
-/// The luminance [cd/m²] of world light along unit `dir` from the camera (0 for sky). With
-/// `venus`, Venus is drawn with B3's haze ([`VenusAtmo::luminance`]); without, as a bare
-/// Lambert deck with ρ from p_V (the plan's row).
-/// The comae of `snap.comets` along the ray `dir` [cd/m²] (module docs): at the ray's
+/// The comae of `comets` along the ray `dir` [cd/m²] (module docs): at the ray's
 /// perpendicular distance from each nucleus in front of the camera, with one pixel
-/// (`pixel_angle` [rad] across) of softening at the nucleus's distance.
-pub fn coma_luminance(snap: &Snapshot, dir: DVec3, pixel_angle: f64) -> f64 {
-    snap.comets
+/// (`pixel_angle` [rad] across) of softening at the nucleus's distance, every comet at every
+/// distance. The reference [`coma_raster`] is checked against; the paper itself uses the raster.
+pub fn coma_luminance(comets: &[CometView], dir: DVec3, pixel_angle: f64) -> f64 {
+    comets
         .iter()
         .filter(|c| c.nucleus_rel_m.dot(dir) > 0.0)
-        .map(|c| {
-            let d = c.nucleus_rel_m.length();
-            let rho = c.nucleus_rel_m.cross(dir).length();
-            // The radius of a disk with one pixel's area at the nucleus (C1's softening).
-            let a = d * pixel_angle / std::f64::consts::PI.sqrt();
-            uni_planet::comet::coma::coma_drawn_brightness(
-                rho,
-                uni_planet::comet::coma::coma_intensity_cd(c),
-                uni_planet::comet::coma::coma_scale_m(c.r_au),
-                a,
-            )
-        })
+        .map(|c| coma_term(c, dir, pixel_angle))
         .filter(|l| l.is_finite())
         .sum()
 }
 
+/// One comet's coma along the ray `dir` [cd/m²] ([`coma_luminance`]'s term).
+fn coma_term(c: &CometView, dir: DVec3, pixel_angle: f64) -> f64 {
+    let d = c.nucleus_rel_m.length();
+    let rho = c.nucleus_rel_m.cross(dir).length();
+    // The radius of a disk with one pixel's area at the nucleus (C1's softening).
+    let a = d * pixel_angle / std::f64::consts::PI.sqrt();
+    uni_planet::comet::coma::coma_drawn_brightness(
+        rho,
+        uni_planet::comet::coma::coma_intensity_cd(c),
+        uni_planet::comet::coma::coma_scale_m(c.r_au),
+        a,
+    )
+}
+
+/// One coma the paper adds ([`visible_comae`]): its comet (an index into the list), the reach
+/// [m] (perpendicular distance from the nucleus) inside which it is added, and its screen
+/// bounding box [x0, x1) × [y0, y1) [px].
+struct PaperComa {
+    index: usize,
+    reach_m: f64,
+    bbox: [u32; 4],
+}
+
+/// The comae of `comets` the comet pass can draw on a `size` frame seen with `cam` (C1L fix
+/// round 2, perf; lead request "paper comet cull"), with the pass's own rules, so the paper and
+/// the GPU agree:
+/// - **Which comets** (`plan_frame`): active, r_h < `COMET_ACTIVE_AU` with a finite total V,
+///   with coma light.
+/// - **How far** (`vs_coma`, `fs_coma`): within the coma quad, `COMA_EXTENT_SCALES` scale lengths
+///   (max(ℓ, a)), shrunk by the glow cull `coma_visible_half_m` at the brightest exposure the
+///   app can meter, EV100 −30 (`scene::EV100_LIMITS`), so nothing the pass could draw at any
+///   exposure is dropped.
+/// - **What is dropped:** light beyond 10 scale lengths (the pass draws none; e^−10 of the
+///   coma's light) and comae whose brightest point is below `GLOW_CULL_PRE` at EV100 −30
+///   (2 × 10⁻¹⁶ cd/m²). Before C1L fix round 2 the paper added every comet's coma at every pixel,
+///   which made the intent tests very slow; the meter counts only pixels ≥ 10⁻³ cd/m², so its EVs
+///   do not move (`paper_comet_cull_keeps_the_meter`).
+/// - **Where:** none when the reach lies wholly behind the camera; else the bounding box of the
+///   cone of rays within the reach of the nucleus (sampled at
+///   32 points, widened by 1/cos(π/32) and 2 px); the whole frame when the camera is within 1.01 ×
+///   the reach of the nucleus or the cone reaches behind it.
+fn visible_comae(comets: &[CometView], cam: &Cam, size: UVec2) -> Vec<PaperComa> {
+    use uni_planet::comet::coma::{
+        COMA_EXTENT_SCALES, coma_intensity_cd, coma_scale_m, coma_visible_half_m,
+    };
+    let pre_max = f64::from(uni_gfx::exposure_scale(*crate::scene::EV100_LIMITS.start()));
+    let pixel_angle = cam.pixel_angle();
+    let whole = [0, size.x, 0, size.y];
+    let mut out = Vec::new();
+    for (index, c) in comets.iter().enumerate() {
+        if !(c.r_au < uni_sim::snapshot::COMET_ACTIVE_AU && c.total_v.is_some_and(f64::is_finite)) {
+            continue;
+        }
+        let intensity = coma_intensity_cd(c);
+        let d = c.nucleus_rel_m.length();
+        if !(intensity > 0.0 && intensity.is_finite() && d > 0.0 && d.is_finite()) {
+            continue;
+        }
+        let scale = coma_scale_m(c.r_au);
+        let a = d * pixel_angle / std::f64::consts::PI.sqrt();
+        let half = COMA_EXTENT_SCALES * scale.max(a);
+        let reach_m = coma_visible_half_m(intensity, scale, a, half, pre_max);
+        // Nothing drawn, or all of it behind the camera (the pass's `sphere_in_view` culls it).
+        if !(reach_m > 0.0) || c.nucleus_rel_m.dot(cam.forward()) < -reach_m {
+            continue;
+        }
+        let bbox = if reach_m >= d / 1.01 {
+            whole
+        } else {
+            // The cone's edge on a plane facing the camera at the nucleus: radius
+            // reach/√(1 − (reach/d)²), widened for the 32-gon.
+            let n = c.nucleus_rel_m / d;
+            let e1 = n.any_orthonormal_vector();
+            let e2 = n.cross(e1);
+            let r = reach_m
+                / (1.0 - (reach_m / d).powi(2)).sqrt()
+                / (std::f64::consts::PI / 32.0).cos();
+            let pts: Option<Vec<DVec2>> = (0..32)
+                .map(|k| {
+                    let t = std::f64::consts::TAU * f64::from(k) / 32.0;
+                    cam.project(c.nucleus_rel_m + r * (t.cos() * e1 + t.sin() * e2))
+                })
+                .collect();
+            match pts {
+                None => whole,
+                Some(p) => {
+                    let lo = p.iter().copied().fold(DVec2::INFINITY, DVec2::min) - 2.0;
+                    let hi = p.iter().copied().fold(DVec2::NEG_INFINITY, DVec2::max) + 2.0;
+                    let clamp = |v: f64, max: u32| v.clamp(0.0, f64::from(max)) as u32;
+                    [
+                        clamp(lo.x.floor(), size.x),
+                        clamp(hi.x.ceil(), size.x),
+                        clamp(lo.y.floor(), size.y),
+                        clamp(hi.y.ceil(), size.y),
+                    ]
+                }
+            }
+        };
+        if bbox[0] < bbox[1] && bbox[2] < bbox[3] {
+            out.push(PaperComa {
+                index,
+                reach_m,
+                bbox,
+            });
+        }
+    }
+    out
+}
+
+/// The comae on a `size` frame seen with `cam` [cd/m²], row-major from the top-left pixel,
+/// sampled at pixel centres as the paper's loop does: [`coma_luminance`]'s terms, added in the
+/// same order, but only for [`visible_comae`] inside their reach and bounding box (C1L fix
+/// round 2, perf).
+pub fn coma_raster(comets: &[CometView], cam: &Cam, size: UVec2) -> Vec<f64> {
+    let (w, h) = (size.x as usize, size.y as usize);
+    let mut out = vec![0.0_f64; w * h];
+    let pixel_angle = cam.pixel_angle();
+    for coma in visible_comae(comets, cam, size) {
+        let c = &comets[coma.index];
+        let [x0, x1, y0, y1] = coma.bbox;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let ray = cam.ray(DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
+                if !(c.nucleus_rel_m.dot(ray) > 0.0)
+                    || c.nucleus_rel_m.cross(ray).length() > coma.reach_m
+                {
+                    continue;
+                }
+                let l = coma_term(c, ray, pixel_angle);
+                if l.is_finite() {
+                    out[y as usize * w + x as usize] += l;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The luminance [cd/m²] of world light along unit `dir` from the camera (0 for sky). With
+/// `venus`, Venus is drawn with B3's haze ([`VenusAtmo::luminance`]); without, as a bare
+/// Lambert deck with ρ from p_V (the plan's row).
 pub fn world_luminance(
     snap: &Snapshot,
     dir: DVec3,
@@ -387,7 +515,9 @@ pub fn on_paper_model(
         .map_or(1.0, |b| {
             earth_atmosphere_factor(crate::measure::phase_rad(b))
         });
-    // The dust tails at every pixel (lead ruling C1L-b).
+    // The comae and the dust tails at every pixel (lead ruling C1L-b; the comae culled as the
+    // comet pass culls them, C1L fix round 2).
+    let comae = coma_raster(&snap.comets, &cam, size);
     let dust = uni_planet::dust_tail_luminance(&snap.comets, world.epoch(), view, size);
     let w = STRIDE * STRIDE;
     let mut lums = Vec::new();
@@ -396,7 +526,7 @@ pub fn on_paper_model(
             let p = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
             let ray = cam.ray(p);
             let l = world_luminance(&snap, ray, rings, earth_k, venus)
-                + coma_luminance(&snap, ray, cam.pixel_angle())
+                + comae[y as usize * size.x as usize + x as usize]
                 + dust.at(x, y);
             if l > 0.0 {
                 for _ in 0..w {
@@ -521,6 +651,129 @@ pub fn point_lux(b: &BodyView) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1L fix round 2 (perf): the culled coma raster against the old every-comet sum
+    /// ([`coma_luminance`]) on a 192 × 108 frame with a bright comet near the centre, a faint
+    /// one far off, one behind the camera, one beyond 5 AU and one without a magnitude law. The
+    /// raster differs only by what the comet pass never draws (beyond 10 scale lengths, or a
+    /// coma beyond 5 AU or below the glow cull at EV −30), bounded per pixel by the dropped
+    /// comets' largest terms; every pixel ≥ 10⁻³ cd/m² keeps its f32 value, and the meter's EV is
+    /// identical.
+    #[test]
+    fn paper_comet_cull_keeps_the_meter() {
+        use uni_core::{AU, Epoch, UniversePos};
+        use uni_physics::smallbody::conic_from_perihelion;
+        let comet = |id: u32, rel: DVec3, r_au: f64, law: Option<(f64, f64)>| {
+            let delta_au = rel.length() / AU;
+            CometView {
+                id,
+                name: format!("comet {id}"),
+                nucleus_rel_m: rel,
+                nucleus_radius_m: 2_000.0,
+                radius_assumed: true,
+                spkid: 2_000_000 + id as i32,
+                sun_rel_m: DVec3::new(-r_au * AU, 0.0, 0.0),
+                helio_vel_mps: DVec3::ZERO,
+                r_au,
+                delta_au,
+                total_v: law
+                    .map(|(m1, k1)| uni_physics::photometry::comet_total_v(m1, k1, r_au, delta_au)),
+                m1: law.map(|l| l.0),
+                k1: law.map(|l| l.1),
+                conic: conic_from_perihelion(r_au, 0.0, 0.0, 0.0, 0.0, 2_451_545.0),
+                conic_epoch: Epoch::J2000,
+                proj_radius_px: 0.0,
+            }
+        };
+        let comets = vec![
+            comet(
+                1,
+                DVec3::new(0.002, 0.001, -0.05) * AU,
+                0.6,
+                Some((5.0, 10.0)),
+            ),
+            comet(2, DVec3::new(0.4, -0.2, -3.0) * AU, 4.0, Some((14.0, 10.0))),
+            comet(3, DVec3::new(0.0, 0.0, 0.1) * AU, 1.0, Some((5.0, 10.0))),
+            comet(4, DVec3::new(-0.2, 0.1, -2.0) * AU, 5.5, Some((14.0, 10.0))),
+            comet(5, DVec3::new(0.1, 0.1, -1.0) * AU, 1.0, None),
+        ];
+        let view = CameraView {
+            pos: UniversePos::default(),
+            orient: DQuat::IDENTITY,
+            fov_y_rad: 20f64.to_radians(),
+            velocity_mps: DVec3::ZERO,
+        };
+        let size = UVec2::new(192, 108);
+        let cam = Cam::new(&view, size);
+        let kept = visible_comae(&comets, &cam, size);
+        let kept_ids: Vec<u32> = kept.iter().map(|k| comets[k.index].id).collect();
+        assert_eq!(kept_ids, vec![1, 2], "{kept_ids:?}");
+        // The most a dropped term can be at any pixel: a kept comet beyond its reach, or a
+        // dropped comet in front of the camera anywhere (its term at its own nucleus); one
+        // behind the camera adds nothing to any pixel in either sum.
+        let pixel_angle = cam.pixel_angle();
+        let mut bound = 0.0_f64;
+        for (i, c) in comets.iter().enumerate() {
+            if !(c.nucleus_rel_m.dot(cam.forward()) > 0.0) {
+                continue;
+            }
+            let at_nucleus = coma_term(c, c.nucleus_rel_m.normalize(), pixel_angle);
+            let edge = kept.iter().find(|k| k.index == i).map_or(at_nucleus, |k| {
+                let d = c.nucleus_rel_m.length();
+                let a = d * pixel_angle / std::f64::consts::PI.sqrt();
+                uni_planet::comet::coma::coma_drawn_brightness(
+                    k.reach_m,
+                    uni_planet::comet::coma::coma_intensity_cd(c),
+                    uni_planet::comet::coma::coma_scale_m(c.r_au),
+                    a,
+                )
+            });
+            if edge.is_finite() {
+                bound = bound.max(edge);
+            }
+        }
+        let raster = coma_raster(&comets, &cam, size);
+        let (mut reference, mut culled) = (Vec::new(), Vec::new());
+        let mut worst = 0.0_f64;
+        for y in 0..size.y {
+            for x in 0..size.x {
+                let ray = cam.ray(DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
+                let r = coma_luminance(&comets, ray, pixel_angle);
+                let c = raster[(y * size.x + x) as usize];
+                worst = worst.max((r - c).abs());
+                if r >= f64::from(uni_post::METER_MIN_CD_M2) {
+                    assert_eq!(r as f32, c as f32, "({x}, {y}): {r:e} vs {c:e}");
+                }
+                if r > 0.0 {
+                    reference.push(r as f32);
+                }
+                if c > 0.0 {
+                    culled.push(c as f32);
+                }
+            }
+        }
+        let lit = reference
+            .iter()
+            .filter(|&&l| l >= uni_post::METER_MIN_CD_M2)
+            .count();
+        println!(
+            "comae kept {kept_ids:?}; largest dropped term {bound:.2e} cd/m², largest difference \
+             {worst:.2e}; {lit} lit px"
+        );
+        assert!(
+            worst <= bound * (1.0 + 1e-9) && bound < 1e-5,
+            "{worst:e} vs {bound:e}"
+        );
+        assert!(lit > 100, "{lit}");
+        let total = size.x * size.y;
+        let ev = |l: &[f32]| {
+            uni_post::target_ev(
+                Histogram::from_luminances(l.iter().copied()).meter(total),
+                0.0,
+            )
+        };
+        assert_eq!(ev(&reference), ev(&culled));
+    }
 
     /// A bare Lambert sphere on paper integrates to the point path's flux (the per-pixel model
     /// and A4's point path agree; Review Focus 4), seen from 118 radii: the point path assumes a
