@@ -23,8 +23,10 @@
 //!
 //! Comets (Task C6, rows 20–21): each listed comet's coma is C1's drawn Haser profile
 //! (`uni_planet::comet::coma::coma_drawn_brightness` with `coma_intensity_cd`, softened over a
-//! pixel at the nucleus), added to the pixel's world light; the tails (0.5× and 0.2× the coma's
-//! light, spread along them) and the km-sized nucleus are left out.
+//! pixel at the nucleus), added to the pixel's world light. The dust tails are the comet pass's
+//! CPU twin (`uni_planet::dust_tail_luminance`, lead ruling C1L-b): the same comets, splats, cap
+//! and floor as a capture's first frame, without the visibility cull and occlusion. The ion
+//! tail (0.2 × the coma's light along a 10⁵ km ribbon) and the km-sized nucleus are left out.
 //!
 //! Points (unresolved bodies) are sky light at star exposure and are not metered.
 //!
@@ -384,6 +386,8 @@ pub fn on_paper_model(
         .map_or(1.0, |b| {
             earth_atmosphere_factor(crate::measure::phase_rad(b))
         });
+    // The dust tails at every pixel (lead ruling C1L-b).
+    let dust = uni_planet::dust_tail_luminance(&snap.comets, world.epoch(), view, size);
     let w = STRIDE * STRIDE;
     let mut lums = Vec::new();
     for y in (0..size.y).step_by(STRIDE as usize) {
@@ -391,7 +395,8 @@ pub fn on_paper_model(
             let p = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
             let ray = cam.ray(p);
             let l = world_luminance(&snap, ray, rings, earth_k, venus)
-                + coma_luminance(&snap, ray, cam.pixel_angle());
+                + coma_luminance(&snap, ray, cam.pixel_angle())
+                + dust.at(x, y);
             if l > 0.0 {
                 for _ in 0..w {
                     lums.push(l as f32);

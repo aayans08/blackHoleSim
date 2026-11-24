@@ -676,11 +676,13 @@ impl Scene {
         self.readback.last_ev100()
     }
 
-    /// The bodies' and star surfaces' warnings from the last prepared frame (a missing map, a
-    /// camera inside a body or star).
+    /// The bodies', star surfaces' and comets' warnings from the last prepared frame (a missing
+    /// map, a camera inside a body or star, a comet dust tail the pass draws only partly: lead
+    /// ruling C1L-I3, `uni_planet::dust_partly_drawn_note`). Grey HUD statuses.
     pub fn pass_warnings(&self) -> Vec<String> {
         let mut w = self.bodies_pass.borrow().warnings();
         w.extend(self.sun_pass.borrow().warnings());
+        w.extend(self.comet_pass.borrow().warnings());
         w
     }
 

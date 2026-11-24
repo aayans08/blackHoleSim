@@ -2098,20 +2098,22 @@ fn comet_view<'a>(world: &World, c: &'a Case, name: &str) -> &'a uni_sim::snapsh
         .unwrap_or_else(|| panic!("{name} is not in the snapshot's comets"))
 }
 
-/// Row 20's re-derived paper EV (Task C6): with NEOWISE's cited visual law (the observed V 2.1
-/// on the date, `uni_sim::world::COMET_VISUAL_LAWS`) the coma twin (`paper::coma_luminance`) puts
-/// 44 pixels over the meter's 10⁻³ cd/m² (as at the earlier V 2.0), under `METER_MIN_LIT_PX`, so
-/// the paper rests at the night EV; the capture's tails (left out of the paper) light ≈ 100 more
-/// and the GPU meter settled at −3.39 (captured at V 2.0; not re-captured at V 2.1). The plan's
-/// "≈ −2 ± 2" assumed a larger, brighter coma on screen.
-pub const NEOWISE_PAPER_EV: f32 = uni_post::NIGHT_EV100;
+/// Row 20's paper EV, derived with the dust tail (C1L fix round 1, lead ruling C1L-b): the coma
+/// twin (`paper::coma_luminance`, NEOWISE's cited visual law, V 2.1) lights only 44 pixels over
+/// the meter's 10⁻³ cd/m², but the comet pass's dust-tail twin (`uni_planet::dust_tail_luminance`,
+/// after C1L-I1: the tail 3.55 × the coma) lights 1 219, whose 50th–95th percentile average is
+/// EV −5.37 (`intent_20_comet_neowise` prints the paper). Before C1L the paper rested at the night
+/// EV (−4) with the tails left out; the plan's "≈ −2 ± 2" assumed a larger, brighter coma.
+pub const NEOWISE_PAPER_EV: f32 = -5.37;
 /// Row 21's re-derived paper EV (Task C6): Halley's coma lights 173 000 pixels at 653 km/px;
 /// the meter's 50th–95th percentile average sits at −4.56 (the plan's "≈ −2 ± 2" was an
-/// estimate before the coma twin existed).
+/// estimate before the coma twin existed). With the dust-tail twin (C1L fix round 1) the paper
+/// reads −4.51: from 2 × 10⁶ km the pass draws 6 % of the dust's light (its 64 px cap; the HUD
+/// says so), which barely moves the meter.
 pub const HALLEY_PAPER_EV: f32 = -4.56;
 
-/// The paper exposure of a comet bookmark (with the coma twin, `paper::coma_luminance`) against
-/// its re-derived row `row_ev`, ±0.5 EV as every intent test.
+/// The paper exposure of a comet bookmark (with the coma twin, `paper::coma_luminance`, and the
+/// dust-tail twin) against its re-derived row `row_ev`, ±0.5 EV as every intent test.
 #[track_caller]
 fn assert_comet_paper(world: &World, c: &Case, row_ev: f32) -> crate::paper::Paper {
     let p = crate::paper::on_paper(world, &c.view, SIZE, None);
