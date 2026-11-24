@@ -59,10 +59,10 @@ use self::nucleus::{
 };
 use self::tails::{
     DUST_TAIL_LIGHT, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
-    KEPLER_SOLVE_US, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light,
-    dust_light_scale, dust_phase, dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m,
-    ion_sigma_m, ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m,
-    is_active, sprite_profile, tailed_comets,
+    KEPLER_SOLVE_US, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light, dust_light_scale,
+    dust_phase, dust_reach_estimate_m, ion_colour, ion_drawn_sigma_m, ion_sigma_m,
+    ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness, ion_tail_length_m, is_active,
+    sprite_profile, tailed_comets,
 };
 use crate::body::{exposure_weight, lens_mask_target, sphere_in_view};
 
@@ -318,8 +318,8 @@ pub(crate) fn plan_frame(
             .map_or_else(|| dust_reach_estimate_m(view.r_au), |t| t.reach_m);
         // The ribbon's half width with its pixel floor at its farthest point (review C1 I2).
         let ion_length = ion_tail_length_m(view.r_au);
-        let ion_reach = ion_length
-            + ION_HALF_WIDTH_SIGMAS * ion_drawn_sigma_m(pixel_rad * (d + ion_length));
+        let ion_reach =
+            ion_length + ION_HALF_WIDTH_SIGMAS * ion_drawn_sigma_m(pixel_rad * (d + ion_length));
         let reach = dust_reach.max(ion_reach).max(half);
         if sphere_in_view(camera, aspect, rel, reach) {
             candidates.push(view.clone());
@@ -801,7 +801,14 @@ impl RenderFeature for CometRenderer {
         let input = self.input.clone();
         let manager = &mut self.manager;
         let plan = input.with(|scene| {
-            plan_frame(scene, &ctx.camera, ctx.viewport, wall_s, manager, max_solves)
+            plan_frame(
+                scene,
+                &ctx.camera,
+                ctx.viewport,
+                wall_s,
+                manager,
+                max_solves,
+            )
         });
         if plan.work.solves > 0 && !self.settle {
             // The whole plan's time per solve (culling included): a cost estimate on the safe side.
@@ -1121,7 +1128,11 @@ pub(crate) fn comet_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeRe
             let [s, x, l, sin_psi] = c.map(f64::from);
             let i = ION_PROBE_INTENSITY_CD;
             let peak = ion_tail_brightness(0.0, 0.0, l, i, sin_psi);
-            exact.push(rel(g[0], ion_tail_brightness(s, x, l, i, sin_psi), 1e-3 * peak));
+            exact.push(rel(
+                g[0],
+                ion_tail_brightness(s, x, l, i, sin_psi),
+                1e-3 * peak,
+            ));
             let sigma = ion_drawn_sigma_m(ion_probe_pixel_m(c));
             let peak = ion_tail_drawn_brightness(0.0, 0.0, l, i, sin_psi, sigma);
             let cpu = ion_tail_drawn_brightness(s, x, l, i, sin_psi, sigma);
@@ -1226,7 +1237,9 @@ pub(crate) mod test_support {
             helio_vel_mps: vel,
             r_au,
             delta_au,
-            total_v: m1.zip(k1).map(|(m1, k1)| comet_total_v(m1, k1, r_au, delta_au)),
+            total_v: m1
+                .zip(k1)
+                .map(|(m1, k1)| comet_total_v(m1, k1, r_au, delta_au)),
             m1,
             k1,
             conic,
@@ -1314,11 +1327,17 @@ mod tests {
                 &mut manager,
                 usize::MAX,
             );
-            assert!(plan.nuclei.is_empty(), "a 2 km nucleus 0.5 AU away is a point");
+            assert!(
+                plan.nuclei.is_empty(),
+                "a 2 km nucleus 0.5 AU away is a point"
+            );
             if active {
                 assert_eq!(plan.comae.len(), 1, "r_h {r_au}: no coma");
                 assert_eq!(plan.tails.len(), 1, "r_h {r_au}: no tail");
-                assert!(plan.tails[0].dust_version.is_some(), "r_h {r_au}: no dust tail");
+                assert!(
+                    plan.tails[0].dust_version.is_some(),
+                    "r_h {r_au}: no dust tail"
+                );
                 assert!(plan.comae[0].profile[0] > 0.0);
                 assert!(plan.tails[0].gpu.nucleus[3] > 0.0 && plan.tails[0].gpu.sun[3] > 0.0);
             } else {
@@ -1335,13 +1354,26 @@ mod tests {
     fn nucleus_resolved_and_comets_culled() {
         let sun_rel = DVec3::new(-AU, 0.0, 0.0);
         // 2 km nucleus at 1 000 km: 2 000/1e6/tan(30°)·540 = 1.87 px.
-        for (dist, eye, drawn) in [(1.0e6, true, true), (3.0e6, true, false), (300.0, false, false)]
-        {
-            let view = static_view(2, DVec3::new(0.0, 0.0, -dist), sun_rel, Some(6.0), Some(10.0));
+        for (dist, eye, drawn) in [
+            (1.0e6, true, true),
+            (3.0e6, true, false),
+            (300.0, false, false),
+        ] {
+            let view = static_view(
+                2,
+                DVec3::new(0.0, 0.0, -dist),
+                sun_rel,
+                Some(6.0),
+                Some(10.0),
+            );
             let px = view.proj_radius_px;
             let mut m = TailManager::default();
             let plan = plan_frame(&scene(vec![view], eye), &camera(), VIEWPORT, 0.0, &mut m, 0);
-            assert_eq!(plan.nuclei.len(), usize::from(drawn), "{dist} m ({px:.2} px)");
+            assert_eq!(
+                plan.nuclei.len(),
+                usize::from(drawn),
+                "{dist} m ({px:.2} px)"
+            );
             if drawn {
                 assert_eq!(plan.nuclei[0].gpu.centre[3], exposure_weight(px, eye));
                 assert!(plan.nuclei[0].gpu.centre[3] < 1.0, "LOD band at {px} px");
@@ -1349,9 +1381,22 @@ mod tests {
             }
         }
         // Behind the camera, 1.5 AU away: the coma (≲ 10⁶ km) and the tails are culled.
-        let behind = static_view(3, DVec3::new(0.0, 0.0, 1.5 * AU), sun_rel, Some(6.0), Some(10.0));
+        let behind = static_view(
+            3,
+            DVec3::new(0.0, 0.0, 1.5 * AU),
+            sun_rel,
+            Some(6.0),
+            Some(10.0),
+        );
         let mut m = TailManager::default();
-        let plan = plan_frame(&scene(vec![behind], false), &camera(), VIEWPORT, 0.0, &mut m, 0);
+        let plan = plan_frame(
+            &scene(vec![behind], false),
+            &camera(),
+            VIEWPORT,
+            0.0,
+            &mut m,
+            0,
+        );
         assert!(plan.comae.is_empty() && plan.tails.is_empty());
     }
 
@@ -1437,8 +1482,7 @@ mod tests {
         let check = |name: &str, size: usize, rust: &[(&str, usize)]| {
             let (wsize, wfields) = wgsl_struct(&m, name);
             assert_eq!(wsize, size, "{name} size");
-            let rust: Vec<(String, usize)> =
-                rust.iter().map(|&(n, o)| (n.to_owned(), o)).collect();
+            let rust: Vec<(String, usize)> = rust.iter().map(|&(n, o)| (n.to_owned(), o)).collect();
             assert_eq!(wfields, rust, "{name} members");
         };
         check(
@@ -1536,11 +1580,17 @@ mod tests {
         assert_eq!(scalar("ION_SEGMENTS"), f64::from(ION_SEGMENTS));
         assert_eq!(scalar("ION_EFOLDS"), f32_of(tails::ION_TAIL_EFOLDS));
         assert_eq!(scalar("ION_WIDTH_M"), f32_of(tails::ION_TAIL_WIDTH_M));
-        assert_eq!(scalar("ION_HALF_WIDTH_SIGMAS"), f32_of(tails::ION_HALF_WIDTH_SIGMAS));
+        assert_eq!(
+            scalar("ION_HALF_WIDTH_SIGMAS"),
+            f32_of(tails::ION_HALF_WIDTH_SIGMAS)
+        );
         assert_eq!(scalar("ION_MIN_SIGMA_PX"), f32_of(ION_MIN_SIGMA_PX));
         assert_eq!(scalar("DUST_G"), f32_of(tails::DUST_PHASE_G));
         assert_eq!(scalar("SPRITE_SIGMAS"), f32_of(tails::SPRITE_SIGMAS));
-        assert_eq!(scalar("COMA_EXTENT_SCALES"), f32_of(coma::COMA_EXTENT_SCALES));
+        assert_eq!(
+            scalar("COMA_EXTENT_SCALES"),
+            f32_of(coma::COMA_EXTENT_SCALES)
+        );
         let nucleus_l = match nucleus::NUCLEUS_BRDF {
             uni_physics::photometry::Brdf::LunarLambert { l } => l,
             uni_physics::photometry::Brdf::Lambert => 0.0,
@@ -1584,7 +1634,10 @@ mod tests {
             );
         }
         let scalar = |name: &str| wgsl_scalar(&m, name);
-        assert_eq!(scalar("ION_PROBE_INTENSITY"), f32_of(ION_PROBE_INTENSITY_CD));
+        assert_eq!(
+            scalar("ION_PROBE_INTENSITY"),
+            f32_of(ION_PROBE_INTENSITY_CD)
+        );
         assert_eq!(scalar("ION_PROBE_PIXEL"), f32_of(ION_PROBE_PIXEL_M));
         assert_eq!(scalar("SPRITE_PROBE_SIGMA"), f32_of(SPRITE_PROBE_SIGMA_M));
         assert_eq!(scalar("DUST_PROBE_SUN_X"), f32_of(DUST_PROBE_SUN_M.x));
@@ -1604,7 +1657,10 @@ mod tests {
         let ratios: Vec<f32> = coma.iter().map(|c| c[0] / c[2]).collect();
         assert!(ratios.iter().any(|&r| r < 2e-3) && ratios.iter().any(|&r| r > 15.0));
         assert!(coma.iter().any(|c| c[3] > c[2]) && coma.iter().any(|c| c[3] < 1e-2 * c[2]));
-        assert!(coma.iter().all(|c| c.iter().all(|x| x.is_finite() && *x > 0.0)));
+        assert!(
+            coma.iter()
+                .all(|c| c.iter().all(|x| x.is_finite() && *x > 0.0))
+        );
         let ion = ion_probe_inputs();
         assert_eq!(ion.len(), 64);
         assert!(ion.iter().all(|c| c[0] >= 0.0 && c[0] < c[2] && c[3] > 0.0));
@@ -1625,6 +1681,9 @@ mod tests {
             cos.push(helio.normalize().dot(-rel.normalize()));
             assert!(dust_grain_light(offset, DUST_PROBE_WEIGHT, nucleus_rel, sun_rel) > 0.0);
         }
-        assert!(cos.iter().any(|&c| c > 0.5) && cos.iter().any(|&c| c < -0.5), "{cos:?}");
+        assert!(
+            cos.iter().any(|&c| c > 0.5) && cos.iter().any(|&c| c < -0.5),
+            "{cos:?}"
+        );
     }
 }

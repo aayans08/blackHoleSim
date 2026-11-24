@@ -36,9 +36,9 @@ pub use stars3d::{
     vivid_color,
 };
 
-// Dependencies the stubs do not use yet (B0 adds every Wave B manifest entry, review I8). These
-// lines keep `cargo::unused_dependencies` quiet until B4/B5 use them; delete each one then.
-use uni_physics as _;
+// A dependency the library does not use yet (B0 added every Wave B manifest entry, review I8);
+// its tests do. This line keeps `cargo::unused_dependencies` quiet; delete it when the library
+// uses it. (Task C6 removed `uni_physics`'s, which C2's asteroids now use.)
 use uni_sim as _;
 
 /// `ShaderLib` path of the 3-D star pass (B4).

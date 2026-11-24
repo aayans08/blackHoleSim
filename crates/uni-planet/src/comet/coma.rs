@@ -121,7 +121,10 @@ mod tests {
             let l = coma_scale_m(r_au);
             assert!((l / (1.0e8 * r_au * r_au) - 1.0).abs() < 1e-15);
             let total = encircled(|rho| coma_surface_brightness(rho, i, l), 20.0 * l, 200_000);
-            assert!((total / i - 1.0).abs() < 0.01, "r_h {r_au}: ∫S dA = {total} of {i}");
+            assert!(
+                (total / i - 1.0).abs() < 0.01,
+                "r_h {r_au}: ∫S dA = {total} of {i}"
+            );
             for pixel in [1e-3 * l, 0.3 * l, 10.0 * l] {
                 let reach = 30.0 * l.max(pixel);
                 let drawn = encircled(
@@ -142,7 +145,10 @@ mod tests {
             coma_surface_brightness(3.0 * l, 1e15, l),
             coma_drawn_brightness(3.0 * l, 1e15, l, a),
         );
-        assert!((drawn / exact - 1.0).abs() < 2.0 * a / l, "{drawn} vs {exact}");
+        assert!(
+            (drawn / exact - 1.0).abs() < 2.0 * a / l,
+            "{drawn} vs {exact}"
+        );
     }
 
     /// The total intensity follows SBDB's K1 law: from r_h 1 to 2 AU at fixed Δ it scales by
@@ -153,7 +159,10 @@ mod tests {
             let ratio = comet_total_intensity_cd(m1, k1, 2.0, 0.8)
                 / comet_total_intensity_cd(m1, k1, 1.0, 0.8);
             let want = 10f64.powf(-0.4 * k1 * 2f64.log10());
-            assert!((ratio / want - 1.0).abs() < 1e-9, "K1 {k1}: {ratio} vs {want}");
+            assert!(
+                (ratio / want - 1.0).abs() < 1e-9,
+                "K1 {k1}: {ratio} vs {want}"
+            );
             let near = comet_total_intensity_cd(m1, k1, 1.5, 0.05);
             let far = comet_total_intensity_cd(m1, k1, 1.5, 3.0);
             assert!((near / far - 1.0).abs() < 1e-12);

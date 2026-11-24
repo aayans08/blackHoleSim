@@ -543,10 +543,7 @@ impl TailManager {
                 .extend(dust_rows(&job.conic, job.k1, job.epoch, range));
             job.rows_done += rows;
             work.solves += (rows as usize + 1) * n_age;
-            if let Some(done) = self
-                .job
-                .take_if(|j| j.rows_done >= DUST_PARAMS.n_beta)
-            {
+            if let Some(done) = self.job.take_if(|j| j.rows_done >= DUST_PARAMS.n_beta) {
                 let grains = tail_grains(&done.grains, done.sun_rel);
                 self.next_version += 1;
                 self.tails.insert(
@@ -629,7 +626,10 @@ mod tests {
                     sum += ion_tail_brightness(s, x, l, i, sin_psi) * sin_psi * ds * dx;
                 }
             }
-            assert!((sum / i - 1.0).abs() < 2e-3, "sin ψ {sin_psi}: {sum} of {i}");
+            assert!(
+                (sum / i - 1.0).abs() < 2e-3,
+                "sin ψ {sin_psi}: {sum} of {i}"
+            );
         }
         assert_eq!(ion_tail_brightness(l, 0.0, l, i, 1.0), 0.0);
         assert_eq!(ion_tail_brightness(-1.0, 0.0, l, i, 1.0), 0.0);
@@ -655,9 +655,8 @@ mod tests {
         let phys = ion_sigma_m();
         let (length, intensity, sin_psi) = (0.3 * AU, 2.0e14, 0.8);
         let s = 0.1 * length;
-        let drawn = |x: f64, sigma: f64| {
-            ion_tail_drawn_brightness(s, x, length, intensity, sin_psi, sigma)
-        };
+        let drawn =
+            |x: f64, sigma: f64| ion_tail_drawn_brightness(s, x, length, intensity, sin_psi, sigma);
         // Light per unit length: ∫ S dx over the ribbon's ±3.5σ (midpoint rule).
         let across = |sigma: f64| {
             let half = ION_HALF_WIDTH_SIGMAS * sigma;
@@ -696,10 +695,19 @@ mod tests {
             let fwhm_px = 2.354_820_045 * sigma / pixel;
             assert!(fwhm_px >= 2.354_820_045 * ION_MIN_SIGMA_PX * (1.0 - 1e-12));
             let kept = across(sigma) / reference;
-            assert!((kept - 1.0).abs() < 1e-9, "{d_au} AU: light across × {kept}");
+            assert!(
+                (kept - 1.0).abs() < 1e-9,
+                "{d_au} AU: light across × {kept}"
+            );
             let ripple = row_ripple(sigma, pixel);
-            assert!(ripple < 5e-3, "{d_au} AU: a row's light ripples by {ripple}");
-            report.push(format!("{d_au} AU: σ {:.2} px, ripple {ripple:.1e}", sigma / pixel));
+            assert!(
+                ripple < 5e-3,
+                "{d_au} AU: a row's light ripples by {ripple}"
+            );
+            report.push(format!(
+                "{d_au} AU: σ {:.2} px, ripple {ripple:.1e}",
+                sigma / pixel
+            ));
         }
         println!("ion ribbon with the floor: {}", report.join("; "));
         // The defect the floor fixes: the bare profile 2 AU away.
@@ -772,12 +780,12 @@ mod tests {
             let (r, v) = heliocentric_state_icrs(&conic, t);
             let grains = dust_rows(&conic, 10.0, t, 0..DUST_PARAMS.n_beta);
             assert_eq!(grains.len(), GRAINS_PER_TAIL);
-            let mean = grains
-                .iter()
-                .map(|g| g.pos_rel_nucleus_m)
-                .sum::<DVec3>()
-                / grains.len() as f64;
-            assert!(mean.dot(v) < 0.0, "mean offset {mean} m leads the motion {v}");
+            let mean =
+                grains.iter().map(|g| g.pos_rel_nucleus_m).sum::<DVec3>() / grains.len() as f64;
+            assert!(
+                mean.dot(v) < 0.0,
+                "mean offset {mean} m leads the motion {v}"
+            );
             assert!(mean.dot(r) > 0.0, "mean offset {mean} m points sunward");
             let sprites = tail_grains(&grains, -r);
             assert_eq!(sprites.len(), GRAINS_PER_TAIL);
@@ -812,9 +820,8 @@ mod tests {
             let to_camera = a.cos() * to_sun + a.sin() * side;
             for delta_au in [0.01, 0.3, 2.0] {
                 let nucleus_rel = -delta_au * AU * to_camera;
-                let light = |g: &TailGrain| {
-                    dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel)
-                };
+                let light =
+                    |g: &TailGrain| dust_grain_light(g.offset_m, g.weight, nucleus_rel, sun_rel);
                 let scale = dust_light_scale(dust_cd, &grains, nucleus_rel, sun_rel);
                 let drawn: f64 = grains.iter().map(|g| scale * light(g)).sum();
                 assert!(
@@ -832,7 +839,10 @@ mod tests {
         // Nothing lit, nothing drawn.
         assert_eq!(dust_light_scale(dust_cd, &[], DVec3::Z, sun_rel), 0.0);
         let on_grain = -grains[100].offset_m;
-        assert_eq!(dust_grain_light(grains[100].offset_m, 1.0, on_grain, sun_rel), 0.0);
+        assert_eq!(
+            dust_grain_light(grains[100].offset_m, 1.0, on_grain, sun_rel),
+            0.0
+        );
 
         // Cost of the per-view scale (computed per tailed comet per frame).
         let clock = std::time::Instant::now();
@@ -886,10 +896,7 @@ mod tests {
         assert!(!picked.contains(&brightest) && !picked.contains(&second));
 
         // All refreshed at wall 0: none due at 0.1 s; all due again at 0.3 s, oldest first.
-        let mut last: HashMap<ObjectId, f64> = picked
-            .iter()
-            .map(|&i| (views[i].id, 0.0))
-            .collect();
+        let mut last: HashMap<ObjectId, f64> = picked.iter().map(|&i| (views[i].id, 0.0)).collect();
         assert!(tail_schedule(&views, &last, 0.1).is_empty());
         last.insert(views[picked[5]].id, -1.0);
         let again = tail_schedule(&views, &last, 0.3);
@@ -966,7 +973,10 @@ mod tests {
         let views = vec![comet_on(1, conic, t0, DVec3::new(0.0, AU, 0.0), 8.0, 10.0)];
         let mut manager = TailManager::default();
         let work = manager.update(&views, t0, 0.0, usize::MAX);
-        assert_eq!((work.started.clone(), work.completed.clone()), (vec![1], vec![1]));
+        assert_eq!(
+            (work.started.clone(), work.completed.clone()),
+            (vec![1], vec![1])
+        );
         // 50 minutes of sim time over 3 000 s of wall time: no refresh.
         for k in 1..=10 {
             let wall = 300.0 * f64::from(k);

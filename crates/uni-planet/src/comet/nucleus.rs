@@ -94,9 +94,9 @@ pub(crate) fn icosphere(subdiv: u32) -> Icosphere {
     .collect();
     // Counter-clockwise seen from outside.
     let mut indices: Vec<u32> = vec![
-        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6,
-        7, 1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6,
-        7, 9, 8, 1,
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4, 11, 10, 2, 10, 7, 6, 7,
+        1, 8, 3, 9, 4, 3, 4, 2, 3, 2, 6, 3, 6, 8, 3, 8, 9, 4, 9, 5, 2, 4, 11, 6, 2, 10, 8, 6, 7, 9,
+        8, 1,
     ];
     for _ in 0..subdiv.min(MAX_SUBDIVISIONS) {
         let mut midpoints: HashMap<(u32, u32), u32> = HashMap::new();
@@ -314,13 +314,19 @@ pub fn vertex_normals(vertices: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
             sum[i] += n;
         }
     }
-    sum.iter().map(|n| n.normalize_or_zero().as_vec3()).collect()
+    sum.iter()
+        .map(|n| n.normalize_or_zero().as_vec3())
+        .collect()
 }
 
 /// The nucleus's fixed orientation (body → ICRS) for `seed`: a uniformly distributed rotation
 /// (Shoemake 1992, "Uniform random rotations", *Graphics Gems III*, 124).
 pub fn nucleus_orientation(seed: u64) -> DQuat {
-    let (u1, u2, u3) = (unit_f64(seed, 201), unit_f64(seed, 202), unit_f64(seed, 203));
+    let (u1, u2, u3) = (
+        unit_f64(seed, 201),
+        unit_f64(seed, 202),
+        unit_f64(seed, 203),
+    );
     let (a, b) = ((1.0 - u1).sqrt(), u1.sqrt());
     let (t2, t3) = (std::f64::consts::TAU * u2, std::f64::consts::TAU * u3);
     DQuat::from_xyzw(a * t2.sin(), a * t2.cos(), b * t3.sin(), b * t3.cos()).normalize()
@@ -428,7 +434,10 @@ mod tests {
                 })
                 .fold(f64::INFINITY, f64::min);
             // A mean triangle is 4π(2 km)²/20 480 ≈ 2 450 m²; none is degenerate.
-            assert!(min_area > 100.0, "seed {seed}: smallest triangle {min_area} m²");
+            assert!(
+                min_area > 100.0,
+                "seed {seed}: smallest triangle {min_area} m²"
+            );
             assert!(volume(&v, &idx) > 0.0, "seed {seed}: inward winding");
             assert!(v.iter().all(|p| p.is_finite()));
         }
@@ -469,16 +478,31 @@ mod tests {
                     100.0 * (mean / radius - 1.0),
                     100.0 * (r_vol / radius - 1.0)
                 );
-                assert!((r_eff / radius - 1.0).abs() < 0.02, "seed {seed}: {r_eff} m");
+                assert!(
+                    (r_eff / radius - 1.0).abs() < 0.02,
+                    "seed {seed}: {r_eff} m"
+                );
                 let mean_tol = if seed & 1 == 0 { 0.05 } else { 0.15 };
-                assert!((mean / radius - 1.0).abs() < mean_tol, "seed {seed}: mean {mean} m");
-                assert!((r_vol / radius - 1.0).abs() < 0.10, "seed {seed}: {r_vol} m");
+                assert!(
+                    (mean / radius - 1.0).abs() < mean_tol,
+                    "seed {seed}: mean {mean} m"
+                );
+                assert!(
+                    (r_vol / radius - 1.0).abs() < 0.10,
+                    "seed {seed}: {r_vol} m"
+                );
                 let (lo, hi) = v.iter().fold((f64::INFINITY, 0.0_f64), |(lo, hi), p| {
                     let r = f64::from(p.length()) / radius;
                     (lo.min(r), hi.max(r))
                 });
-                assert!(hi < crate::comet::NUCLEUS_BOUND_RADII, "seed {seed}: reaches {hi} R");
-                assert!(lo > crate::comet::NUCLEUS_INSIDE_RADII, "seed {seed}: dips to {lo} R");
+                assert!(
+                    hi < crate::comet::NUCLEUS_BOUND_RADII,
+                    "seed {seed}: reaches {hi} R"
+                );
+                assert!(
+                    lo > crate::comet::NUCLEUS_INSIDE_RADII,
+                    "seed {seed}: dips to {lo} R"
+                );
             }
         }
     }
@@ -494,9 +518,17 @@ mod tests {
             let n: Vec<f64> = ico.dirs.iter().map(|&d| relief_noise(d, seed)).collect();
             let (lo, hi) = n
                 .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
-            assert!(-1.0 <= lo && hi <= 1.0, "seed {seed}: noise in [{lo}, {hi}]");
-            assert!(lo < -0.2 && hi > 0.2, "seed {seed}: noise only in [{lo}, {hi}]");
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| {
+                    (a.min(x), b.max(x))
+                });
+            assert!(
+                -1.0 <= lo && hi <= 1.0,
+                "seed {seed}: noise in [{lo}, {hi}]"
+            );
+            assert!(
+                lo < -0.2 && hi > 0.2,
+                "seed {seed}: noise only in [{lo}, {hi}]"
+            );
         }
         for seed in [1_000_036_u64, 1_000_012, 1_003_690, 2] {
             assert!(ico.dirs.iter().all(|&d| base_radius(d, seed) == 1.0));
@@ -504,7 +536,10 @@ mod tests {
             let r: Vec<f64> = v.iter().map(|p| f64::from(p.length())).collect();
             let ratio = r.iter().copied().fold(0.0, f64::max)
                 / r.iter().copied().fold(f64::INFINITY, f64::min);
-            assert!(ratio <= 5.0 / 3.0 + 1e-5, "one-lobe seed {seed}: max/min {ratio}");
+            assert!(
+                ratio <= 5.0 / 3.0 + 1e-5,
+                "one-lobe seed {seed}: max/min {ratio}"
+            );
         }
         for seed in [1_000_025_u64, 1_000_001, 7, 3] {
             let b: Vec<f64> = ico.dirs.iter().map(|&d| base_radius(d, seed)).collect();

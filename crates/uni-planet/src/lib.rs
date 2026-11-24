@@ -38,12 +38,6 @@ pub use probes::gpu_probes;
 pub use rings::{RingRenderer, planet_shadow_on_ring, ring_phase};
 pub use star_surface::{StarSurfaceRenderer, granulation, limb_darkening, limb_darkening_mean};
 
-// Dependencies the stubs do not use yet (B0 adds every Wave B manifest entry, review I8). These
-// lines keep `cargo::unused_dependencies` quiet until B1/B2 use them; delete each one then.
-use bytemuck as _;
-use pollster as _;
-use uni_physics as _;
-
 /// `ShaderLib` path of the bodies pass (B1).
 pub const BODY_WGSL: &str = "planet/body.wgsl";
 /// `ShaderLib` path of the star-surface pass (B2).
