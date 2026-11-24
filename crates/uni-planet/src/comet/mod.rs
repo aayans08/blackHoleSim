@@ -225,11 +225,21 @@ impl GrainGpu {
 /// pixel stay below black. Twin of `GLOW_CULL_PRE` in `comet.wgsl`. It removes the fill of faint
 /// comets' comae and tails, which no exposure the frame has could show.
 pub const GLOW_CULL_PRE: f64 = 1.75e-7;
-/// A dust splat's σ is at most this many pixels on each axis (twin of `SPRITE_MAX_PX` in
-/// `comet.wgsl`); a wider one keeps its surface brightness and loses the light beyond (a camera
-/// inside a tail; approximate). C1 had 32 px on round sprites; the C1L splats of row 20's tail
-/// stay below 64 px.
-pub const SPRITE_MAX_PX: f64 = 64.0;
+/// A dust splat's σ is at most this many pixels on each axis on the full-resolution path (twin of
+/// `SPRITE_MAX_PX` in `comet.wgsl`; only thin needles reach it there, wider splats take the
+/// coarse path) and [`COARSE_MAX_PX`] on the coarse path; a wider one keeps its surface
+/// brightness and loses the light beyond (a camera inside a tail; approximate).
+pub const SPRITE_MAX_PX: f64 = 256.0;
+/// The coarse path's cap [px] (twin of `COARSE_MAX_PX` in `comet.wgsl`).
+pub const COARSE_MAX_PX: f64 = 1024.0;
+/// A dust splat whose minor σ is at least this many pixels is drawn into the coarse target
+/// (twin of `COARSE_MIN_SIGMA_PX` in `comet.wgsl`): there it is ≥ 2 texels wide, so its samples
+/// at texel centres sum to its light within 2·e^(−8π²) (Poisson summation) and the cubic
+/// B-spline upsampling adds a σ of 0.58 texel in quadrature (C1L).
+pub const COARSE_MIN_SIGMA_PX: f64 = 16.0;
+/// The coarse target has 1/this of the internal lines and columns (C1L): wide, faint dust splats
+/// (the far tail, or a tail seen from close by, row 21) cost 1/64 of their full-resolution fill.
+pub const COARSE_DOWNSAMPLE: u32 = 8;
 
 /// `[v.x, v.y, v.z, w]` in f32 (camera-relative values are formed in f64 first).
 fn vec4(v: DVec3, w: f64) -> [f32; 4] {
@@ -467,6 +477,14 @@ pub struct CometRenderer {
     coma_pipeline: wgpu::RenderPipeline,
     ion_pipeline: wgpu::RenderPipeline,
     dust_pipeline: wgpu::RenderPipeline,
+    dust_coarse_pipeline: wgpu::RenderPipeline,
+    composite_pipeline: wgpu::RenderPipeline,
+    coarse_bgl: wgpu::BindGroupLayout,
+    coarse_sampler: wgpu::Sampler,
+    /// The coarse dust target (C1L), at the internal size / [`COARSE_DOWNSAMPLE`].
+    coarse: Option<CoarseTarget>,
+    /// This frame's scissor for the composite [x, y, w, h], `None` without dust on screen.
+    coarse_scissor: Option<[u32; 4]>,
     bgl: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     nuclei: RecordBuffer,
@@ -612,6 +630,97 @@ impl CometRenderer {
         let coma_pipeline = pipeline("comet comae", "vs_coma", "fs_coma", &[], &glow, false);
         let ion_pipeline = pipeline("comet ion tails", "vs_ion", "fs_ion", &[], &glow, false);
         let dust_pipeline = pipeline("comet dust tails", "vs_dust", "fs_dust", &[], &glow, false);
+        // C1L: wide dust splats into the coarse target (additive, no depth), and the composite
+        // that adds the target back to hdr where no body wrote depth.
+        let dust_coarse_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("comet dust tails (coarse)"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_dust_coarse"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_dust_coarse"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let coarse_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("comets coarse bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let composite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("comets composite layout"),
+            bind_group_layouts: &[Some(camera_bgl), Some(&bgl), Some(&coarse_bgl)],
+            immediate_size: 0,
+        });
+        let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("comet dust composite"),
+            layout: Some(&composite_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_dust_composite"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_dust_composite"),
+                compilation_options: Default::default(),
+                targets: &glow,
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // The triangle lies on the far plane (depth 0): GreaterEqual passes only where no
+            // body wrote depth.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let coarse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("comets coarse bilinear"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let nuclei = RecordBuffer::new(
             device,
             "comet nuclei",
@@ -671,6 +780,12 @@ impl CometRenderer {
             us_per_solve: KEPLER_SOLVE_US,
             settle: false,
             cpu_ms: 0.0,
+            dust_coarse_pipeline,
+            composite_pipeline,
+            coarse_bgl,
+            coarse_sampler,
+            coarse: None,
+            coarse_scissor: None,
         })
     }
 
@@ -854,6 +969,26 @@ impl RenderFeature for CometRenderer {
             self.us_per_solve = 0.8 * self.us_per_solve + 0.2 * us.clamp(0.01, 1_000.0);
         }
         self.upload(gpu, &plan);
+        let has_dust = self.tail_draws.iter().any(|&(_, n)| n > 0);
+        self.coarse_scissor = if has_dust {
+            let manager = &self.manager;
+            let tails: Vec<(DVec3, &[tails::TailGrain])> = plan
+                .tails
+                .iter()
+                .filter_map(|t| {
+                    let grains = manager.tails.get(&t.id)?;
+                    let n = t.gpu.nucleus;
+                    let rel = DVec3::new(n[0].into(), n[1].into(), n[2].into());
+                    Some((rel, grains.grains.as_slice()))
+                })
+                .collect();
+            dust_screen_bounds(&ctx.camera, ctx.viewport, &tails)
+        } else {
+            None
+        };
+        if self.coarse_scissor.is_some() {
+            self.ensure_coarse(gpu, ctx.viewport);
+        }
         self.cpu_ms = (start.elapsed().as_secs_f64() * 1e3) as f32;
     }
 
@@ -880,6 +1015,50 @@ impl RenderFeature for CometRenderer {
                 },
             })
         };
+        // C1L: with wide dust on screen, the coarse pass runs first; the "comets" interval then
+        // spans both passes (begin in the coarse one, end in the main one).
+        let coarse = self.coarse_scissor.and(self.coarse.as_ref());
+        let writes = timer.render_writes("comets");
+        let (coarse_writes, main_writes) = match (&writes, coarse) {
+            (Some(w), Some(_)) => (
+                Some(wgpu::RenderPassTimestampWrites {
+                    query_set: w.query_set,
+                    beginning_of_pass_write_index: w.beginning_of_pass_write_index,
+                    end_of_pass_write_index: None,
+                }),
+                Some(wgpu::RenderPassTimestampWrites {
+                    query_set: w.query_set,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: w.end_of_pass_write_index,
+                }),
+            ),
+            _ => (None, writes.clone()),
+        };
+        let per_tail = GRAINS_PER_TAIL as u32;
+        if let Some(target) = coarse {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("comets coarse dust"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: coarse_writes,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, frame.camera, &[]);
+            pass.set_bind_group(1, &self.bind_group, &[]);
+            pass.set_pipeline(&self.dust_coarse_pipeline);
+            for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
+                pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
+            }
+        }
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("comets"),
             color_attachments: &[load(&targets.hdr_view), load(&targets.lens_mask_view)],
@@ -891,7 +1070,7 @@ impl RenderFeature for CometRenderer {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: timer.render_writes("comets"),
+            timestamp_writes: main_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -919,12 +1098,127 @@ impl RenderFeature for CometRenderer {
                 pass.draw(0..6 * ION_SEGMENTS, slot..slot + 1);
             }
             pass.set_pipeline(&self.dust_pipeline);
-            let per_tail = GRAINS_PER_TAIL as u32;
             for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
                 pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
             }
         }
+        if let (Some(target), Some([x, y, w, h])) = (coarse, self.coarse_scissor) {
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(2, &target.bind_group, &[]);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.draw(0..3, 0..1);
+        }
     }
+}
+
+/// The coarse dust target (C1L): a texture at the internal size / [`COARSE_DOWNSAMPLE`] and the
+/// composite's bind group reading it.
+struct CoarseTarget {
+    size: UVec2,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+impl CometRenderer {
+    /// (Re)creates the coarse target for internal size `viewport` when its size changed.
+    fn ensure_coarse(&mut self, gpu: &GpuContext, viewport: UVec2) {
+        let size = coarse_size(viewport);
+        if self.coarse.as_ref().is_some_and(|c| c.size == size) {
+            return;
+        }
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("comets coarse dust"),
+            size: wgpu::Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("comets coarse bg"),
+            layout: &self.coarse_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.coarse_sampler),
+                },
+            ],
+        });
+        self.coarse = Some(CoarseTarget {
+            size,
+            view,
+            bind_group,
+        });
+    }
+}
+
+/// The coarse target's size for internal size `viewport`: ⌈viewport / COARSE_DOWNSAMPLE⌉.
+pub(crate) fn coarse_size(viewport: UVec2) -> UVec2 {
+    UVec2::new(
+        viewport.x.max(1).div_ceil(COARSE_DOWNSAMPLE),
+        viewport.y.max(1).div_ceil(COARSE_DOWNSAMPLE),
+    )
+}
+
+/// A pixel rectangle [x, y, w, h] of internal size `viewport` that contains every dust splat of
+/// `tails` (each: the nucleus relative to the camera [m], its splats) out to its
+/// [`tails::SPRITE_SIGMAS`] cut, plus the B-spline's reach (C1L: the composite's scissor). A
+/// splat across the camera plane widens it to the whole frame (conservative), one wholly behind
+/// it is skipped; `None` when no splat can be on screen.
+pub(crate) fn dust_screen_bounds(
+    camera: &CameraView,
+    viewport: UVec2,
+    tails: &[(DVec3, &[tails::TailGrain])],
+) -> Option<[u32; 4]> {
+    let (w, h) = (f64::from(viewport.x.max(1)), f64::from(viewport.y.max(1)));
+    let f = 0.5 * h / (0.5 * camera.fov_y_rad).tan();
+    let to_camera = camera.orient.inverse();
+    // The B-spline reaches two texels from a sample.
+    let margin = 2.0 * f64::from(COARSE_DOWNSAMPLE);
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (nucleus, grains) in tails {
+        for g in grains.iter() {
+            let p = to_camera * (*nucleus + g.offset_m);
+            let d = p.length();
+            let reach_m = tails::SPRITE_SIGMAS * tails::sigma_bound_m(g.cov_m2);
+            let depth = -p.z;
+            if depth < -reach_m {
+                // Wholly behind the camera.
+                continue;
+            }
+            if !(depth > reach_m) {
+                return Some([0, 0, viewport.x.max(1), viewport.y.max(1)]);
+            }
+            // The cut is capped at COARSE_MAX_PX σ; beyond the cap the splat is drawn smaller.
+            let pixel_m = d / f;
+            let reach =
+                (reach_m / pixel_m).min(tails::SPRITE_SIGMAS * COARSE_MAX_PX) * d / depth + margin;
+            let (cx, cy) = (0.5 * w + f * p.x / depth, 0.5 * h - f * p.y / depth);
+            x0 = x0.min(cx - reach);
+            y0 = y0.min(cy - reach);
+            x1 = x1.max(cx + reach);
+            y1 = y1.max(cy + reach);
+        }
+    }
+    let (x0, y0) = (x0.floor().clamp(0.0, w), y0.floor().clamp(0.0, h));
+    let (x1, y1) = (x1.ceil().clamp(0.0, w), y1.ceil().clamp(0.0, h));
+    (x1 > x0 && y1 > y0).then(|| [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32])
 }
 
 /// `ShaderLib` path of the comet probes.
@@ -1638,6 +1932,66 @@ mod tests {
         assert!(drawn_by_phase[0] < drawn_by_phase[1] && drawn_by_phase[1] < drawn_by_phase[2]);
     }
 
+    /// C1L: the composite's scissor contains every dust splat's centre (and a splat's cut, up to
+    /// the coarse cap) for a tail seen from afar, covers the whole frame once a splat reaches the
+    /// camera plane, and is `None` for a tail behind the camera's view; the coarse target is the
+    /// internal size / 8, rounded up.
+    #[test]
+    fn dust_bounds_hold_the_splats() {
+        assert_eq!(coarse_size(UVec2::new(1920, 1080)), UVec2::new(240, 135));
+        assert_eq!(coarse_size(UVec2::new(1727, 1081)), UVec2::new(216, 136));
+        let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
+        let t = conic.tp.add_seconds(20.0 * DAY);
+        let (r, _) = heliocentric_state_icrs(&conic, t);
+        let side = r.normalize().any_orthonormal_vector();
+        let view = comet_on(5, conic, t, r + 0.6 * AU * side, 8.0, 10.0);
+        let look = CameraView {
+            orient: DQuat::from_rotation_arc(DVec3::NEG_Z, view.nucleus_rel_m.normalize()),
+            ..camera()
+        };
+        let scene = CometScene {
+            comets: vec![view.clone()],
+            epoch: t,
+            eye_adapted: false,
+        };
+        let mut manager = TailManager::default();
+        let _ = plan_frame(&scene, &look, VIEWPORT, 0.0, &mut manager, usize::MAX);
+        let grains = manager.tails[&view.id].grains.clone();
+        let tails = [(view.nucleus_rel_m, grains.as_slice())];
+        let [x, y, w, h] = dust_screen_bounds(&look, VIEWPORT, &tails).expect("on screen");
+        assert!(w > 0 && h > 0 && x + w <= VIEWPORT.x && y + h <= VIEWPORT.y);
+        let f = 540.0 / (0.5 * look.fov_y_rad).tan();
+        let to_camera = look.orient.inverse();
+        let mut inside = 0;
+        for g in &grains {
+            let p = to_camera * (view.nucleus_rel_m + g.offset_m);
+            let (cx, cy) = (960.0 + f * p.x / -p.z, 540.0 - f * p.y / -p.z);
+            if (0.0..1920.0).contains(&cx) && (0.0..1080.0).contains(&cy) {
+                inside += 1;
+                assert!(
+                    cx >= f64::from(x)
+                        && cx <= f64::from(x + w)
+                        && cy >= f64::from(y)
+                        && cy <= f64::from(y + h),
+                    "splat at ({cx:.0}, {cy:.0}) outside {:?}",
+                    [x, y, w, h]
+                );
+            }
+        }
+        assert!(inside > 0);
+        // Looking away: nothing; a splat across the camera plane: the whole frame.
+        let away = CameraView {
+            orient: DQuat::from_rotation_arc(DVec3::NEG_Z, -view.nucleus_rel_m.normalize()),
+            ..camera()
+        };
+        assert_eq!(dust_screen_bounds(&away, VIEWPORT, &tails), None);
+        let near = [(DVec3::ZERO, grains.as_slice())];
+        assert_eq!(
+            dust_screen_bounds(&look, VIEWPORT, &near),
+            Some([0, 0, 1920, 1080])
+        );
+    }
+
     /// naga's layout of one struct of `comet.wgsl`: its size and (name, offset) members.
     fn wgsl_struct(m: &naga::Module, name: &str) -> (usize, Vec<(String, usize)>) {
         let mut layouter = naga::proc::Layouter::default();
@@ -1738,7 +2092,14 @@ mod tests {
             .iter()
             .map(|e| (e.name.as_str(), e.stage))
             .collect();
-        for part in ["nucleus", "coma", "ion", "dust"] {
+        for part in [
+            "nucleus",
+            "coma",
+            "ion",
+            "dust",
+            "dust_coarse",
+            "dust_composite",
+        ] {
             assert!(stages.contains(&(&format!("vs_{part}"), naga::ShaderStage::Vertex)));
             assert!(stages.contains(&(&format!("fs_{part}"), naga::ShaderStage::Fragment)));
         }
@@ -1781,6 +2142,8 @@ mod tests {
         assert_eq!(scalar("SPRITE_SIGMAS"), f32_of(tails::SPRITE_SIGMAS));
         assert_eq!(scalar("SPRITE_MIN_PX"), f32_of(tails::SPRITE_MIN_PX));
         assert_eq!(scalar("SPRITE_MAX_PX"), f32_of(SPRITE_MAX_PX));
+        assert_eq!(scalar("COARSE_MAX_PX"), f32_of(COARSE_MAX_PX));
+        assert_eq!(scalar("COARSE_MIN_SIGMA_PX"), f32_of(COARSE_MIN_SIGMA_PX));
         assert_eq!(scalar("GLOW_CULL_PRE"), f32_of(GLOW_CULL_PRE));
         assert_eq!(
             scalar("COMA_EXTENT_SCALES"),

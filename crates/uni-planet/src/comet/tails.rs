@@ -648,7 +648,7 @@ fn merge(members: &[Splat], merge_spread: f64) -> Option<Splat> {
 
 /// The largest σ [m] of a splat's covariance: an upper bound on its largest eigenvalue's root
 /// (the largest row sum of |cov|, Gershgorin).
-fn sigma_bound_m(cov: DMat3) -> f64 {
+pub(crate) fn sigma_bound_m(cov: DMat3) -> f64 {
     let c = cov.abs();
     let rows = [
         c.x_axis.x + c.y_axis.x + c.z_axis.x,
@@ -1230,7 +1230,14 @@ mod tests {
             let pixel_m = d / f_full;
             let (mut s1, mut s2, phi) =
                 splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * pixel_m);
-            let s_max = crate::comet::SPRITE_MAX_PX * pixel_m;
+            // The pass's two paths: wide splats on the coarse one, with its larger cap.
+            let coarse = s2 >= crate::comet::COARSE_MIN_SIGMA_PX * pixel_m;
+            let cap = if coarse {
+                crate::comet::COARSE_MAX_PX
+            } else {
+                crate::comet::SPRITE_MAX_PX
+            };
+            let s_max = cap * pixel_m;
             if s1 > s_max {
                 i *= s_max / s1;
                 s1 = s_max;
