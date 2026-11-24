@@ -95,7 +95,10 @@ pub const PASS_BUDGETS_MS: &[(&str, f64)] = &[
     ("rings", 0.4),
     ("comets", 0.5),
     ("atmosphere", 3.0),
-    ("histogram", 0.3),
+    // Lead ruling (Task C6 context, item 13): 0.3 → 0.6 ms. Every separate pass boundary costs
+    // ≈ 0.35–0.45 ms on this GPU (a timestamp-only mark measured 0.42–0.46 ms; progress.md at
+    // dc61b36), so the meter's own work is a small part of its time.
+    ("histogram", 0.6),
     // Lead ruling "band budget" (Wave B gate): re-baselined 0.3 → 0.6 ms, the measured floor
     // of a full-screen pass on the M3 (≈ 0.34 ms) plus the faithful band's own work (≈ 0.55).
     ("band", 0.6),
@@ -111,7 +114,9 @@ pub const PASS_BUDGETS_MS: &[(&str, f64)] = &[
 /// budget (B9t): (budget key, the timer labels that make it up). uni-atmo's half-resolution
 /// march (task B9p) is "atmosphere" + "atmosphere composite" + "atmosphere mask"; uni-post's
 /// bloom is "bloom" (the pyramid: every downsample and upsample dispatch, one compute pass) +
-/// "bloom composite".
+/// "bloom composite". Wave C's two passes are single timed passes with no sub-pass labels (Task
+/// C6, item 11): "comets" (C1: nuclei, comae, ion and dust tails in one render pass) and
+/// "asteroids" (C2: one indexed draw), budgeted under their own names above.
 pub const FEATURE_PASSES: &[(&str, &[&str])] = &[
     (
         "atmosphere",
@@ -127,9 +132,13 @@ fn feature_of(name: &str) -> Option<&'static (&'static str, &'static [&'static s
         .find(|(_, parts)| parts.contains(&name))
 }
 
-/// CPU sub-budgets per frame [ms] (plan "Performance budget", ruling 3): the World snapshot and
-/// the comet tails, keyed by their bench JSON fields.
-pub const CPU_BUDGETS_MS: &[(&str, f64)] = &[("snapshot_cpu_ms", 2.0), ("comets_cpu_ms", 1.0)];
+/// CPU sub-budgets per frame [ms] (plan "Performance budget", ruling 3): the World snapshot, the
+/// comet tails and the asteroid mean anomalies, keyed by their bench JSON fields.
+pub const CPU_BUDGETS_MS: &[(&str, f64)] = &[
+    ("snapshot_cpu_ms", 2.0),
+    ("comets_cpu_ms", 1.0),
+    ("asteroids_cpu_ms", 0.5),
+];
 
 /// A pass is flagged when its mean exceeds this many times its budget (plan, Gate rule).
 pub const BUDGET_FACTOR: f64 = 1.25;
@@ -190,6 +199,9 @@ pub struct BenchWindow {
     /// As `snapshot_cpu_ms`.
     #[serde(default)]
     pub comets_cpu_ms: Option<Value>,
+    /// As `snapshot_cpu_ms`.
+    #[serde(default)]
+    pub asteroids_cpu_ms: Option<Value>,
 }
 
 impl BenchWindow {
@@ -198,6 +210,7 @@ impl BenchWindow {
         let value = match field {
             "snapshot_cpu_ms" => self.snapshot_cpu_ms.as_ref(),
             "comets_cpu_ms" => self.comets_cpu_ms.as_ref(),
+            "asteroids_cpu_ms" => self.asteroids_cpu_ms.as_ref(),
             _ => None,
         }?;
         value
@@ -563,14 +576,20 @@ mod tests {
     #[test]
     fn budget_table_matches_the_plan() {
         // Plan "Performance budget": the budgeted passes sum to 12.35 ms (band-update counted
-        // at 0 steady, the HUD at 0.5), 12.65 ms since the lead's band re-baseline (0.3 → 0.6).
+        // at 0 steady, the HUD at 0.5), 12.65 ms since the lead's band re-baseline (0.3 → 0.6),
+        // 12.95 ms since the histogram's (0.3 → 0.6, Task C6 item 13): still ≤ 13 ms.
         let sum: f64 = PASS_BUDGETS_MS
             .iter()
             .filter(|(name, _)| *name != "band-update")
             .map(|(_, ms)| ms)
             .sum();
-        assert!((sum - 12.65).abs() < 1e-9, "{sum}");
+        assert!((sum - 12.95).abs() < 1e-9, "{sum}");
+        assert!(sum <= 13.0);
         assert_eq!(budget_ms("band"), Some(0.6));
+        assert_eq!(budget_ms("histogram"), Some(0.6));
+        assert_eq!(budget_ms("comets"), Some(0.5));
+        assert_eq!(budget_ms("asteroids"), Some(1.0));
+        assert!(CPU_BUDGETS_MS.contains(&("asteroids_cpu_ms", 0.5)));
         assert_eq!(budget_ms("bodies"), Some(1.5));
         assert_eq!(budget_ms("lens"), None);
     }

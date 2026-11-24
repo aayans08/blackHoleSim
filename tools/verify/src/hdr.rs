@@ -29,10 +29,16 @@
 //!   "row 5 Mars samples"); without one, the sample's own pixel.
 //! - `profile`: the least-squares slope of ln(mean Y) against ln(mean ρ) over 1-px annuli from
 //!   `r_min` to `r_max` around the feature, against its `expected_slope`.
-//! - `angle`: the direction of Σ Y·ρ̂ over the pixels in the annulus [`r_min`, `r_max`) whose
-//!   colour passes the test B > R (bluer than neutral, as the CO⁺ ion tail is against the
-//!   solar-coloured dust and coma), against `angle_deg`. Angles are degrees counter-clockwise
-//!   from the image's +x axis with y up.
+//! - `angle`: the direction of a straight blue feature from the centre, against `angle_deg`
+//!   (Task C6). For each ray from the centre (every 0.25°) the median of the blue excess B − R
+//!   over the 1-px steps from `r_min` to `r_max`; the feature is the ray whose median stands
+//!   highest above the median of all rays (the CO⁺ ion tail is bluer than the solar-coloured
+//!   dust, coma and band), refined by the excess-weighted mean of the rays within 1.5° of it. A
+//!   field star crosses a ray at a few radii only, so the median ignores it; B8's first
+//!   estimator, the direction of Σ Y·ρ̂ over the annulus's B > R pixels, is still printed, but at
+//!   `comet-neowise-2020` the field's blue stars (9 000 pixels) outweighed the 1.5-px ion tail
+//!   and put it 40° off. Angles are degrees counter-clockwise from the image's +x axis with y
+//!   up.
 //! - `flux`: E = Σ_{ρ_i < R} (Y_i − Y_bg)·Ω_i ÷ `pre[1]` against `expected_lux` (re-review r2
 //!   NPA). Ω_i = Ω_c·cos³θ_i is the solid angle of pixel i, the `uni_sky::stars` convention
 //!   (Ω_c = s², s = 2·tan(fov_y/2)/H; cos θ_i = 1/√(1 + (s·d_i)²), d_i the pixel centre's distance
@@ -805,7 +811,87 @@ pub struct AngleResult {
     pub pixels: usize,
 }
 
+/// Ray step of [`feature_angle`] [deg].
+const RAY_STEP_DEG: f64 = 0.25;
+/// Half-width of the refinement around the best ray [deg].
+const RAY_REFINE_DEG: f64 = 1.5;
+
+/// The direction of the straight blue feature `feature` (module docs: the ray-median
+/// estimator) and the number of samples on its ray that stand above the rays' median; NaN and 0
+/// when no ray stands above it.
 pub fn feature_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleResult> {
+    let f = cap.feature(feature)?;
+    let n = (360.0 / RAY_STEP_DEG).round() as usize;
+    let steps = (f.r_max - f.r_min).floor().max(1.0) as usize;
+    let excess = |rgb: [f64; 3]| rgb[2] - rgb[0];
+    let mut scores = vec![f64::NAN; n];
+    let mut on_ray: Vec<Vec<f64>> = vec![Vec::new(); n];
+    for (k, score) in scores.iter_mut().enumerate() {
+        let (sn, cs) = (k as f64 * RAY_STEP_DEG).to_radians().sin_cos();
+        let mut v: Vec<f64> = (0..steps)
+            .filter_map(|i| {
+                let r = f.r_min + 0.5 + i as f64;
+                // Image y points down; angles are counter-clockwise with y up.
+                let (x, y) = cap.pixel_at(f.x + r * cs, f.y - r * sn)?;
+                Some(excess(cap.rgb(x, y)))
+            })
+            .collect();
+        if 2 * v.len() < steps {
+            continue;
+        }
+        v.sort_by(f64::total_cmp);
+        *score = v[v.len() / 2];
+        on_ray[k] = v;
+    }
+    let mut valid: Vec<f64> = scores.iter().copied().filter(|s| s.is_finite()).collect();
+    if valid.is_empty() {
+        return Ok(AngleResult {
+            angle_deg: f64::NAN,
+            pixels: 0,
+        });
+    }
+    valid.sort_by(f64::total_cmp);
+    let base = valid[valid.len() / 2];
+    let Some((best, peak)) = scores
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_finite())
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(k, &s)| (k, s - base))
+    else {
+        return Ok(AngleResult {
+            angle_deg: f64::NAN,
+            pixels: 0,
+        });
+    };
+    if !(peak > 0.0) {
+        return Ok(AngleResult {
+            angle_deg: f64::NAN,
+            pixels: 0,
+        });
+    }
+    // Excess-weighted mean of the rays near the best one (on the circle, about it).
+    let half = (RAY_REFINE_DEG / RAY_STEP_DEG).round() as i64;
+    let (mut sw, mut swa) = (0.0, 0.0);
+    for d in -half..=half {
+        let k = (best as i64 + d).rem_euclid(n as i64) as usize;
+        let e = scores[k] - base;
+        if e.is_finite() && e > 0.0 {
+            sw += e;
+            swa += e * d as f64 * RAY_STEP_DEG;
+        }
+    }
+    let angle = best as f64 * RAY_STEP_DEG + swa / sw;
+    let pixels = on_ray[best].iter().filter(|&&v| v > base).count();
+    Ok(AngleResult {
+        angle_deg: (angle + 180.0).rem_euclid(360.0) - 180.0,
+        pixels,
+    })
+}
+
+/// B8's first `angle` estimator, printed beside [`feature_angle`]'s: the direction of Σ Y·ρ̂
+/// over the annulus's pixels with B > R.
+pub fn weighted_angle(cap: &HdrCapture, feature: &str) -> anyhow::Result<AngleResult> {
     let f = cap.feature(feature)?;
     let (mut sx, mut sy, mut pixels) = (0.0, 0.0, 0);
     for (x, y, dx, dy, rho) in cap.pixels_within(f.x, f.y, f.r_max) {
@@ -836,27 +922,39 @@ pub fn check_angle(cap: &HdrCapture, feature: &str, tol_deg: f64) -> anyhow::Res
         .angle_deg
         .with_context(|| format!("feature {feature:?} has no angle_deg"))?;
     let a = feature_angle(cap, feature)?;
+    let old = weighted_angle(cap, feature)?;
+    let first = format!(
+        "  B8's Σ Y·ρ̂ over the B > R pixels: {:.3}° from {} px (not the verdict; module docs)",
+        old.angle_deg, old.pixels
+    );
     if a.pixels == 0 {
         return Ok(Verdict {
-            lines: vec![format!(
-                "angle {feature}: no pixel between {} and {} px passes the colour test B > R FAIL",
-                f.r_min, f.r_max
-            )],
+            lines: vec![
+                first,
+                format!(
+                    "angle {feature}: no ray between {} and {} px stands above the rays' median \
+                     blue excess FAIL",
+                    f.r_min, f.r_max
+                ),
+            ],
             pass: false,
         });
     }
     let error = (a.angle_deg - expected + 180.0).rem_euclid(360.0) - 180.0;
     let pass = error.abs() <= tol_deg;
     Ok(Verdict {
-        lines: vec![format!(
-            "angle {feature}: {:.3}° from {} px with B > R ({}–{} px) vs {expected}° ± {tol_deg}° \
-             (error {error:+.3}°) {}",
-            a.angle_deg,
-            a.pixels,
-            f.r_min,
-            f.r_max,
-            pass_word(pass)
-        )],
+        lines: vec![
+            first,
+            format!(
+                "angle {feature}: {:.3}° (ray median of B − R, {} samples above the field, {}–{} \
+                 px) vs {expected}° ± {tol_deg}° (error {error:+.3}°) {}",
+                a.angle_deg,
+                a.pixels,
+                f.r_min,
+                f.r_max,
+                pass_word(pass)
+            ),
+        ],
         pass,
     })
 }
@@ -1380,6 +1478,30 @@ pub(crate) mod tests {
         assert!(check_angle(&cap, "ion_tail", 1.0).expect("check").pass);
         // A feature without its expectation is an error, not a pass.
         assert!(check_angle(&cap, "coma", 1.0).is_err());
+
+        // Task C6: a faint 1.5-px blue line in a field of bright blue stars (as at
+        // comet-neowise-2020): the ray median finds the line; B8's weighted sum is pulled off.
+        let mut field = cap.clone();
+        for p in field.pixels.iter_mut() {
+            *p = [0.0035, 0.0027, 0.0022, 1.0]; // a reddish band
+        }
+        let mut seed = 12345_u64;
+        let mut rnd = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as f64 / f64::from(1u32 << 31)
+        };
+        for _ in 0..400 {
+            let (x, y) = ((rnd() * f64::from(w)) as i64, (rnd() * f64::from(h)) as i64);
+            let b = 0.05 + 0.5 * rnd();
+            add(&mut field, x, y, [0.2 * b, 0.5 * b, b]);
+        }
+        streak(37.0, [0.0002, 0.0004, 0.0015], &mut field);
+        let a = feature_angle(&field, "ion_tail").expect("angle");
+        close(a.angle_deg, 37.0, 0.5, "faint ion tail among blue stars");
+        let old = weighted_angle(&field, "ion_tail").expect("weighted");
+        assert!((old.angle_deg - 37.0).abs() > 1.0, "{}", old.angle_deg);
     }
 
     // ---- Test fixture: a copy of uni-sky's PSF CPU twin (crates/uni-sky/src/psf.rs at
