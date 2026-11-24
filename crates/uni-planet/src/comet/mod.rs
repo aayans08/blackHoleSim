@@ -230,8 +230,10 @@ pub const GLOW_CULL_PRE: f64 = 1.75e-7;
 /// coarse path) and [`COARSE_MAX_PX`] on the coarse path; a wider one keeps its surface
 /// brightness and loses the light beyond (a camera inside a tail; approximate).
 pub const SPRITE_MAX_PX: f64 = 256.0;
-/// The coarse path's cap [px] (twin of `COARSE_MAX_PX` in `comet.wgsl`).
+/// The coarse paths' caps [px] (twins of `COARSE_MAX_PX` and `COARSER_MAX_PX` in
+/// `comet.wgsl`).
 pub const COARSE_MAX_PX: f64 = 1024.0;
+pub const COARSER_MAX_PX: f64 = 4096.0;
 /// A dust splat whose minor σ is at least this many pixels is drawn into the coarse target
 /// (twin of `COARSE_MIN_SIGMA_PX` in `comet.wgsl`): there it is ≥ 2 texels wide, so its samples
 /// at texel centres sum to its light within 2·e^(−8π²) (Poisson summation) and the cubic
@@ -240,6 +242,12 @@ pub const COARSE_MIN_SIGMA_PX: f64 = 16.0;
 /// The coarse target has 1/this of the internal lines and columns (C1L): wide, faint dust splats
 /// (the far tail, or a tail seen from close by, row 21) cost 1/64 of their full-resolution fill.
 pub const COARSE_DOWNSAMPLE: u32 = 8;
+/// A dust splat whose minor σ is at least this many pixels goes to the coarser target instead
+/// (twin of `COARSER_MIN_SIGMA_PX`), ≥ 2 of its texels wide: a splat wider than the frame then
+/// costs at most the coarser target's ≈ 500 texels, not the coarse target's 32 000.
+pub const COARSER_MIN_SIGMA_PX: f64 = 128.0;
+/// The coarser target has 1/this of the internal lines and columns.
+pub const COARSER_DOWNSAMPLE: u32 = 64;
 
 /// `[v.x, v.y, v.z, w]` in f32 (camera-relative values are formed in f64 first).
 fn vec4(v: DVec3, w: f64) -> [f32; 4] {
@@ -478,11 +486,13 @@ pub struct CometRenderer {
     ion_pipeline: wgpu::RenderPipeline,
     dust_pipeline: wgpu::RenderPipeline,
     dust_coarse_pipeline: wgpu::RenderPipeline,
+    dust_coarser_pipeline: wgpu::RenderPipeline,
     composite_pipeline: wgpu::RenderPipeline,
     coarse_bgl: wgpu::BindGroupLayout,
     coarse_sampler: wgpu::Sampler,
-    /// The coarse dust target (C1L), at the internal size / [`COARSE_DOWNSAMPLE`].
-    coarse: Option<CoarseTarget>,
+    /// The coarse dust targets (C1L), at the internal size / [`COARSE_DOWNSAMPLE`] and /
+    /// [`COARSER_DOWNSAMPLE`].
+    coarse: Option<CoarseTargets>,
     /// This frame's scissor for the composite [x, y, w, h], `None` without dust on screen.
     coarse_scissor: Option<[u32; 4]>,
     bgl: wgpu::BindGroupLayout,
@@ -632,34 +642,39 @@ impl CometRenderer {
         let dust_pipeline = pipeline("comet dust tails", "vs_dust", "fs_dust", &[], &glow, false);
         // C1L: wide dust splats into the coarse target (additive, no depth), and the composite
         // that adds the target back to hdr where no body wrote depth.
-        let dust_coarse_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("comet dust tails (coarse)"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_dust_coarse"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_dust_coarse"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: HDR_FORMAT,
-                    blend: Some(wgpu::BlendState {
-                        color: add,
-                        alpha: add,
-                    }),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let coarse_pipeline = |label: &str, vs: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(vs),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_dust_coarse"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: HDR_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: add,
+                            alpha: add,
+                        }),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let dust_coarse_pipeline = coarse_pipeline("comet dust tails (coarse)", "vs_dust_coarse");
+        let dust_coarser_pipeline =
+            coarse_pipeline("comet dust tails (coarser)", "vs_dust_coarser");
         let coarse_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("comets coarse bgl"),
             entries: &[
@@ -677,6 +692,16 @@ impl CometRenderer {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -781,6 +806,7 @@ impl CometRenderer {
             settle: false,
             cpu_ms: 0.0,
             dust_coarse_pipeline,
+            dust_coarser_pipeline,
             composite_pipeline,
             coarse_bgl,
             coarse_sampler,
@@ -1035,28 +1061,43 @@ impl RenderFeature for CometRenderer {
             _ => (None, writes.clone()),
         };
         let per_tail = GRAINS_PER_TAIL as u32;
-        if let Some(target) = coarse {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("comets coarse dust"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: coarse_writes,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, frame.camera, &[]);
-            pass.set_bind_group(1, &self.bind_group, &[]);
-            pass.set_pipeline(&self.dust_coarse_pipeline);
-            for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
-                pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
+        if let Some(targets) = coarse {
+            // The timer's begin goes on the first of the two coarse passes.
+            let mut begin = coarse_writes;
+            for (view, pipeline, label) in [
+                (
+                    &targets.coarse_view,
+                    &self.dust_coarse_pipeline,
+                    "comets coarse dust",
+                ),
+                (
+                    &targets.coarser_view,
+                    &self.dust_coarser_pipeline,
+                    "comets coarser dust",
+                ),
+            ] {
+                let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: begin.take(),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, frame.camera, &[]);
+                pass.set_bind_group(1, &self.bind_group, &[]);
+                pass.set_pipeline(pipeline);
+                for &(slot, splats) in self.tail_draws.iter().filter(|(_, n)| *n > 0) {
+                    pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
+                }
             }
         }
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1102,72 +1143,90 @@ impl RenderFeature for CometRenderer {
                 pass.draw(0..6, slot * per_tail..slot * per_tail + splats);
             }
         }
-        if let (Some(target), Some([x, y, w, h])) = (coarse, self.coarse_scissor) {
+        if let (Some(targets), Some([x, y, w, h])) = (coarse, self.coarse_scissor) {
             pass.set_pipeline(&self.composite_pipeline);
-            pass.set_bind_group(2, &target.bind_group, &[]);
+            pass.set_bind_group(2, &targets.bind_group, &[]);
             pass.set_scissor_rect(x, y, w, h);
             pass.draw(0..3, 0..1);
         }
     }
 }
 
-/// The coarse dust target (C1L): a texture at the internal size / [`COARSE_DOWNSAMPLE`] and the
-/// composite's bind group reading it.
-struct CoarseTarget {
-    size: UVec2,
-    view: wgpu::TextureView,
+/// The coarse dust targets (C1L): textures at the internal size / [`COARSE_DOWNSAMPLE`] and /
+/// [`COARSER_DOWNSAMPLE`], and the composite's bind group reading both.
+struct CoarseTargets {
+    /// The internal size they were made for.
+    viewport: UVec2,
+    coarse_view: wgpu::TextureView,
+    coarser_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
 }
 
 impl CometRenderer {
-    /// (Re)creates the coarse target for internal size `viewport` when its size changed.
+    /// (Re)creates the coarse targets for internal size `viewport` when it changed.
     fn ensure_coarse(&mut self, gpu: &GpuContext, viewport: UVec2) {
-        let size = coarse_size(viewport);
-        if self.coarse.as_ref().is_some_and(|c| c.size == size) {
+        if self.coarse.as_ref().is_some_and(|c| c.viewport == viewport) {
             return;
         }
-        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("comets coarse dust"),
-            size: wgpu::Extent3d {
-                width: size.x,
-                height: size.y,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let target = |label: &str, size: UVec2| {
+            gpu.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size.x,
+                        height: size.y,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: HDR_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let coarse_view = target(
+            "comets coarse dust",
+            coarse_size(viewport, COARSE_DOWNSAMPLE),
+        );
+        let coarser_view = target(
+            "comets coarser dust",
+            coarse_size(viewport, COARSER_DOWNSAMPLE),
+        );
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("comets coarse bg"),
             layout: &self.coarse_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(&coarse_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.coarse_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&coarser_view),
+                },
             ],
         });
-        self.coarse = Some(CoarseTarget {
-            size,
-            view,
+        self.coarse = Some(CoarseTargets {
+            viewport,
+            coarse_view,
+            coarser_view,
             bind_group,
         });
     }
 }
 
-/// The coarse target's size for internal size `viewport`: ⌈viewport / COARSE_DOWNSAMPLE⌉.
-pub(crate) fn coarse_size(viewport: UVec2) -> UVec2 {
+/// A coarse target's size for internal size `viewport`: ⌈viewport / `downsample`⌉.
+pub(crate) fn coarse_size(viewport: UVec2, downsample: u32) -> UVec2 {
     UVec2::new(
-        viewport.x.max(1).div_ceil(COARSE_DOWNSAMPLE),
-        viewport.y.max(1).div_ceil(COARSE_DOWNSAMPLE),
+        viewport.x.max(1).div_ceil(downsample),
+        viewport.y.max(1).div_ceil(downsample),
     )
 }
 
@@ -1184,8 +1243,8 @@ pub(crate) fn dust_screen_bounds(
     let (w, h) = (f64::from(viewport.x.max(1)), f64::from(viewport.y.max(1)));
     let f = 0.5 * h / (0.5 * camera.fov_y_rad).tan();
     let to_camera = camera.orient.inverse();
-    // The B-spline reaches two texels from a sample.
-    let margin = 2.0 * f64::from(COARSE_DOWNSAMPLE);
+    // The B-spline reaches two texels of the coarser target from a sample.
+    let margin = 2.0 * f64::from(COARSER_DOWNSAMPLE);
     let (mut x0, mut y0, mut x1, mut y1) = (
         f64::INFINITY,
         f64::INFINITY,
@@ -1938,8 +1997,9 @@ mod tests {
     /// internal size / 8, rounded up.
     #[test]
     fn dust_bounds_hold_the_splats() {
-        assert_eq!(coarse_size(UVec2::new(1920, 1080)), UVec2::new(240, 135));
-        assert_eq!(coarse_size(UVec2::new(1727, 1081)), UVec2::new(216, 136));
+        assert_eq!(coarse_size(UVec2::new(1920, 1080), 8), UVec2::new(240, 135));
+        assert_eq!(coarse_size(UVec2::new(1727, 1081), 8), UVec2::new(216, 136));
+        assert_eq!(coarse_size(UVec2::new(1920, 1080), 64), UVec2::new(30, 17));
         let conic = conic_from_perihelion(1.24, 0.64, 7.04, 50.1, 12.8, 2_459_885.5);
         let t = conic.tp.add_seconds(20.0 * DAY);
         let (r, _) = heliocentric_state_icrs(&conic, t);
@@ -2144,6 +2204,8 @@ mod tests {
         assert_eq!(scalar("SPRITE_MAX_PX"), f32_of(SPRITE_MAX_PX));
         assert_eq!(scalar("COARSE_MAX_PX"), f32_of(COARSE_MAX_PX));
         assert_eq!(scalar("COARSE_MIN_SIGMA_PX"), f32_of(COARSE_MIN_SIGMA_PX));
+        assert_eq!(scalar("COARSER_MAX_PX"), f32_of(COARSER_MAX_PX));
+        assert_eq!(scalar("COARSER_MIN_SIGMA_PX"), f32_of(COARSER_MIN_SIGMA_PX));
         assert_eq!(scalar("GLOW_CULL_PRE"), f32_of(GLOW_CULL_PRE));
         assert_eq!(
             scalar("COMA_EXTENT_SCALES"),

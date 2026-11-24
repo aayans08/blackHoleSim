@@ -13,8 +13,9 @@
 //   sprite's plane (splat_axes), lit by E☉ ∝ 1/r² at the grain and the Henyey-Greenstein phase
 //   function (dust_grain_light) × the tail's emission weight × the dust's light production
 //   (TailGpu.sun.w = I_coma / DUST_HEAD_TIME_S), additive. Splats at least COARSE_MIN_SIGMA_PX
-//   wide are drawn into a coarse target (1/8 of the lines; vs_dust_coarse / fs_dust_coarse, its
-//   own pass before this one) and added back by fs_dust_composite with a cubic B-spline.
+//   (COARSER_MIN_SIGMA_PX) wide are drawn into a coarse target of 1/8 (1/64) of the lines
+//   (vs_dust_coarse, vs_dust_coarser / fs_dust_coarse, their own passes before this one) and
+//   added back by fs_dust_composite with a cubic B-spline.
 //
 // Glow (coma, ion, dust) whose brightest point would land below GLOW_CULL_PRE pre-exposed is not
 // drawn: a thousandth of AgX's black point, invisible at the frame's exposure.
@@ -56,9 +57,13 @@ const SPRITE_MIN_PX: f32 = 0.75;
 // surface brightness and loses the light beyond (a camera inside a tail; approximate).
 const SPRITE_MAX_PX: f32 = 256.0;
 const COARSE_MAX_PX: f32 = 1024.0;
-// A splat whose minor σ is at least this many pixels is drawn into the coarse target, 1/8 of the
-// lines (comet::COARSE_DOWNSAMPLE), there ≥ 2 texels wide, and upsampled with a cubic B-spline.
+const COARSER_MAX_PX: f32 = 4096.0;
+// A splat whose minor σ is at least COARSE_MIN_SIGMA_PX pixels is drawn into the coarse target
+// (1/8 of the lines, comet::COARSE_DOWNSAMPLE), one of at least COARSER_MIN_SIGMA_PX into the
+// coarser one (1/64, comet::COARSER_DOWNSAMPLE): both ≥ 2 texels wide there, upsampled with a
+// cubic B-spline.
 const COARSE_MIN_SIGMA_PX: f32 = 16.0;
+const COARSER_MIN_SIGMA_PX: f32 = 128.0;
 // Glow whose brightest point is below this pre-exposed value is not drawn (comet::GLOW_CULL_PRE:
 // AgX's black point 2^-12.47393 / 1000).
 const GLOW_CULL_PRE: f32 = 1.75e-7;
@@ -489,10 +494,16 @@ struct DustOut {
     @location(1) @interpolate(flat) slot: u32,
 }
 
-// One corner of splat g, on the full-resolution path (coarse = false) or the coarse one. Both
-// paths compute the same ellipse; a splat whose minor σ is at least COARSE_MIN_SIGMA_PX pixels
-// belongs to the coarse path, and the other path collapses it (nothing drawn).
-fn dust_vertex(vi: u32, g: u32, coarse: bool) -> DustOut {
+// The path of a splat whose minor σ is sigma_px pixels: 0 full resolution, 1 the coarse target,
+// 2 the coarser one.
+fn dust_level(sigma_px: f32) -> u32 {
+    let coarse = select(0u, 1u, sigma_px >= COARSE_MIN_SIGMA_PX);
+    return select(coarse, 2u, sigma_px >= COARSER_MIN_SIGMA_PX);
+}
+
+// One corner of splat g on path `level` (dust_level). Every path computes the same ellipse; the
+// paths a splat does not belong to collapse it (nothing drawn).
+fn dust_vertex(vi: u32, g: u32, level: u32) -> DustOut {
     let slot = g / GRAINS_PER_TAIL;
     let t = tails[slot];
     let grain = grains[g];
@@ -514,12 +525,13 @@ fn dust_vertex(vi: u32, g: u32, coarse: bool) -> DustOut {
     let up = cross(right, dir);
     let px = pixel_size_at(dist);
     let axes = splat_axes(grain.cov_l0, grain.cov_l1.xy, right, up, SPRITE_MIN_PX * px);
-    if ((axes.y >= COARSE_MIN_SIGMA_PX * px) != coarse) {
+    if (dust_level(axes.y / px) != level) {
         return out;
     }
     var s1 = axes.x;
     var s2 = axes.y;
-    let s_max = select(SPRITE_MAX_PX, COARSE_MAX_PX, coarse) * px;
+    let caps = array<f32, 3>(SPRITE_MAX_PX, COARSE_MAX_PX, COARSER_MAX_PX);
+    let s_max = caps[level] * px;
     if (s1 > s_max) {
         intensity = intensity * (s_max / s1);
         s1 = s_max;
@@ -552,7 +564,7 @@ fn dust_radiance(in: DustOut) -> vec3<f32> {
 
 @vertex
 fn vs_dust(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> DustOut {
-    return dust_vertex(vi, g, false);
+    return dust_vertex(vi, g, 0u);
 }
 
 @fragment
@@ -563,11 +575,16 @@ fn fs_dust(in: DustOut) -> GlowOut {
     return out;
 }
 
-// The coarse path (C1L): wide splats, drawn into the coarse target (1/8 of the lines, cleared
-// every frame, no depth), at 1/64 of the fill.
+// The coarse paths (C1L): wide splats, drawn into the coarse targets (1/8 and 1/64 of the lines,
+// cleared every frame, no depth), at 1/64 and 1/4096 of the fill.
 @vertex
 fn vs_dust_coarse(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> DustOut {
-    return dust_vertex(vi, g, true);
+    return dust_vertex(vi, g, 1u);
+}
+
+@vertex
+fn vs_dust_coarser(@builtin(vertex_index) vi: u32, @builtin(instance_index) g: u32) -> DustOut {
+    return dust_vertex(vi, g, 2u);
 }
 
 @fragment
@@ -575,15 +592,16 @@ fn fs_dust_coarse(in: DustOut) -> @location(0) vec4<f32> {
     return vec4<f32>(dust_radiance(in), 0.0);
 }
 
-// The coarse target, read back into hdr by the composite (group 2 of its own layout).
+// The coarse targets, read back into hdr by the composite (group 2 of its own layout).
 @group(2) @binding(0) var dust_coarse: texture_2d<f32>;
 @group(2) @binding(1) var dust_sampler: sampler;
+@group(2) @binding(2) var dust_coarser: texture_2d<f32>;
 
 // The coarse target at uv with a cubic B-spline: four bilinear taps (Sigg & Hadwiger 2005,
 // "Fast Third-Order Texture Filtering", GPU Gems 2, ch. 20). The weights sum to 1, so the light
 // is kept; the B-spline is smooth (C²) where bilinear upsampling by 8 would show its facets.
-fn sample_coarse(uv: vec2<f32>) -> vec3<f32> {
-    let size = vec2<f32>(textureDimensions(dust_coarse));
+fn sample_bspline(tex: texture_2d<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let size = vec2<f32>(textureDimensions(tex));
     let p = uv * size - 0.5;
     let i = floor(p);
     let f = p - i;
@@ -597,10 +615,10 @@ fn sample_coarse(uv: vec2<f32>) -> vec3<f32> {
     let g1 = w2 + w3;
     let t0 = (i - 1.0 + w1 / g0 + 0.5) / size;
     let t1 = (i + 1.0 + w3 / g1 + 0.5) / size;
-    let a = textureSampleLevel(dust_coarse, dust_sampler, vec2<f32>(t0.x, t0.y), 0.0).rgb;
-    let b = textureSampleLevel(dust_coarse, dust_sampler, vec2<f32>(t1.x, t0.y), 0.0).rgb;
-    let c = textureSampleLevel(dust_coarse, dust_sampler, vec2<f32>(t0.x, t1.y), 0.0).rgb;
-    let d = textureSampleLevel(dust_coarse, dust_sampler, vec2<f32>(t1.x, t1.y), 0.0).rgb;
+    let a = textureSampleLevel(tex, dust_sampler, vec2<f32>(t0.x, t0.y), 0.0).rgb;
+    let b = textureSampleLevel(tex, dust_sampler, vec2<f32>(t1.x, t0.y), 0.0).rgb;
+    let c = textureSampleLevel(tex, dust_sampler, vec2<f32>(t0.x, t1.y), 0.0).rgb;
+    let d = textureSampleLevel(tex, dust_sampler, vec2<f32>(t1.x, t1.y), 0.0).rgb;
     return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
 }
 
@@ -616,7 +634,8 @@ fn vs_dust_composite(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f
 @fragment
 fn fs_dust_composite(@builtin(position) pos: vec4<f32>) -> GlowOut {
     var out: GlowOut;
-    let light = sample_coarse(pos.xy / camera.viewport.xy);
+    let uv = pos.xy / camera.viewport.xy;
+    let light = sample_bspline(dust_coarse, uv) + sample_bspline(dust_coarser, uv);
     out.color = vec4<f32>(min(light, vec3<f32>(HDR_MAX)), 0.0);
     out.mask = vec4<f32>(0.0);
     return out;

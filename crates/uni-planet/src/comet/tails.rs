@@ -1231,8 +1231,9 @@ mod tests {
             let (mut s1, mut s2, phi) =
                 splat_axes(cov_factor(g.cov_m2), right, up, SPRITE_MIN_PX * pixel_m);
             // The pass's two paths: wide splats on the coarse one, with its larger cap.
-            let coarse = s2 >= crate::comet::COARSE_MIN_SIGMA_PX * pixel_m;
-            let cap = if coarse {
+            let cap = if s2 >= crate::comet::COARSER_MIN_SIGMA_PX * pixel_m {
+                crate::comet::COARSER_MAX_PX
+            } else if s2 >= crate::comet::COARSE_MIN_SIGMA_PX * pixel_m {
                 crate::comet::COARSE_MAX_PX
             } else {
                 crate::comet::SPRITE_MAX_PX
