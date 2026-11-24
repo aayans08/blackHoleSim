@@ -3,7 +3,9 @@
 //! - **Dust** (Task C1L): `uni_physics::dust::finson_probstein` (Finson & Probstein 1968, ApJ 154,
 //!   327) on `CometView::conic` (J2000 ecliptic, as it expects; lead ruling A.1: never rotate it
 //!   to ICRS first), β ∈ [0.001, 0.9] in 16 log steps × ages up to 60 d in 64 steps = 1 024 grains
-//!   ([`DUST_PARAMS`]), dust production ∝ r_h^(−K1/2.5) at emission (the comet's magnitude law).
+//!   ([`DUST_PARAMS`]), dust production ∝ r_h^−max(K1/2.5 − 2, 0) at emission ([`dust_production`]:
+//!   the comet's total visual magnitude law without the sunlight it already contains; C1L fix
+//!   round 1, lead ruling C1L-I1).
 //!   - *Light.* Each grain stands for the dust emitted in its cell of ln β × age. The dust's light
 //!     production now is the coma's light divided by [`DUST_HEAD_TIME_S`], a time calibrated on
 //!     C/2020 F3 (NEOWISE) from its measured dust production A(0)fρ (Aravind et al. 2025), its
@@ -12,8 +14,9 @@
 //!     [`TailGrain::weight`] (production at emission relative to now × its size class's share ×
 //!     the cell's age span) × the sunlight at its own heliocentric distance × a
 //!     Henyey–Greenstein phase function with g = 0.6 ([`DUST_PHASE_G`]). The tail is therefore
-//!     several times brighter than the coma just after perihelion (≈ 6 × for row 20's NEOWISE)
-//!     and fainter on the way in; it depends on the viewing phase as the phase function does.
+//!     several times brighter than the coma just after perihelion (3.55 × for row 20's
+//!     NEOWISE, 12 d after it: `neowise_dust_tail_is_long_and_curved` prints it) and fainter on
+//!     the way in; it depends on the viewing phase as the phase function does.
 //!     The v0 ratio "dust = 0.5 × coma" is gone (C1L: it made NEOWISE's tail short).
 //!   - *Shape.* The grains are drawn as elliptical Gaussian splats (Zwicker et al. 2001, "EWA
 //!     Splatting", IEEE TVCG 8, 223), whose 3D covariance spans half a grid step toward each
@@ -785,9 +788,9 @@ pub fn tail_schedule(
     due.into_iter().map(|(i, _)| i).collect()
 }
 
-/// The grains of β rows `rows` (indices 0..32 into [`DUST_PARAMS`]'s β grid) of `conic` at
-/// `t_obs`, with dust production ∝ r_h^(−K1/2.5) (module docs). Row-major as `finson_probstein`
-/// (β-major, ages within a row).
+/// The grains of β rows `rows` (indices 0..16 into [`DUST_PARAMS`]'s β grid) of `conic` at
+/// `t_obs`, with dust production ∝ r_h^−max(K1/2.5 − 2, 0) ([`dust_production`]). Row-major as
+/// `finson_probstein` (β-major, ages within a row).
 pub(crate) fn dust_rows(
     conic: &Conic,
     k1: f64,
@@ -817,8 +820,8 @@ pub(crate) fn dust_rows(
         n_beta: j1 - j0,
         ..DUST_PARAMS
     };
-    // Production ∝ r_h^(−K1/2.5): SBDB's total-magnitude law m = M1 + 5 log Δ + K1 log r_h
-    // (plan C1).
+    // Production ∝ r_h^−max(K1/2.5 − 2, 0) ([`dust_production`]; plan C1 as amended by lead
+    // ruling C1L-I1).
     finson_probstein(conic, t_obs, &p, &|r_h| dust_production(r_h, k1))
 }
 
@@ -1022,10 +1025,27 @@ pub(crate) fn tail_reach_m(grains: &[TailGrain]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-/// The production law's value at heliocentric distance `r_au` for slope `k1`: r_h^(−K1/2.5)
-/// (the factor `dust_rows` weights the emissions with).
+/// The dust production law's value at heliocentric distance `r_au` for the comet's total visual
+/// slope `k1`: r_h^−max(K1/2.5 − 2, 0), the factor `dust_rows` weights the emissions with (C1L
+/// fix round 1, review I1, lead ruling C1L-I1, 2026-11-24).
+///
+/// - **Why −2.** The magnitude law m = M1 + 5 log₁₀ Δ + K1 log₁₀ r_h (SBDB's total-magnitude law;
+///   `uni_sim::world::COMET_VISUAL_LAWS` where a comet has a cited one) makes the comet's light
+///   ∝ r_h^(−K1/2.5) at a fixed Δ. That light already contains the sunlight on it, E☉ ∝ r_h⁻²:
+///   a coma of constant scattering cross-section has K1 = 5. So the cross-section goes as
+///   r_h^−(K1/2.5 − 2), and at a constant outflow speed so does the dust production (a steady
+///   coma holds production × crossing time; A'Hearn et al. 1984, AJ 89, 579, the relation
+///   [`DUST_HEAD_TIME_S`] rests on). Each grain is then lit again by the Sun at its own distance
+///   at the time it is seen ([`dust_grain_light`]: (r_h/r)²). C1L used r_h^(−K1/2.5), which
+///   counted the r⁻² twice: at row 20 it weighted perihelion's dust 5.3 × today's instead of
+///   2.2 × (r_h 0.455 against q 0.295 AU), and drew the tail 5.49 × the coma instead of 3.55 ×
+///   (`neowise_dust_tail_is_long_and_curved`).
+/// - **Approximate.** K1 is the slope of the comet's TOTAL visual light, which for many comets
+///   is dominated by gas (C₂ Swan bands in the V band), not dust; using it for the dust
+///   production is the plan's approximation (card note `uni_ui::theme::NOTE_TAILS`). A K1 below
+///   5 would make the production grow with r_h; it is held constant there (exponent floored at 0).
 pub(crate) fn dust_production(r_au: f64, k1: f64) -> f64 {
-    r_au.powf(-k1 / 2.5)
+    r_au.powf(-(k1 / 2.5 - 2.0).max(0.0))
 }
 
 /// A conservative reach [m] of a dust tail not computed yet, for culling: 1.5 × the drift
