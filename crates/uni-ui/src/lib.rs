@@ -24,7 +24,3 @@ pub use theme::{
     FREE_FLIGHT_LABEL, FlightLabel, LabelTone, SATURN_MOONS_LABEL, TWINKLE_LABEL,
     UNLENSED_STARS_LABEL, VIVID_STAR_COLOURS_LABEL, gravity_kicker, tone_color, ui_labels,
 };
-
-// A dependency the stubs do not use yet (Task C0 adds every Wave C manifest entry, review I8).
-// This line keeps `cargo::unused_dependencies` quiet until C4/C5 use it; delete it then.
-use uni_physics as _;

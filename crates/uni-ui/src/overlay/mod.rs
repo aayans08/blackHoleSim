@@ -258,19 +258,50 @@ pub fn build_overlay(
         reserved: bracket.iter().map(bracket::label_rect).collect(),
     };
     let markers = markers::layout(&cands, &rules);
+    // Orbits (coordinator ruling at Task C6): the selected object's and the goto target's only,
+    // unless the settings ask for more, and never over a body's disk.
     let mut orbits = Vec::new();
-    orbits::solar_system_orbits(
-        world,
-        snap,
-        view.pos,
-        &map,
-        selected,
-        s.planet_orbits,
-        &mut orbits,
-    );
-    if s.exo_orbits {
-        orbits::exo_orbits(world, snap, view.pos, &map, selected, &mut orbits);
+    let mut targets = vec![selected];
+    if goto_target != selected {
+        targets.push(goto_target);
     }
+    for (k, target) in targets.into_iter().enumerate() {
+        let first = k == 0;
+        orbits::solar_system_orbits(
+            world,
+            snap,
+            view.pos,
+            &map,
+            target,
+            s.planet_orbits && first,
+            &mut orbits,
+        );
+        orbits::exo_orbits(
+            world,
+            snap,
+            view.pos,
+            &map,
+            target,
+            s.exo_orbits && first,
+            &mut orbits,
+        );
+    }
+    let disks: Vec<(Vec2, f32)> = snap
+        .bodies
+        .iter()
+        .map(|b| (b.rel_pos_m, b.proj_radius_px))
+        .chain(
+            snap.star_surfaces
+                .iter()
+                .map(|s| (s.rel_pos_m, s.proj_radius_px)),
+        )
+        .filter_map(|(rel, px)| {
+            let c = map.project(map.camera(rel))?;
+            let r = px * map.radius_scale() + f64::from(orbits::DISK_CLIP_MARGIN_PT);
+            (r.is_finite() && r > 0.0).then(|| (c.as_vec2(), r as f32))
+        })
+        .collect();
+    let orbits = orbits::clip_out_disks(orbits, &disks);
     Overlay {
         bracket,
         markers,
@@ -674,7 +705,7 @@ mod tests {
         });
         let exo = per(&mut || {
             out.clear();
-            orbits::exo_orbits(&world, &snap, view.pos, &map, Some(saturn), &mut out);
+            orbits::exo_orbits(&world, &snap, view.pos, &map, Some(saturn), true, &mut out);
         });
         let velocity = per(&mut || {
             std::hint::black_box(world.velocity(saturn));

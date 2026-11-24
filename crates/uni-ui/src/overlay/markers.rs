@@ -288,20 +288,46 @@ pub(crate) fn layout(cands: &[Candidate], rules: &Rules) -> Vec<Marker> {
             .then(a.dist_m.total_cmp(&b.dist_m))
             .then(a.id.cmp(&b.id))
     });
-    // Labels where they do not overlap one already placed (lead ruling B.3).
+    // Labels where they do not overlap one already placed (lead ruling B.3). An "other" object
+    // (dwarf planet, comet, asteroid, exoplanet host or star) that is neither the goto target,
+    // aimed at nor selected is marked only with its label: if the label would overlap, or labels
+    // are off, the whole marker goes (coordinator ruling at Task C6: soft and uncluttered).
     let mut taken = rules.reserved.clone();
-    for (_, m) in &mut shown {
+    let mut keep = vec![true; shown.len()];
+    for (k, (c, m)) in shown.iter_mut().enumerate() {
+        let other = tier(c) == 2 && is_other(c.kind);
         let Some(rect) = label_rect(m) else {
+            keep[k] = !other || m.aim_fill > 0.0;
             continue;
         };
         if taken.iter().any(|t| t.intersects(rect)) {
             m.label = None;
             m.sub = None;
+            keep[k] = !other;
         } else {
             taken.push(rect);
         }
     }
-    shown.into_iter().map(|(_, m)| m).collect()
+    shown
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|((_, m), _)| m)
+        .collect()
+}
+
+/// The kinds marked only by brightness (and only with a label that fits): the coordinator's
+/// ruling at Task C6 ("others": dwarf planets, comets, asteroids, exoplanet hosts; stars, which
+/// are destinations only when chosen, too).
+fn is_other(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::DwarfPlanet
+            | ObjectKind::Comet
+            | ObjectKind::Asteroid
+            | ObjectKind::ExoHost
+            | ObjectKind::Star
+    )
 }
 
 /// Where `m`'s label and distance lie [pt], estimated without fonts at

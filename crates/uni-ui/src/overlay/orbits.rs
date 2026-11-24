@@ -2,9 +2,13 @@
 //!
 //! 256-point polylines of the current osculating conic (`Conic::from_state` of the body's state
 //! about its parent), projected in f64 from camera-relative positions and split at the near
-//! plane, 1 pt grey at 35 % alpha (selected: cyan). Which orbits: the planets and dwarf planets
-//! about the Sun and the selected planet's major moons while `OverlaySettings::planet_orbits` is
-//! on; the selected object's own orbit (planet, dwarf planet, moon, comet or asteroid) always.
+//! plane, 1 pt grey at 35 % alpha (selected: cyan). Which orbits (coordinator ruling at Task C6:
+//! orbit lines off by default, soft and uncluttered): the selected object's and the goto
+//! target's own orbit (planet, dwarf planet, moon, comet or asteroid) and, for a planet or dwarf
+//! planet, its major moons' orbits; with `OverlaySettings::planet_orbits` on (off in the app),
+//! also every planet's and dwarf planet's about the Sun and a selected moon's siblings'. No
+//! orbit is drawn over a body's disk: [`clip_out_disks`] cuts every line where it crosses the
+//! projected disk of a resolved body or star (so a body also hides the orbits behind it).
 //!
 //! **Exoplanet orbits** (ruling 13, review m9) use the sky-plane frame of Winn 2010
 //! ("Transits and Occultations", arXiv:1001.2010, §2.1 eqs. 1–4, read 2026-11-23): +Z toward the
@@ -399,18 +403,21 @@ pub(crate) fn solar_system_orbits(
     {
         drawn.push(info.id);
     }
-    if planet_orbits {
+    // The major moons of a selected planet always; of a selected moon's planet (its siblings)
+    // only with every planet orbit on.
+    let moon_host = selected_info.and_then(|info| match info.kind {
+        ObjectKind::Planet | ObjectKind::DwarfPlanet => Some(info.id),
+        ObjectKind::Moon if planet_orbits => info.parent,
+        _ => None,
+    });
+    {
         let planets = snap
             .destinations
             .iter()
-            .filter(|d| matches!(d.kind, ObjectKind::Planet | ObjectKind::DwarfPlanet))
+            .filter(|d| {
+                planet_orbits && matches!(d.kind, ObjectKind::Planet | ObjectKind::DwarfPlanet)
+            })
             .map(|d| d.id);
-        // The major moons of the selected planet, or of a selected moon's planet.
-        let moon_host = selected_info.and_then(|info| match info.kind {
-            ObjectKind::Planet | ObjectKind::DwarfPlanet => Some(info.id),
-            ObjectKind::Moon => info.parent,
-            _ => None,
-        });
         let moons: Vec<ObjectId> = match moon_host {
             Some(host) => objects
                 .iter()
@@ -486,17 +493,19 @@ fn conic_reach(c: &Conic) -> f64 {
     }
 }
 
-/// The orbits of every planet around a selected exoplanet host and around each host within
-/// [`EXO_ORBIT_RANGE_M`] of `cam`. A host that near is in `snap.star_surfaces` when resolved,
-/// or a point in `snap.points` while on screen (within uni-sim's 64 px point margin): a host
-/// drawn as a point just beyond that margin loses its orbits, which then reach at most a few
-/// degrees into the frame.
+/// The orbits of every planet around a selected exoplanet host and, with `nearby`
+/// (`OverlaySettings::exo_orbits`, off in the app: coordinator ruling at Task C6), around each
+/// host within [`EXO_ORBIT_RANGE_M`] of `cam`. A host that near is in `snap.star_surfaces` when
+/// resolved, or a point in `snap.points` while on screen (within uni-sim's 64 px point margin): a
+/// host drawn as a point just beyond that margin loses its orbits, which then reach at most a
+/// few degrees into the frame.
 pub(crate) fn exo_orbits(
     world: &World,
     snap: &Snapshot,
     cam: UniversePos,
     map: &ScreenMap,
     selected: Option<ObjectId>,
+    nearby: bool,
     out: &mut Vec<OrbitLine>,
 ) {
     let objects = world.objects();
@@ -507,13 +516,14 @@ pub(crate) fn exo_orbits(
     };
     let near = |id: ObjectId| world.position(id).delta_from(cam).length() <= EXO_ORBIT_RANGE_M;
     let mut hosts: Vec<ObjectId> = selected.filter(|&id| is_host(id)).into_iter().collect();
-    let nearby = snap
+    let candidates = snap
         .star_surfaces
         .iter()
         .map(|s| s.id)
         .chain(snap.points.iter().filter_map(|p| p.id))
-        .chain(snap.destinations.iter().map(|d| d.id));
-    for id in nearby {
+        .chain(snap.destinations.iter().map(|d| d.id))
+        .filter(|_| nearby);
+    for id in candidates {
         if !hosts.contains(&id) && is_host(id) && near(id) {
             hosts.push(id);
         }
@@ -534,6 +544,92 @@ pub(crate) fn exo_orbits(
             }
         }
     }
+}
+
+/// Margin around a disk inside which no orbit is drawn [pt].
+pub(crate) const DISK_CLIP_MARGIN_PT: f32 = 2.0;
+
+/// `lines` with every part inside a disk of `disks` ((centre, radius) [pt]) cut out (coordinator
+/// ruling at Task C6: never over a body's disk; a body hides the orbits behind it). A line cut
+/// in its middle becomes two; a dot inside a disk goes.
+pub(crate) fn clip_out_disks(lines: Vec<OrbitLine>, disks: &[(Vec2, f32)]) -> Vec<OrbitLine> {
+    if disks.is_empty() {
+        return lines;
+    }
+    let inside = |p: Vec2| disks.iter().any(|&(c, r)| p.distance(c) < r);
+    let mut out = Vec::new();
+    for line in lines {
+        let OrbitLine { pts, dashed, tone } = line;
+        let mut runs: Vec<Vec<Vec2>> = Vec::new();
+        let mut run: Vec<Vec2> = Vec::new();
+        if pts.len() == 1 {
+            if !inside(pts[0]) {
+                runs.push(pts);
+            }
+        } else {
+            for seg in pts.windows(2) {
+                let (a, b) = (seg[0], seg[1]);
+                for (t0, t1) in outside_intervals(a, b, disks) {
+                    let (p0, p1) = (a + (b - a) * t0, a + (b - a) * t1);
+                    let joins = run.last().is_some_and(|&q| q.distance(p0) < 1e-4);
+                    if !joins {
+                        if run.len() >= 2 {
+                            runs.push(std::mem::take(&mut run));
+                        }
+                        run.clear();
+                        run.push(p0);
+                    }
+                    run.push(p1);
+                }
+            }
+            if run.len() >= 2 {
+                runs.push(run);
+            }
+        }
+        out.extend(runs.into_iter().map(|pts| OrbitLine { pts, dashed, tone }));
+    }
+    out
+}
+
+/// The parameter intervals [t0, t1] ⊂ [0, 1] of segment a → b outside every disk, in order.
+fn outside_intervals(a: Vec2, b: Vec2, disks: &[(Vec2, f32)]) -> Vec<(f32, f32)> {
+    let d = b - a;
+    let dd = d.length_squared();
+    // The inside intervals, merged.
+    let mut cuts: Vec<(f32, f32)> = Vec::new();
+    for &(c, r) in disks {
+        let f = a - c;
+        if !(dd > 0.0) {
+            if f.length() < r {
+                return Vec::new();
+            }
+            continue;
+        }
+        // |f + t d|² = r²: t² dd + 2t f·d + |f|² − r² = 0.
+        let bh = f.dot(d);
+        let disc = bh * bh - dd * (f.length_squared() - r * r);
+        if disc <= 0.0 {
+            continue;
+        }
+        let s = disc.sqrt();
+        let (t0, t1) = (((-bh - s) / dd).max(0.0), ((-bh + s) / dd).min(1.0));
+        if t0 < t1 {
+            cuts.push((t0, t1));
+        }
+    }
+    cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut keep = Vec::new();
+    let mut from = 0.0_f32;
+    for (t0, t1) in cuts {
+        if t0 > from {
+            keep.push((from, t0));
+        }
+        from = from.max(t1);
+    }
+    if from < 1.0 {
+        keep.push((from, 1.0));
+    }
+    keep
 }
 
 /// Paints `lines`: antialiased 1 pt polylines in their tone at 35 % alpha, dashed where
@@ -559,6 +655,60 @@ pub(crate) fn draw(painter: &Painter, lines: &[OrbitLine]) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    /// Coordinator ruling at Task C6: an orbit line crossing a disk is cut where it enters and
+    /// leaves it (with the margin the caller adds), a line wholly inside goes, a dot inside goes.
+    #[test]
+    fn orbit_lines_are_cut_out_of_disks() {
+        let line = |pts: Vec<Vec2>| OrbitLine {
+            pts,
+            dashed: false,
+            tone: LabelTone::Neutral,
+        };
+        let disks = [(Vec2::new(50.0, 0.0), 10.0)];
+        let out = clip_out_disks(
+            vec![line(vec![Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)])],
+            &disks,
+        );
+        assert_eq!(out.len(), 2);
+        assert!((out[0].pts[1].x - 40.0).abs() < 1e-3, "{:?}", out[0].pts);
+        assert!((out[1].pts[0].x - 60.0).abs() < 1e-3, "{:?}", out[1].pts);
+        // A polyline through the disk keeps its outside vertices, joined.
+        let out = clip_out_disks(
+            vec![line(vec![
+                Vec2::new(0.0, 0.0),
+                Vec2::new(20.0, 0.0),
+                Vec2::new(45.0, 0.0),
+                Vec2::new(70.0, 5.0),
+                Vec2::new(90.0, 30.0),
+            ])],
+            &disks,
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].pts.len(), 3);
+        assert!(
+            out.iter()
+                .all(|l| l.pts.iter().all(|p| p.distance(disks[0].0) >= 10.0 - 1e-3))
+        );
+        // Wholly inside, and a dot inside: nothing left; a line missing the disk: unchanged.
+        assert!(
+            clip_out_disks(
+                vec![line(vec![Vec2::new(48.0, 0.0), Vec2::new(52.0, 1.0)])],
+                &disks
+            )
+            .is_empty()
+        );
+        assert!(clip_out_disks(vec![line(vec![Vec2::new(50.0, 1.0)])], &disks).is_empty());
+        let miss = vec![Vec2::new(0.0, 20.0), Vec2::new(100.0, 20.0)];
+        let out = clip_out_disks(vec![line(miss.clone())], &disks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pts, miss);
     }
 }
 
