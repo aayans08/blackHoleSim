@@ -676,8 +676,9 @@ macro_rules! splat_axes_in {
             let v = [factor.x_axis, factor.y_axis, factor.z_axis]
                 .map(|c| (right.dot(c), up.dot(c)));
             // C1L fix round 1 (review I2): every length is divided by the largest projected
-            // component or the floor, k, before it is squared, so no square exceeds 9 and the
-            // f32 shader cannot overflow (squaring metres overflowed f32 above σ₁ ≈ 6.1 × 10⁹ m,
+            // component or the floor, k, before it is squared: every component is then ≤ 1, so
+            // m ≤ 4 and det ≤ m² ≤ 16 (the largest intermediate), and the f32 shader cannot
+            // overflow (squaring metres overflowed f32 above σ₁ ≈ 6.1 × 10⁹ m,
             // and the splat vanished); σ₁ and σ₂ are scaled back by k.
             let k = v.iter().fold(floor_m.abs(), |a, c| a.max(c.0.abs()).max(c.1.abs()));
             if !(k > 0.0) {
@@ -706,8 +707,8 @@ splat_axes_in!(
     /// projected onto the plane spanned by the unit vectors `right` and `up` (the sprite's plane,
     /// facing the camera), plus `floor_m`² on both axes (the smallest σ drawn, [`SPRITE_MIN_PX`]
     /// pixels). With uᵢ = (right·Lᵢ, up·Lᵢ)/k the columns projected and divided by k, the
-    /// largest |component| or the floor (so nothing squared exceeds 9: no f32 overflow at any
-    /// size, fix round 1), the 2D covariance C/k² has trace Σ|uᵢ|² + 2f² and determinant
+    /// largest |component| or the floor (every component ≤ 1, so the largest intermediate is
+    /// m² ≤ 16, det ≤ m²: no f32 overflow at any size, fix round 1), the 2D covariance C/k² has trace Σ|uᵢ|² + 2f² and determinant
     /// Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴, f = floor/k (Cauchy–Binet: a sum of squares, so an
     /// elongated splat's minor axis does not cancel in f32); σ₁² = k²(m + √(m² − det)),
     /// m = trace/2, σ₂² = k⁴det/σ₁². Returns (σ₁, σ₂, φ) [m, m, rad]: σ₁ ≥ σ₂ along the axes
@@ -808,8 +809,7 @@ pub(crate) struct SplatDraw {
 
 impl SplatDraw {
     /// The splat's brightest point [cd/m²], its centre: what `vs_dust`'s visibility cull compares
-    /// with `GLOW_CULL_PRE` after `scene_pre()` (the tests' twin of that cull).
-    #[cfg(test)]
+    /// with `GLOW_CULL_PRE` after `scene_pre()`.
     pub(crate) fn peak_cd_m2(&self) -> f64 {
         self.drawn_cd * sprite_profile(0.0, 1.0) / (self.s1 * self.s2)
     }
@@ -886,21 +886,28 @@ pub struct DustDrawn {
     pub drawn_fraction: f64,
     /// The tail's splats.
     pub splats: usize,
+    /// The brightest splat centre's luminance as drawn [cd/m², not pre-exposed]: × the frame's
+    /// scene exposure it is what `vs_dust`'s visibility cull compares with `GLOW_CULL_PRE`, so
+    /// below that nothing of the tail is drawn (C1L fix round 2, review r1 minor 5).
+    pub peak_cd_m2: f64,
 }
 
-/// The light of `grains` (a tail's splats) [cd] and the part of it the pass draws [cd], from
-/// [`splat_draw`] (arguments as there).
+/// The light of `grains` (a tail's splats) [cd], the part of it the pass draws [cd], and its
+/// brightest splat centre [cd/m²] ([`SplatDraw::peak_cd_m2`]), from [`splat_draw`] (arguments as
+/// there).
 pub(crate) fn dust_light_drawn(
     grains: &[TailGrain],
     rate: f64,
     nucleus_rel: DVec3,
     sun_rel: DVec3,
     cam: &SpriteCamera,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
     grains
         .iter()
         .filter_map(|g| splat_draw(g, rate, nucleus_rel, sun_rel, cam))
-        .fold((0.0, 0.0), |(l, d), s| (l + s.light_cd, d + s.drawn_cd))
+        .fold((0.0, 0.0, 0.0), |(l, d, p), s| {
+            (l + s.light_cd, d + s.drawn_cd, p.max(s.peak_cd_m2()))
+        })
 }
 
 /// The dust tails' luminance on a frame, pixel by pixel (C1L fix round 1, lead ruling C1L-b;
@@ -2248,7 +2255,8 @@ mod tests {
         let clock = std::time::Instant::now();
         let mut share = 0.0;
         for _ in 0..200 {
-            let (l, d) = dust_light_drawn(&grains, rate, view.nucleus_rel_m, view.sun_rel_m, &cam);
+            let (l, d, _) =
+                dust_light_drawn(&grains, rate, view.nucleus_rel_m, view.sun_rel_m, &cam);
             share += d / l / 200.0;
         }
         let share_ms = clock.elapsed().as_secs_f64() * 1e3 / 200.0;
@@ -2562,7 +2570,7 @@ mod tests {
         let clock = std::time::Instant::now();
         let mut sink = 0.0;
         for _ in 0..reps {
-            let (l, dr) =
+            let (l, dr, _) =
                 dust_light_drawn(&tail.grains, rate, view.nucleus_rel_m, view.sun_rel_m, &cam);
             sink += dr / l;
         }
@@ -2577,6 +2585,16 @@ mod tests {
         );
         assert!(d.drawn_fraction > 0.0 && d.drawn_fraction < 0.1, "{d:?}");
         assert!(d.drawn_fraction < crate::comet::DUST_DRAWN_NOTE_BELOW);
+        // Review r1 minor 5: the note needs the tail to be visible. At row 21's metered EV −4.51
+        // (C1L fix round 1 capture) it is; at EV 20 (a sunlit scene) nothing of it would draw.
+        let notes = |ev: Option<f32>| crate::comet::dust_notes(&plan.dust_drawn, ev);
+        assert_eq!(notes(Some(-4.51)), vec![note.clone()]);
+        assert_eq!(notes(None), vec![note.clone()]);
+        assert!(
+            notes(Some(20.0)).is_empty(),
+            "peak {:e} cd/m²",
+            d.peak_cd_m2
+        );
         // Not due again for DRAWN_REFRESH_WALL_S: the cached value is reported.
         let again = crate::comet::plan_frame(&scene, &camera, size, 0.2, &mut manager, 0, 1);
         assert_eq!(again.dust_drawn, plan.dust_drawn);

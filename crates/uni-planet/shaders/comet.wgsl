@@ -233,8 +233,9 @@ fn sprite_profile(r: f32, sigma: f32) -> f32 {
 // L11), l1 = (L21, L22)) projected on the unit vectors right and up, plus floor² on both axes.
 // Every length is first divided by k, the largest projected component or the floor (C1L fix
 // round 1, review I2: squaring metres overflowed f32 above σ₁ ≈ 6.1e9 m and the splat
-// vanished; now nothing squared exceeds 9). With uᵢ the scaled projected columns of L and
-// f = floor/k: trace Σ|uᵢ|² + 2f², determinant Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴
+// vanished; now every component is ≤ 1, so m ≤ 4 and det ≤ m² ≤ 16). With uᵢ the scaled
+// projected columns of L and f = floor/k: trace Σ|uᵢ|² + 2f², determinant
+// Σ_{i<j}(uᵢ × uⱼ)² + f²Σ|uᵢ|² + f⁴
 // (Cauchy–Binet: no cancellation for elongated splats), σ₁² = k²(m + √(m² − det)),
 // σ₂ = k √(det/(m + √(m² − det))). Returns (σ₁, σ₂, φ): σ₁ ≥ σ₂ along cos φ·right + sin φ·up and
 // −sin φ·right + cos φ·up; 0 for a zero covariance and floor. Twin of tails::splat_axes.

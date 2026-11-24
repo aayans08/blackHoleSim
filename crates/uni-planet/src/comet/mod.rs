@@ -440,7 +440,7 @@ pub(crate) fn plan_frame(
             continue;
         };
         let rate = dust_rate_cd_per_s(view, coma_intensity_cd(view));
-        let (light, drawn) = dust_light_drawn(
+        let (light, drawn, peak) = dust_light_drawn(
             &tail.grains,
             rate,
             view.nucleus_rel_m,
@@ -462,6 +462,7 @@ pub(crate) fn plan_frame(
                     light_cd: light,
                     drawn_fraction: fraction,
                     splats: tail.grains.len(),
+                    peak_cd_m2: peak,
                 },
             },
         );
@@ -476,8 +477,30 @@ pub(crate) fn plan_frame(
 }
 
 /// A drawn dust tail that keeps less than this share of its light ([`DustDrawn::drawn_fraction`])
-/// raises the grey HUD note [`dust_partly_drawn_note`] (lead ruling C1L-I3, 2026-11-24).
+/// raises the grey HUD note [`dust_partly_drawn_note`] (lead ruling C1L-I3, 2026-11-24), if it
+/// is visible ([`dust_notes`]).
 pub const DUST_DRAWN_NOTE_BELOW: f64 = 0.8;
+
+/// The grey notes for `drawn` (a frame's [`DustDrawn`]) at the frame's metered scene exposure
+/// `scene_ev100`: [`dust_partly_drawn_note`] of the least-drawn tail among those that keep less
+/// than [`DUST_DRAWN_NOTE_BELOW`] of their light and are visible (C1L fix round 2, review r1
+/// minor 5). **Visibility rule:** a tail is visible when its brightest splat centre
+/// ([`DustDrawn::peak_cd_m2`]) × `exposure_scale(scene_ev100)` reaches [`GLOW_CULL_PRE`], i.e.
+/// when `vs_dust`'s visibility cull lets at least one of its splats through; a tail below it
+/// draws nothing, so nothing on screen is "partly drawn". With `scene_ev100` unknown (`None`)
+/// every partly drawn tail counts.
+pub fn dust_notes(drawn: &[DustDrawn], scene_ev100: Option<f32>) -> Vec<String> {
+    let pre = scene_ev100.map(|ev| f64::from(uni_gfx::exposure_scale(ev)));
+    drawn
+        .iter()
+        .filter(|d| d.drawn_fraction < DUST_DRAWN_NOTE_BELOW)
+        .filter(|d| pre.is_none_or(|p| d.peak_cd_m2 * p >= GLOW_CULL_PRE))
+        .map(|d| d.drawn_fraction)
+        .min_by(f64::total_cmp)
+        .map(dust_partly_drawn_note)
+        .into_iter()
+        .collect()
+}
 
 /// The grey HUD note for a dust tail drawn with `fraction` of its light (lead ruling C1L-I3):
 /// "Comet dust tail partly drawn at this range ({pct} % of its light; renderer limit)", the
@@ -594,6 +617,8 @@ pub struct CometRenderer {
     cpu_ms: f32,
     /// The last prepared frame's drawn dust tails ([`DustDrawn`], C1L fix round 1).
     dust_drawn: Vec<DustDrawn>,
+    /// The metered scene EV the notes' visibility rule uses ([`CometRenderer::set_scene_ev100`]).
+    scene_ev100: Option<f32>,
 }
 
 impl CometRenderer {
@@ -775,6 +800,7 @@ impl CometRenderer {
             settle: false,
             cpu_ms: 0.0,
             dust_drawn: Vec::new(),
+            scene_ev100: None,
         })
     }
 
@@ -801,18 +827,19 @@ impl CometRenderer {
     }
 
     /// Grey notes for the HUD from the last prepared frame (as `BodyRenderer::warnings`; the app
-    /// shows them with the other renderer statuses): [`dust_partly_drawn_note`] of the
-    /// least-drawn tail when a drawn dust tail keeps less than [`DUST_DRAWN_NOTE_BELOW`] of its
-    /// light (lead ruling C1L-I3), otherwise none.
+    /// shows them with the other renderer statuses): [`dust_notes`] at the scene exposure last
+    /// given to [`CometRenderer::set_scene_ev100`] (lead ruling C1L-I3; the visibility rule of
+    /// review r1 minor 5).
     pub fn warnings(&self) -> Vec<String> {
-        self.dust_drawn
-            .iter()
-            .map(|d| d.drawn_fraction)
-            .filter(|&f| f < DUST_DRAWN_NOTE_BELOW)
-            .min_by(f64::total_cmp)
-            .map(dust_partly_drawn_note)
-            .into_iter()
-            .collect()
+        dust_notes(&self.dust_drawn, self.scene_ev100)
+    }
+
+    /// The frame's metered scene exposure [EV100] for [`CometRenderer::warnings`]' visibility
+    /// rule: the app passes the last read-back auto EV, or the manual one (`FrameCtx::exposure`
+    /// holds the HUD's manual EV even in Auto, so the pass cannot read it there). `None` (the
+    /// default): every partly drawn tail raises the note.
+    pub fn set_scene_ev100(&mut self, scene_ev100: Option<f32>) {
+        self.scene_ev100 = scene_ev100;
     }
 
     /// Uploads `plan`'s records, builds the nucleus meshes it needs, and assigns tail slots.
@@ -1829,6 +1856,42 @@ mod tests {
         }
         println!("dust / coma at phases 10°, 90°, 160°: {drawn_by_phase:.3?}");
         assert!(drawn_by_phase[0] < drawn_by_phase[1] && drawn_by_phase[1] < drawn_by_phase[2]);
+    }
+
+    /// Lead ruling C1L-I3 and review r1 minor 5: the note names the least-drawn visible tail,
+    /// only below `DUST_DRAWN_NOTE_BELOW`, and a tail too faint to draw at the frame's exposure
+    /// raises none.
+    #[test]
+    fn dust_notes_pick_the_least_drawn_visible_tail() {
+        let d = |id: u32, fraction: f64, peak: f64| DustDrawn {
+            id,
+            light_cd: 1.0e15,
+            drawn_fraction: fraction,
+            splats: 100,
+            peak_cd_m2: peak,
+        };
+        let ev = Some(-5.0_f32);
+        let pre = f64::from(uni_gfx::exposure_scale(-5.0));
+        let bright = 10.0 * GLOW_CULL_PRE / pre;
+        let faint = 0.1 * GLOW_CULL_PRE / pre;
+        assert!(dust_notes(&[d(1, 0.85, bright)], ev).is_empty());
+        assert_eq!(
+            dust_notes(
+                &[d(1, 0.5, bright), d(2, 0.3, bright), d(3, 0.1, faint)],
+                ev
+            ),
+            vec![dust_partly_drawn_note(0.3)]
+        );
+        assert_eq!(
+            dust_notes(&[d(3, 0.1, faint)], None),
+            vec![dust_partly_drawn_note(0.1)]
+        );
+        assert!(dust_notes(&[d(3, 0.1, faint)], ev).is_empty());
+        assert_eq!(
+            dust_partly_drawn_note(0.063),
+            "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)"
+        );
+        assert!(dust_partly_drawn_note(0.004).contains("(< 1 % of its light"));
     }
 
     /// naga's layout of one struct of `comet.wgsl`: its size and (name, offset) members.

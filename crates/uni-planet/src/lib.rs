@@ -33,7 +33,7 @@ pub use comet::nucleus::nucleus_mesh;
 pub use comet::tails::{DustDrawn, DustRaster, dust_tail_luminance, ion_tail_dir, tail_schedule};
 pub use comet::{
     CometRenderer, CometScene, DUST_DRAWN_NOTE_BELOW, MAX_TAILED_COMETS, TAIL_REFRESH_WALL_S,
-    dust_partly_drawn_note,
+    dust_notes, dust_partly_drawn_note,
 };
 pub use eclipse::sun_visible_fraction;
 pub use lod::lod_exposure_mix;
