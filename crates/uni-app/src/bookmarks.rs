@@ -947,7 +947,9 @@ fn generate_wave_c(world: &mut World, marks: &[Mark]) -> Vec<Mark> {
         out.push(Mark {
             comment: "#22 6 AU above the ecliptic over the Sun, looking down at it, fov 70° \
                       (128.5 px/AU at the Sun), the vernal equinox up; \"Highlight asteroid \
-                      belt\" on (amber label)."
+                      belt\" on (amber label). The belt check reads the 3:1 Kirkwood dip in \
+                      semi-major axis, not in projected distance (lead ruling, C6 fix round 1: \
+                      eccentricities smear the gaps in distance from the Sun)."
                 .to_owned(),
             b,
         });
@@ -2204,7 +2206,8 @@ fn intent_22_asteroid_belt_above() {
     assert!(angle(c.fwd(), sun) < 1e-9);
     // 128.5 px/AU at the Sun (rectilinear: f / 6 AU, f = 540 / tan 35°).
     near("px/AU", 540.0 / deg(35.0).tan() / 6.0, 128.5, 0.01);
-    // The belt from the CPU positions: the 3:1 Kirkwood gap in a, and the Trojan clouds.
+    // The belt from the CPU positions: the 3:1 Kirkwood gap in a (lead ruling, C6 fix round 1:
+    // a, not the plan's projected r, where eccentricities smear the gap), and the Trojan clouds.
     let belt = uni_sky::BeltModel::from_catalogue(
         world.sim.asteroid_records(),
         crate::scene::BELT_MAIN,

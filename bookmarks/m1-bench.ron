@@ -114,7 +114,7 @@
         look_at: "C/2020 F3 (NEOWISE)",
         up: (0.0, 0.0, 1.0),
     ),
-    // #22 6 AU above the ecliptic over the Sun, looking down at it, fov 70° (128.5 px/AU at the Sun), the vernal equinox up; "Highlight asteroid belt" on (amber label).
+    // #22 6 AU above the ecliptic over the Sun, looking down at it, fov 70° (128.5 px/AU at the Sun), the vernal equinox up; "Highlight asteroid belt" on (amber label). The belt check reads the 3:1 Kirkwood dip in semi-major axis, not in projected distance (lead ruling, C6 fix round 1: eccentricities smear the gaps in distance from the Sun).
     (
         name: "asteroid-belt-above",
         view: (
