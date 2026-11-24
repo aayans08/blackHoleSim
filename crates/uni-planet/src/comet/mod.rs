@@ -13,7 +13,9 @@
 //! plus the coma. The nucleus reflects sunlight as a p_V 0.04 lunar-Lambert body of its (assumed)
 //! radius ([`nucleus::nucleus_illuminance_lux`], which the app's nucleus point should use too);
 //! the coma carries the total minus that, floored at 0 ([`coma::coma_intensity_cd`]); the ion
-//! tail adds 0.2 × the coma's light (v0 ratio, card note `uni_ui::theme::NOTE_TAILS`); the dust
+//! tail's light per unit length is anchored on Aravind et al. 2025's CO⁺ fluxes per candela of
+//! the coma's light and falls down the tail as their measured ρ^−0.88 (C1L fix round 2, lead
+//! ruling C1L-R2 (b); card note `uni_ui::theme::NOTE_TAILS`); the dust
 //! tail carries the dust emitted over the last 60 days, at a light production
 //! ([`tails::dust_rate_cd_per_s`]) from the comet's measured A(0)fρ law where it has one
 //! ([`tails::COMET_DUST_LAWS`], C1L fix round 2), else the coma's light /
@@ -62,7 +64,7 @@ use self::nucleus::{
 };
 pub use self::tails::DustDrawn;
 use self::tails::{
-    DrawnCache, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_LIGHT,
+    DrawnCache, GRAINS_PER_TAIL, ION_HALF_WIDTH_SIGMAS, ION_SEGMENTS, ION_TAIL_ANCHOR_PER_CD,
     KEPLER_SOLVE_US, SpriteCamera, TAIL_CPU_SHARE_MS, TailManager, TailWork, dust_grain_light,
     dust_light_drawn, dust_phase, dust_rate_cd_per_s, dust_reach_estimate_m, ion_colour,
     ion_drawn_sigma_m, ion_sigma_m, ion_tail_brightness, ion_tail_dir, ion_tail_drawn_brightness,
@@ -178,7 +180,8 @@ pub(crate) struct ComaGpu {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct TailGpu {
-    /// xyz: nucleus − camera [m], root axes; w: the ion tail's luminous intensity [cd].
+    /// xyz: nucleus − camera [m], root axes; w: the ion tail's light per unit length at its
+    /// anchor [cd/m] (`tails::ION_TAIL_ANCHOR_PER_CD` × the coma's light).
     pub(crate) nucleus: [f32; 4],
     /// xyz: Sun − nucleus [m]; w: the dust's light production [cd/s per unit of HG]
     /// (`tails::dust_rate_cd_per_s`: from the comet's dust law, else the coma's light /
@@ -389,10 +392,10 @@ pub(crate) fn plan_frame(
         let view = &candidates[i];
         let intensity = coma_intensity_cd(view);
         let axis = ion_tail_dir(view.sun_rel_m, view.helio_vel_mps);
-        let ion_light = if axis == DVec3::ZERO {
+        let ion_anchor = if axis == DVec3::ZERO {
             0.0
         } else {
-            ION_TAIL_LIGHT * intensity
+            ION_TAIL_ANCHOR_PER_CD * intensity
         };
         // C1L: the dust's light production; each splat's light is this × its emission weight ×
         // (r_h/r)² × HG, evaluated on the GPU.
@@ -404,7 +407,7 @@ pub(crate) fn plan_frame(
         plan.tails.push(TailDraw {
             id: view.id,
             gpu: TailGpu {
-                nucleus: vec4(view.nucleus_rel_m, ion_light),
+                nucleus: vec4(view.nucleus_rel_m, ion_anchor),
                 sun: vec4(view.sun_rel_m, dust_rate),
                 ion_axis: vec4(axis, ion_tail_length_m(view.r_au)),
                 ion_colour: rgb0(ion_rgb),
@@ -1124,7 +1127,7 @@ fn cs_coma(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 }
 
-// in: (s, x, L, sin ψ); out: (ion_tail_brightness at ION_PROBE_INTENSITY,
+// in: (s, x, L, sin ψ); out: (ion_tail_brightness with ION_PROBE_INTENSITY [cd/m] at the anchor,
 // ion_tail_drawn_brightness at the σ of a pixel of ION_PROBE_PIXEL × s/L, that σ
 // (ion_drawn_sigma), 0).
 @compute @workgroup_size(64, 1, 1)
@@ -1183,7 +1186,8 @@ fn cs_phase(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// The ion tail's intensity in the probe [cd] (twin of `ION_PROBE_INTENSITY`).
+/// The ion tail's light per unit length at its anchor in the probe [cd/m] (twin of
+/// `ION_PROBE_INTENSITY`).
 const ION_PROBE_INTENSITY_CD: f64 = 1.0e14;
 /// The ion probe's pixel scale [m] (twin of `ION_PROBE_PIXEL`): case (s, x, L, sin ψ) draws the
 /// ribbon for a pixel of `ION_PROBE_PIXEL_M` × s/L ([`ion_probe_pixel_m`]), so the cases with
@@ -2027,7 +2031,11 @@ mod tests {
         let scalar = |name: &str| wgsl_scalar(&m, name);
         assert_eq!(scalar("GRAINS_PER_TAIL"), GRAINS_PER_TAIL as f64);
         assert_eq!(scalar("ION_SEGMENTS"), f64::from(ION_SEGMENTS));
-        assert_eq!(scalar("ION_EFOLDS"), f32_of(tails::ION_TAIL_EFOLDS));
+        assert_eq!(scalar("ION_TAIL_SLOPE"), f32_of(tails::ION_TAIL_SLOPE));
+        assert_eq!(
+            scalar("ION_TAIL_ANCHOR_M"),
+            f32_of(tails::ION_TAIL_ANCHOR_M)
+        );
         assert_eq!(scalar("ION_WIDTH_M"), f32_of(tails::ION_TAIL_WIDTH_M));
         assert_eq!(
             scalar("ION_HALF_WIDTH_SIGMAS"),

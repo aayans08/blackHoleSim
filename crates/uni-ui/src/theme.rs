@@ -251,10 +251,12 @@ pub fn note_orbit_two_body(date_ymd: &str) -> String {
 pub const NOTE_NO_SURFACE_MAP: &str = "No surface map: uniform albedo";
 /// A comet's tails. The dust tail's light is calibrated on one comet's measured dust production
 /// (uni-planet `comet::tails::DUST_HEAD_TIME_S`), so the note says so (lead ruling C1L-c,
-/// 2026-11-24).
+/// 2026-11-24); NEOWISE's dust slope (`comet::tails::COMET_DUST_LAWS`) is extrapolated to
+/// perihelion (lead ruling on C1L fix round 2, 2026-11-24).
 pub const NOTE_TAILS: &str = "Tails: Finson\u{2013}Probstein dust model; brightness approximate. \
                               Dust tail calibrated on C/2020 F3 (NEOWISE) only; other comets \
-                              approximate";
+                              approximate. NEOWISE: dust production extrapolated from Biver et \
+                              al. 2022 (13 Jul\u{2013}14 Aug 2020) to perihelion";
 /// A comet's nucleus (review m11).
 pub const NOTE_NUCLEUS_SHAPE: &str = "Nucleus shape: procedural";
 /// A comet's brightness from SBDB's M1, K1: every comet without a cited total visual light curve
@@ -978,7 +980,8 @@ mod tests {
         assert_eq!(
             NOTE_TAILS,
             "Tails: Finson–Probstein dust model; brightness approximate. Dust tail calibrated on \
-             C/2020 F3 (NEOWISE) only; other comets approximate"
+             C/2020 F3 (NEOWISE) only; other comets approximate. NEOWISE: dust production \
+             extrapolated from Biver et al. 2022 (13 Jul–14 Aug 2020) to perihelion"
         );
         // Task C6 fix round 1 (I1): the comet brightness notes.
         assert_eq!(

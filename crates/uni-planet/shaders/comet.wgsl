@@ -32,8 +32,11 @@
 const GRAINS_PER_TAIL: u32 = 1024u;
 // Segments of the ion-tail ribbon (twin of tails::ION_SEGMENTS).
 const ION_SEGMENTS: u32 = 32u;
-// e-foldings of the ion tail's fall-off over its length (tails::ION_TAIL_EFOLDS).
-const ION_EFOLDS: f32 = 3.0;
+// The ion tail's fall-off s^-ION_TAIL_SLOPE beyond its anchor ION_TAIL_ANCHOR_M [m], flat inside
+// (tails::ION_TAIL_SLOPE, tails::ION_TAIL_ANCHOR_M: Aravind et al. 2025's measured CO+ fall-off,
+// extrapolated down the tail; lead ruling C1L-R2 (b)).
+const ION_TAIL_SLOPE: f32 = 0.884;
+const ION_TAIL_ANCHOR_M: f32 = 9.685e7;
 // The ion tail's FWHM [m] (tails::ION_TAIL_WIDTH_M) and the ribbon's half width in σ.
 const ION_WIDTH_M: f32 = 1.0e8;
 const ION_HALF_WIDTH_SIGMAS: f32 = 3.5;
@@ -88,7 +91,7 @@ struct ComaGpu {
 
 // Twin of uni_planet::comet::TailGpu: 80 bytes, one per tail slot.
 struct TailGpu {
-    // xyz: nucleus − camera [m]; w: the ion tail's luminous intensity [cd].
+    // xyz: nucleus − camera [m]; w: the ion tail's light per unit length at its anchor [cd/m].
     nucleus: vec4<f32>,
     // xyz: Sun − nucleus [m]; w: the dust's light production [cd/s per unit of HG]
     // (tails::dust_emission_cd_per_s: I_coma / DUST_HEAD_TIME_S).
@@ -149,35 +152,33 @@ fn coma_visible_half(intensity: f32, scale: f32, pixel: f32, half: f32, pre: f32
 }
 
 // The ion tail as the ribbon draws it [cd/m²], at s along and x across the axis, for a tail of
-// `length` carrying `intensity`, seen at sin ψ to its axis, with its Gaussian cross-section
-// widened to `sigma` (≥ the physical σ) and renormalised (the light across is kept). Twin of
+// `length` whose light per unit length at the anchor is `anchor` [cd/m], seen at sin ψ to its axis:
+// flat to ION_TAIL_ANCHOR_M, then (s/s_a)^-ION_TAIL_SLOPE, with its Gaussian cross-section widened
+// to `sigma` (≥ the physical σ) and renormalised (the light across is kept). Twin of
 // tails::ion_tail_drawn_brightness.
 fn ion_tail_drawn_brightness(
     s: f32,
     x: f32,
     length: f32,
-    intensity: f32,
+    anchor: f32,
     sin_psi: f32,
     sigma: f32,
 ) -> f32 {
     if (!(s >= 0.0 && s < length && sigma > 0.0)) {
         return 0.0;
     }
-    let lambda = length / ION_EFOLDS;
-    let tip = exp(-ION_EFOLDS);
-    let norm = lambda * (1.0 - tip) - length * tip;
-    let along = (exp(-s / lambda) - tip) / norm;
+    let along = pow(max(s, ION_TAIL_ANCHOR_M) / ION_TAIL_ANCHOR_M, -ION_TAIL_SLOPE);
     let t = x / sigma;
     let across = exp(-0.5 * t * t) / (sqrt(TAU) * sigma);
     let sin_eff = max(sin_psi, ION_WIDTH_M / length);
-    return intensity * along * across / sin_eff;
+    return anchor * along * across / sin_eff;
 }
 
 // The ion tail's surface brightness [cd/m²] at its physical width (FWHM ION_WIDTH_M). Twin of
 // tails::ion_tail_brightness.
-fn ion_tail_brightness(s: f32, x: f32, length: f32, intensity: f32, sin_psi: f32) -> f32 {
+fn ion_tail_brightness(s: f32, x: f32, length: f32, anchor: f32, sin_psi: f32) -> f32 {
     let sigma = ION_WIDTH_M / FWHM_PER_SIGMA;
-    return ion_tail_drawn_brightness(s, x, length, intensity, sin_psi, sigma);
+    return ion_tail_drawn_brightness(s, x, length, anchor, sin_psi, sigma);
 }
 
 // The σ [m] the ribbon is drawn with where a pixel spans `pixel` metres: the physical σ, at

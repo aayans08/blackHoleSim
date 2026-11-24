@@ -35,10 +35,13 @@
 //!     ([`tail_grains`]): fewer, equally smooth splats, so less fill.
 //! - **Ion:** straight along the aberrated anti-sunward direction û = normalize(400 km/s · r̂_h −
 //!   v_comet) (Brandt 1968, in *Introduction to the Solar Wind*; ruling 8), 0.3 AU / r_h long (at
-//!   most 1 AU), falling off exponentially along its length, a Gaussian 10⁵ km wide (FWHM)
-//!   across it, CO⁺ blue (the comet-tail system's 36 bands summed through the CMFs, Rousselot et
-//!   al. 2024 g-factors at Opitom et al. 2019 wavelengths, [`ion_colour`]; C1L fix round 2, lead
-//!   ruling C1L-R2), 0.2 × the coma's light (v0; [`ION_TAIL_LIGHT`]). Drawn as a ribbon that turns about its axis to face the camera,
+//!   most 1 AU), a Gaussian 10⁵ km wide (FWHM) across it, CO⁺ blue (the comet-tail system's 36
+//!   bands summed through the CMFs, Rousselot et al. 2024 g-factors at Opitom et al. 2019
+//!   wavelengths, [`ion_colour`]). Its light is anchored on Aravind et al. 2025's CO⁺ fluxes with
+//!   every band counted, 1.33 × 10⁻⁴ cd/m² at 1.04 × 10⁵ km from NEOWISE's head on 2020-07-24, and
+//!   falls along the tail as their measured ρ^−0.88, extrapolated outward ([`ION_TAIL_SLOPE`],
+//!   [`ION_TAIL_ANCHOR_PER_CD`]; C1L fix round 2, lead ruling C1L-R2 (b)). Drawn as a ribbon that
+//!   turns about its axis to face the camera,
 //!   with the surface brightness of an optically thin cylinder ([`ion_tail_brightness`]); from
 //!   afar its σ is widened to at least [`ION_MIN_SIGMA_PX`] with the light across it kept
 //!   ([`ion_tail_drawn_brightness`], review C1 I2), so it never aliases into a beaded line.
@@ -75,16 +78,31 @@ pub const ION_TAIL_LENGTH_AT_1AU_M: f64 = 0.3 * AU;
 pub const ION_TAIL_MAX_LENGTH_M: f64 = AU;
 /// Ion-tail width [m], the FWHM of its Gaussian cross-section (plan C1: 10⁵ km).
 pub const ION_TAIL_WIDTH_M: f64 = 1.0e8;
-/// The ion tail's light as a fraction of the coma's (plan C1, v0; approximate, card note
-/// `uni_ui::theme::NOTE_TAILS`). C1L fix round 2 derived it from Aravind et al. 2025's CO⁺ fluxes
-/// with every band of the system counted ([`aravind_co_plus_luminance`]) and this ribbon's
-/// profile calibrated at their outermost aperture: 0.34 (`ion_light_from_aravind`), which would
-/// make the line brighter, not the 10⁻⁶–10⁻⁵ cd/m² lead ruling C1L-R2 expected. The v0 value
-/// stays until the lead rules (the along-tail profile beyond 10⁵ km is not measured there).
-pub const ION_TAIL_LIGHT: f64 = 0.2;
-/// e-foldings of the ion tail's exponential fall-off over its length (a choice: the brightness
-/// at the tip is e^(−3) = 5 % of the base's before the profile is brought to 0 there).
-pub const ION_TAIL_EFOLDS: f64 = 3.0;
+/// The ion tail's measured fall-off: its CO⁺ surface brightness goes as ρ^−[`ION_TAIL_SLOPE`]
+/// with the distance ρ from the head (lead ruling C1L-R2 (b), 2026-11-24). It is the
+/// least-squares slope of Aravind et al. 2025's CO⁺ (3-0) + (2-0) fluxes against their aperture
+/// distances, 3.6–10.4 × 10⁴ km on 2020-07-24 ([`ARAVIND_CO_PLUS_FLUX`]: −0.884,
+/// `ion_tail_is_anchored_on_aravind`). Beyond 10.4 × 10⁴ km (≈ 0.1° at row 20) it is an
+/// extrapolation: no source we could read measures the fall-off down the tail, and near the head
+/// the slope is that of an ion coma's 1/ρ column (approximate; card note
+/// `uni_ui::theme::NOTE_TAILS`).
+pub const ION_TAIL_SLOPE: f64 = 0.884;
+/// The ion tail's anchor [m along its axis]: Aravind et al.'s outermost aperture, ρ = 1.035 ×
+/// 10⁸ m on the sky at 22° to the tail, i.e. s = ρ cos 22°/sin ψ with sin ψ = 0.9913 that night
+/// (`ion_tail_is_anchored_on_aravind`). Inside it the profile is held flat at the anchor's level
+/// (continuous, and below the coma there); outside it falls as s^−[`ION_TAIL_SLOPE`], never
+/// brighter than at the anchor.
+pub const ION_TAIL_ANCHOR_M: f64 = 9.685e7;
+/// The ion tail's light per unit length of its axis at the anchor [cd/m], per candela of the
+/// coma's light [1/m] (lead ruling C1L-R2 (b)): Aravind et al.'s all-band CO⁺ luminance at their
+/// outermost aperture, 1.328 × 10⁻⁴ cd/m² ([`aravind_co_plus_luminance`]), × sin ψ / the
+/// cross-section's Gaussian there (x = ρ sin 22° = 0.91 σ off the axis), divided by the coma's
+/// 1.203 × 10¹⁵ cd that night (NEOWISE's visual law at r_h 0.66, Δ 0.69 AU):
+/// 2.13 × 10⁴ cd/m / 1.203 × 10¹⁵ cd. The ion tail scales with the coma's light at other times
+/// and for other comets (approximate). At row 20 the line is then 5.6, 1.4 and 0.74 × 10⁻⁵
+/// cd/m² at 1°, 5° and 10° from the head (C1's v0 0.2 × the coma drew 3.3, 2.5 and
+/// 1.8 × 10⁻⁴).
+pub const ION_TAIL_ANCHOR_PER_CD: f64 = 1.768e-11;
 /// Segments of the ion-tail ribbon (twin of `ION_SEGMENTS` in `comet.wgsl`).
 pub const ION_SEGMENTS: u32 = 32;
 /// The ribbon reaches this many σ of the cross-section on each side (light beyond: 5 × 10⁻⁴).
@@ -235,7 +253,11 @@ impl CometDustLaw {
 /// on the SBDB orbit (`neowise_dust_law_range_is_the_papers`). Their absolute values (red band;
 /// 10 000 cm on 21.9 July in their Fig. 2) are not used: the level stays Aravind et al. 2025's
 /// green-continuum A(0)fρ = 34.99 m on 2020-07-22 at r_h 0.63 AU ([`NEOWISE_AFRHO0_M`]), the
-/// anchor [`DUST_HEAD_TIME_S`] is calibrated at, so only the slope is Biver's.
+/// anchor [`DUST_HEAD_TIME_S`] is calibrated at, so only the slope is Biver's. The tail of a
+/// view near perihelion holds dust emitted outside that span: NEOWISE's dust production is
+/// extrapolated from Biver et al. 2022 (13 Jul–14 Aug 2020) to perihelion (98.6 % of row 20's
+/// emission weight; accepted for M1 by lead ruling, 2026-11-24; card note
+/// `uni_ui::theme::NOTE_TAILS`).
 pub const COMET_DUST_LAWS: [CometDustLaw; 1] = [CometDustLaw {
     spkid: NEOWISE_SPKID,
     name: "C/2020 F3 (NEOWISE)",
@@ -536,47 +558,60 @@ pub fn ion_tail_length_m(r_au: f64) -> f64 {
 }
 
 /// The ion tail's surface brightness [cd/m²] on its ribbon at distance `s_m` along the axis from
-/// the nucleus and `x_m` across it, for a tail of `length_m` carrying `intensity_cd`, seen at
-/// angle ψ to its axis (`sin_psi`). The light per unit length falls as e^(−s/λ) − e^(−L/λ),
-/// λ = L/[`ION_TAIL_EFOLDS`] (0 at the tip), the cross-section is a Gaussian of FWHM
-/// [`ION_TAIL_WIDTH_M`], and the ribbon's brightness is divided by sin ψ (at least w/L) because an
-/// optically thin cylinder's projected light is foreshortened into a shorter streak. Over the
-/// ribbon ∫S sin ψ ds dx = I. CPU twin of the shader's; probed on the GPU.
+/// the nucleus and `x_m` across it, for a tail of `length_m` whose light per unit length at the
+/// anchor is `anchor_cd_per_m` [cd/m] ([`ION_TAIL_ANCHOR_PER_CD`] × the coma's light), seen at
+/// angle ψ to its axis (`sin_psi`). The light per unit length is flat to [`ION_TAIL_ANCHOR_M`]
+/// and falls as (s/s_a)^−[`ION_TAIL_SLOPE`] beyond it, to the tail's end (lead ruling C1L-R2 (b));
+/// the cross-section is a Gaussian of FWHM [`ION_TAIL_WIDTH_M`], and the ribbon's brightness is
+/// divided by sin ψ (at least w/L) because an optically thin cylinder's projected light is
+/// foreshortened into a shorter streak. Over the ribbon ∫S sin ψ ds dx = [`ion_tail_light_cd`].
+/// CPU twin of the shader's; probed on the GPU.
 pub fn ion_tail_brightness(
     s_m: f64,
     x_m: f64,
     length_m: f64,
-    intensity_cd: f64,
+    anchor_cd_per_m: f64,
     sin_psi: f64,
 ) -> f64 {
-    ion_tail_drawn_brightness(s_m, x_m, length_m, intensity_cd, sin_psi, ion_sigma_m())
+    ion_tail_drawn_brightness(s_m, x_m, length_m, anchor_cd_per_m, sin_psi, ion_sigma_m())
 }
 
 /// The ion tail as the ribbon draws it: [`ion_tail_brightness`] with the cross-section's σ
 /// widened to `sigma_m` (≥ the physical σ: [`ion_drawn_sigma_m`]) and the Gaussian renormalised
-/// to it, so the light across the tail, and ∫S sin ψ ds dx = I, are unchanged (review C1 I2).
+/// to it, so the light across the tail, and ∫S sin ψ ds dx, are unchanged (review C1 I2).
 /// The sin ψ cap keeps the physical width (the axial column is a property of the tail, not of
 /// the pixel). 0 for σ ≤ 0. CPU twin of the shader's; probed on the GPU.
 pub fn ion_tail_drawn_brightness(
     s_m: f64,
     x_m: f64,
     length_m: f64,
-    intensity_cd: f64,
+    anchor_cd_per_m: f64,
     sin_psi: f64,
     sigma_m: f64,
 ) -> f64 {
     if !(s_m >= 0.0 && s_m < length_m && sigma_m > 0.0) {
         return 0.0;
     }
-    let lambda = length_m / ION_TAIL_EFOLDS;
-    let tip = (-ION_TAIL_EFOLDS).exp();
-    // ∫₀^L (e^(−s/λ) − e^(−L/λ)) ds.
-    let norm = lambda * (1.0 - tip) - length_m * tip;
-    let along = ((-s_m / lambda).exp() - tip) / norm;
+    let along = (s_m.max(ION_TAIL_ANCHOR_M) / ION_TAIL_ANCHOR_M).powf(-ION_TAIL_SLOPE);
     let t = x_m / sigma_m;
     let across = (-0.5 * t * t).exp() / (std::f64::consts::TAU.sqrt() * sigma_m);
     let sin_eff = sin_psi.max(ION_TAIL_WIDTH_M / length_m);
-    intensity_cd * along * across / sin_eff
+    anchor_cd_per_m * along * across / sin_eff
+}
+
+/// The ion tail's whole light [cd] for a tail of `length_m` with `anchor_cd_per_m` at its anchor:
+/// ∫₀^L of the light per unit length, s_a + s_a^k (L^(1−k) − s_a^(1−k))/(1 − k) times the anchor's,
+/// k = [`ION_TAIL_SLOPE`] (the flat part to s_a, then the power law). Row 20's NEOWISE: 0.020 ×
+/// the coma (C1's v0: 0.2 ×).
+pub fn ion_tail_light_cd(length_m: f64, anchor_cd_per_m: f64) -> f64 {
+    let (sa, k) = (ION_TAIL_ANCHOR_M, ION_TAIL_SLOPE);
+    let len = length_m.max(0.0);
+    let span = if len <= sa {
+        len
+    } else {
+        sa + sa.powf(k) * (len.powf(1.0 - k) - sa.powf(1.0 - k)) / (1.0 - k)
+    };
+    anchor_cd_per_m * span
 }
 
 /// σ of the ion tail's Gaussian cross-section [m]: FWHM / (2√(2 ln 2)).
@@ -1603,13 +1638,15 @@ mod tests {
         assert_eq!(ion_tail_length_m(0.1), AU);
     }
 
-    /// The ion ribbon's profile integrates to the tail's light, ∫∫ S sin ψ ds dx = I, and is 0 at
-    /// the tip and beyond either end.
+    /// The ion ribbon's profile integrates to the tail's light, ∫∫ S sin ψ ds dx =
+    /// [`ion_tail_light_cd`], and is 0 at the tip and beyond either end.
     #[test]
     fn ion_tail_profile_integrates_to_its_light() {
-        let (l, i) = (0.4 * AU, 2.0e14);
+        let (l, anchor) = (0.4 * AU, 2.0e4);
+        let i = ion_tail_light_cd(l, anchor);
+        assert!(i > anchor * ION_TAIL_ANCHOR_M && i < anchor * l, "{i}");
         for sin_psi in [1.0, 0.5, 0.1] {
-            let (ns, nx) = (4_000, 400);
+            let (ns, nx) = (20_000, 200);
             let half = ION_HALF_WIDTH_SIGMAS * ION_TAIL_WIDTH_M / 2.354_820_045;
             let (ds, dx) = (l / ns as f64, 2.0 * half / nx as f64);
             let mut sum = 0.0;
@@ -1617,7 +1654,7 @@ mod tests {
                 for b in 0..nx {
                     let s = (a as f64 + 0.5) * ds;
                     let x = -half + (b as f64 + 0.5) * dx;
-                    sum += ion_tail_brightness(s, x, l, i, sin_psi) * sin_psi * ds * dx;
+                    sum += ion_tail_brightness(s, x, l, anchor, sin_psi) * sin_psi * ds * dx;
                 }
             }
             assert!(
@@ -1625,13 +1662,17 @@ mod tests {
                 "sin ψ {sin_psi}: {sum} of {i}"
             );
         }
-        assert_eq!(ion_tail_brightness(l, 0.0, l, i, 1.0), 0.0);
-        assert_eq!(ion_tail_brightness(-1.0, 0.0, l, i, 1.0), 0.0);
-        assert_eq!(ion_tail_brightness(l + 1.0, 0.0, l, i, 1.0), 0.0);
+        assert_eq!(ion_tail_brightness(l, 0.0, l, anchor, 1.0), 0.0);
+        assert_eq!(ion_tail_brightness(-1.0, 0.0, l, anchor, 1.0), 0.0);
+        assert_eq!(ion_tail_brightness(l + 1.0, 0.0, l, anchor, 1.0), 0.0);
+        // Flat inside the anchor, never brighter outward.
+        let on = |s: f64| ion_tail_brightness(s, 0.0, l, anchor, 1.0);
+        assert_eq!(on(0.0), on(0.5 * ION_TAIL_ANCHOR_M));
+        assert!(on(2.0 * ION_TAIL_ANCHOR_M) < on(ION_TAIL_ANCHOR_M));
         // Looking along the axis the brightness is capped at the axial column (sin ψ ≥ w/L).
         assert_eq!(
-            ion_tail_brightness(1e9, 0.0, l, i, 0.0),
-            ion_tail_brightness(1e9, 0.0, l, i, ION_TAIL_WIDTH_M / l)
+            ion_tail_brightness(1e9, 0.0, l, anchor, 0.0),
+            ion_tail_brightness(1e9, 0.0, l, anchor, ION_TAIL_WIDTH_M / l)
         );
         let c = ion_colour();
         assert!((luminance(c) - 1.0).abs() < 1e-5, "{c}");
@@ -2101,17 +2142,17 @@ mod tests {
         assert!((dust_production(0.5, -4.0) - 16.0).abs() < 1e-12);
     }
 
-    /// Lead ruling C1L-R2: Aravind et al.'s CO⁺ fluxes as luminance, and the ion light they imply.
-    /// - The vibrational fit places Opitom et al.'s 15 bands within 1.5 nm.
-    /// - The two measured bands (3-0, 2-0) carry < 1 % of the system's luminance (Rousselot et
-    ///   al.'s g and the CIE ȳ), so the outermost aperture (1.04 × 10⁵ km) is 1.33 × 10⁻⁴ cd/m².
-    /// - The colour is a blue (B > G > R; R:G 0.38), not C1's violet (R > G).
-    /// - The ribbon calibrated there, with its present profile, carries 0.34 × the coma's light
-    ///   (C1's v0: 0.2), which puts row 20's line at 5.6, 4.2 and 3.0 × 10⁻⁴ cd/m² at 1°, 5° and
-    ///   10°: the ruling's expected 10⁻⁶–10⁻⁵ is not reached (the fix round 2 report). Prints the
-    ///   numbers; `ION_TAIL_LIGHT` stays C1's 0.2 until the lead rules.
+    /// Lead ruling C1L-R2 (b): the ion tail anchored on Aravind et al. 2025's CO⁺ fluxes.
+    /// - The vibrational fit places Opitom et al.'s 15 bands within 1.5 nm; the two measured
+    ///   bands (3-0, 2-0) carry < 1 % of the system's luminance; the colour is a blue (B > G > R).
+    /// - [`ION_TAIL_SLOPE`], [`ION_TAIL_ANCHOR_M`] and [`ION_TAIL_ANCHOR_PER_CD`] are what their
+    ///   inputs give, and the ribbon then reproduces the outermost aperture's 1.33 × 10⁻⁴ cd/m².
+    /// - Row 20's line (on its axis, drawn σ) is 5.6, 1.4 and 0.74 × 10⁻⁵ cd/m² at 1°, 5° and 10°
+    ///   from the head, and falls monotonically from 0.1° to 10°.
+    /// - Inside the anchor (the flat part) the line is below the coma at rows 20 and 21 and on
+    ///   the calibration night.
     #[test]
-    fn ion_light_from_aravind() {
+    fn ion_tail_is_anchored_on_aravind() {
         use uni_physics::standish::{Planet, heliocentric_state_icrs as planet_state};
         let c = co_plus_vibrational_fit();
         let worst = CO_PLUS_BANDS_NM
@@ -2124,7 +2165,6 @@ mod tests {
             })
             .fold(0.0, f64::max);
         let xyz = co_plus_xyz();
-        let g2 = CO_PLUS_G[3][0] + CO_PLUS_G[2][0];
         let two_band = (CO_PLUS_G[3][0] * cie_1931_cmf_fit(400.0).y
             + CO_PLUS_G[2][0] * cie_1931_cmf_fit(425.0).y)
             / xyz.y;
@@ -2135,55 +2175,77 @@ mod tests {
             col.z > col.y && col.y > col.x && col.x / col.y < 0.5,
             "{col}"
         );
-        println!(
-            "CO+ fit {c:?}, worst residual {worst:.2} nm; Y/(g30+g20) {:.4}; the two measured \
-             bands carry {:.2} % of the luminance; colour {col}, xy ({:.3}, {:.3})",
-            xyz.y / g2,
-            100.0 * two_band,
-            xyz.x / xyz.element_sum(),
-            xyz.y / xyz.element_sum()
-        );
-        for k in 0..5 {
-            println!(
-                "  ρ {:.0} km: {:.3e} cd/m²",
-                ARAVIND_CO_PLUS_FLUX[k].0,
-                aravind_co_plus_luminance(k)
-            );
-        }
         assert!((aravind_co_plus_luminance(4) / 1.328e-4 - 1.0).abs() < 0.01);
         assert_eq!(aravind_co_plus_luminance(5), 0.0);
+        // The slope: least squares of ln(F₃₀ + F₂₀) against ln ρ.
+        let pts: Vec<(f64, f64)> = ARAVIND_CO_PLUS_FLUX
+            .iter()
+            .map(|&(rho, a, b)| (rho.ln(), (a + b).ln()))
+            .collect();
+        let n = pts.len() as f64;
+        let (mx, my) = (
+            pts.iter().map(|p| p.0).sum::<f64>() / n,
+            pts.iter().map(|p| p.1).sum::<f64>() / n,
+        );
+        let slope = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>()
+            / pts.iter().map(|p| (p.0 - mx) * (p.0 - mx)).sum::<f64>();
+        assert!((slope + ION_TAIL_SLOPE).abs() < 1e-3, "{slope}");
+        // The night's geometry (the Earth–Sun distance checked against the ephemeris).
         let t = Epoch::parse_iso_utc("2020-07-24T21:00:00Z").expect("date");
         let (earth, _) = planet_state(Planet::EmBary, t);
-        let (nuc, _) = heliocentric_state_icrs(&neowise_conic(), t);
-        println!(
-            "2020-07-24: r_h {:.4}, Δ {:.4}, Earth–Sun {:.4} AU",
-            nuc.length() / AU,
-            (nuc - earth).length() / AU,
-            earth.length() / AU
-        );
         assert!((earth.length() / AU - ARAVIND_ION_NIGHT_AU[2]).abs() < 5e-4);
         let [r, d, e] = ARAVIND_ION_NIGHT_AU;
         let cos_a = (r * r + d * d - e * e) / (2.0 * r * d);
         let sin_psi = (1.0 - cos_a * cos_a).sqrt();
-        let len = ion_tail_length_m(r);
         let (rho, _, _) = ARAVIND_CO_PLUS_FLUX[4];
         let a = ARAVIND_SLIT_TO_TAIL_DEG.to_radians();
-        let (s_m, x_m) = (rho * 1e3 * a.cos() / sin_psi, rho * 1e3 * a.sin());
-        let per_cd = ion_tail_brightness(s_m, x_m, len, 1.0, sin_psi);
-        let i_ion = aravind_co_plus_luminance(4) / per_cd;
+        let (s_a, x_a) = (rho * 1e3 * a.cos() / sin_psi, rho * 1e3 * a.sin());
+        assert!((s_a / ION_TAIL_ANCHOR_M - 1.0).abs() < 1e-3, "{s_a}");
+        let sigma = ion_sigma_m();
+        let across = (-0.5 * (x_a / sigma).powi(2)).exp() / (std::f64::consts::TAU.sqrt() * sigma);
+        let anchor = aravind_co_plus_luminance(4) * sin_psi / across;
         let law = uni_sim::world::comet_visual_law(NEOWISE_SPKID).expect("law");
-        let coma = crate::comet::coma::comet_total_intensity_cd(law.m1(), law.k1, r, d);
-        let ratio = i_ion / coma;
-        assert!((0.30..0.38).contains(&ratio), "{ratio}");
+        let coma_cal = crate::comet::coma::comet_total_intensity_cd(law.m1(), law.k1, r, d);
+        let per_cd = anchor / coma_cal;
         println!(
-            "ion night: sin ψ {sin_psi:.4}; I_ion {i_ion:.3e} cd = {ratio:.4} × the coma ({coma:.3e} cd)"
+            "ion anchor: slope {slope:.4}, s_a {s_a:.4e} m, sin ψ {sin_psi:.4}, {anchor:.4e} cd/m \
+             = {per_cd:.4e} per cd of the coma ({coma_cal:.4e} cd); colour {col}"
         );
+        assert!(
+            (per_cd / ION_TAIL_ANCHOR_PER_CD - 1.0).abs() < 1e-3,
+            "{per_cd:e}"
+        );
+        // Round trip: the ribbon at the aperture gives the measured luminance.
+        let len = ion_tail_length_m(r);
+        let back = ion_tail_brightness(s_a, x_a, len, ION_TAIL_ANCHOR_PER_CD * coma_cal, sin_psi);
+        assert!(
+            (back / aravind_co_plus_luminance(4) - 1.0).abs() < 2e-3,
+            "{back:e}"
+        );
+        // The near head stays below the coma (the profile is flat inside the anchor).
+        let below_coma = |anchor_cd_m: f64, coma_cd: f64, r_au: f64, sin_p: f64, len_m: f64| {
+            let l = crate::comet::coma::coma_scale_m(r_au);
+            (1..=50).all(|k| {
+                let s_m = ION_TAIL_ANCHOR_M * f64::from(k) / 50.0;
+                let ion = ion_tail_brightness(s_m, 0.0, len_m, anchor_cd_m, sin_p);
+                let coma = crate::comet::coma::coma_surface_brightness(s_m * sin_p, coma_cd, l);
+                ion <= coma
+            })
+        };
+        assert!(below_coma(
+            ION_TAIL_ANCHOR_PER_CD * coma_cal,
+            coma_cal,
+            r,
+            sin_psi,
+            len
+        ));
         // Row 20.
         let (view, camera, vel, coma20) = neowise_row_20();
         let axis = ion_tail_dir(view.sun_rel_m, vel);
         let len20 = ion_tail_length_m(view.r_au);
+        let anchor20 = ION_TAIL_ANCHOR_PER_CD * coma20;
         let pixel_rad = 2.0 * (0.5 * camera.fov_y_rad).tan() / 1080.0;
-        for deg in [1.0_f64, 5.0, 10.0] {
+        let on_axis = |deg: f64| {
             let angle = |s: f64| angle_deg(view.nucleus_rel_m, view.nucleus_rel_m + axis * s);
             let (mut lo, mut hi) = (0.0, len20);
             for _ in 0..100 {
@@ -2193,15 +2255,58 @@ mod tests {
             let p = view.nucleus_rel_m + axis * lo;
             let sp = axis.cross(p.normalize()).length();
             let sigma = ion_drawn_sigma_m(p.length() * pixel_rad);
-            let at =
-                |light: f64| ion_tail_drawn_brightness(lo, 0.0, len20, light * coma20, sp, sigma);
-            println!(
-                "  row 20 at {deg}°: s {:.3e} m, sin ψ {sp:.3}; ion line now (0.2) {:.3e}, derived ({ratio:.3}) {:.3e} cd/m²",
+            (
                 lo,
-                at(ION_TAIL_LIGHT),
-                at(ratio)
-            );
+                sp,
+                ion_tail_drawn_brightness(lo, 0.0, len20, anchor20, sp, sigma),
+            )
+        };
+        let at: Vec<f64> = [1.0, 5.0, 10.0].map(|deg| on_axis(deg).2).to_vec();
+        println!(
+            "row 20 ion line at 1°, 5°, 10°: {:.3e}, {:.3e}, {:.3e} cd/m²; whole tail {:.4} × the \
+             coma",
+            at[0],
+            at[1],
+            at[2],
+            ion_tail_light_cd(len20, anchor20) / coma20
+        );
+        for (got, want) in at.iter().zip([5.65e-5, 1.36e-5, 7.4e-6]) {
+            assert!((got / want - 1.0).abs() < 0.05, "{got:e} vs {want:e}");
         }
+        let mut last = f64::INFINITY;
+        for k in 1..=100 {
+            let v = on_axis(0.1 * f64::from(k)).2;
+            assert!(
+                v <= last * (1.0 + 1e-9),
+                "rises at {:.1}°",
+                0.1 * f64::from(k)
+            );
+            last = v;
+        }
+        let sp20 = on_axis(0.05).1;
+        assert!(below_coma(anchor20, coma20, view.r_au, sp20, len20));
+        // Row 21 (Halley, SBDB's M1 5.5 and K1 8.0), from the side.
+        let conic = conic_from_perihelion(
+            0.574_863_831_374_341_3,
+            0.967_935_995_695_321_1,
+            162.190_530_043_912_9,
+            59.098_947_206_124_37,
+            112.241_431_463_776_4,
+            2_446_469.973_616_146_5,
+        );
+        let t21 = Epoch::parse_iso_utc("1986-03-13T00:00:00Z").expect("date");
+        let (nucleus, _) = heliocentric_state_icrs(&conic, t21);
+        let cam = DVec3::new(-5.220_879e8, -4.682_337e8, 1.873_014e9);
+        let halley = comet_on(2, conic, t21, nucleus + cam, 5.5, 8.0);
+        let coma21 = crate::comet::coma::coma_intensity_cd(&halley);
+        let len21 = ion_tail_length_m(halley.r_au);
+        assert!(below_coma(
+            ION_TAIL_ANCHOR_PER_CD * coma21,
+            coma21,
+            halley.r_au,
+            1.0,
+            len21
+        ));
     }
 
     /// C1L (owner: NEOWISE's dust tail was short and not visibly curved): at row 20's geometry

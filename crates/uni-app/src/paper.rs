@@ -26,7 +26,8 @@
 //! pixel at the nucleus), added to the pixel's world light. The dust tails are the comet pass's
 //! CPU twin (`uni_planet::dust_tail_luminance`, lead ruling C1L-b): the same comets, splats, cap
 //! and floor as a capture's first frame, without the visibility cull and occlusion. The ion
-//! tail (0.2 × the coma's light along a 10⁵ km ribbon) and the km-sized nucleus are left out.
+//! tail (≈ 0.02 × the coma's light along a 10⁵ km ribbon, C1L fix round 2) and the km-sized
+//! nucleus are left out.
 //!
 //! Points (unresolved bodies) are sky light at star exposure and are not metered.
 //!
