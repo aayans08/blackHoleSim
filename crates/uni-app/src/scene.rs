@@ -849,6 +849,10 @@ impl Scene {
             epoch: ctx.epoch,
             eye_adapted: eye,
         });
+        // The comet pass's partly-drawn note needs the tail to be visible at the metered scene
+        // exposure (C1L fix round 2, review r1 minor 5; `uni_planet::dust_notes`).
+        let scene_ev = self.metered_scene_ev(&settings);
+        self.comet_pass.borrow_mut().set_scene_ev100(Some(scene_ev));
         // The procedural belt is always drawn (real photometry: invisible from afar, plan
         // round 2, I12); the pass multiplies by BELT_HIGHLIGHT_GAIN itself while `highlight`.
         let sun_rel = snapshot.sun.as_ref().map_or(DVec3::NAN, |s| s.rel_pos_m);
@@ -921,14 +925,19 @@ impl Scene {
         if !(w > 0.0) {
             return 1.0;
         }
-        let scene_ev = match settings.mode {
+        point_exposure_factor(w, settings.eye_star_ev100, self.metered_scene_ev(settings))
+    }
+
+    /// The scene EV the frame is metered at: the manual one in Manual mode, the last read-back
+    /// auto EV in Auto (one frame late while adapting; the manual one before the first read-back).
+    fn metered_scene_ev(&self, settings: &ExposureSettings) -> f32 {
+        match settings.mode {
             ExposureMode::Manual => settings.manual.scene_ev100,
             ExposureMode::Auto => self
                 .readback
                 .last_ev100()
                 .map_or(settings.manual.scene_ev100, |e| e[0]),
-        };
-        point_exposure_factor(w, settings.eye_star_ev100, scene_ev)
+        }
     }
 
     /// Records `frame` into `output` (see [`Renderer::render`]).
