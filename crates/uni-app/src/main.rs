@@ -12,6 +12,7 @@ mod bookmarks;
 mod capture;
 mod measure;
 mod paper;
+mod present;
 mod scene;
 mod selftest;
 mod tap;

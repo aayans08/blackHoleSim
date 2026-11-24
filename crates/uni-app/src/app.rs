@@ -1,8 +1,9 @@
 //! winit ApplicationHandler: window, main loop and per-frame wiring (M0 Task 11, M1 Task B9).
 //!
 //! Starts at the `start` bookmark of `bookmarks/m1.ron` (Earth from 60 000 km), renders
-//! continuously (`ControlFlow::Poll`, Fifo present), and feeds winit input to the HUD and the
-//! fly camera. The scene renders at a fixed internal resolution of about 1080 lines at the
+//! continuously (`ControlFlow::Poll`, Fifo present) while the window is visible, and feeds winit
+//! input to the HUD and the fly camera. While the window is minimised, hidden or covered it
+//! sleeps and retries four times a second, and nothing moves (Task C6w, [`crate::present`]). The scene renders at a fixed internal resolution of about 1080 lines at the
 //! window's aspect ([`internal_size`]); the tonemap upscales it to the swapchain and the HUD
 //! draws at full resolution on top (review I6).
 //!
@@ -51,6 +52,7 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
+use crate::present::{self, Attempt, Change, PresentGate};
 use crate::scene::{
     HudExtras, INTERACTIVE_LENS_SCALE, OVERLAY_SETTINGS, Perf, Scene, StarCatalog, UiState,
     ViewChoices, absolute_view, apply_bookmark, default_controls, flight_label, hud_data,
@@ -74,8 +76,9 @@ const FPS_SMOOTHING: f32 = 0.1;
 /// How often the window logs its frame rate at `info` level (the HUD's perf line, for runs read
 /// from the terminal: `RUST_LOG=info`).
 const FPS_LOG_INTERVAL: Duration = Duration::from_secs(10);
-/// Longest frame time the camera moves by [s]. After a stall (a minimised window, a debugger)
-/// a held key moves the camera one short step instead of speed × the stall.
+/// Longest frame time the camera moves by [s]. After a stall (a debugger, a slow frame) a held
+/// key moves the camera one short step instead of speed × the stall. (After a pause in
+/// presenting, such as a minimised window, the first frame's dt is 0: [`crate::present`].)
 const MAX_CAMERA_DT_S: f64 = 0.1;
 /// GPU error lines kept on the HUD (the most recent ones; review m6).
 const MAX_GPU_ERROR_NOTICES: usize = 3;
@@ -135,6 +138,7 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
         last_fps_log: None,
         cpu_ms: 0.0,
         cursor_grabbed: false,
+        present: PresentGate::new(),
     };
     event_loop
         .run_app(&mut app)
@@ -245,6 +249,8 @@ struct App {
     cpu_ms: f32,
     /// The cursor is hidden and locked for mouse look.
     cursor_grabbed: bool,
+    /// When to try to present again while the surface gives no texture (Task C6w).
+    present: PresentGate,
 }
 
 impl App {
@@ -294,17 +300,49 @@ impl App {
         })
     }
 
-    /// Updates and renders one frame, unless the window is minimised.
+    /// Updates and renders one frame if the surface gives a texture; otherwise tells the
+    /// [`PresentGate`] why not, and returns (the gate decides when to try again).
     fn redraw(&mut self) {
         let Some(g) = self.gfx.as_mut() else {
             return;
         };
         let size = g.window.inner_size();
+        let attempt_at = Instant::now();
         if size.width == 0 || size.height == 0 {
-            return; // minimised (Review Focus 1)
+            // Minimised on a platform that zeroes the size (Review Focus 1; macOS keeps it and
+            // reports `Occluded` instead).
+            let change = self.present.on_attempt(Attempt::Occluded, attempt_at);
+            log_present(change, self.frame_index);
+            return;
         }
+        let Some(surface) = g.gpu.surface.as_ref() else {
+            return;
+        };
+        let acquired = surface.surface.get_current_texture();
+        let frame = match acquired {
+            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
+            other => {
+                let attempt = present::attempt_of(&other);
+                drop(other);
+                if attempt == Attempt::Reconfigured {
+                    g.resize(size.width, size.height);
+                }
+                let change = self.present.on_attempt(attempt, attempt_at);
+                log_present(change, self.frame_index);
+                return;
+            }
+        };
+
+        // dt runs from the last presented frame; the first frame after a pause moves nothing
+        // (the hidden time is not simulated: `present` module docs).
         let now = Instant::now();
-        let dt = self.last_frame.map_or(0.0, |t| (now - t).as_secs_f64());
+        let resumed = !self.present.presenting();
+        let change = self.present.on_attempt(Attempt::Frame, now);
+        log_present(change, self.frame_index);
+        let dt = match self.last_frame {
+            Some(t) if !resumed => (now - t).as_secs_f64(),
+            _ => 0.0,
+        };
         self.last_frame = Some(now);
         self.fps = smoothed_fps(self.fps, dt);
         if self
@@ -319,20 +357,6 @@ impl App {
                 self.frame_index
             );
         }
-
-        let Some(surface) = g.gpu.surface.as_ref() else {
-            return;
-        };
-        let frame = match surface.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(_)
-            | wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost => {
-                g.resize(size.width, size.height);
-                return;
-            }
-            _ => return, // timeout, occluded or a validation error: try the next frame
-        };
 
         let start = Instant::now();
         if self.input.take_pressed_once(Action::ToggleHud) {
@@ -514,6 +538,32 @@ impl App {
     }
 }
 
+/// Logs a change of the window's present state (`present` module docs), so a run read from the
+/// terminal shows why frames stopped (`RUST_LOG=universe=info`; the C6 run's stall was an
+/// occluded window).
+fn log_present(change: Option<Change>, frame: u64) {
+    match change {
+        None => {}
+        // The window is occluded for a moment before it is first shown.
+        Some(Change::Paused(Attempt::Occluded)) if frame == 0 => {
+            log::debug!("window: occluded before the first frame")
+        }
+        Some(Change::Paused(Attempt::Occluded)) => log::info!(
+            "window: occluded (minimised, hidden or covered), rendering paused after frame {frame}"
+        ),
+        Some(Change::Paused(a)) => log::debug!("window: no surface texture ({a:?}), retrying"),
+        Some(Change::Stuck { for_s, last }) => {
+            log::warn!("window: no surface texture for {for_s:.1} s (last: {last:?}), retrying")
+        }
+        Some(Change::Resumed { for_s, skipped }) if for_s >= 0.25 => {
+            log::info!("window: presenting again at frame {frame} after {for_s:.1} s ({skipped})")
+        }
+        Some(Change::Resumed { for_s, skipped }) => {
+            log::debug!("window: presenting again at frame {frame} after {for_s:.3} s ({skipped})")
+        }
+    }
+}
+
 /// The navigator state [`log_navigation`] compares: mode, aim candidate, selection.
 type NavLog = (FlightMode, Option<uni_sim::registry::ObjectId>, Option<uni_sim::registry::ObjectId>);
 
@@ -645,6 +695,7 @@ impl ApplicationHandler for App {
                 el.exit();
             }
             WindowEvent::Resized(size) => g.resize(size.width, size.height),
+            WindowEvent::Occluded(occluded) => self.present.on_occluded(occluded, Instant::now()),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
@@ -654,9 +705,19 @@ impl ApplicationHandler for App {
         self.input.on_device_event(&event);
     }
 
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
-        if let Some(g) = &self.gfx {
-            g.window.request_redraw();
+    /// Renders continuously (`ControlFlow::Poll`; Fifo paces the frames) while the window
+    /// presents; otherwise sleeps until the [`PresentGate`]'s next attempt or the next event
+    /// (Task C6w: an occluded window used to spin one core).
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let Some(g) = &self.gfx else {
+            return;
+        };
+        match self.present.next_attempt(Instant::now()) {
+            None => {
+                el.set_control_flow(ControlFlow::Poll);
+                g.window.request_redraw();
+            }
+            Some(at) => el.set_control_flow(ControlFlow::WaitUntil(at)),
         }
     }
 }
