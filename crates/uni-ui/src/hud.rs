@@ -86,8 +86,14 @@ const HEADLESS_MAX_RUNS: usize = 4;
 
 /// Room kept free at the bottom right for the perf line and hints [pt].
 const PERF_RESERVE: f32 = 40.0;
-/// Gap between neighbouring panels [pt].
+/// Gap between neighbouring panels [pt]; also the least gap a notes block keeps from the
+/// other HUD blocks ([`rise`], [`fall`]).
 const PANEL_GAP: f32 = 16.0;
+/// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
+/// line's area, which hangs 4 pt lower than the margin).
+const POPUP_GAP: f32 = 10.0;
+/// Gap between the perf line and the key hints under it [pt].
+const PERF_LINE_GAP: f32 = 4.0;
 
 /// What the HUD shows this frame. Filled by the app; the HUD only reads it.
 #[derive(Clone, Debug)]
@@ -565,6 +571,15 @@ fn area(id: &str, order: Order) -> egui::Area {
 }
 
 /// Everything the HUD draws in one run (module docs).
+///
+/// Layout (C4w): the top blocks first, then the bottom ones, then the notes. egui places an
+/// anchored area from the size it had on its last pass, so a bottom block that grew since (a
+/// longer note list, a wrapped note, the FTL line) was drawn too low, over the block under it;
+/// a capture, which draws each bookmark once on one HUD, kept it there. Every bottom block is
+/// therefore placed from its size measured this pass ([`measure`], [`show_measured`]), and the
+/// notes blocks (the honesty line, its pop-up, the stack under Location) keep [`PANEL_GAP`]
+/// clear of every block drawn before them ([`rise`], [`fall`]); one with no room scrolls
+/// ([`fit`]).
 fn draw_hud(
     ctx: &egui::Context,
     data: &HudData,
@@ -583,61 +598,34 @@ fn draw_hud(
         });
 
     let notes = hud_notes(data, c);
-    let card = data.target.as_ref().filter(|_| c.card_expanded);
-    if c.card_expanded {
-        area("location", Order::Middle)
-            .anchor(Align2::LEFT_TOP, [m, m])
+    // Read once: a click below may close the card, which takes effect on the next pass.
+    let expanded = c.card_expanded;
+    let card = data.target.as_ref().filter(|_| expanded);
+    // The blocks drawn so far; the notes keep clear of them.
+    let mut taken: Vec<egui::Rect> = Vec::new();
+
+    // The top row.
+    if let Some(card) = card {
+        let rect = area("card", Order::Middle)
+            .anchor(Align2::RIGHT_TOP, [-m, m])
             .show(ctx, |ui| {
-                if panels::show_location(ui, &data.location) {
+                // The header (≈ 90 pt) and the padding stay; the body scrolls.
+                let max_body =
+                    screen.height() - 2.0 * m - 2.0 * CARD_PADDING_Y - 2.0 - 90.0 - PERF_RESERVE;
+                let clicks = show_card(ui, card, max_body.max(80.0));
+                if clicks.actions.contains(&CardAction::Close) {
                     c.card_expanded = false;
                 }
-                // The notes stack (12 pt, in tone); the flight label is the Speed header.
-                let stack: Vec<_> = notes
-                    .iter()
-                    .filter(|(t, _)| *t != data.speed.header)
-                    .collect();
-                if !stack.is_empty() {
-                    ui.add_space(8.0);
-                    ui.set_max_width(LOCATION_WIDTH);
-                    notes_stack(ui, &stack);
+                out.actions.extend(clicks.actions);
+                if clicks.selected_moon.is_some() {
+                    out.selected_moon = clicks.selected_moon;
                 }
+                ui.is_sizing_pass()
             });
-        if let Some(g) = &data.gravity {
-            area("gravity", Order::Middle)
-                .anchor(Align2::LEFT_BOTTOM, [m, -m])
-                .show(ctx, |ui| panels::show_gravity(ui, g));
-        }
-        // Centred, but clear of the Gravity panel on a narrow screen.
-        let mut left = screen.center().x - SPEED_WIDTH / 2.0;
-        if data.gravity.is_some() {
-            left = left.max(screen.left() + m + GRAVITY_WIDTH + PANEL_GAP);
-        }
-        area("speed", Order::Middle)
-            .anchor(Align2::LEFT_BOTTOM, [left - screen.left(), -m])
-            .show(ctx, |ui| panels::show_speed(ui, &data.speed));
-        if let Some(card) = card {
-            area("card", Order::Middle)
-                .anchor(Align2::RIGHT_TOP, [-m, m])
-                .show(ctx, |ui| {
-                    // The header (≈ 90 pt) and the padding stay; the body scrolls.
-                    let max_body = screen.height()
-                        - 2.0 * m
-                        - 2.0 * CARD_PADDING_Y
-                        - 2.0
-                        - 90.0
-                        - PERF_RESERVE;
-                    let clicks = show_card(ui, card, max_body.max(80.0));
-                    if clicks.actions.contains(&CardAction::Close) {
-                        c.card_expanded = false;
-                    }
-                    out.actions.extend(clicks.actions);
-                    if clicks.selected_moon.is_some() {
-                        out.selected_moon = clicks.selected_moon;
-                    }
-                });
-        }
-    } else {
-        area("place", Order::Middle)
+        taken.extend(shown_rect(&rect));
+    }
+    if !expanded {
+        let rect = area("place", Order::Middle)
             .anchor(Align2::LEFT_TOP, [m, m])
             .show(ctx, |ui| {
                 let halo = ui.painter().add(egui::Shape::Noop);
@@ -647,25 +635,9 @@ fn draw_hud(
                 if line.clicked() {
                     c.card_expanded = true;
                 }
+                ui.is_sizing_pass()
             });
-        if !notes.is_empty() {
-            let line_w = NOTES_LINE_MAX_WIDTH.max(screen.width() - 2.0 * m - 320.0);
-            let line_h = area("notes", Order::Middle)
-                .anchor(Align2::LEFT_BOTTOM, [m, -m + 4.0])
-                .show(ctx, |ui| {
-                    let line = notes_line(ui, &notes, line_w);
-                    if line.clicked() {
-                        c.notes_expanded = !c.notes_expanded;
-                    }
-                    line.rect.height()
-                })
-                .inner;
-            if c.notes_expanded {
-                area("notes popup", Order::Foreground)
-                    .anchor(Align2::LEFT_BOTTOM, [m, -m - line_h - 6.0])
-                    .show(ctx, |ui| notes_popup(ui, &notes));
-            }
-        }
+        taken.extend(shown_rect(&rect));
     }
 
     // Time: the warp panel (T), the Time panel (expanded, no card) or the one-line time.
@@ -674,18 +646,24 @@ fn draw_hud(
     } else {
         (Align2::RIGHT_TOP, [-m, m])
     };
-    if c.show_warp {
+    let time = if c.show_warp {
         area("warp", Order::Middle)
             .anchor(time_anchor.0, time_anchor.1)
-            .show(ctx, |ui| match panels::show_warp(ui, &data.time) {
-                Some(WarpPick::Pause) => out.toggle_pause = true,
-                Some(WarpPick::Preset(i)) => out.warp_preset = Some(i),
-                None => {}
-            });
-    } else if c.card_expanded && card.is_none() {
+            .show(ctx, |ui| {
+                match panels::show_warp(ui, &data.time) {
+                    Some(WarpPick::Pause) => out.toggle_pause = true,
+                    Some(WarpPick::Preset(i)) => out.warp_preset = Some(i),
+                    None => {}
+                }
+                ui.is_sizing_pass()
+            })
+    } else if expanded && card.is_none() {
         area("time", Order::Middle)
             .anchor(Align2::RIGHT_TOP, [-m, m])
-            .show(ctx, |ui| panels::show_time(ui, &data.time));
+            .show(ctx, |ui| {
+                panels::show_time(ui, &data.time);
+                ui.is_sizing_pass()
+            })
     } else {
         area("time line", Order::Middle)
             .anchor(Align2::CENTER_TOP, [0.0, m])
@@ -695,30 +673,317 @@ fn draw_hud(
                 haloed(ui, |ui| {
                     theme::text(ui, &panels::time_line(&data.time), font, INK_SOFT)
                 });
-            });
-    }
+                ui.is_sizing_pass()
+            })
+    };
+    taken.extend(shown_rect(&time));
 
+    // The bottom row, each block placed from its size this pass.
     let hint = if card.is_some() {
         HINT_CARD
     } else {
         HINT_COLLAPSED
     };
-    area("perf", Order::Middle)
-        .anchor(Align2::RIGHT_BOTTOM, [-m, -m + 2.0])
-        .interactable(false)
-        .show(ctx, |ui| {
-            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
-                haloed(ui, |ui| {
-                    let font = mono_font(SMALL_SIZE, Weight::Regular);
-                    theme::text(ui, &perf_line(data), font.clone(), INK_3);
-                    theme::text(ui, hint, font, INK_3);
+    let perf_lines = [perf_line(data), hint.to_owned()];
+    let perf = show_measured(
+        ctx,
+        Measured {
+            id: "perf",
+            order: Order::Middle,
+            align: Align2::RIGHT_BOTTOM,
+            at: screen.right_bottom() + egui::vec2(-m, -m + 2.0),
+            max_width: screen.width(),
+            interactable: false,
+        },
+        |ui| perf_block(ui, &perf_lines),
+    );
+    taken.push(perf);
+
+    let left = screen.left() + m;
+    if expanded {
+        if let Some(g) = &data.gravity {
+            let rect = show_measured(
+                ctx,
+                Measured::bottom_left("gravity", egui::pos2(left, screen.bottom() - m)),
+                |ui| panels::show_gravity(ui, g),
+            );
+            taken.push(rect);
+        }
+        // Centred, but clear of the Gravity panel on a narrow screen.
+        let mut speed_left = screen.center().x - SPEED_WIDTH / 2.0;
+        if data.gravity.is_some() {
+            speed_left = speed_left.max(left + GRAVITY_WIDTH + PANEL_GAP);
+        }
+        let rect = show_measured(
+            ctx,
+            Measured::bottom_left("speed", egui::pos2(speed_left, screen.bottom() - m)),
+            |ui| panels::show_speed(ui, &data.speed),
+        );
+        taken.push(rect);
+
+        // Anchored at its top left, so its rect holds even on egui's sizing pass.
+        let location = area("location", Order::Middle)
+            .anchor(Align2::LEFT_TOP, [m, m])
+            .show(ctx, |ui| {
+                if panels::show_location(ui, &data.location) {
+                    c.card_expanded = false;
+                }
+            })
+            .response
+            .rect;
+        // The notes stack under Location (12 pt, in tone; the flight label is the Speed
+        // header), 11 pt under it as in C4 (egui's item spacing and 8 pt). It ends
+        // `PANEL_GAP` over the Gravity panel (or any block below it); longer, it scrolls.
+        let stack: Vec<_> = notes
+            .iter()
+            .filter(|(t, _)| *t != data.speed.header)
+            .collect();
+        if !stack.is_empty() {
+            let h = measure(ctx, "notes stack", LOCATION_WIDTH, |ui| {
+                notes_stack(ui, &stack)
+            })
+            .y;
+            let x = egui::Rangef::new(left, left + LOCATION_WIDTH);
+            let top = location.bottom() + ctx.global_style().spacing.item_spacing.y + 8.0;
+            let slot = fall(x, top, h, screen.bottom() - m, &taken, PANEL_GAP);
+            placed("notes stack", Order::Middle, egui::pos2(left, slot.top)).show(ctx, |ui| {
+                ui.set_max_width(LOCATION_WIDTH);
+                fit(ui, "notes stack", slot.height, h, |ui| {
+                    notes_stack(ui, &stack)
                 });
             });
+        }
+    } else if !notes.is_empty() {
+        // The honesty line, bottom left: beside the perf block when the line's least width fits
+        // there, else over it (a narrow window).
+        let beside = perf.left() - PANEL_GAP - left;
+        let mut line_w = NOTES_LINE_MAX_WIDTH.max(screen.width() - 2.0 * m - 320.0);
+        if beside >= NOTES_LINE_MAX_WIDTH {
+            line_w = line_w.min(beside);
+        }
+        let size = measure(ctx, "notes line", line_w, |ui| {
+            notes_line(ui, &notes, line_w);
         });
+        let x = egui::Rangef::new(left, left + size.x);
+        let bottom = screen.bottom() - m + 4.0;
+        let slot = rise(x, bottom, size.y, screen.top() + m, &taken, PANEL_GAP);
+        let line = placed("notes", Order::Middle, egui::pos2(left, slot.top))
+            .show(ctx, |ui| {
+                let line = notes_line(ui, &notes, line_w);
+                if line.clicked() {
+                    c.notes_expanded = !c.notes_expanded;
+                }
+                line.rect
+            })
+            .inner;
+        // Its pop-up stands on it, from its height this pass, and stops under the top row.
+        if c.notes_expanded {
+            let size = measure(ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
+                notes_popup(ui, &notes)
+            });
+            let x = egui::Rangef::new(left, left + size.x);
+            let bottom = line.top() - POPUP_GAP;
+            let slot = rise(x, bottom, size.y, screen.top() + m, &taken, PANEL_GAP);
+            placed("notes popup", Order::Foreground, egui::pos2(left, slot.top)).show(ctx, |ui| {
+                fit(ui, "notes popup", slot.height, size.y, |ui| {
+                    notes_popup(ui, &notes)
+                })
+            });
+        }
+    }
 
     if c.show_help {
         show_controls_window(ctx, data, c);
+    }
+}
+
+/// The rect of a top-row area just shown, whose closure returned `ui.is_sizing_pass()`. None
+/// on egui's first, invisible pass of a new area: egui then places it from a guessed size (its
+/// default area size), so its rect is wrong for a right or centre anchor (the card at 800 pt
+/// came out 180 pt left of its place), and the notes would make room for a block not there.
+fn shown_rect(r: &egui::InnerResponse<bool>) -> Option<egui::Rect> {
+    (!r.inner).then_some(r.response.rect)
+}
+
+/// A fixed HUD area with its top left at `left_top`, for a block the HUD placed from its size
+/// this pass: not pushed back on screen by its size on the last pass, as egui's constraint
+/// would (the placement keeps it on screen).
+fn placed(id: &str, order: Order, left_top: egui::Pos2) -> egui::Area {
+    area(id, order).fixed_pos(left_top).constrain(false)
+}
+
+/// Where [`show_measured`] puts a block: its `align` corner at `at`.
+struct Measured {
+    id: &'static str,
+    order: Order,
+    align: Align2,
+    at: egui::Pos2,
+    /// The width the block may lay out to [pt].
+    max_width: f32,
+    interactable: bool,
+}
+
+impl Measured {
+    /// A panel at the bottom left, its bottom-left corner at `at`.
+    fn bottom_left(id: &'static str, at: egui::Pos2) -> Self {
+        Self {
+            id,
+            order: Order::Middle,
+            align: Align2::LEFT_BOTTOM,
+            at,
+            max_width: SPEED_WIDTH,
+            interactable: true,
+        }
+    }
+}
+
+/// Shows `add` in a fixed area placed by `at` from the size `add` lays out to this pass
+/// ([`measure`]), so a block that grew or shrank since the last pass is never drawn at its old
+/// size (C4w). Returns the area's rect.
+fn show_measured(
+    ctx: &egui::Context,
+    at: Measured,
+    mut add: impl FnMut(&mut egui::Ui),
+) -> egui::Rect {
+    let size = measure(ctx, at.id, at.max_width, &mut add);
+    let corner = egui::vec2(
+        at.align.x().to_factor() * size.x,
+        at.align.y().to_factor() * size.y,
+    );
+    placed(at.id, at.order, at.at - corner)
+        .interactable(at.interactable)
+        .show(ctx, add)
+        .response
+        .rect
+}
+
+/// The size `add` lays out to this pass, at most `max_width` wide: it runs in an invisible,
+/// disabled `Ui` far off screen, so it paints nothing and no pointer reaches it. The text it
+/// lays out is cached, so drawing it again costs little.
+fn measure(
+    ctx: &egui::Context,
+    id: &str,
+    max_width: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::Vec2 {
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(-MEASURE_OFFSET, -MEASURE_OFFSET),
+        egui::vec2(max_width.max(1.0), MEASURE_OFFSET / 2.0),
+    );
+    let mut ui = egui::Ui::new(
+        ctx.clone(),
+        Id::unique(("hud measure", id)),
+        egui::UiBuilder::new().max_rect(rect).invisible(),
+    );
+    add(&mut ui);
+    ui.min_size()
+}
+
+/// How far up and left of the screen [`measure`] lays its blocks out [pt]: more than any HUD
+/// block is wide or tall, small enough for f32 to keep sub-point positions (2⁻⁹ pt).
+const MEASURE_OFFSET: f32 = 20_000.0;
+
+/// Draws `add` as it is when `room` holds its measured `height`, else in a vertical scroll
+/// area `room` tall, so a notes block never runs into the next block.
+fn fit(ui: &mut egui::Ui, id: &str, room: f32, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    if height <= room + 0.5 {
+        add(ui);
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt(("hud fit", id))
+            .max_height(room)
+            .show(ui, add);
+    }
+}
+
+/// A block's place on the screen's vertical axis [pt]: its top edge and the height it gets,
+/// which is less than its own only when it has no room (it then scrolls, [`fit`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Slot {
+    top: f32,
+    height: f32,
+}
+
+/// The blocks of `taken` that share columns with `x`.
+fn in_columns(taken: &[egui::Rect], x: egui::Rangef) -> impl Iterator<Item = &egui::Rect> {
+    taken
+        .iter()
+        .filter(move |r| r.max.x > x.min && r.min.x < x.max)
+}
+
+/// Places a block `h` tall in the columns `x`, standing on `bottom` (its bottom edge), clear of
+/// the blocks in `taken` by `gap`:
+/// - a block in those columns that reaches across the bottom edge lifts it to `gap` over that
+///   block (again for any block met there);
+/// - the lowest block wholly above, or `ceiling`, caps its top `gap` under it. A block taller
+///   than the room gets the room (never less than 0).
+fn rise(
+    x: egui::Rangef,
+    bottom: f32,
+    h: f32,
+    ceiling: f32,
+    taken: &[egui::Rect],
+    gap: f32,
+) -> Slot {
+    let mut bottom = bottom;
+    // Each block lifts it at most once: after that the edge is over that block.
+    for _ in 0..=taken.len() {
+        match in_columns(taken, x).find(|r| r.min.y - gap < bottom && r.max.y + gap > bottom) {
+            Some(r) => bottom = r.min.y - gap,
+            None => break,
+        }
+    }
+    let top = in_columns(taken, x)
+        .filter(|r| r.max.y + gap <= bottom)
+        .map(|r| r.max.y + gap)
+        .fold(ceiling, f32::max);
+    let height = h.min(bottom - top).max(0.0);
+    Slot {
+        top: bottom - height,
+        height,
+    }
+}
+
+/// [`rise`] downward: a block `h` tall in the columns `x` hanging from `top`, pushed down past
+/// any block of `taken` across that edge, its bottom capped `gap` over the highest block wholly
+/// below, or at `floor`.
+fn fall(x: egui::Rangef, top: f32, h: f32, floor: f32, taken: &[egui::Rect], gap: f32) -> Slot {
+    let mut top = top;
+    for _ in 0..=taken.len() {
+        match in_columns(taken, x).find(|r| r.min.y - gap < top && r.max.y + gap > top) {
+            Some(r) => top = r.max.y + gap,
+            None => break,
+        }
+    }
+    let bottom = in_columns(taken, x)
+        .filter(|r| r.min.y - gap >= top)
+        .map(|r| r.min.y - gap)
+        .fold(floor, f32::min);
+    Slot {
+        top,
+        height: h.min(bottom - top).max(0.0),
+    }
+}
+
+/// The perf line over the key hints, both right-aligned on one halo (bottom right). It is laid
+/// out at its own width, so its area's rect is the block itself (a right-aligned egui layout
+/// would stretch the area to its last width).
+fn perf_block(ui: &mut egui::Ui, lines: &[String; 2]) {
+    let font = mono_font(SMALL_SIZE, Weight::Regular);
+    let galleys = lines.each_ref().map(|s| {
+        ui.painter()
+            .layout_job(theme::job(s, font.clone(), INK_3, 0.0, f32::INFINITY))
+    });
+    let width = galleys.iter().map(|g| g.size().x).fold(0.0, f32::max);
+    let height = galleys.iter().map(|g| g.size().y).sum::<f32>() + PERF_LINE_GAP;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.add(theme::halo_shape(rect.expand(6.0)));
+    let mut y = rect.top();
+    for galley in galleys {
+        let size = galley.size();
+        painter.galley(egui::pos2(rect.right() - size.x, y), galley, INK_3);
+        y += size.y + PERF_LINE_GAP;
     }
 }
 
@@ -1675,7 +1940,24 @@ mod tests {
                         .iter()
                         .find(|p| p.text == header)
                         .unwrap_or_else(|| panic!("{case}: no flight label in {:?}", f.all_text()));
-                    assert!(shown.pos.y > h as f32 - 60.0, "{case}: {shown:?}");
+                    // The bottom row, beside the perf block. At 800 pt a cut line too long for
+                    // the room beside it sits over the perf block instead, never on it (C4w).
+                    let perf = f.get("60 fps · GPU 16.5 ms");
+                    let perf_left = perf.pos.x.min(f.get(HINT_COLLAPSED).pos.x);
+                    let line_right = line_texts(&f)
+                        .iter()
+                        .map(|p| p.pos.x + p.size.x)
+                        .fold(0.0, f32::max);
+                    let beside =
+                        shown.pos.y > h as f32 - 60.0 && line_right <= perf_left - PANEL_GAP + 1.0;
+                    let over = shown.pos.y + shown.size.y <= perf.pos.y - PANEL_GAP + 1.0
+                        && shown.pos.y > h as f32 - 100.0;
+                    assert!(
+                        beside || (w == 800 && over),
+                        "{case}: {shown:?}, line right {line_right}, {perf:?}"
+                    );
+                    let overlaps = overlapping_texts(&f);
+                    assert!(overlaps.is_empty(), "{case}: {overlaps:?}");
                     assert!(
                         shown.pos.x + shown.size.x <= more.pos.x,
                         "{case}: {shown:?}"
@@ -1716,6 +1998,354 @@ mod tests {
         );
         assert_eq!(red.font.size, 12.0);
         assert_eq!(f.get("Inside Sun").color, NON_PHYSICAL);
+    }
+
+    /// The honesty notes of the M1 comet captures (C1L r1 phase 2, the capture JSON `hud.notes`):
+    /// NEOWISE's six, and with `halley` Halley's seventh, which wraps in the pop-up.
+    fn comet_notes(halley: bool) -> Vec<(String, LabelTone)> {
+        use crate::theme::VIVID_STAR_COLOURS_LABEL;
+        use uni_sim::honesty::{HonestyFlag, label};
+        let mut notes: Vec<(String, LabelTone)> = [
+            (FREE_FLIGHT_LABEL, LabelTone::NonPhysical),
+            (label(HonestyFlag::BandModel), LabelTone::Neutral),
+            (
+                label(HonestyFlag::MilkyWayDetailProcedural),
+                LabelTone::Neutral,
+            ),
+            (label(HonestyFlag::ProceduralBelt), LabelTone::Neutral),
+            (EYE_ADAPTED_STARS_LABEL, LabelTone::NonPhysical),
+            (VIVID_STAR_COLOURS_LABEL, LabelTone::NonPhysical),
+        ]
+        .into_iter()
+        .map(|(s, t)| (s.to_owned(), t))
+        .collect();
+        if halley {
+            notes.push((
+                "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)"
+                    .into(),
+                LabelTone::Neutral,
+            ));
+        }
+        notes
+    }
+
+    /// The collapsed honesty line's texts (11 pt regular text face; the perf line is mono).
+    fn line_texts(f: &Frame) -> Vec<&Painted> {
+        f.texts
+            .iter()
+            .filter(|p| p.font == egui::FontId::new(SMALL_SIZE, family(FONT_TEXT)))
+            .collect()
+    }
+
+    /// Pairs of painted texts whose rects overlap by more than half a point.
+    fn overlapping_texts(f: &Frame) -> Vec<(String, String)> {
+        let rects: Vec<(&str, egui::Rect)> = f
+            .texts
+            .iter()
+            .filter(|p| !p.text.trim().is_empty())
+            .map(|p| {
+                let r = egui::Rect::from_min_size(p.pos, p.size).shrink(0.5);
+                (p.text.as_str(), r)
+            })
+            .collect();
+        let mut pairs = Vec::new();
+        for (i, (a, ra)) in rects.iter().enumerate() {
+            for (b, rb) in &rects[i + 1..] {
+                if ra.intersects(*rb) {
+                    pairs.push(((*a).to_owned(), (*b).to_owned()));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// C4w (C1L r1 phase 2, Halley's dust note): egui places an anchored area from the size it
+    /// had on its last pass. A capture draws each bookmark once on one HUD, so on Halley (after
+    /// NEOWISE) the pop-up was placed for six notes and drew seven, its last two lines over the
+    /// honesty line. It is now placed from its height measured this pass, so it sits 10 pt over
+    /// the line whatever the list was before, longer or shorter.
+    #[test]
+    fn notes_popup_sits_on_the_line_whatever_came_before() {
+        let ctx = headless_context();
+        for halley in [false, true, false, true, true] {
+            let mut d = data();
+            d.notes = comet_notes(halley);
+            d.eye_adapted_stars = true;
+            let mut c = HudControls {
+                notes_expanded: true,
+                ..controls()
+            };
+            let f = look(&ctx, 1.0, &d, &mut c);
+            let case = format!("halley {halley}");
+            let popup = f.has_stroke(theme::HAIRLINE).expect("pop-up frame");
+            let line = line_texts(&f);
+            assert!(!line.is_empty(), "{case}: no honesty line");
+            let line_top = line.iter().map(|p| p.pos.y).fold(f32::INFINITY, f32::min);
+            assert!(
+                (line_top - 10.0 - popup.bottom()).abs() <= 1.0,
+                "{case}: pop-up bottom {} vs line top {line_top}",
+                popup.bottom()
+            );
+            let full =
+                "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)";
+            let dust = f.texts.iter().find(|p| p.text == full);
+            assert_eq!(dust.is_some(), halley, "{case}");
+            if let Some(dust) = dust {
+                let r = egui::Rect::from_min_size(dust.pos, dust.size);
+                assert!(r.height() > 20.0, "{case}: the note wraps: {dust:?}");
+                assert!(popup.contains_rect(r), "{case}: {dust:?} outside {popup:?}");
+            }
+            assert_eq!(
+                overlapping_texts(&f),
+                Vec::<(String, String)>::new(),
+                "{case}"
+            );
+        }
+    }
+
+    /// C4w: [`rise`] stands a block on its bottom edge, lifted over a block across that edge,
+    /// capped under the lowest block above (or the ceiling), and given only the room it has.
+    #[test]
+    fn rise_stacks_a_block_over_its_edge_and_under_the_blocks_above() {
+        let x = egui::Rangef::new(24.0, 404.0);
+        let rect = |x0: f32, y0: f32, x1: f32, y1: f32| {
+            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+        };
+        let place = rect(24.0, 24.0, 300.0, 50.0);
+        let perf = rect(1600.0, 1020.0, 1896.0, 1058.0);
+        // Room: it stands on its edge, whatever is in other columns.
+        let s = rise(x, 1037.0, 200.0, 24.0, &[place, perf], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 837.0,
+                height: 200.0
+            }
+        );
+        // No room: it fills the room, 16 pt under the lowest block above.
+        let s = rise(x, 1037.0, 2000.0, 24.0, &[place, perf], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 66.0,
+                height: 971.0
+            }
+        );
+        // Nothing above: the ceiling caps it.
+        let s = rise(x, 1037.0, 2000.0, 24.0, &[perf], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 24.0,
+                height: 1013.0
+            }
+        );
+        // A block across its edge in its columns (a narrow window's perf block) lifts it, and
+        // a second one met there lifts it again.
+        let low = rect(300.0, 1000.0, 600.0, 1060.0);
+        let s = rise(x, 1050.0, 14.0, 24.0, &[low], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 970.0,
+                height: 14.0
+            }
+        );
+        let next = rect(0.0, 950.0, 100.0, 990.0);
+        let s = rise(x, 1050.0, 14.0, 24.0, &[low, next], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 920.0,
+                height: 14.0
+            }
+        );
+        // The gap counts: a block ending 10 pt under the edge still lifts it.
+        let s = rise(
+            x,
+            1037.0,
+            20.0,
+            24.0,
+            &[rect(24.0, 1047.0, 300.0, 1060.0)],
+            16.0,
+        );
+        assert_eq!(s.top + s.height, 1031.0);
+        // No room at all: zero height, never negative.
+        let s = rise(x, 60.0, 50.0, 24.0, &[place], 16.0);
+        assert_eq!(s.height, 0.0);
+    }
+
+    /// C4w: [`fall`] hangs a block from its top edge and stops it `gap` over the highest block
+    /// below it in its columns (the Gravity panel under the Location stack), or at the floor.
+    #[test]
+    fn fall_hangs_a_block_and_stops_over_the_blocks_below() {
+        let x = egui::Rangef::new(24.0, 324.0);
+        let gravity = egui::Rect::from_min_max(egui::pos2(24.0, 900.0), egui::pos2(284.0, 1056.0));
+        let card = egui::Rect::from_min_max(egui::pos2(1476.0, 24.0), egui::pos2(1896.0, 700.0));
+        let s = fall(x, 250.0, 300.0, 1056.0, &[gravity, card], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 250.0,
+                height: 300.0
+            }
+        );
+        let s = fall(x, 250.0, 900.0, 1056.0, &[gravity, card], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 250.0,
+                height: 634.0
+            }
+        );
+        let s = fall(x, 250.0, 900.0, 1056.0, &[card], 16.0);
+        assert_eq!(
+            s,
+            Slot {
+                top: 250.0,
+                height: 806.0
+            }
+        );
+        // A block across its top pushes it under that block.
+        let s = fall(
+            x,
+            250.0,
+            10.0,
+            1056.0,
+            &[
+                gravity,
+                egui::Rect::from_min_max(egui::pos2(0.0, 200.0), egui::pos2(50.0, 260.0)),
+            ],
+            16.0,
+        );
+        assert_eq!(
+            s,
+            Slot {
+                top: 276.0,
+                height: 10.0
+            }
+        );
+    }
+
+    /// The HUD's visible blocks after the last run on `ctx`: (area name, rect).
+    fn blocks(ctx: &egui::Context) -> Vec<(&'static str, egui::Rect)> {
+        const NAMES: [&str; 12] = [
+            "card",
+            "place",
+            "warp",
+            "time",
+            "time line",
+            "perf",
+            "gravity",
+            "speed",
+            "location",
+            "notes stack",
+            "notes",
+            "notes popup",
+        ];
+        ctx.memory(|mem| {
+            let visible = mem.areas().visible_layer_ids();
+            NAMES
+                .iter()
+                .filter_map(|&name| {
+                    let id = Id::unique(("hud", name));
+                    let rect = mem.area_rect(id)?;
+                    visible.iter().any(|l| l.id == id).then_some((name, rect))
+                })
+                .collect()
+        })
+    }
+
+    /// C4w (the owner: soft and uncluttered): however long the note list, however long its
+    /// notes, on the capture size and the owner's windows down to 960 × 540 and 800 × 600 pt,
+    /// collapsed (line and pop-up) or expanded (the stack under Location, with or without the
+    /// card), no notes block touches another HUD block or leaves the screen, also when the list
+    /// grew since the last draw (C1L r1). Blocks that would not fit scroll.
+    #[test]
+    fn notes_never_overlap_other_blocks() {
+        let mut long = comet_notes(true);
+        for i in 0..9 {
+            long.push((
+                format!(
+                    "Test note {i}: an approximation stated in a sentence long enough to wrap \
+                     onto two lines in the pop-up (renderer limit)"
+                ),
+                if i % 2 == 0 {
+                    LabelTone::Neutral
+                } else {
+                    LabelTone::NonPhysical
+                },
+            ));
+        }
+        let lists = [("comets", comet_notes(true)), ("long", long)];
+        let popup = HudControls {
+            notes_expanded: true,
+            ..controls()
+        };
+        let sizes = [
+            ([1920, 1080], 1.0),
+            ([2560, 1664], 2.0),
+            ([2940, 1912], 2.0),
+            ([1920, 1080], 2.0),
+            ([1600, 1200], 2.0),
+        ];
+        for (size_px, ppp) in sizes {
+            let screen = egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(size_px[0] as f32, size_px[1] as f32) / ppp,
+            );
+            for (list_name, list) in &lists {
+                for (mode, c, card) in [
+                    ("collapsed", popup, false),
+                    ("expanded", expanded(), false),
+                    ("card", expanded(), true),
+                ] {
+                    let case = format!("{size_px:?} @ {ppp}, {list_name}, {mode}");
+                    let ctx = headless_context();
+                    let mut d = data();
+                    d.target = card.then(mars_card);
+                    d.eye_adapted_stars = true;
+                    d.lens_on_screen = true;
+                    // First the plain list, then this one on the same HUD.
+                    let mut c1 = c;
+                    let (mut o, _, _) =
+                        run_hud_settled(&ctx, size_px, ppp, 8192, &d, &Overlay::default(), &mut c1);
+                    o.textures_delta.clear();
+                    d.notes = list.clone();
+                    let mut c2 = c;
+                    let (mut o, _, _) =
+                        run_hud_settled(&ctx, size_px, ppp, 8192, &d, &Overlay::default(), &mut c2);
+                    o.textures_delta.clear();
+                    let blocks = blocks(&ctx);
+                    let names: Vec<&str> = blocks.iter().map(|b| b.0).collect();
+                    let note_blocks: &[&str] = if mode == "collapsed" {
+                        &["notes", "notes popup"]
+                    } else {
+                        &["notes stack"]
+                    };
+                    for name in note_blocks {
+                        assert!(names.contains(name), "{case}: no {name} in {names:?}");
+                    }
+                    for (name, rect) in &blocks {
+                        if !note_blocks.contains(name) {
+                            continue;
+                        }
+                        assert!(
+                            screen.expand(0.5).contains_rect(*rect),
+                            "{case}: {name} {rect:?} off {screen:?}"
+                        );
+                        for (other, r) in &blocks {
+                            if other != name {
+                                assert!(
+                                    !rect.shrink(0.5).intersects(*r),
+                                    "{case}: {name} {rect:?} touches {other} {r:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Review I5: invalid timings read "n/a", never 0.
