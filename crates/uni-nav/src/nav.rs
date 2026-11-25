@@ -33,7 +33,8 @@
 //!   [`NavStatus::speed_mps`] is the speed the HUD shows.
 //!
 //! **The app's frame** (C6 wires it): on a [`crate::Action::Select`] press, [`Navigator::pick`]
-//! at the cursor (`InputState::cursor_px` × internal ÷ output size) with the last snapshot; then
+//! at the cursor (`InputState::cursor_px` × internal ÷ output size) with the last snapshot and
+//! the `crate::pick::PickView` of the camera and internal size it was taken with; then
 //! [`Navigator::update`] with the last snapshot and the frame's dt; [`handle_time_keys`]; then
 //! any Esc press the navigator left (collapse the card, else [`Navigator::deselect`]);
 //! `World::set_selected` and `World::set_goto_target` from the status; the world's tick with
@@ -52,7 +53,7 @@ use crate::camera::{FlyCamera, ROLL_RATE_RAD_PER_S, SPEED_STEP_LOG10};
 use crate::cruise::{self, CRUISE_LOG10_DEFAULT, CRUISE_LOG10_RANGE, DROPOUT_SPEED_MPS};
 use crate::goto::{GotoFlight, standoff_distance};
 use crate::input::{Action, InputState};
-use crate::pick::nearest_pick;
+use crate::pick::{PickView, pick_disks, pick_object};
 
 /// A destination within this angle of the view centre [deg] becomes the aim candidate (the
 /// owner-approved preview, `74-hud.js`).
@@ -192,18 +193,22 @@ impl Navigator {
         }
     }
 
-    /// The click: selects the pick item of `snap` nearest `cursor_internal_px` [internal px]
-    /// within `radius_px`, by priority on ties (`crate::pick`); returns it (and keeps it
-    /// selected), or `None` (the selection is then unchanged). If the object is one of
-    /// `snap.destinations` (it has a marker), the goto to it starts at once (lead ruling, owner
-    /// point 1).
+    /// The click: selects what `snap`, seen from `view` (the camera and internal size it was
+    /// taken with), shows at `cursor_internal_px` [internal px] (`crate::pick::pick_object`: a
+    /// resolved body anywhere on its disk, the nearest along the cursor's ray; a point within
+    /// `radius_px` unless a nearer disk hides it); returns it (and keeps it selected), or `None`
+    /// (the selection is then unchanged). If the object is one of `snap.destinations` (it has a
+    /// marker), the goto to it starts at once (lead ruling, owner point 1); a hidden object is
+    /// never picked, so a click never flies to one (final review, app I2).
     pub fn pick(
         &mut self,
         snap: &Snapshot,
+        view: &PickView,
         cursor_internal_px: Vec2,
         radius_px: f32,
     ) -> Option<ObjectId> {
-        let id = nearest_pick(&snap.pick, cursor_internal_px, radius_px)?;
+        let disks = pick_disks(snap);
+        let id = pick_object(&snap.pick, &disks, view, cursor_internal_px, radius_px)?;
         self.selected = Some(id);
         if snap.destinations.iter().any(|d| d.id == id) {
             self.begin_goto(id);
@@ -603,7 +608,10 @@ pub(crate) mod testkit {
             spkid: 29_999_999,
             name_index: 0,
         };
-        World::new(data(vec![rock], vec![ASTEROID.to_owned()], Vec::new()), date())
+        World::new(
+            data(vec![rock], vec![ASTEROID.to_owned()], Vec::new()),
+            date(),
+        )
     }
 
     /// [`world`] plus one unnamed Sun-like catalogue star at 1 pc on +z (ICRS), at rest.
@@ -723,6 +731,156 @@ mod tests {
     use crate::goto::{GOTO_DURATION_S, standoff_distance, turn_duration_s};
     use crate::input::Action;
 
+    /// A view for snapshots built by hand (their picks are points, so any view does).
+    fn pick_view() -> crate::pick::PickView {
+        crate::pick::PickView::new(
+            &uni_core::CameraView {
+                pos: uni_core::UniversePos::default(),
+                orient: DQuat::IDENTITY,
+                fov_y_rad: 60_f64.to_radians(),
+                velocity_mps: DVec3::ZERO,
+            },
+            testkit::VIEWPORT,
+        )
+    }
+
+    /// The snapshot of `cam` and the view it was taken from (`World::snapshot` at the tests'
+    /// internal size, as the app's frame does).
+    fn snapped(
+        world: &uni_sim::world::World,
+        cam: &crate::camera::FlyCamera,
+    ) -> (uni_sim::snapshot::Snapshot, crate::pick::PickView) {
+        (
+            world.snapshot(&cam.view, testkit::VIEWPORT),
+            crate::pick::PickView::new(&cam.view, testkit::VIEWPORT),
+        )
+    }
+
+    /// Where object `id` projects in `snap`'s view [internal px].
+    fn screen_of(
+        world: &uni_sim::world::World,
+        cam: &crate::camera::FlyCamera,
+        view: &crate::pick::PickView,
+        id: ObjectId,
+    ) -> glam::Vec2 {
+        let rel = world.position(id).delta_from(cam.view.pos);
+        view.screen(rel).expect("in front of the camera").as_vec2()
+    }
+
+    /// Final review, app I2, on the real Solar System: Mars 425 px in radius (the
+    /// `mars-reference-angle` view) is picked 200 px off its centre, which the old 12-px rule
+    /// missed, and the click flies there (Mars has a marker).
+    #[test]
+    fn a_click_anywhere_on_mars_picks_mars() {
+        let world = testkit::world();
+        let mars = id(&world, "Mars");
+        let radius = world.objects()[mars as usize].radii_m.max_element();
+        // 425 px at 1080 lines and 60°: tan(half-angle) = 425 tan 30° / 540.
+        let q = 425.0 * 30_f64.to_radians().tan() / 540.0;
+        let d = radius * (1.0 + q * q).sqrt() / q;
+        let dir = DVec3::new(0.3, -0.8, 0.2).normalize();
+        let cam = camera(&world, world.position(mars).offset(-dir * d), dir);
+        let (snap, view) = snapped(&world, &cam);
+        let disk = snap.bodies.iter().find(|b| b.id == mars).expect("resolved");
+        assert!(
+            (disk.proj_radius_px - 425.0).abs() < 1.0,
+            "{}",
+            disk.proj_radius_px
+        );
+        let centre = screen_of(&world, &cam, &view, mars);
+        let at = centre + glam::Vec2::new(200.0, -40.0);
+        assert_eq!(
+            crate::pick::nearest_pick(&snap.pick, at, 12.0),
+            None,
+            "the old rule"
+        );
+        let mut nav = Navigator::new();
+        assert_eq!(nav.pick(&snap, &view, at, 12.0), Some(mars));
+        assert_eq!(nav.mode, FlightMode::Goto { target: mars });
+        // Off the disk, far from everything: the selection stays.
+        let sky = centre + glam::Vec2::new(0.0, 500.0);
+        assert!(sky.y < 1080.0 && sky.y > 0.0);
+        assert_eq!(nav.pick(&snap, &view, sky, 12.0), None);
+        assert_eq!(nav.selected, Some(mars));
+    }
+
+    /// Final review, app I2: Io occulted just inside Jupiter's limb, as a point, is never
+    /// picked: a click on it selects Jupiter (the old rule flew to Io: a destination, nearest
+    /// the cursor, more than 12 px from Jupiter's centre).
+    #[test]
+    fn an_occulted_moon_is_never_picked_or_flown_to() {
+        let mut world = testkit::world();
+        let jupiter = id(&world, "Jupiter");
+        let io = id(&world, "Io");
+        let (j, i) = (world.position(jupiter), world.position(io));
+        let u = j.delta_from(i).normalize(); // Io → Jupiter
+        let l = j.delta_from(i).length();
+        let w = u.any_orthonormal_vector();
+        let r_j = world.objects()[jupiter as usize].radii_m.min_element();
+        // From 1.5e9 m beyond Jupiter, the line to Io passes 0.8 R_J from Jupiter's centre.
+        let d = 1.5e9;
+        let delta = 0.8 * r_j * (l + d) / l;
+        let pos = j.offset(u * d + w * delta);
+        let cam = camera(&world, pos, j.delta_from(pos));
+        // Io must be a destination for the old rule's flight: Jupiter's major moon while
+        // Jupiter is the home planet, or selected.
+        world.set_selected(Some(io));
+        let (snap, view) = snapped(&world, &cam);
+        assert!(
+            snap.bodies.iter().any(|b| b.id == jupiter),
+            "Jupiter resolved"
+        );
+        assert!(snap.bodies.iter().all(|b| b.id != io), "Io a point");
+        assert!(snap.destinations.iter().any(|d| d.id == io));
+        let at = snap
+            .pick
+            .iter()
+            .find(|p| p.id == io)
+            .expect("Io's pick item")
+            .screen_px;
+        let jc = screen_of(&world, &cam, &view, jupiter);
+        assert!(at.distance(jc) > 12.0, "{at} vs {jc}");
+        assert_eq!(
+            crate::pick::nearest_pick(&snap.pick, at, 12.0),
+            Some(io),
+            "the old rule"
+        );
+        let mut nav = Navigator::new();
+        assert_eq!(nav.pick(&snap, &view, at, 12.0), Some(jupiter));
+        assert_ne!(nav.mode, FlightMode::Goto { target: io });
+    }
+
+    /// Final review, app I2: 100 km over Earth looking at the horizon, Earth's centre is off
+    /// screen (no pick item), yet a click on the ground picks Earth.
+    #[test]
+    fn a_planet_whose_centre_is_off_screen_is_picked_by_its_disk() {
+        let world = testkit::world();
+        let earth = id(&world, "Earth");
+        let r = world.objects()[earth as usize].radii_m.max_element();
+        let up = DVec3::Z;
+        let mut cam = camera(
+            &world,
+            world.position(earth).offset(up * (r + 1.0e5)),
+            DVec3::X,
+        );
+        // Looking along +x with +z (away from Earth) up: camera −Z → +x, +Y → +z, +X → −y.
+        cam.view.orient = DQuat::from_mat3(&glam::DMat3::from_cols(DVec3::NEG_Y, up, DVec3::NEG_X));
+        let (snap, view) = snapped(&world, &cam);
+        assert!(snap.pick.iter().all(|p| p.id != earth), "centre off screen");
+        assert!(
+            view.screen(world.position(earth).delta_from(cam.view.pos))
+                .is_none()
+        );
+        let mut nav = Navigator::new();
+        let ground = glam::Vec2::new(960.0, 1000.0);
+        assert_eq!(nav.pick(&snap, &view, ground, 12.0), Some(earth));
+        // The horizon is about 166 px under the centre (10.1° dip): the sky above is not Earth.
+        let disks = crate::pick::pick_disks(&snap);
+        let sky = glam::Vec2::new(960.0, 300.0);
+        let above = crate::pick::pick_object(&snap.pick, &disks, &view, sky, 12.0);
+        assert_ne!(above, Some(earth));
+    }
+
     fn cruising() -> Navigator {
         let mut nav = Navigator::new();
         nav.toggle_cruise();
@@ -752,19 +910,36 @@ mod tests {
         for (log10, dt) in [(CRUISE_LOG10_DEFAULT, DT), (1.0, 0.1)] {
             let mut world = testkit::world();
             let earth = id(&world, "Earth");
-            let top = world.objects()[earth as usize].atmosphere_top_m.expect("Earth's top");
+            let top = world.objects()[earth as usize]
+                .atmosphere_top_m
+                .expect("Earth's top");
             let start = world.position(earth).offset(DVec3::Z * 1.0e8);
             let mut cam = camera(&world, start, DVec3::NEG_Z);
             let mut nav = cruising();
             nav.cruise_log10 = log10;
             let mut input = InputState::new();
-            let out = run(&mut nav, &mut cam, &mut world, &mut input, false, dt, 20_000, not_cruising);
+            let out = run(
+                &mut nav,
+                &mut cam,
+                &mut world,
+                &mut input,
+                false,
+                dt,
+                20_000,
+                not_cruising,
+            );
             let last = out.last().expect("frames");
             assert_eq!(last.dropout, Some(DropOut::Atmosphere), "cruise {log10}");
             assert_eq!(last.mode, FlightMode::Free);
             let d = dist(&world, &cam, earth);
-            assert!(d >= top - 1.0, "cruise {log10}: {d} m from the centre, top {top}");
-            assert!(d <= top + 1.0, "cruise {log10}: stopped early, {d} m vs top {top}");
+            assert!(
+                d >= top - 1.0,
+                "cruise {log10}: {d} m from the centre, top {top}"
+            );
+            assert!(
+                d <= top + 1.0,
+                "cruise {log10}: stopped early, {d} m vs top {top}"
+            );
             // Free flight at 1 km/s afterwards.
             assert!((cam.speed_mps() - DROPOUT_SPEED_MPS).abs() < 1e-6);
             assert!((last.speed_mps - DROPOUT_SPEED_MPS).abs() < 1e-6);
@@ -788,10 +963,23 @@ mod tests {
         let mut nav = cruising();
         nav.cruise_log10 = 1.0;
         let mut input = InputState::new();
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, 0.1, 1000, not_cruising);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            0.1,
+            1000,
+            not_cruising,
+        );
         assert_eq!(out.last().and_then(|s| s.dropout), Some(DropOut::NearStar));
         let d = dist(&world, &cam, sun);
-        assert!(d >= 10.0 * r_sun - 1.0 && d < 10.0 * r_sun + 1.0, "{} R☉", d / r_sun);
+        assert!(
+            d >= 10.0 * r_sun - 1.0 && d < 10.0 * r_sun + 1.0,
+            "{} R☉",
+            d / r_sun
+        );
 
         // Toward TestBH-1 from 1 AU.
         let bh = id(&world, "TestBH-1");
@@ -800,10 +988,23 @@ mod tests {
         let mut cam = camera(&world, start, DVec3::NEG_Z);
         let mut nav = cruising();
         nav.cruise_log10 = 1.0;
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, 0.1, 1000, not_cruising);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            0.1,
+            1000,
+            not_cruising,
+        );
         assert_eq!(out.last().and_then(|s| s.dropout), Some(DropOut::BlackHole));
         let d = dist(&world, &cam, bh);
-        assert!(d >= 100.0 * r_s - 1.0 && d < 100.0 * r_s + 1.0, "{} r_s", d / r_s);
+        assert!(
+            d >= 100.0 * r_s - 1.0 && d < 100.0 * r_s + 1.0,
+            "{} r_s",
+            d / r_s
+        );
     }
 
     #[test]
@@ -817,7 +1018,16 @@ mod tests {
         let mut nav = cruising();
         nav.cruise_log10 = 1.0;
         let mut input = InputState::new();
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, 0.1, 1000, not_cruising);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            0.1,
+            1000,
+            not_cruising,
+        );
         assert_eq!(out.last().and_then(|s| s.dropout), Some(DropOut::NearStar));
         let star = world
             .objects()
@@ -839,14 +1049,39 @@ mod tests {
         let mut input = InputState::new();
         let mut cam = camera(&world, pos, DVec3::NEG_X);
         let mut nav = cruising();
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 1, |_| true);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            false,
+            DT,
+            1,
+            |_| true,
+        );
         assert_eq!(out[0].dropout, Some(DropOut::Atmosphere));
         assert!((dist(&world, &cam, earth) - 6.43e6).abs() < 1e-3);
 
-        let mut cam = camera(&world, world.position(earth).offset(DVec3::X * 6.43e6), DVec3::X);
+        let mut cam = camera(
+            &world,
+            world.position(earth).offset(DVec3::X * 6.43e6),
+            DVec3::X,
+        );
         let mut nav = cruising();
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 30, |_| false);
-        assert!(out.iter().all(|s| s.mode == FlightMode::Cruise && s.dropout.is_none()));
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            false,
+            DT,
+            30,
+            |_| false,
+        );
+        assert!(
+            out.iter()
+                .all(|s| s.mode == FlightMode::Cruise && s.dropout.is_none())
+        );
         assert!(dist(&world, &cam, earth) > 6.43e6 + 1.0e3);
     }
 
@@ -854,7 +1089,11 @@ mod tests {
     fn cruise_wheel_moves_cruise_log10_within_range() {
         let mut world = testkit::world();
         let earth = id(&world, "Earth");
-        let mut cam = camera(&world, world.position(earth).offset(DVec3::Z * 1e9), DVec3::Z);
+        let mut cam = camera(
+            &world,
+            world.position(earth).offset(DVec3::Z * 1e9),
+            DVec3::Z,
+        );
         let speed = cam.speed_log10;
         let mut nav = cruising();
         let mut input = InputState::new();
@@ -869,7 +1108,10 @@ mod tests {
         input.add_wheel(-100.0);
         assert_eq!(step(&mut input, &mut nav), CRUISE_LOG10_RANGE.0);
         drop(step);
-        assert_eq!(cam.speed_log10, speed, "the wheel moved the free-flight speed");
+        assert_eq!(
+            cam.speed_log10, speed,
+            "the wheel moved the free-flight speed"
+        );
     }
 
     #[test]
@@ -886,7 +1128,12 @@ mod tests {
         }
         a.update(&mut input_a, 0.2);
         steer(&mut b, &mut input_b, 0.2);
-        assert!(a.view.orient.abs_diff_eq(b.view.orient, 1e-12), "{} vs {}", a.view.orient, b.view.orient);
+        assert!(
+            a.view.orient.abs_diff_eq(b.view.orient, 1e-12),
+            "{} vs {}",
+            a.view.orient,
+            b.view.orient
+        );
         assert_eq!(b.view.pos, pos, "steering moved the camera");
     }
 
@@ -904,7 +1151,9 @@ mod tests {
         let mut input = InputState::new();
         input.on_key(KeyCode::KeyF, true, false);
         input.on_key(KeyCode::KeyF, false, false);
-        let out = run(&mut nav, &mut cam, world, &mut input, false, DT, 2000, not_flying);
+        let out = run(
+            &mut nav, &mut cam, world, &mut input, false, DT, 2000, not_flying,
+        );
         (out, cam)
     }
 
@@ -917,7 +1166,9 @@ mod tests {
         let standoff = standoff_distance(&info, &world);
         let top = info.atmosphere_top_m.expect("Earth's top");
         assert!(standoff > top);
-        let start = world.position(earth).offset(DVec3::new(1.0, -2.0, 0.5).normalize() * 1.0e9);
+        let start = world
+            .position(earth)
+            .offset(DVec3::new(1.0, -2.0, 0.5).normalize() * 1.0e9);
         let mut cam = camera(&world, start, DVec3::Z);
         let mut nav = Navigator::new();
         nav.selected = Some(earth);
@@ -925,14 +1176,30 @@ mod tests {
         let mut input = InputState::new();
         // Mid-travel the camera's velocity is its closing velocity: toward Earth, at the
         // status's speed (a frame's average against the profile's instantaneous speed).
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 210, |_| false);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            false,
+            DT,
+            210,
+            |_| false,
+        );
         let mid = out.last().expect("frames");
         assert!(matches!(mid.mode, FlightMode::Goto { .. }) && mid.speed_mps > 0.0);
         let v = cam.view.velocity_mps;
         let to_earth = world.position(earth).delta_from(cam.view.pos).normalize();
         assert!(v.normalize().dot(to_earth) > 0.999_999, "{v}");
-        assert!((v.length() / mid.speed_mps - 1.0).abs() < 0.05, "{} vs {}", v.length(), mid.speed_mps);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 2000, not_flying);
+        assert!(
+            (v.length() / mid.speed_mps - 1.0).abs() < 0.05,
+            "{} vs {}",
+            v.length(),
+            mid.speed_mps
+        );
+        let out = run(
+            &mut nav, &mut cam, &mut world, &mut input, false, DT, 2000, not_flying,
+        );
         let last = out.last().expect("frames");
         assert_eq!(last.dropout, Some(DropOut::Arrived));
         assert_eq!(cam.view.velocity_mps, DVec3::ZERO, "at rest on arrival");
@@ -961,20 +1228,33 @@ mod tests {
                 let expected = turn_duration_s(turn) + GOTO_DURATION_S;
                 let took = out.len() as f64 * DT;
                 let case = format!("{} m, facing {facing}", distance);
-                assert_eq!(out.last().and_then(|s| s.dropout), Some(DropOut::Arrived), "{case}");
-                assert!((took - expected).abs() <= 0.25, "{case}: {took} s vs {expected} s");
+                assert_eq!(
+                    out.last().and_then(|s| s.dropout),
+                    Some(DropOut::Arrived),
+                    "{case}"
+                );
+                assert!(
+                    (took - expected).abs() <= 0.25,
+                    "{case}: {took} s vs {expected} s"
+                );
                 let d = dist(&world, &cam, earth);
                 assert!((d / standoff - 1.0).abs() < 1e-3, "{case}: {d}");
                 // The camera really moves (parallax): the distance left only shrinks (up to the
                 // rounding of a distance this large while the camera holds still in the turn),
                 // and the progress only grows.
                 let to_go: Vec<f64> = out.iter().filter_map(|s| s.to_go_m).collect();
-                assert!(to_go.windows(2).all(|w| w[1] <= w[0] * (1.0 + 1e-14)), "{case}");
+                assert!(
+                    to_go.windows(2).all(|w| w[1] <= w[0] * (1.0 + 1e-14)),
+                    "{case}"
+                );
                 assert!(to_go.last().is_some_and(|&g| g < 1e-3 * standoff), "{case}");
                 let progress: Vec<f32> = out.iter().filter_map(|s| s.goto_progress).collect();
                 assert!(progress.windows(2).all(|w| w[1] >= w[0]), "{case}");
                 if distance == PC {
-                    assert!(out.iter().any(|s| s.ftl), "{case}: 1 pc in 4.5 s is above c");
+                    assert!(
+                        out.iter().any(|s| s.ftl),
+                        "{case}: 1 pc in 4.5 s is above c"
+                    );
                 }
             }
         }
@@ -991,12 +1271,25 @@ mod tests {
             let info = world.objects()[target as usize].clone();
             assert_eq!(info.frame.is_some(), name == "Earth");
             let standoff = standoff_distance(&info, &world);
-            let start = world.position(target).offset(DVec3::new(-1.0, 0.5, 0.2).normalize() * 1e9);
+            let start = world
+                .position(target)
+                .offset(DVec3::new(-1.0, 0.5, 0.2).normalize() * 1e9);
             let (out, cam) = fly_to(&mut world, target, start, DVec3::X);
-            assert_eq!(out.last().and_then(|s| s.dropout), Some(DropOut::Arrived), "{name}");
+            assert_eq!(
+                out.last().and_then(|s| s.dropout),
+                Some(DropOut::Arrived),
+                "{name}"
+            );
             let d = dist(&world, &cam, target);
-            assert!((d / standoff - 1.0).abs() < 0.01, "{name}: {d} vs {standoff}");
-            let anchors: Vec<_> = out.iter().filter(|s| matches!(s.mode, FlightMode::Goto { .. })).map(|s| s.anchor).collect();
+            assert!(
+                (d / standoff - 1.0).abs() < 0.01,
+                "{name}: {d} vs {standoff}"
+            );
+            let anchors: Vec<_> = out
+                .iter()
+                .filter(|s| matches!(s.mode, FlightMode::Goto { .. }))
+                .map(|s| s.anchor)
+                .collect();
             assert!(anchors.iter().all(|&a| a == info.frame), "{name}");
         }
     }
@@ -1008,16 +1301,36 @@ mod tests {
             let mut world = testkit::world();
             let bh = id(&world, "TestBH-1");
             let horizon = world.objects()[bh as usize].radii_m.x;
-            let mut cam = camera(&world, world.position(bh).offset(DVec3::Z * (d_surface + horizon)), DVec3::Z);
+            let mut cam = camera(
+                &world,
+                world.position(bh).offset(DVec3::Z * (d_surface + horizon)),
+                DVec3::Z,
+            );
             let mut nav = cruising();
             nav.cruise_log10 = 0.0;
             let mut input = InputState::new();
-            let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 1, |_| true);
-            assert!((out[0].speed_mps / d_surface - 1.0).abs() < 1e-9, "{}", out[0].speed_mps);
+            let out = run(
+                &mut nav,
+                &mut cam,
+                &mut world,
+                &mut input,
+                false,
+                DT,
+                1,
+                |_| true,
+            );
+            assert!(
+                (out[0].speed_mps / d_surface - 1.0).abs() < 1e-9,
+                "{}",
+                out[0].speed_mps
+            );
             assert_eq!(out[0].ftl, ftl, "{d_surface}");
             // The camera's velocity (for the HUD, and M3's aberration) is the cruise along −Z.
             let v = cam.view.velocity_mps;
-            assert!((v - forward(&cam) * out[0].speed_mps).length() < 1e-6 * d_surface, "{v}");
+            assert!(
+                (v - forward(&cam) * out[0].speed_mps).length() < 1e-6 * d_surface,
+                "{v}"
+            );
         }
     }
 
@@ -1058,7 +1371,11 @@ mod tests {
         (world, cam, earth)
     }
 
-    fn angle_to(world: &uni_sim::world::World, cam: &crate::camera::FlyCamera, id: ObjectId) -> f64 {
+    fn angle_to(
+        world: &uni_sim::world::World,
+        cam: &crate::camera::FlyCamera,
+        id: ObjectId,
+    ) -> f64 {
         let to = world.position(id).delta_from(cam.view.pos);
         forward(cam).angle_between(to)
     }
@@ -1069,21 +1386,50 @@ mod tests {
         let mut nav = Navigator::new();
         let mut input = InputState::new();
         // Not armed: the start view does not fly off by itself.
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 90, |_| false);
-        assert!(out.iter().all(|s| s.aim.is_none() && s.mode == FlightMode::Free));
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            90,
+            |_| false,
+        );
+        assert!(
+            out.iter()
+                .all(|s| s.aim.is_none() && s.mode == FlightMode::Free)
+        );
         // A tap of a movement key arms it; the ring fills over 1 s and the view eases on.
         input.on_key(KeyCode::KeyD, true, false);
         input.on_key(KeyCode::KeyD, false, false);
         let before = angle_to(&world, &cam, earth);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 120, |s| {
-            matches!(s.mode, FlightMode::Goto { .. })
-        });
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            120,
+            |s| matches!(s.mode, FlightMode::Goto { .. }),
+        );
         let launch = out.len();
-        assert!((59..=62).contains(&launch), "launched after {launch} frames");
+        assert!(
+            (59..=62).contains(&launch),
+            "launched after {launch} frames"
+        );
         let fills: Vec<f32> = out.iter().filter_map(|s| s.aim.map(|a| a.fill)).collect();
         assert!(fills.windows(2).all(|w| w[1] > w[0]), "{fills:?}");
-        assert!(out[..launch - 1].iter().all(|s| s.aim.map(|a| a.target) == Some(earth)));
-        assert!(angle_to(&world, &cam, earth) < 0.5 * before, "the view did not ease on");
+        assert!(
+            out[..launch - 1]
+                .iter()
+                .all(|s| s.aim.map(|a| a.target) == Some(earth))
+        );
+        assert!(
+            angle_to(&world, &cam, earth) < 0.5 * before,
+            "the view did not ease on"
+        );
         let last = out.last().expect("frames");
         assert_eq!(last.mode, FlightMode::Goto { target: earth });
         assert_eq!(last.selected, Some(earth));
@@ -1091,7 +1437,16 @@ mod tests {
         // The launch came after its frame's input, so a press in the next frame aborts it.
         input.on_key(KeyCode::KeyD, true, false);
         input.on_key(KeyCode::KeyD, false, false);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 1, |_| true);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            1,
+            |_| true,
+        );
         assert_eq!((out[0].mode, out[0].dropout), (FlightMode::Free, None));
     }
 
@@ -1102,25 +1457,76 @@ mod tests {
         let mut input = InputState::new();
         input.on_key(KeyCode::KeyD, true, false);
         input.on_key(KeyCode::KeyD, false, false);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 10, |_| false);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            10,
+            |_| false,
+        );
         assert!(out.last().and_then(|s| s.aim).is_some());
         // Esc cancels the aim (and disarms: the ring does not come back).
         input.on_key(KeyCode::Escape, true, false);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 90, |_| false);
-        assert!(out.iter().all(|s| s.aim.is_none() && s.mode == FlightMode::Free));
-        assert!(!input.has_pending_press(Action::Deselect), "the navigator took it");
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            90,
+            |_| false,
+        );
+        assert!(
+            out.iter()
+                .all(|s| s.aim.is_none() && s.mode == FlightMode::Free)
+        );
+        assert!(
+            !input.has_pending_press(Action::Deselect),
+            "the navigator took it"
+        );
         // Esc aborts a goto.
         nav.selected = Some(earth);
         assert!(nav.goto_selected());
-        run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 5, |_| false);
+        run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            5,
+            |_| false,
+        );
         input.on_key(KeyCode::Escape, true, false);
-        let out = run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 1, |_| true);
+        let out = run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            1,
+            |_| true,
+        );
         assert_eq!(out[0].mode, FlightMode::Free);
         assert_eq!(out[0].dropout, None);
         assert!(!input.has_pending_press(Action::Deselect));
         // Nothing left to cancel: the press stays for the app (card, then deselect).
         input.on_key(KeyCode::Escape, true, false);
-        run(&mut nav, &mut cam, &mut world, &mut input, true, DT, 1, |_| true);
+        run(
+            &mut nav,
+            &mut cam,
+            &mut world,
+            &mut input,
+            true,
+            DT,
+            1,
+            |_| true,
+        );
         assert!(input.take_pressed_once(Action::Deselect));
         nav.deselect();
         assert_eq!(nav.selected, None);
@@ -1137,7 +1543,16 @@ mod tests {
             nav.selected = Some(earth);
             assert!(nav.goto_selected());
             let mut input = InputState::new();
-            run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 30, |_| false);
+            run(
+                &mut nav,
+                &mut cam,
+                &mut world,
+                &mut input,
+                false,
+                DT,
+                30,
+                |_| false,
+            );
             assert_eq!(nav.mode, FlightMode::Goto { target: earth });
             if abort == "key" {
                 input.on_key(KeyCode::KeyW, true, false);
@@ -1145,7 +1560,16 @@ mod tests {
                 input.set_looking(true);
                 input.add_mouse_delta(DVec2::new(10.0, 0.0));
             }
-            let out = run(&mut nav, &mut cam, &mut world, &mut input, false, DT, 1, |_| true);
+            let out = run(
+                &mut nav,
+                &mut cam,
+                &mut world,
+                &mut input,
+                false,
+                DT,
+                1,
+                |_| true,
+            );
             assert_eq!(out[0].mode, FlightMode::Free, "{abort}");
             assert_eq!(out[0].dropout, None, "{abort}");
         }
@@ -1211,10 +1635,18 @@ mod tests {
                     nav.selected = Some(earth);
                     tap(&mut input, KeyCode::KeyF);
                 } else {
-                    assert_eq!(nav.pick(&snap, at, 12.0), Some(earth), "{case}");
+                    assert_eq!(
+                        nav.pick(&snap, &pick_view(), at, 12.0),
+                        Some(earth),
+                        "{case}"
+                    );
                 }
                 let s = one(&mut nav, &mut cam, &mut world, &mut input);
-                assert_eq!((s.mode, s.dropout), (flying, None), "{case}: the launch frame");
+                assert_eq!(
+                    (s.mode, s.dropout),
+                    (flying, None),
+                    "{case}: the launch frame"
+                );
                 assert!(s.to_go_m.is_some(), "{case}: the flight runs");
                 let s = one(&mut nav, &mut cam, &mut world, &mut input);
                 assert_eq!(s.mode, flying, "{case}: the frame after the launch");
@@ -1228,7 +1660,11 @@ mod tests {
                     tap(&mut input, KeyCode::KeyW);
                 }
                 let s = one(&mut nav, &mut cam, &mut world, &mut input);
-                assert_eq!((s.mode, s.dropout), (FlightMode::Free, None), "{case}: aborted after");
+                assert_eq!(
+                    (s.mode, s.dropout),
+                    (FlightMode::Free, None),
+                    "{case}: aborted after"
+                );
             }
         }
     }
@@ -1257,14 +1693,18 @@ mod tests {
         let mut nav = Navigator::new();
         let at = |x: f32| glam::Vec2::new(x, 505.0);
         // Not a destination: selected only.
-        assert_eq!(nav.pick(&snap, at(300.0), 12.0), Some(9));
+        let v = pick_view();
+        assert_eq!(nav.pick(&snap, &v, at(300.0), 12.0), Some(9));
         assert_eq!((nav.selected, nav.mode), (Some(9), FlightMode::Free));
         // Nothing under the cursor: the selection stays.
-        assert_eq!(nav.pick(&snap, at(600.0), 12.0), None);
+        assert_eq!(nav.pick(&snap, &v, at(600.0), 12.0), None);
         assert_eq!(nav.selected, Some(9));
         // A destination: selected, and the goto starts at once.
-        assert_eq!(nav.pick(&snap, at(100.0), 12.0), Some(7));
-        assert_eq!((nav.selected, nav.mode), (Some(7), FlightMode::Goto { target: 7 }));
+        assert_eq!(nav.pick(&snap, &v, at(100.0), 12.0), Some(7));
+        assert_eq!(
+            (nav.selected, nav.mode),
+            (Some(7), FlightMode::Goto { target: 7 })
+        );
         // C toggles: a goto is aborted into cruise; then back to free flight.
         nav.toggle_cruise();
         assert_eq!(nav.mode, FlightMode::Cruise);

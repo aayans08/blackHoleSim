@@ -8,8 +8,9 @@
 //! draws at full resolution on top (review I6).
 //!
 //! Each frame (B9 Step 1, Task C6 with the navigator; uni-nav `nav` module docs, "the app's
-//! frame"): a click picks with the last snapshot (`Navigator::pick`; the cursor scaled from the
-//! window to the internal resolution); the navigator moves the camera in free flight, cruise or
+//! frame"): a click picks with the last snapshot and the view it was taken with
+//! (`Navigator::pick`: a body anywhere on its disk, nothing hidden behind one; the cursor scaled
+//! from the window to the internal resolution); the navigator moves the camera in free flight, cruise or
 //! a goto (`Navigator::update`, with the last snapshot's destinations for the aim ring); the time
 //! keys (P, `.`, `,`); any Esc the navigator left closes the card, else the notes list, else
 //! deselects (the cancel chain: aim → goto → card → notes → selection); the selection and the
@@ -35,6 +36,7 @@ use anyhow::Context as _;
 use glam::{DQuat, DVec3, UVec2};
 use uni_core::{CameraView, Epoch, UniversePos};
 use uni_gfx::GpuContext;
+use uni_nav::pick::PickView;
 use uni_nav::{
     Action, Bookmark, ExposureChoice, FlightMode, FlyCamera, InputState, LensEnvChoice, NavStatus,
     Navigator,
@@ -114,6 +116,8 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
         event_loop.owned_display_handle(),
     ));
     desc.backends = wgpu::Backends::METAL;
+    // Replaced with the first frame's; the empty first snapshot picks nothing anyway.
+    let last_view = PickView::new(&camera.view, UVec2::ONE);
     let mut app = App {
         instance: Some(wgpu::Instance::new(desc)),
         assets,
@@ -126,6 +130,7 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
         camera,
         nav: Navigator::new(),
         last_snap: Snapshot::default(),
+        last_view,
         input: InputState::new(),
         modifiers: ModifiersState::empty(),
         last_nav: None,
@@ -228,8 +233,10 @@ struct App {
     camera: FlyCamera,
     /// Selection, the aim ring, cruise and the goto (C3).
     nav: Navigator,
-    /// The last frame's snapshot: the navigator's pick items and destinations.
+    /// The last frame's snapshot: the navigator's pick items, disks and destinations.
     last_snap: Snapshot,
+    /// The camera and internal size `last_snap` was taken with (a click's ray).
+    last_view: PickView,
     input: InputState,
     /// The keyboard modifiers held (for Cmd+Q).
     modifiers: ModifiersState,
@@ -402,7 +409,7 @@ impl App {
             let to_internal = internal.as_dvec2() / output.as_dvec2();
             let at = (cursor * to_internal).as_vec2();
             let radius = uni_nav::pick_radius_px(internal.y);
-            self.nav.pick(&self.last_snap, at, radius);
+            self.nav.pick(&self.last_snap, &self.last_view, at, radius);
         }
         let status = self.nav.update(
             &mut self.camera,
@@ -535,6 +542,7 @@ impl App {
         cmds.push(enc.finish());
         apply_hud_output(&hud_out, &mut self.nav, &mut self.world, &mut self.controls);
         self.last_snap = f.snapshot;
+        self.last_view = PickView::new(&self.camera.view, internal);
         self.cpu_ms = start.elapsed().as_secs_f32() * 1e3;
 
         g.gpu.queue.submit(cmds);
