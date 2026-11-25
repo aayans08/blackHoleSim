@@ -474,7 +474,8 @@ pub fn settle_at_bookmark_epoch(b: &uni_nav::Bookmark, world: &mut World) -> any
 
 /// The bookmark's UI state (Task C6): its `target` selected in `world` (an unknown name is an
 /// error naming the bookmark), its `highlight_belt`, and its flight label (`cruise`: the cruise
-/// label; otherwise free flight). Captures and the bench apply it.
+/// label; otherwise free flight, at rest, so below c). Captures, the bench and the window's
+/// `--start` apply it.
 pub fn bookmark_ui(b: &uni_nav::Bookmark, world: &mut World) -> anyhow::Result<UiState> {
     let selected = match &b.target {
         Some(name) => Some(
@@ -495,6 +496,7 @@ pub fn bookmark_ui(b: &uni_nav::Bookmark, world: &mut World) -> anyhow::Result<U
     };
     Ok(UiState {
         flight,
+        ftl: false,
         highlight_belt: b.highlight_belt == Some(true),
         selected,
     })

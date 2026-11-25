@@ -183,6 +183,13 @@ pub const VIVID_STAR_COLOURS_LABEL: &str = "Vivid star colours · non-physical";
 pub const FREE_FLIGHT_LABEL: &str = "FREE FLIGHT · GRAVITY NOT SIMULATED";
 /// Cruise at any speed, or a goto above c (plan table), amber.
 pub const CRUISE_LABEL: &str = "CRUISE · FTL · NON-PHYSICAL · GRAVITY IGNORED";
+/// Free flight faster than light, amber: the M0 honesty rule (CLAUDE.md §3: speeds faster than
+/// c are labelled "FTL · non-physical"). uni-app lists it right after [`FREE_FLIGHT_LABEL`]
+/// whenever the free-flight speed the HUD shows exceeds c (final review, app I1: before, only
+/// the expanded Speed panel said so), so the collapsed honesty line and the capture JSON's
+/// `honesty` carry it; [`CRUISE_LABEL`] already says FTL. The Speed panel's amber row has the
+/// same text, so the expanded notes stack leaves it out while that row shows.
+pub const FTL_LABEL: &str = "FTL · non-physical";
 /// While "Highlight asteroid belt" is on (round 2, review I12), amber.
 pub const BELT_HIGHLIGHT_LABEL: &str = "Asteroid belt brightness exaggerated (non-physical)";
 /// While the debug grid shows through a traced lens (ruling 14; m0.1's string), amber. The app

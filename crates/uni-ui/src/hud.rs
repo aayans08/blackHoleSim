@@ -749,10 +749,11 @@ fn draw_hud(
             .rect;
         drawn.push(location);
         // The notes stack under Location (12 pt, in tone; the flight label is the Speed
-        // header), 11 pt under it as in C4 (egui's item spacing and 8 pt). It ends
+        // header, and the FTL label its amber row: [`stack_skips`]), 11 pt under it as in C4
+        // (egui's item spacing and 8 pt). It ends
         // `PANEL_GAP` over the Gravity panel (or any block below it); with less room, its
         // honesty notes stay whole and the others scroll or are left out ([`plan_notes`]).
-        let stack = block_notes(&notes, &data.warnings, Some(&data.speed.header));
+        let stack = block_notes(&notes, &data.warnings, &stack_skips(data));
         if !stack.is_empty() {
             let height = |fit| {
                 measure(ctx, "notes stack", LOCATION_WIDTH, |ui| {
@@ -812,7 +813,7 @@ fn draw_hud(
         // Its pop-up stands on it, from its height this pass, and stops under the top row;
         // with less room, its honesty notes stay whole and the others scroll or are left out.
         if c.notes_expanded {
-            let popup = block_notes(&notes, &data.warnings, None);
+            let popup = block_notes(&notes, &data.warnings, &[]);
             let size = |fit| {
                 measure(ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
                     notes_popup(ui, &popup, fit)
@@ -962,18 +963,18 @@ struct Note<'a> {
     warning: bool,
 }
 
-/// The notes a block lists: every note but `skip` (expanded, the flight label, which the Speed
-/// header shows), in order. Honesty notes are the non-physical and danger ones and the
+/// The notes a block lists: every note but those in `skip` (expanded, what the Speed panel
+/// shows: [`stack_skips`]), in order. Honesty notes are the non-physical and danger ones and the
 /// warnings (`HudData::warnings`: the renderer's, GPU errors, data notices; whatever tone the
 /// app gave the same text).
 fn block_notes<'a>(
     notes: &'a [(String, LabelTone)],
     warnings: &[String],
-    skip: Option<&str>,
+    skip: &[&str],
 ) -> Vec<Note<'a>> {
     notes
         .iter()
-        .filter(|(t, _)| Some(t.as_str()) != skip)
+        .filter(|(t, _)| !skip.contains(&t.as_str()))
         .map(|(text, tone)| {
             let warning = warnings.contains(text);
             Note {
@@ -984,6 +985,16 @@ fn block_notes<'a>(
             }
         })
         .collect()
+}
+
+/// The notes the expanded stack leaves out because the Speed panel shows them: the flight label
+/// (its header) and, while its amber FTL row shows, [`theme::FTL_LABEL`].
+fn stack_skips(data: &HudData) -> Vec<&str> {
+    let mut skip = vec![data.speed.header.as_str()];
+    if panels::speed_shows_ftl(&data.speed) {
+        skip.push(theme::FTL_LABEL);
+    }
+    skip
 }
 
 /// `s` on one line: every run of white space, a wgpu error's line breaks included, one space.
@@ -1221,7 +1232,7 @@ pub fn drawn_blocks(data: &HudData, controls: &HudControls) -> Vec<&'static str>
     });
     out.push("perf line");
     if c.card_expanded {
-        if !block_notes(&notes, &data.warnings, Some(&data.speed.header)).is_empty() {
+        if !block_notes(&notes, &data.warnings, &stack_skips(data)).is_empty() {
             out.push("notes list");
         }
     } else if !notes.is_empty() {
@@ -1970,13 +1981,55 @@ mod tests {
         assert!(f.has_stroke(CRUISE_BORDER).is_none());
     }
 
-    /// Free flight faster than light: the speed itself says FTL, in amber (M0 honesty rule).
+    /// Free flight faster than light (M0 honesty rule; final review, app I1): the app lists
+    /// the amber FTL label right after the flight label, so the collapsed honesty line shows it
+    /// second with an amber dot and the pop-up in amber; expanded, the Speed panel's amber row
+    /// shows it and the notes stack does not repeat it.
     #[test]
     fn free_flight_above_c_is_labelled() {
+        use crate::theme::FTL_LABEL;
         let mut d = data();
         d.speed.speed_mps = 10.0 * uni_core::C;
+        d.speed_mps = d.speed.speed_mps;
+        d.notes = vec![
+            (FREE_FLIGHT_LABEL.to_owned(), LabelTone::NonPhysical),
+            (FTL_LABEL.to_owned(), LabelTone::NonPhysical),
+        ];
+        let notes = hud_notes(&d, &controls());
+        assert_eq!(notes[1], (FTL_LABEL.to_owned(), LabelTone::NonPhysical));
+        // Collapsed: second on the line, after its amber dot.
+        let f = draw(&d, controls());
+        let flight = f.get(FREE_FLIGHT_LABEL);
+        let ftl = f.get(FTL_LABEL);
+        assert!(ftl.pos.x > flight.pos.x && (ftl.pos.y - flight.pos.y).abs() < 1.0);
+        assert!(ftl.pos.y > 1000.0, "{ftl:?}");
+        let dots = f
+            .circles
+            .iter()
+            .filter(|(p, fill)| *fill == NON_PHYSICAL_SOFT && p.y > 1000.0)
+            .count();
+        assert_eq!(dots, 2, "flight + FTL: {:?}", f.circles);
+        // The pop-up: the label in amber.
+        let c = HudControls {
+            notes_expanded: true,
+            ..controls()
+        };
+        let f = draw(&d, c);
+        assert!(
+            f.texts.iter().any(|p| p.text == FTL_LABEL
+                && p.color == NON_PHYSICAL
+                && p.font.size == NOTES_SIZE),
+            "{:?}",
+            f.all_text()
+        );
+        // Expanded: the Speed panel's amber row, once.
         let f = draw(&d, expanded());
-        assert_eq!(f.get("FTL · non-physical").color, NON_PHYSICAL);
+        assert_eq!(f.get(FTL_LABEL).color, NON_PHYSICAL);
+        let n = f.texts.iter().filter(|p| p.text == FTL_LABEL).count();
+        assert_eq!(n, 1, "{:?}", f.all_text());
+        // Below c the panel has no row, so a listed label would stay in the stack.
+        d.speed.speed_mps = 0.5 * uni_core::C;
+        assert_eq!(stack_skips(&d), [FREE_FLIGHT_LABEL]);
     }
 
     /// Round 2 (review I12): the amber label follows the "Highlight asteroid belt" toggle.
@@ -2589,10 +2642,10 @@ mod tests {
         .map(|(s, t)| (s.to_owned(), t))
         .collect();
         let warnings = vec!["No surface map: uniform albedo".to_owned()];
-        let all = block_notes(&notes, &warnings, None);
+        let all = block_notes(&notes, &warnings, &[]);
         let honesty: Vec<bool> = all.iter().map(|n| n.honesty).collect();
         assert_eq!(honesty, [true, false, true, true]);
-        let stack = block_notes(&notes, &[], Some(FREE_FLIGHT_LABEL));
+        let stack = block_notes(&notes, &[], &[FREE_FLIGHT_LABEL]);
         let texts: Vec<&str> = stack.iter().map(|n| n.text).collect();
         assert_eq!(
             texts,
@@ -2642,7 +2695,7 @@ mod tests {
         let tone = |s: &str| shown.iter().find(|(t, _)| t == s).map(|(_, t)| *t);
         assert_eq!(tone("Inside Earth"), Some(LabelTone::Neutral));
         assert_eq!(tone(&gpu_error("bodies")), Some(LabelTone::NonPhysical));
-        let block = block_notes(&shown, &d.warnings, None);
+        let block = block_notes(&shown, &d.warnings, &[]);
         for text in merged {
             let n = block.iter().find(|n| n.text == text).expect(text);
             assert!(n.honesty && n.warning, "{n:?}");
@@ -2692,7 +2745,7 @@ mod tests {
     fn scroll_room_under_egui_floor_is_kept() {
         let ctx = headless_context();
         let notes = long_notes();
-        let block = block_notes(&notes, &[], None);
+        let block = block_notes(&notes, &[], &[]);
         assert!(block.iter().any(|n| n.honesty) && block.iter().any(|n| !n.honesty));
         let mut o = ctx.run_ui(headless_input(SIZE, 1.0, 8192), |ui| {
             let ctx = ui.ctx().clone();
@@ -3054,7 +3107,7 @@ mod tests {
             ..controls()
         };
         let notes = hud_notes(&d, &c);
-        let popup = block_notes(&notes, &d.warnings, None);
+        let popup = block_notes(&notes, &d.warnings, &[]);
         let lines = [perf_line(&d), HINT_COLLAPSED.to_owned()];
         let g = d.gravity.clone().expect("gravity");
         // One pass per frame, as in the HUD; only the measure calls are timed.
@@ -3168,7 +3221,8 @@ mod tests {
 
     /// The most honesty notes M1 raises at once (ruling C4w r2 (4)), built as uni-app's
     /// `hud_data` builds them ([`frame_notes`]):
-    /// - free flight above c, so the Speed panel has its FTL row;
+    /// - free flight above c, so the Speed panel has its FTL row and the app lists the FTL
+    ///   label;
     /// - every amber flag that can hold together: inside a traced hole's horizon (red) on the
     ///   debug grid with the stars unlensed, the four extrapolation and catching-up labels, the
     ///   belt highlighted, eye-adapted stars, vivid colours. Being inside a body ("Inside X")
@@ -3189,7 +3243,7 @@ mod tests {
             (label(f).to_owned(), tone)
         };
         let amber = |s: &str| (s.to_owned(), LabelTone::NonPhysical);
-        let mut labels = vec![amber(FREE_FLIGHT_LABEL)];
+        let mut labels = vec![amber(FREE_FLIGHT_LABEL), amber(crate::theme::FTL_LABEL)];
         labels.extend(
             [
                 HonestyFlag::PlanetsExtrapolated,
@@ -3373,7 +3427,7 @@ mod tests {
             .filter(|(t, tone)| {
                 matches!(tone, LabelTone::NonPhysical | LabelTone::Danger) || d.warnings.contains(t)
             })
-            .filter(|(t, _)| !c.card_expanded || *t != d.speed.header)
+            .filter(|(t, _)| !c.card_expanded || !stack_skips(d).contains(&t.as_str()))
             .map(|(t, _)| {
                 if d.warnings.contains(&t) {
                     one_line(&t)

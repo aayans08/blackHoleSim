@@ -132,20 +132,26 @@ pub fn absolute_view(world: &World, view: &CameraView, anchor: uni_core::FrameId
 pub const CRUISE_NOTE: &str = "auto drop-out near stars, atmospheres and black holes";
 
 /// What the navigator and the HUD decide that a frame's passes and labels depend on (Task C6):
-/// the flight label (ruling 6), the "Highlight asteroid belt" toggle and the selection (Saturn's
-/// moons' label also follows a selected moon).
+/// the flight label (ruling 6), whether the speed the HUD shows exceeds c, the "Highlight
+/// asteroid belt" toggle and the selection (Saturn's moons' label also follows a selected moon).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiState {
     pub flight: FlightLabel,
+    /// The speed the HUD shows exceeds c (`NavStatus::ftl`; false in captures, which stand
+    /// still): in free flight the amber `uni_ui::theme::FTL_LABEL` follows it (M0 honesty rule;
+    /// final review, app I1). It follows the free-flight speed setting, which the Speed panel
+    /// shows, so the label stays up while a camera set above c is at rest.
+    pub ftl: bool,
     pub highlight_belt: bool,
     pub selected: Option<ObjectId>,
 }
 
 impl Default for UiState {
-    /// Free flight, no highlight, nothing selected.
+    /// Free flight below c, no highlight, nothing selected.
     fn default() -> Self {
         Self {
             flight: FlightLabel::Free,
+            ftl: false,
             highlight_belt: false,
             selected: None,
         }
@@ -1074,13 +1080,15 @@ fn flag_tone(f: HonestyFlag) -> LabelTone {
 }
 
 /// The honesty labels in effect for a frame (`view` at internal size `viewport`) with their
-/// tones, in a fixed order: the flight label (`uni_ui::theme::ui_labels`; ruling 6), uni-sim's
-/// world-state labels (the band's two, which uni-sim raises together, only while the band is
-/// drawn: ruling, B4L), the procedural belt's (grey) while it is visible, the belt-highlight and
-/// eye-adapted labels (`ui_labels`), the vivid-colour label, the lens labels, the twinkle label
-/// (grey) and Saturn's moons' (grey: approximate positions, ruling 10) while one of Saturn's
-/// major moons is resolved (≥ `POINT_LOD_PX`) or selected (Task C6: a faint point is not
-/// enough). One list for the HUD's notes and the capture JSON's `honesty` (ruling C.5).
+/// tones, in a fixed order: the flight label (`uni_ui::theme::ui_labels`; ruling 6), the amber
+/// FTL label in free flight above c (`UiState::ftl`; M0 honesty rule, final review app I1),
+/// uni-sim's world-state labels (the band's two, which uni-sim raises together, only while the
+/// band is drawn: ruling, B4L), the procedural belt's (grey) while it is visible, the
+/// belt-highlight and eye-adapted labels (`ui_labels`), the vivid-colour label, the lens labels,
+/// the twinkle label (grey) and Saturn's moons' (grey: approximate positions, ruling 10) while
+/// one of Saturn's major moons is resolved (≥ `POINT_LOD_PX`) or selected (Task C6: a faint
+/// point is not enough). One list for the HUD's notes and the capture JSON's `honesty` (ruling
+/// C.5).
 pub fn honesty_labels(
     world: &World,
     view: &CameraView,
@@ -1105,6 +1113,9 @@ pub fn honesty_labels(
         .map_or((None, &ui[..]), |(f, r)| (Some(f), r));
     if let Some((text, tone)) = flight {
         push(text, *tone);
+    }
+    if inputs.ui.flight == FlightLabel::Free && inputs.ui.ftl {
+        push(uni_ui::theme::FTL_LABEL, LabelTone::NonPhysical);
     }
     for f in world.sim.honesty(view, viewport) {
         let band_label = matches!(
@@ -2399,6 +2410,49 @@ mod tests {
             has(&l, uni_ui::VIVID_STAR_COLOURS_LABEL),
             Some(LabelTone::NonPhysical)
         );
+        // Final review, app I1 (M0 rule): free flight above c is labelled FTL in amber, right
+        // after the flight label, in the one list the HUD and the capture JSON share; cruise's
+        // own label already says FTL, and below c there is none.
+        let ftl = uni_ui::theme::FTL_LABEL;
+        let fast = UiState {
+            ftl: true,
+            ..UiState::default()
+        };
+        let l = labels(&near, fast, false);
+        assert_eq!(l[1], (ftl.to_owned(), LabelTone::NonPhysical), "{l:?}");
+        assert!(label_texts(&l).contains(&ftl.to_owned()));
+        assert_eq!(has(&labels(&near, UiState::default(), false), ftl), None);
+        let cruise_fast = UiState {
+            ftl: true,
+            ..cruise
+        };
+        assert_eq!(has(&labels(&near, cruise_fast, false), ftl), None);
+    }
+
+    /// Final review, app I1: the free camera's FTL flag is the navigator's (its speed setting,
+    /// what the Speed panel shows), and still captures stand at rest below c.
+    #[test]
+    fn ftl_follows_the_shown_speed() {
+        let world = World::bare(Epoch::J2000);
+        let view = view_at(
+            UniversePos::from_meters(DVec3::new(1e12, 0.0, 0.0)),
+            DQuat::IDENTITY,
+        );
+        let rest = still_status(&world, &view, false, None);
+        assert!(!rest.ftl && flight_label(&rest) == FlightLabel::Free);
+        let mut cam = uni_nav::FlyCamera::new(view);
+        cam.speed_log10 = 9.0; // 10⁹ m/s, above c
+        let mut nav = uni_nav::Navigator::new();
+        let mut input = uni_nav::InputState::new();
+        let s = nav.update(
+            &mut cam,
+            &world.sim,
+            &Snapshot::default(),
+            &mut input,
+            1.0 / 60.0,
+        );
+        assert!(s.ftl && s.speed_mps > uni_core::C, "{s:?}");
+        assert_eq!(flight_label(&s), FlightLabel::Free);
     }
 
     /// The navigator's HUD part (C4's wiring notes): en route, the kicker "EN ROUTE TO" and the

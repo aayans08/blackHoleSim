@@ -448,6 +448,7 @@ impl App {
         g.scene.set_lens_scale(self.controls.lens_scale);
         let ui = UiState {
             flight: flight_label(&status),
+            ftl: status.ftl,
             highlight_belt: self.controls.highlight_belt,
             selected: self.nav.selected,
         };
@@ -570,7 +571,11 @@ fn log_present(change: Option<Change>, frame: u64) {
 }
 
 /// The navigator state [`log_navigation`] compares: mode, aim candidate, selection.
-type NavLog = (FlightMode, Option<uni_sim::registry::ObjectId>, Option<uni_sim::registry::ObjectId>);
+type NavLog = (
+    FlightMode,
+    Option<uni_sim::registry::ObjectId>,
+    Option<uni_sim::registry::ObjectId>,
+);
 
 /// Logs the navigator's changes at `info` (mode, aim candidate, selection, drop-outs), so a
 /// window run can be followed from the terminal (`RUST_LOG=universe=info`).

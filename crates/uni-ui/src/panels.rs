@@ -13,9 +13,9 @@ use crate::format::{
     format_speed_value, format_time_rate,
 };
 use crate::theme::{
-    self, BODY_SIZE, CRUISE_BORDER, CRUISE_LABEL, EPOCH_SIZE, GRAVITY_WIDTH, HAIRLINE, INK, INK_2,
-    INK_3, INK_SOFT, KICKER_TRACKING_EM, LOCATION_WIDTH, LabelTone, NON_PHYSICAL, REGION_SIZE,
-    SMALL_SIZE, SPEED_BAR_FILL, SPEED_BAR_HEIGHT, SPEED_BAR_MAX_C, SPEED_BAR_MIN_MPS,
+    self, BODY_SIZE, CRUISE_BORDER, CRUISE_LABEL, EPOCH_SIZE, FTL_LABEL, GRAVITY_WIDTH, HAIRLINE,
+    INK, INK_2, INK_3, INK_SOFT, KICKER_TRACKING_EM, LOCATION_WIDTH, LabelTone, NON_PHYSICAL,
+    REGION_SIZE, SMALL_SIZE, SPEED_BAR_FILL, SPEED_BAR_HEIGHT, SPEED_BAR_MAX_C, SPEED_BAR_MIN_MPS,
     SPEED_BAR_TRACK, SPEED_SIZE, SPEED_TICK_HEIGHT, SPEED_WIDTH, TARGET, TIME_WARP_WIDTH,
     TIME_WIDTH, WARP_BUTTONS, WARP_NOTES, Weight, mono_font, text_font, tone_color,
 };
@@ -415,7 +415,6 @@ pub(crate) fn show_speed(ui: &mut egui::Ui, s: &SpeedPanel) {
             mono_font(SPEED_SIZE, Weight::Light),
             INK,
         );
-        let ftl = s.speed_mps > C;
         let sub_font = mono_font(theme::NOTES_SIZE, Weight::Regular);
         if cruise {
             let per_hour = format!("{} per hour", format_distance(s.speed_mps * 3600.0));
@@ -424,9 +423,9 @@ pub(crate) fn show_speed(ui: &mut egui::Ui, s: &SpeedPanel) {
                 None => per_hour,
             };
             theme::text_centered(ui, &sub, sub_font, INK_2);
-        } else if ftl && !s.header.contains("FTL") {
+        } else if speed_shows_ftl(s) {
             // Free flight above c: the M0 rule "speeds faster than c are labelled".
-            theme::text_centered(ui, "FTL · non-physical", sub_font.clone(), NON_PHYSICAL);
+            theme::text_centered(ui, FTL_LABEL, sub_font.clone(), NON_PHYSICAL);
             theme::text_centered(ui, &format_c_fraction(s.speed_mps), sub_font, INK_2);
         } else {
             theme::text_centered(ui, &format_c_fraction(s.speed_mps), sub_font, INK_2);
@@ -434,6 +433,12 @@ pub(crate) fn show_speed(ui: &mut egui::Ui, s: &SpeedPanel) {
         ui.add_space(4.0);
         speed_bar(ui, s.speed_mps);
     });
+}
+
+/// Whether the Speed panel shows its amber [`FTL_LABEL`] row: faster than c under a header that
+/// does not already say FTL (free flight; the cruise header says it).
+pub(crate) fn speed_shows_ftl(s: &SpeedPanel) -> bool {
+    s.speed_mps > C && !s.header.contains("FTL")
 }
 
 /// A kicker centred in the available width.
