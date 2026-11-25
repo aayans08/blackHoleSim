@@ -1579,19 +1579,17 @@ pub const SOLAR_SYSTEM_AU: f64 = 120.0;
 
 /// What the HUD shows for this frame (C4's wiring notes): the notes are the frame's honesty
 /// labels with their tones (one list with the capture JSON's `honesty`), then the renderer's
-/// status lines in grey; `warnings` (data, GPU errors, the lens coverage warning) stay amber.
-/// The panels come from the world and `nav`.
+/// status lines in grey; `warnings` (data, GPU errors, the lens coverage warning) stay amber,
+/// and also list the renderer's statuses, which makes them honesty notes the HUD never scrolls
+/// away (lead ruling C4w r2 (1); `uni_ui::hud::frame_notes`, which also merges statuses that
+/// differ only in their parenthesis). The panels come from the world and `nav`.
 pub fn hud_data(world: &World, frame: &Frame, nav: NavHud, extras: HudExtras<'_>) -> HudData {
     let ctx = &frame.ctx;
     let (nearest_name, nearest_dist_m) = world.nearest(&ctx.camera.pos);
     let mut warnings = extras.warnings.to_vec();
     warnings.extend(frame.coverage.warning().map(str::to_owned));
-    let mut notes = frame.labels.clone();
-    for s in extras.statuses {
-        if !notes.iter().any(|(t, _)| t == s) {
-            notes.push((s.clone(), LabelTone::Neutral));
-        }
-    }
+    let (notes, warnings) =
+        uni_ui::hud::frame_notes(frame.labels.clone(), extras.statuses, warnings);
     let dist_from_sun_m = world
         .position_of("Sun")
         .map_or(f64::NAN, |s| ctx.camera.pos.delta_from(s).length());

@@ -89,15 +89,16 @@ const PERF_RESERVE: f32 = 40.0;
 /// Gap between neighbouring panels [pt]; also the least gap a notes block keeps from the
 /// other HUD blocks ([`rise`], [`fall`]).
 const PANEL_GAP: f32 = 16.0;
-/// The window's least inner size [pt] (lead ruling C4w-I1; uni-app sets it on the window).
-/// Chosen from the C4w size sweep (`honesty_notes_stay_whole_on_screen`):
+/// The window's least inner size [pt] (lead rulings C4w-I1 and C4w r2 (4); uni-app sets it
+/// on the window). Chosen from the C4w size sweep (`honesty_notes_stay_whole_on_screen`, with
+/// M1's worst honesty set, `worst_honesty` in the tests):
 /// - 960 pt keeps the honesty line beside the perf block (its 560 pt least width and the perf
-///   block need about 880 pt), the 520 pt Speed panel on screen, and Location clear of the
-///   centred time line while the card is open;
-/// - 600 pt leaves the expanded notes stack, between Location and the Gravity and Speed panels,
-///   206 pt, room for the most honesty notes M1 raises at once (nine, 192 pt with their wrapped
-///   lines; at 540 pt the room is 146 pt).
-pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 600.0];
+///   block need about 880 pt) and the 520 pt Speed panel on screen, clear of the Location
+///   column (x 340–860);
+/// - 740 pt gives the expanded notes stack, between Location (its top 180.5 pt) and Gravity,
+///   411.5 pt for the worst set's 18 honesty notes, 387 pt with their wrapped lines (one spare
+///   one-line note); the pop-up then has 625.5 pt for its 451 pt.
+pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 740.0];
 /// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
 /// line's area, which hangs 4 pt lower than the margin).
 const POPUP_GAP: f32 = 10.0;
@@ -129,7 +130,11 @@ pub struct HudData {
     /// Simulated seconds per real second; 0 is paused.
     pub time_rate: f64,
     pub star_count: u32,
-    /// Renderer warnings ("Inside Sun", "No surface map: …"): in the notes, amber.
+    /// Warnings, each an honesty note the HUD never scrolls out of view or leaves out, drawn on
+    /// one line (lead rulings C4w-I1 and C4w r2): data notices, GPU errors, the flash message,
+    /// the lens-coverage warning and the renderer's pass statuses ("Inside Sun", "Inside
+    /// Earth", "No surface map: …"; [`frame_notes`] builds them as uni-app does). A warning
+    /// that is not also in `notes` shows there in amber; the statuses keep their grey.
     pub warnings: Vec<String>,
     /// Shows "Inside event horizon" in red, first in the notes.
     pub inside_horizon: bool,
@@ -725,11 +730,11 @@ fn draw_hud(
             );
             taken.push(rect);
         }
-        // Centred, but clear of the Gravity panel on a narrow screen.
-        let mut speed_left = screen.center().x - SPEED_WIDTH / 2.0;
-        if data.gravity.is_some() {
-            speed_left = speed_left.max(left + GRAVITY_WIDTH + PANEL_GAP);
-        }
+        // Centred, but on a narrow screen clear of the Gravity panel and of the Location
+        // column, whose notes stack then runs down to Gravity rather than to the taller Speed
+        // panel (C4w r2: 86 pt more room for the honesty notes at 960 pt wide).
+        let speed_left = (screen.center().x - SPEED_WIDTH / 2.0)
+            .max(left + LOCATION_WIDTH.max(GRAVITY_WIDTH) + PANEL_GAP);
         let rect = show_measured(
             ctx,
             Measured::bottom_left("speed", egui::pos2(speed_left, screen.bottom() - m)),
@@ -763,8 +768,16 @@ fn draw_hud(
             let x = egui::Rangef::new(left, left + LOCATION_WIDTH);
             let top = location.bottom() + ctx.global_style().spacing.item_spacing.y + 8.0;
             let slot = fall(x, top, all, screen.bottom() - m, &taken, PANEL_GAP);
-            let (fit, _) = plan_notes(slot.height, all, || height(NotesFit::HONESTY_ONLY));
-            placed("notes stack", Order::Middle, egui::pos2(left, slot.top)).show(ctx, |ui| {
+            let (fit, h) = plan_notes(slot.height, all, || height(NotesFit::HONESTY_ONLY));
+            // Honesty notes past the room are drawn whole: on screen, up over Location if
+            // they must (ruling C4w r2 (3)).
+            let bottom = screen.bottom() - m;
+            let top = if slot.top + h > bottom {
+                (bottom - h).max(screen.top() + m)
+            } else {
+                slot.top
+            };
+            placed("notes stack", Order::Middle, egui::pos2(left, top)).show(ctx, |ui| {
                 ui.set_max_width(LOCATION_WIDTH);
                 notes_stack(ui, &stack, fit);
             });
@@ -809,7 +822,9 @@ fn draw_hud(
             let bottom = line.top() - POPUP_GAP;
             let slot = rise(x, bottom, all.y, screen.top() + m, &taken, PANEL_GAP);
             let (fit, h) = plan_notes(slot.height, all.y, || size(NotesFit::HONESTY_ONLY).y);
-            let top = slot.top + slot.height - h;
+            // Honesty notes past the room are drawn whole: on screen, down over the line if
+            // they must (ruling C4w r2 (3)).
+            let top = (slot.top + slot.height - h).max(screen.top() + m);
             placed("notes popup", Order::Foreground, egui::pos2(left, top))
                 .show(ctx, |ui| notes_popup(ui, &popup, fit));
         }
@@ -911,18 +926,21 @@ fn measure(
 /// block is wide or tall, small enough for f32 to keep sub-point positions (2⁻⁹ pt).
 const MEASURE_OFFSET: f32 = 20_000.0;
 
-/// One note of a notes block (the pop-up or the stack): its sentence and tone, and whether it
-/// is an honesty note, which no block scrolls out of view or leaves out (lead ruling C4w-I1).
+/// One note of a notes block (the pop-up or the stack): its sentence and tone, whether it is
+/// an honesty note, which no block scrolls out of view or leaves out (lead ruling C4w-I1), and
+/// whether it is a warning, drawn on one line ([`note_text`]; ruling C4w r2 (3)).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Note<'a> {
     text: &'a str,
     tone: LabelTone,
     honesty: bool,
+    warning: bool,
 }
 
 /// The notes a block lists: every note but `skip` (expanded, the flight label, which the Speed
 /// header shows), in order. Honesty notes are the non-physical and danger ones and the
-/// renderer warnings (`HudData::warnings`, whatever tone the app gave the same text).
+/// warnings (`HudData::warnings`: the renderer's, GPU errors, data notices; whatever tone the
+/// app gave the same text).
 fn block_notes<'a>(
     notes: &'a [(String, LabelTone)],
     warnings: &[String],
@@ -931,13 +949,45 @@ fn block_notes<'a>(
     notes
         .iter()
         .filter(|(t, _)| Some(t.as_str()) != skip)
-        .map(|(text, tone)| Note {
-            text,
-            tone: *tone,
-            honesty: matches!(tone, LabelTone::NonPhysical | LabelTone::Danger)
-                || warnings.contains(text),
+        .map(|(text, tone)| {
+            let warning = warnings.contains(text);
+            Note {
+                text,
+                tone: *tone,
+                honesty: warning || matches!(tone, LabelTone::NonPhysical | LabelTone::Danger),
+                warning,
+            }
         })
         .collect()
+}
+
+/// `s` on one line: every run of white space, a wgpu error's line breaks included, one space.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A note's text in its tone, 12 pt, at the available width. A warning is ONE line: its white
+/// space made single spaces ([`one_line`]) and its overflow ellipsized, the full text on hover
+/// (and in the log for GPU errors and data notices) (lead ruling C4w r2 (3)). Any other note
+/// wraps.
+fn note_text(ui: &mut egui::Ui, n: &Note<'_>) {
+    let font = text_font(NOTES_SIZE, Weight::Regular);
+    let color = tone_color(n.tone);
+    if !n.warning {
+        theme::text(ui, n.text, font, color);
+        return;
+    }
+    let mut job = theme::job(&one_line(n.text), font, color, 0.0, ui.available_width());
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter().galley(rect.min, galley, color);
+    if elided {
+        response.on_hover_text(n.text);
+    }
 }
 
 /// How a notes block lays out its notes.
@@ -999,9 +1049,12 @@ fn note_rows(
         NotesFit::HonestyFirst { room } => {
             notes.iter().filter(|n| n.honesty).for_each(|n| row(ui, n));
             if room > 0.0 {
+                // No floor: egui's default 64 pt least height would overrun a smaller room
+                // (review C4w r1 N1).
                 egui::ScrollArea::vertical()
                     .id_salt(("hud notes", id))
                     .max_height(room)
+                    .min_scrolled_height(0.0)
                     .show(ui, |ui| {
                         notes.iter().filter(|n| !n.honesty).for_each(|n| row(ui, n));
                     });
@@ -1108,6 +1161,75 @@ fn haloed(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.painter().set(halo, theme::halo_shape(rect.expand(6.0)));
 }
 
+/// The notes and warnings of a frame, as uni-app's `hud_data` builds them (lead ruling C4w r2
+/// (1)): `labels` (the frame's honesty labels in their tones), then the renderer's pass
+/// statuses (`statuses`: "Inside Sun", "Inside Earth", "No surface map: …", the comet
+/// partly-drawn note) in grey after them (C6's tone ruling); and `warnings` (data notices, GPU
+/// errors, the flash message, the lens-coverage warning) followed by the same statuses, which
+/// makes them honesty notes. Statuses that differ only inside their closing parenthesis are
+/// one line ([`merge_statuses`]), so a crowded Saturn system shows one "No surface map" line.
+pub fn frame_notes(
+    labels: Vec<(String, LabelTone)>,
+    statuses: &[String],
+    warnings: Vec<String>,
+) -> (Vec<(String, LabelTone)>, Vec<String>) {
+    let statuses = merge_statuses(statuses);
+    let mut notes = labels;
+    for s in &statuses {
+        if !notes.iter().any(|(t, _)| t == s) {
+            notes.push((s.clone(), LabelTone::Neutral));
+        }
+    }
+    let mut warnings = warnings;
+    for s in statuses {
+        if !warnings.contains(&s) {
+            warnings.push(s);
+        }
+    }
+    (notes, warnings)
+}
+
+/// `statuses` with those that differ only inside a closing parenthesis joined into one, in
+/// first-seen order: "No surface map: uniform albedo (Mimas)" and "… ((433) Eros)" become
+/// "No surface map: uniform albedo (Mimas, (433) Eros)". The text before the first " (" is the
+/// status, the rest its subject; a status without one stays as it is. Each text once.
+fn merge_statuses(statuses: &[String]) -> Vec<String> {
+    // (head, the subjects inside its parenthesis); no subjects: the status as it is.
+    let mut merged: Vec<(&str, Vec<&str>)> = Vec::new();
+    for s in statuses {
+        match s.strip_suffix(')').and_then(|t| t.split_once(" (")) {
+            Some((head, subject)) => {
+                match merged
+                    .iter_mut()
+                    .find(|(h, subjects)| *h == head && !subjects.is_empty())
+                {
+                    Some((_, subjects)) if subjects.contains(&subject) => {}
+                    Some((_, subjects)) => subjects.push(subject),
+                    None => merged.push((head, vec![subject])),
+                }
+            }
+            None => {
+                if !merged
+                    .iter()
+                    .any(|(h, sub)| *h == s.as_str() && sub.is_empty())
+                {
+                    merged.push((s, Vec::new()));
+                }
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(head, subjects)| {
+            if subjects.is_empty() {
+                head.to_owned()
+            } else {
+                format!("{head} ({})", subjects.join(", "))
+            }
+        })
+        .collect()
+}
+
 /// The notes in their order: "Inside event horizon" (red), the flight label, the app's notes,
 /// then the labels of the HUD's own flags (the belt toggle, eye-adapted stars, the traced lens)
 /// and the renderer warnings (amber); each text once.
@@ -1172,7 +1294,7 @@ fn notes_line(ui: &mut egui::Ui, notes: &[(String, LabelTone)], max_w: f32) -> e
     let mut x = 0.0;
     let mut cut = false;
     for (i, (text, tone)) in notes.iter().enumerate() {
-        let galley = layout(ui, short_label(text));
+        let galley = layout(ui, &one_line(short_label(text)));
         let dotted = matches!(tone, LabelTone::NonPhysical | LabelTone::Danger);
         let lead = if i > 0 { sep.size().x } else { 0.0 };
         let need = lead + if dotted { dot_w } else { 0.0 } + galley.size().x;
@@ -1248,12 +1370,7 @@ fn notes_popup(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
                     );
                     ui.painter()
                         .circle_filled(dot.center(), NOTE_DOT / 2.0, tone_color(n.tone));
-                    theme::text(
-                        ui,
-                        n.text,
-                        text_font(NOTES_SIZE, Weight::Regular),
-                        tone_color(n.tone),
-                    );
+                    note_text(ui, n);
                 });
             });
         });
@@ -1264,14 +1381,7 @@ fn notes_popup(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
 fn notes_stack(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
     haloed(ui, |ui| {
         ui.spacing_mut().item_spacing = egui::vec2(0.0, NOTE_ROW_GAP);
-        note_rows(ui, "notes stack", notes, fit, |ui, n| {
-            theme::text(
-                ui,
-                n.text,
-                text_font(NOTES_SIZE, Weight::Regular),
-                tone_color(n.tone),
-            );
-        });
+        note_rows(ui, "notes stack", notes, fit, note_text);
     });
 }
 
@@ -1524,6 +1634,9 @@ mod tests {
         tracking: f32,
         /// The clip rect it was painted with (a scroll area's viewport clips its rows).
         clip: egui::Rect,
+        /// Its rows, and whether its text was cut with "…".
+        rows: usize,
+        elided: bool,
     }
 
     impl Painted {
@@ -1572,6 +1685,8 @@ mod tests {
                         font: first.map_or_else(Default::default, |s| s.format.font_id.clone()),
                         tracking: first.map_or(0.0, |s| s.format.extra_letter_spacing),
                         clip,
+                        rows: t.galley.rows.len(),
+                        elided: t.galley.elided,
                     });
                 }
                 egui::Shape::Rect(r) => f.rects.push((r.rect, r.fill, r.stroke.color)),
@@ -2402,6 +2517,130 @@ mod tests {
         assert!(!stack[2].honesty, "not a warning here");
     }
 
+    /// Lead ruling C4w r2 (1): the renderer's pass statuses reach the HUD as uni-app's
+    /// `hud_data` sends them: grey notes after the labels and also warnings, so the HUD pins
+    /// them; statuses that differ only in their parenthesis are one line.
+    #[test]
+    fn frame_notes_pin_renderer_statuses() {
+        let labels = vec![(FREE_FLIGHT_LABEL.to_owned(), LabelTone::NonPhysical)];
+        let statuses: Vec<String> = [
+            "Inside Earth",
+            "No surface map: uniform albedo (Mimas)",
+            "No surface map: uniform albedo (Tethys)",
+            "No surface map: uniform albedo ((433) Eros)",
+            "No surface map: uniform albedo (Mimas)",
+            "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)",
+            "Inside Earth",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let (notes, warnings) = frame_notes(labels, &statuses, vec![gpu_error("bodies")]);
+        let merged = [
+            "Inside Earth",
+            "No surface map: uniform albedo (Mimas, Tethys, (433) Eros)",
+            "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)",
+        ];
+        let texts: Vec<&str> = notes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(texts[1..], merged, "{notes:?}");
+        assert!(notes[1..].iter().all(|(_, t)| *t == LabelTone::Neutral));
+        assert_eq!(warnings[0], gpu_error("bodies"));
+        assert_eq!(warnings[1..], merged);
+        // The HUD keeps them grey and pins them.
+        let mut d = data();
+        d.notes = notes;
+        d.warnings = warnings;
+        let shown = hud_notes(&d, &controls());
+        let tone = |s: &str| shown.iter().find(|(t, _)| t == s).map(|(_, t)| *t);
+        assert_eq!(tone("Inside Earth"), Some(LabelTone::Neutral));
+        assert_eq!(tone(&gpu_error("bodies")), Some(LabelTone::NonPhysical));
+        let block = block_notes(&shown, &d.warnings, None);
+        for text in merged {
+            let n = block.iter().find(|n| n.text == text).expect(text);
+            assert!(n.honesty && n.warning, "{n:?}");
+        }
+    }
+
+    /// Ruling C4w r2 (3): every warning and GPU error is one line in the HUD, its line breaks
+    /// made spaces and its overflow ellipsized (the full text on hover and in the log): in the
+    /// pop-up, in the stack, and on the honesty line.
+    #[test]
+    fn warnings_are_one_line() {
+        let mut d = data();
+        d.warnings = vec![gpu_error("bodies")];
+        let drawn = one_line(&gpu_error("bodies"));
+        for c in [
+            HudControls {
+                notes_expanded: true,
+                ..controls()
+            },
+            expanded(),
+        ] {
+            let f = draw(&d, c);
+            let p = f
+                .texts
+                .iter()
+                .find(|p| p.text == drawn && p.font.size == NOTES_SIZE)
+                .unwrap_or_else(|| panic!("no warning in {:?}", f.all_text()));
+            assert_eq!((p.rows, p.elided), (1, true), "{p:?}");
+            assert!(p.size.y < 2.0 * NOTES_SIZE, "{p:?}");
+            if !c.card_expanded {
+                let line: Vec<&Painted> = line_texts(&f)
+                    .into_iter()
+                    .filter(|p| p.text.starts_with("GPU error"))
+                    .collect();
+                assert!(
+                    !line.is_empty() && line.iter().all(|p| p.rows == 1),
+                    "{line:?}"
+                );
+            }
+        }
+    }
+
+    /// Review C4w r1 N1: egui gives a scroll area a 64 pt least height by default, so a room of
+    /// 24–64 pt for the informational notes drew taller than [`plan_notes`] planned, over the
+    /// next block. The block is now exactly its honesty notes, the row gap and the room.
+    #[test]
+    fn scroll_room_under_egui_floor_is_kept() {
+        let ctx = headless_context();
+        let notes = long_notes();
+        let block = block_notes(&notes, &[], None);
+        assert!(block.iter().any(|n| n.honesty) && block.iter().any(|n| !n.honesty));
+        let mut o = ctx.run_ui(headless_input(SIZE, 1.0, 8192), |ui| {
+            let ctx = ui.ctx().clone();
+            for room in [24.0, 30.0, 40.0, 50.0, 63.0] {
+                let stack = |id: &str, fit| {
+                    measure(&ctx, id, LOCATION_WIDTH, |ui| notes_stack(ui, &block, fit)).y
+                };
+                let popup = |id: &str, fit| {
+                    measure(&ctx, id, NOTES_POPUP_WIDTH, |ui| {
+                        notes_popup(ui, &block, fit)
+                    })
+                    .y
+                };
+                let fit = NotesFit::HonestyFirst { room };
+                for (name, base, h) in [
+                    (
+                        "stack",
+                        stack(&format!("n1 stack base {room}"), NotesFit::HONESTY_ONLY),
+                        stack(&format!("n1 stack {room}"), fit),
+                    ),
+                    (
+                        "pop-up",
+                        popup(&format!("n1 popup base {room}"), NotesFit::HONESTY_ONLY),
+                        popup(&format!("n1 popup {room}"), fit),
+                    ),
+                ] {
+                    let want = base + NOTE_ROW_GAP + room;
+                    assert!(
+                        (h - want).abs() <= 0.5,
+                        "{name}, room {room}: {h} vs {want}"
+                    );
+                }
+            }
+        });
+        o.textures_delta.clear();
+    }
+
     /// Review C4w M3: what the HUD's measuring costs. Prints the mean of one settled HUD run
     /// (collapsed with the pop-up; expanded with the card) and of one frame's measure calls
     /// alone (all six measured blocks, more than either mode makes)
@@ -2545,25 +2784,85 @@ mod tests {
         long
     }
 
-    /// The most honesty notes M1 raises at once: inside a horizon at a traced hole on the debug
-    /// grid, planets extrapolated, the belt highlighted, two renderer warnings (one wraps), on
-    /// top of the comet captures' labels.
+    /// A GPU error as the app lists it: uni-gfx's "GPU error: " and wgpu's multi-line chain
+    /// (wgpu-core `format_error`).
+    fn gpu_error(pass: &str) -> String {
+        format!(
+            "GPU error: Validation Error\n\nCaused by:\n  In a RenderPass\n    note: encoder = \
+             `{pass}`\n  In a draw command, indexed:false indirect:false\n    note: render \
+             pipeline = `{pass}`\n  Buffer is bound with size 336 where the shader expects 352"
+        )
+    }
+
+    /// The most honesty notes M1 raises at once (ruling C4w r2 (4)), built as uni-app's
+    /// `hud_data` builds them ([`frame_notes`]):
+    /// - free flight above c, so the Speed panel has its FTL row;
+    /// - every amber flag that can hold together: inside a traced hole's horizon (red) on the
+    ///   debug grid with the stars unlensed, the four extrapolation and catching-up labels, the
+    ///   belt highlighted, eye-adapted stars, vivid colours. Being inside a body ("Inside X")
+    ///   or beyond the lens's reach (the coverage warning) excludes a traced lens, so neither
+    ///   is here: they are one line against the three lens lines;
+    /// - the most warnings: the 3 GPU errors the app keeps, the flash message, a data notice,
+    ///   and the renderer's statuses (three bodies without maps, merged into one line; a map
+    ///   without statistics; the comet partly-drawn note). 18 honesty notes in the stack.
     fn worst_honesty(d: &mut HudData, c: &mut HudControls) {
+        use crate::theme::{SATURN_MOONS_LABEL, VIVID_STAR_COLOURS_LABEL};
         use uni_sim::honesty::{HonestyFlag, label};
-        d.notes = comet_notes(true);
-        d.notes
-            .push((DEBUG_GRID_LABEL.into(), LabelTone::NonPhysical));
-        d.notes.push((
-            label(HonestyFlag::PlanetsExtrapolated).into(),
-            LabelTone::NonPhysical,
-        ));
-        d.inside_horizon = true;
-        d.warnings = vec![
-            "Inside Sun".into(),
-            "GPU error: validation error in the bodies pass (the frame may be incomplete; see \
-             the log)"
-                .into(),
+        let flag = |f: HonestyFlag| {
+            let tone = if uni_sim::honesty::is_non_physical(f) {
+                LabelTone::NonPhysical
+            } else {
+                LabelTone::Neutral
+            };
+            (label(f).to_owned(), tone)
+        };
+        let amber = |s: &str| (s.to_owned(), LabelTone::NonPhysical);
+        let mut labels = vec![amber(FREE_FLIGHT_LABEL)];
+        labels.extend(
+            [
+                HonestyFlag::PlanetsExtrapolated,
+                HonestyFlag::PlutoExtrapolated,
+                HonestyFlag::StarsExtrapolated,
+                HonestyFlag::CometsCatchingUp,
+                HonestyFlag::BandModel,
+                HonestyFlag::MilkyWayDetailProcedural,
+                HonestyFlag::ProceduralBelt,
+            ]
+            .map(flag),
+        );
+        labels.extend([
+            amber(BELT_HIGHLIGHT_LABEL),
+            amber(EYE_ADAPTED_STARS_LABEL),
+            amber(VIVID_STAR_COLOURS_LABEL),
+            amber(DEBUG_GRID_LABEL),
+            amber(UNLENSED_STARS_LABEL),
+            (SATURN_MOONS_LABEL.to_owned(), LabelTone::Neutral),
+        ]);
+        let statuses: Vec<String> = [
+            "No surface map: uniform albedo (Mimas)",
+            "No surface map: uniform albedo (Enceladus)",
+            "No surface map: uniform albedo (Tethys)",
+            "Surface map incomplete (Saturn; no albedo statistics: the point colour is solar)",
+            "Comet dust tail partly drawn at this range (6 % of its light; renderer limit)",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let warnings = vec![
+            "No AT-HYG stars: the sky shows the BSC5 stars instead".to_owned(),
+            gpu_error("bodies"),
+            gpu_error("rings"),
+            gpu_error("comets"),
+            "Saved view captures/views/view-2026-11-25T10-00-00.ron (render with --capture)"
+                .to_owned(),
         ];
+        let (notes, warnings) = frame_notes(labels, &statuses, warnings);
+        d.notes = notes;
+        d.warnings = warnings;
+        d.inside_horizon = true;
+        d.eye_adapted_stars = true;
+        d.lens_on_screen = false;
+        d.speed.speed_mps = 3.0 * uni_core::C;
+        d.speed_mps = d.speed.speed_mps;
         c.highlight_belt = true;
     }
 
@@ -2629,7 +2928,17 @@ mod tests {
                         d.lens_on_screen = true;
                         match list {
                             "comets" => d.notes = comet_notes(true),
-                            "long" => d.notes = long_notes(),
+                            "long" => {
+                                // With two renderer statuses, routed as the app routes them.
+                                let statuses = [
+                                    "Inside Earth".to_owned(),
+                                    "No surface map: uniform albedo (Phobos)".to_owned(),
+                                ];
+                                let (notes, warnings) =
+                                    frame_notes(long_notes(), &statuses, Vec::new());
+                                d.notes = notes;
+                                d.warnings = warnings;
+                            }
                             _ => worst_honesty(&mut d, &mut c),
                         }
                         let case = format!("{size_px:?} @ {ppp}, {list}, {mode}, warp {show_warp}");
@@ -2685,6 +2994,7 @@ mod tests {
 
     /// The honesty notes of `d` under `c`: non-physical or danger in tone, or a renderer
     /// warning; expanded, without the flight label (the Speed header shows it).
+    /// Warnings as drawn: on one line ([`one_line`]).
     fn honesty_texts(d: &HudData, c: &HudControls) -> Vec<String> {
         hud_notes(d, c)
             .into_iter()
@@ -2692,7 +3002,13 @@ mod tests {
                 matches!(tone, LabelTone::NonPhysical | LabelTone::Danger) || d.warnings.contains(t)
             })
             .filter(|(t, _)| !c.card_expanded || *t != d.speed.header)
-            .map(|(t, _)| t)
+            .map(|(t, _)| {
+                if d.warnings.contains(&t) {
+                    one_line(&t)
+                } else {
+                    t
+                }
+            })
             .collect()
     }
 
@@ -2717,6 +3033,9 @@ mod tests {
                     .iter()
                     .find(|p| p.text == *text && p.font.size == NOTES_SIZE)
                     .unwrap_or_else(|| panic!("{case}: {text:?} not drawn: {:?}", f.all_text()));
+                if d.warnings.iter().any(|w| one_line(w) == *text) {
+                    assert_eq!(p.rows, 1, "{case}: a warning on one line: {p:?}");
+                }
                 let r = egui::Rect::from_min_size(p.pos, p.size);
                 assert!(
                     p.clip.expand(0.5).contains_rect(r) && screen.expand(0.5).contains_rect(r),
