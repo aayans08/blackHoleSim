@@ -22,18 +22,24 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: the M1 gate, steps 1–5 (2026-11-25, HEAD `335b309`; the M1
-> final fix wave is in progress; ledger `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`, gate report
-> `task-M1-gate-report.md`). On the M3: `cargo test --workspace --lib --bins` 1 082 passed, 0 failed, 7 ignored;
-> `universe --selftest` 55/55 PASS (every render crate's GPU probes plus `depth_writers_write_g`); `--capture
-> bookmarks/m1.ron --hdr` renders 27/27 with no GPU error (the `--hud` set 27/27, `bookmarks/m0.ron` 6/6); the plan's
-> numeric checks 42/42 PASS (row 27's lens seam ratio 1.043); the M0 shadow regression (bookmark `bh-shadow-30M-grid`)
-> measures 158.745 px. Not yet run at the gate (target): step 6, the 60-s bench, and step 7, the window run. The last
-> 60-s bench (`--bench bookmarks/m1-bench.ron --sustained 60`, C6, 2026-11-24, before C1L's comet changes, machine
-> busy): 10/10 views within GPU p95 ≤ 16 ms, CPU p95 ≤ 4 ms, interval p95 ≤ 16.7 ms over the last 10 s (132–228 fps;
-> 3 views passed only in a re-run). Per-pass budgets re-baselined by ruling: band 0.6 ms, histogram 0.6 ms (≈0.4 ms
-> per pass boundary on this GPU). The app window runs the full M1 stack with the Navigator, HUD v2 and overlay (C6:
-> `start` at 60 fps, CPU 1.9–2.4 ms, no GPU error). M1 capture sheet: target (after the gate). Wave B capture sheet:
+> **Updated by the lead after each wave.** Last update: the sync after the M1 final fix wave F1–F5 (task S1,
+> 2026-11-25; ledger `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`, reports `final-fix-F*-report.md`,
+> `task-S1-report.md`). The gate re-runs at the final HEAD (target). Measured in the fix wave: `universe --selftest`
+> 57/57 PASS (F3: uni-sky's new `stars3d_halo_taper` and `world_points_shape` probes); `--bench
+> bookmarks/m1-bench.ron --sustained 6` (F3, busy machine): the tonemap's time valid in every frame of all 10 views,
+> pass sum 100 % of the GPU frame; F3's `--capture bookmarks/m1.ron` 27/27, no GPU error, every view but
+> `asteroid-belt-above` (scene EV 18.04 now, paper 18.05) within 0.031 EV of the gate. The M1 gate, steps 1–5
+> (HEAD `335b309`, gate report `task-M1-gate-report.md`), before the fix wave: `cargo test --workspace --lib --bins`
+> 1 082 passed, 0 failed, 7 ignored; `universe --selftest` 55/55 PASS (every render crate's GPU probes plus
+> `depth_writers_write_g`); `--capture bookmarks/m1.ron --hdr` renders 27/27 with no GPU error (the `--hud` set 27/27,
+> `bookmarks/m0.ron` 6/6); the plan's numeric checks 42/42 PASS (row 27's lens seam ratio 1.043); the M0 shadow
+> regression (bookmark `bh-shadow-30M-grid`) measures 158.745 px. Not yet run at the gate (target): step 6, the
+> 60-s bench, and step 7, the window run. The last 60-s bench (`--bench bookmarks/m1-bench.ron --sustained 60`, C6,
+> 2026-11-24, before C1L's comet changes, machine busy): 10/10 views within GPU p95 ≤ 16 ms, CPU p95 ≤ 4 ms,
+> interval p95 ≤ 16.7 ms over the last 10 s (132–228 fps; 3 views passed only in a re-run). Per-pass budgets
+> re-baselined by ruling: band 0.6 ms, histogram 0.6 ms (≈0.4 ms per pass boundary on this GPU). The app window runs
+> the full M1 stack with the Navigator, HUD v2 and overlay (C6: `start` at 60 fps, CPU 1.9–2.4 ms, no GPU error). M1
+> capture sheet: target (after the gate). Wave B capture sheet:
 > https://claude.ai/artifact/CxNGdYe4roydB4AvvuhTh7 ; engine sky before/after: https://claude.ai/artifact/58pKRE6QDzjqQLM9CrtkLN
 > Older sheets (M0): https://claude.ai/artifact/826GQeJr5fJL542uRbm9sx (the earlier Ld8A… sheet has corrupted timings).
 
@@ -48,18 +54,25 @@ crates/
   uni-gfx/      FROZEN API, implemented: context (GpuContext, headless + windowed, GPU error log), targets (pass
                 contract, HDR_MAX), frame (FrameCtx, CameraUniform 336 B, ExposureUniform 32 B, LightUniform
                 144 B, exposure_scale), timer (PassTimer: Option ms per pass, each pass's end stamp
-                GpuTimings::pass_end_ms / PassTimer::last_end_ms, whole-frame ms; Renderer::gpu_timings()), renderer
+                GpuTimings::pass_end_ms / PassTimer::last_end_ms, whole-frame ms; Renderer::gpu_timings(); a frame
+                resolves once a later one has completed, ring of 6, F3), renderer
                 (RenderFeature, Renderer, FrameBindings), shared (SharedInput<T>), env (cube_dir twin), probe
                 (compute probes for --selftest), shader (ShaderLib #import + naga validate), capture (read_hdr),
                 proj (reversed-Z infinite); shaders/common/*.wgsl
   uni-post/     histogram auto-exposure (meter samples 1 px per 2×2 block, decodes lens_mask.a star share with
-                pre_mix), dual star exposure, bloom (6 levels), upscale + AgX tonemap + TPDF dither; CPU twins
-                [M1 B6, B9h]. The default star EV −6.5 is the app's (`uni_app::scene::DEFAULT_STAR_EV100`);
-                `uni_sky::DEFAULT_STAR_EV100` (−4) is M0's, kept for the debug-grid bookmark
+                pre_mix), dual star exposure, bloom (6 levels), upscale + AgX-style tonemap + TPDF dither; CPU twins
+                [M1 B6, B9h]. AgX (Sobotka's idea) with constants derived in `agx.rs` (F3; the earlier ones were
+                copied from an "All rights reserved" source): inset = each BT.709 primary 20 % of the way to D65,
+                outset its exact inverse, log2 range middle grey −10/+6.5 stops, the file's own toe/shoulder sigmoid
+                fitted to the M0 look (captures moved ≤ 2 code values). The default star EV −6.5 is the app's
+                (`uni_app::scene::DEFAULT_STAR_EV100`); `uni_sky::DEFAULT_STAR_EV100` (−4) is M0's, kept for the
+                debug-grid bookmark
   uni-nav/      quaternion 6-DoF FlyCamera, log speed [10⁻¹, 10²⁶] m/s, winit input → Action, RON bookmarks, anchor
                 (camera parented to a body frame, resolve_bookmark) [A6]; Navigator [C3]: aim ring on the destination
-                nearest the view centre (fills, then flies), click pick (within 12 px of an object's projected
-                centre at 1080 lines) + F to fly to the selection, animated goto (turn, then 4.5 s
+                nearest the view centre (fills, then flies), click pick (F1: the cursor's ray against every
+                resolved body ellipsoid, star surface and nucleus ≥ 1.5 px, nearest hit wins, so a hidden object is
+                never picked or flown to; points within 12 px at 1080 lines unless a nearer disk covers them; rings,
+                atmospheres and comae do not occlude) + F to fly to the selection, animated goto (turn, then 4.5 s
                 accelerate–cruise–decelerate to a stand-off; frameless targets followed by position + velocity),
                 cruise (speed from the distance to the nearest surface, ≤ 0.05 pc per frame, labelled FTL),
                 time-warp keys, Esc chain aim → goto → card → selection
@@ -68,12 +81,18 @@ crates/
                 facts, Horizons goldens; data_dir() [M1 A7–A9.1]
   uni-physics/  planets: Standish 1992 Table 1 (1800–2050) / Table 2 with 20-yr blend bands 1780–1800 and
                 2050–2070, Meeus Pluto, SSB; moons: Meeus 47 Moon, E5 Galileans, Meeus 46 Saturn moons
-                (approximate, labelled), JPL mean elements; WGCCRE 2015 rotation; Ephemeris; photometry
-                (Mallama & Hilton 2018, phase correction C ≤ 10), small bodies (two-body + planet-perturbed
-                RK4, osculate_at), Finson–Probstein dust, calculators [M1 A1–A3]
+                (approximate, labelled), JPL mean elements outside the Meeus window J2000 ± 3000 yr
+                (`EphemFlag::MoonTheoryFallback`; moons without elements stay at the window edge, `MoonsFrozen`;
+                F2); WGCCRE 2015 rotation; Ephemeris; photometry (Mallama & Hilton 2018, phase correction C ≤ 10;
+                F2: `PhaseLaw`, Saturn's point × its rings by Eq. 10 (`saturn_ring_factor`, ≥ 1, held at α 6.5°,
+                β 27°), the Moon by Krisciunas & Schaefer 1991 Eq. 9, H–G for asteroids), small bodies (two-body +
+                planet-perturbed RK4, osculate_at), Finson–Probstein dust, calculators [M1 A1–A3]
   uni-sim/      time warp, registry (17 821 objects incl. 8 973 H ≤ 10 asteroids, grows at runtime),
                 cached f64 states (threaded refresh, 0.42 ms per tick release), snapshot (CPU mean 0.26–0.97 ms in
-                C6's sustained bench, 1.95 ms on a busy machine), honesty flags, near-star index; comets start from
+                C6's sustained bench, 1.95 ms on a busy machine), honesty flags (F2 adds the amber
+                `MoonsMeanElements` and `MoonsFrozen`), near-star index; the H ≤ 10 registry asteroids follow
+                H–G with their SBDB G and a p_V that reproduces H (F2; the disk path still uses G 0.15, so 98 of
+                them, Vesta ≤ 0.35 mag, jump at the 1.5 px handover, M2); comets start from
                 data/baked/comets_2026.ron and catch up after date jumps under the "catching up" label [M1 A4, A4r,
                 A4p]. Wave C [C0, C6]: active comets in the snapshot, destinations and marker candidates (the Sun,
                 planets, the dominant planet's major moons, ≤ 3 other bright ones), World::details for cards,
@@ -81,44 +100,58 @@ crates/
                 SBDB's law, noted on the card)
   uni-procgen/  galaxy model v0 (+ galaxy.wgsl), faint-star luminosity function [M1 A5]
   uni-sky/      StarField3 (AT-HYG 333 294 stars in 3-D sectors, eye-glare halo fitted to CIE glare, vivid colours
-                labelled, Young 1967 twinkle under an atmosphere), points (reflected bodies at the blended exposure),
-                band v0 + environment cubemap (procedural dust/star-cloud detail + 12 named clouds, labelled), M0
-                BSC5 StarField fallback; band and catalogue stars have no depth test (lens_mask only) [M1 B4, B5,
-                B4L, B9c]; asteroids [C2]: the 33 678 SBDB H ≤ 14 records solved on the GPU (f32 Kepler with a
-                double-single mean anomaly, ≤ ~100 km in the main belt; uni-sim's registry asteroids are skipped
-                here), a procedural belt from the catalogue's (a, e, i) histograms (app ladder 80 k main + 20 k
-                Kuiper, Trojans at L4/L5, labelled procedural), opt-in belt highlight (amber, non-physical)
+                labelled, Young 1967 twinkle under an atmosphere; a clamped halo tapers to black inside its 64-px
+                footprint and keeps its light up to it, F3), points (reflected bodies at the blended exposure; the
+                sprite of a light that light-adapts the eye is skipped), world_points (F3: `ADAPTING_LUX` 1 lx,
+                `WorldPointDrawer`, hosted by uni-planet's `sun` pass), band v0 + environment cubemap (procedural
+                dust/star-cloud detail + 12 named clouds, labelled), M0 BSC5 StarField fallback; band and catalogue
+                stars have no depth test (lens_mask only) [M1 B4, B5, B4L, B9c]; asteroids [C2]: the 33 678 SBDB
+                H ≤ 14 records solved on the GPU (f32 Kepler with a double-single mean anomaly, ≤ ~100 km in the
+                main belt; uni-sim's registry asteroids are skipped here), a procedural belt from the catalogue's
+                (a, e, i) histograms (app ladder 80 k main + 20 k Kuiper, Trojans at L4/L5, labelled procedural),
+                opt-in belt highlight (amber, non-physical)
   uni-rel/      binet CPU tracer (golden-tested); LensTracer (environment = the band cubemap, or the M0 debug grid with
-                LensEnv::DebugGrid; skips pixels with a body in front); DebugSkyBackground; LensScale [M1 B7]
+                LensEnv::DebugGrid; skips pixels with a body in front; inside a horizon a black placeholder frame,
+                labelled, the infalling view is M3's); DebugSkyBackground; LensScale [M1 B7]
   uni-planet/   analytic ellipsoid bodies with BC7 maps (proxy cap mesh, exact limb), star surfaces (limb darkening,
                 granulation), Saturn's rings (Salo & French 2010 layer), eclipse/LOD twins [M1 B0–B2, B10, B11];
                 comets [C1, C1L] (comet/{mod,nucleus,coma,tails}.rs, comet.wgsl): nucleus mesh in the LOD band like a
                 body, coma (SBDB total minus the nucleus), Finson–Probstein dust tail (1 024 grains per tail, EWA
                 splats, Biver et al. 2022 dust law where known), CO⁺ ion tail anchored on Aravind et al. 2025; ≤ 8
-                tailed comets; grey note when a tail is partly drawn
+                tailed comets; grey note when a tail is partly drawn. Depends on uni-sky (F3, accepted for M1): the
+                `sun` pass draws a light-adapting light's point with uni-sky's `WorldPointDrawer`
   uni-atmo/     Hillaire 2020 atmospheres for Earth, Mars, Venus, Titan (dual-source and grey variants; half-res
                 march, 16–24 steps), ground lighting, scintillation [M1 B3, B9p]
   uni-ui/       egui HUD v2 [C4, C4w]: collapsed by default (place line + "i", one time line, honesty line, perf
                 line); expanded Location, Time/warp, Speed, Gravity ("not applied") panels and the target card (it
                 uses the height down to the block below; its rows scroll only when they do not fit, below about
-                1320 pt wide); honesty notes and renderer warnings pinned, one line each, never scrolled; Tab hides
-                the whole HUD; Inter / IBM Plex Mono; window least size 960 × 740 pt. Overlay [C5]: markers,
+                1320 pt wide); honesty notes and renderer warnings pinned, one line each, never scrolled; F1's amber
+                labels: "FTL · non-physical" (free flight set above c; the expanded stack leaves it to the Speed
+                panel's row), "Inside the event horizon: view not simulated (…)" first (replaces the red status),
+                the lens label "Stars near the hole not yet lensed; gravitational blueshift not applied (M3)"; Tab
+                hides the HUD but keeps the honesty line; Inter / IBM Plex Mono; window least size 960 × 840 pt
+                (M1's worst set, 20 honesty notes, `worst_set_fits_the_least_window`). Overlay [C5]: markers,
                 brackets, orbit lines only for the selection or goto target (exoplanet orbits dashed), kept off the
                 HUD panels
   uni-app/      binary `universe [--start <name>]`: the window at a bookmarks/m1.ron view (default "start") with the
                 full M1 stack, Navigator, HUD and overlay; an occluded window stops presenting and retries at 4 Hz
                 [C6w]; `--capture <ron> --out <dir> [--size] [--frames] [--hud] [--hdr]` (capture JSON v2: settle
-                then Manual, honesty and HUD blocks, pre-bloom HDR sidecar from the pre-bloom tap, per-pass
-                durations from pass_end_ms, projected/regions/samples/flux); `--bench <ron> [--sustained s] [--json
-                out]`; `--selftest` (55 checks: pcg3d, agx, binet, every render crate's GPU probes, depth writers
-                write g). `--sky v1` is accepted and ignored
+                then Manual, honesty and HUD blocks (`honesty` lists the FTL, horizon and moon labels too),
+                pre-bloom HDR sidecar from the pre-bloom tap, per-pass durations from pass_end_ms,
+                projected/regions/samples/flux; a point's `projected` radius is its saturated core as drawn, at the
+                scene EV for a light-adapting light); `--bench <ron> [--sustained s] [--json out]`; late GPU errors
+                fail `--capture` and `--bench` (F1, compile-checked only); `--selftest` (57 checks: pcg3d, agx,
+                binet, every render crate's GPU probes, depth writers write g). `--sky v1` is accepted and ignored
 tools/bake/     bin `uni-bake`: bsc5, athyg, exo, map, rings, sbdb, sats, facts, horizons, comets-epoch
                 (raw inputs in data/cache/, outputs in data/baked/)
 tools/verify/   bin `uni-verify`: `sheet --captures <dir> --out <html> [--bench <json>]`, `contact --captures <dir>
                 --out <png> [--width 2400]` (one labelled grid PNG), `shadow`, `disk` (limb ellipse fit), `points`
-                (projected positions vs brightness centroids), `bench` (p95 gates on a bench JSON); HDR checks on
-                the `--hdr` sidecar: `ratio`, `stats`, `samples`, `profile`, `angle`, `flux`, `limb` (also as
-                `hdr <check>`)
+                (projected positions vs brightness centroids; SNR ≥ 8 or FAIL), `bench` (p95 gates on a bench JSON;
+                the 10-s windows need a sustained run ≥ 10 s), `gate --captures <hdr dir> --hud <hud dir> [--out]`
+                (F4: the plan's M1 numeric checks, 43 with row 11's ev100 check, → checks.json; run before deleting
+                the .hdr.bin sidecars); HDR checks on the `--hdr` sidecar: `ratio` (a non-finite ratio FAILs),
+                `stats`, `samples`, `profile`, `angle`, `flux`, `limb` (also as `hdr <check>`). Its disk tests
+                tonemap through `uni_post::agx` (dev-dependency)
 bookmarks/m0.ron             the six M0 capture bookmarks (RON, implicit_some)
 bookmarks/m1.ron, m1-bench.ron  the 27 M1 capture bookmarks (intent-tested) and the 10 bench views; sky-v1.ron
 data/baked/bsc5.bin          Yale Bright Star Catalogue, 9096 stars (CDS V/50), committed
@@ -157,20 +190,29 @@ doc comment; every feature must follow it)**
 - *Shared inputs.* Per-frame app → feature data goes through `uni_gfx::SharedInput<T>`. The app sets each one
   before `Renderer::render`; features read them only in `prepare`.
 - *Pre-exposed HDR.* `hdr` (Rgba16Float) holds light × exposure, and the tonemap applies AgX with no exposure
-  of its own. World light (bodies, the Sun's disk, rings, atmospheres, comets) writes luminance [cd/m²] ×
-  `scene_pre()`. Sky light and point sources (catalogue stars, the band, planets/Sun/asteroids drawn as points)
-  write luminance × `star_pre()` (ruling 5). `star_pre == scene_pre` unless "Eye-adapted stars" is in effect:
-  `ExposureSettings.eye_adapted && !ExposureSettings.daylight`, where the app sets `daylight` while the camera is
-  inside an atmosphere shell with the Sun above its local horizon (a daytime sky hides the stars, review m12). The
-  HUD's amber label follows exactly this condition, not `FrameCtx.exposure` (review m13). A resolved body whose
-  projected radius is between `POINT_LOD_PX` (1.5 px) and `BLEND_LOD_PX` (4 px) blends its exposure factor from
-  `star_pre` to `scene_pre` in log space, `pre_mix(star_pre, scene_pre, w)` = exp2(mix(log2 a, log2 b, w))
-  (`common/exposure.wgsl`, CPU twin `uni_gfx::pre_mix`, B11; w from `uni_planet::lod_exposure_mix`, B0), so the
-  point → disk handover never pops; the blend is labelled as part of "Eye-adapted stars". Each factor is `exposure_scale(EV) =
-  1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 < f16's 65504). The Sun's disk (~1.6e9 cd/m²) is ~4.1e4
-  at scene EV 15. The exposure buffer is also `STORAGE`, so the auto-exposure resolve can write it on the GPU;
-  the meter reads world light only, before any sky light or point source is written. Environment cubemap texels
-  hold absolute luminance in units of `ENV_UNIT_CD_M2` (1e-4 cd/m²), not pre-exposed.
+  of its own. World light (bodies, the Sun's disk, rings, atmospheres, comets, and the point of a light that
+  light-adapts the eye) writes luminance [cd/m²] × `scene_pre()`. Sky light and other point sources (catalogue
+  stars, the band, planets/asteroids and a distant Sun drawn as points) write luminance × `star_pre()` (ruling 5).
+  A light of `FrameCtx::lights` whose illuminance at the camera is ≥ `uni_sky::ADAPTING_LUX` (1 lx: the Sun inside
+  ~356 AU) is world light at every size (F3, render I2): below `POINT_LOD_PX` the `sun` pass (uni-planet) draws its
+  point (the star PSF, core + glare halo, uni-sky's `WorldPointDrawer`) at `scene_pre` before the meter, depth
+  tested `Greater` and never written (a body in front covers its glare), and the points pass skips its sprite; in
+  the 1.5–4 px LOD band its disk is × f and its point × (1 − f), f = `lod_exposure_mix`. `star_pre == scene_pre`
+  unless "Eye-adapted stars" is in effect: `ExposureSettings.eye_adapted && !ExposureSettings.daylight`, where the
+  app sets `daylight` while the camera is inside an atmosphere shell with the Sun above its local horizon (a daytime
+  sky hides the stars, review m12). The HUD's amber label follows exactly this condition, not `FrameCtx.exposure`
+  (review m13). A resolved body whose projected radius is between `POINT_LOD_PX` (1.5 px) and `BLEND_LOD_PX` (4 px)
+  blends its exposure factor from `star_pre` to `scene_pre` in log space, `pre_mix(star_pre, scene_pre, w)` =
+  exp2(mix(log2 a, log2 b, w)) (`common/exposure.wgsl`, CPU twin `uni_gfx::pre_mix`, B11; w from
+  `uni_planet::lod_exposure_mix`, B0), so the exposure is continuous at the point → disk handover; the blend is
+  labelled as part of "Eye-adapted stars". The light is not continuous everywhere yet (F2, measured): Saturn's disk
+  and rings are 0.38 mag fainter than its point with the rings open and 0.7–0.8 mag backlit (the rings pass is not
+  calibrated to Eq. 10), and asteroids with a catalogue G ≠ 0.15 jump up to 0.35 mag (M2). Each factor is
+  `exposure_scale(EV) = 1/(1.2·2^EV)`. Clamp what you write to `HDR_MAX` (60000 < f16's 65504). The Sun's disk
+  (~1.6e9 cd/m²) is ~4.1e4 at scene EV 15. The exposure buffer is also `STORAGE`, so the auto-exposure resolve can
+  write it on the GPU; the meter reads world light only (a light-adapting light's point included), before any sky
+  light or sky-light point is written. Environment cubemap texels hold absolute luminance in units of
+  `ENV_UNIT_CD_M2` (1e-4 cd/m²), not pre-exposed.
 - *Field-of-view dependence (deliberate, review m26).* Star brightness against the band depends on the field of
   view: stars are written as E/Ω_pixel, the band as a surface brightness, so at fov 20° a star's pixels are
   (tan 30°/tan 10°)² = 10.7× (+3.42 EV) brighter relative to the band than at 60°. That is what a camera does
@@ -214,9 +256,12 @@ doc comment; every feature must follow it)**
 - *Timing.* `Renderer::gpu_ms() -> Vec<(&str, Option<f32>)>`, `gpu_frame_ms() -> Option<f32>` and
   `gpu_timings()`, up to 64 timed passes per frame. Per-pass durations are differences of the passes' end stamps
   (`GpuTimings::pass_end_ms`, each end tick minus the frame bracket's begin; `scene::pass_durations`, B9t): Metal
-  samples a render pass's begin tick early, so the raw spans do not difference cleanly. In `--sustained` runs
-  (two frames in flight) Metal often has not written the last render pass's (the tonemap's) end tick when the
-  frame resolves, so the tonemap reads "n/a" in most frames (C6: 0.1–25 % valid); serial runs are valid.
+  samples a render pass's begin tick early, so the raw spans do not difference cleanly. Metal writes a frame's
+  last samples (the tonemap's end, both closing-bracket ticks) after its completion callback, so `PassTimer`
+  resolves a completed frame only once a later frame has completed (F3; ring of 6 slots): window and
+  `--sustained` timings lag one more frame, and the tonemap is valid in every frame (C6 had 0.1–25 %);
+  `read_back_blocking` (serial and headless runs) resolves at once. The `exposure` compute pass still reads
+  "n/a" in 5–40 % of sustained frames (not investigated).
   `None` means no valid measurement: show "n/a" (HUD, terminal, sheet) or write `null` (capture JSON), never 0.
 - *GPU errors and features.* `GpuContext` logs uncaptured errors and device loss instead of panicking. The
   window shows the latest on the HUD; `--capture`, `--bench` and `--selftest` fail on them. The device is
@@ -230,7 +275,7 @@ doc comment; every feature must follow it)**
   binding 0, storage output at binding 1 of one group) and reads it back. `universe --selftest` runs uni-app's
   pcg3d, agx and binet probes, every render crate's `gpu_probes(gpu, lib) -> Vec<ProbeResult>` (uni-gfx,
   uni-planet, uni-atmo, uni-sky, uni-post, uni-rel; a crate that returns no probe fails) and
-  `depth_writers_write_g`: 55 checks. `uni_gfx::read_hdr` reads the pre-exposed `hdr` back as RGBA f32 (`hdr` has
+  `depth_writers_write_g`: 57 checks. `uni_gfx::read_hdr` reads the pre-exposed `hdr` back as RGBA f32 (`hdr` has
   `COPY_SRC`); render probes use it. The `--hdr` capture sidecar comes from uni-app's pre-bloom tap instead
   (`tap.rs`, a copy of `hdr` just before bloom).
 
@@ -294,6 +339,8 @@ Verbatim from the M0 plan. They bind every task.
 
 **Honesty**
 - Anything approximate or non-physical is labelled on screen. In M0 that means the lens background ("M0 debug grid") and speeds faster than c ("FTL · non-physical").
+  (M1 final fix wave: free flight above c shows "FTL · non-physical" in the honesty line and the capture JSON too;
+  the full M1 list is the plan's table "Honesty labels in M1".)
 - (Added after M0, review I4.) Dual exposure: whenever star EV ≠ scene EV (the default since B4L: star EV −6.5,
   scene EV metered by auto-exposure; M0's was star EV −4, scene EV 0), the HUD shows the amber line "Eye-adapted
   stars (dual exposure, non-physical)" (design §2, §7.4).
@@ -331,7 +378,8 @@ pathspec commit
 - No f64 in shaders: the M3 has no FP64. Double-precision work stays on the CPU.
 - GPU timestamps only at pass boundaries (`TIMESTAMP_QUERY_INSIDE_PASSES` is false on this M3).
 - Measured on this M3 (M0 fix wave). Metal writes pass timestamps into the counter buffer late. A query resolve
-  in the same command buffer read stale values, so `PassTimer` resolves only after the frame has finished.
+  in the same command buffer read stale values, so `PassTimer` resolves only after the frame has finished, and
+  (F3) only once a later frame has finished too, because the last samples land after the completion callback.
   Metal also orders encoders only through shared tracked resources (wgpu-hal barriers are no-ops), so a pass
   that touches nothing can run alongside others. The frame brackets therefore write a texel of `hdr`.
 - 32 storage textures per shader stage. BC and ASTC texture compression are available.
