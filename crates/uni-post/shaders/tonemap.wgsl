@@ -24,43 +24,60 @@
 #import "common/camera.wgsl"
 #import "common/color.wgsl"
 
-// ---- AgX -------------------------------------------------------------------------------
-// Source: Troy Sobotka, AgX (github.com/sobotka/AgX), "base" transform with the default
-// contrast look, in the real-time form of Benjamin Wrensch 2023, "Minimal AgX Implementation"
-// (iolite-engine.com/blog_posts/minimal_agx_implementation). Matrices, EV range and the
-// polynomial are verbatim from there.
+// ---- AgX-style transform --------------------------------------------------------------
+// The idea is Troy Sobotka's AgX (github.com/sobotka/AgX): inset, log2 encoding around middle
+// grey, sigmoid, outset. Every constant is derived in crates/uni-post/src/agx.rs (final fix
+// wave F3; the M0 constants were copied from a post with no licence): the inset moves each
+// Rec. 709 primary 20 % of the way to D65 in CIE 1931 xy with white kept (BT.709-6 primaries,
+// SMPTE RP 177 construction), the outset is its exact inverse, the log range is 10 stops below
+// and 6.5 above middle grey, and the sigmoid is agx.rs's own toe/shoulder curve.
 
-// Inset matrix (columns): mixes a few percent of each primary into the others, so very bright
-// saturated colours move toward white instead of clipping per channel.
+// Inset matrix (columns): (1 − t)·I + t·𝟙wᵀ, t = 0.2, w_j = S_j/ΣS (agx.rs AGX_INSET).
 const AGX_INSET: mat3x3<f32> = mat3x3<f32>(
-    vec3<f32>(0.842479062253094, 0.0423282422610123, 0.0423756549057051),
-    vec3<f32>(0.0784335999999992, 0.878468636469772, 0.0784336),
-    vec3<f32>(0.0792237451477643, 0.0791661274605434, 0.879142973793104),
+    vec3<f32>(0.8423989290495315, 0.04239892904953144, 0.04239892904953144),
+    vec3<f32>(0.07843016510486392, 0.8784301651048639, 0.07843016510486392),
+    vec3<f32>(0.07917090584560466, 0.07917090584560466, 0.8791709058456048),
 );
 
-// Outset matrix (columns): the inverse of AGX_INSET, applied after the sigmoid.
+// Outset matrix (columns): the exact inverse of AGX_INSET, applied after the sigmoid.
 const AGX_OUTSET: mat3x3<f32> = mat3x3<f32>(
-    vec3<f32>(1.19687900512017, -0.0528968517574562, -0.0529716355144438),
-    vec3<f32>(-0.0980208811401368, 1.15190312990417, -0.0980434501171241),
-    vec3<f32>(-0.0990297440797205, -0.0989611768448433, 1.15107367264116),
+    vec3<f32>(1.197001338688086, -0.0529986613119143, -0.0529986613119143),
+    vec3<f32>(-0.09803770638107989, 1.15196229361892, -0.09803770638107989),
+    vec3<f32>(-0.09896363230700582, -0.09896363230700582, 1.151036367692994),
 );
 
-// Log2 encoding range [EV relative to 1.0]: 10 stops below and 6.5 stops above middle grey
-// (log2 0.18 = −2.47393).
-const AGX_MIN_EV: f32 = -12.47393;
-const AGX_MAX_EV: f32 = 4.026069;
+// Log2 encoding range [EV relative to 1.0]: log2 0.18 − 10 and log2 0.18 + 6.5.
+const AGX_MIN_EV: f32 = -12.473931188332411;
+const AGX_MAX_EV: f32 = 4.026068811667588;
 
 // Floor before log2 so zero or negative input stays finite; far below 2^AGX_MIN_EV, so it
 // lands at the bottom of the range like any other near-black value.
 const AGX_LOG_FLOOR: f32 = 1e-10;
 
-// 6th-order polynomial fit of AgX's default-contrast sigmoid on [0, 1] (Wrensch 2023,
-// `agxDefaultContrastApprox`; mean squared error 3.67e-6). Output is sRGB-encoded.
-fn agx_default_contrast(x: vec3<f32>) -> vec3<f32> {
-    let x2 = x * x;
-    let x4 = x2 * x2;
-    return 15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2
-        + 0.1191 * x - 0.00232;
+// The sigmoid's pivot (middle grey's position 10/16.5 → code value 0.5), its slope there and the
+// toe's and shoulder's powers (agx.rs SIGMOID_*).
+const SIGMOID_PIVOT_IN: f32 = 0.6060606060606061;
+const SIGMOID_PIVOT_OUT: f32 = 0.5;
+const SIGMOID_SLOPE: f32 = 2.02;
+const SIGMOID_TOE_POWER: f32 = 2.9;
+const SIGMOID_SHOULDER_POWER: f32 = 2.8;
+
+// k·v / (1 + (k^p − 1)·v^p)^(1/p): 0 at 0, 1 at 1, slope k at 0. Twin of agx.rs rational_curve.
+fn rational_curve(v: f32, k: f32, p: f32) -> f32 {
+    return k * v / pow(1.0 + (pow(k, p) - 1.0) * pow(v, p), 1.0 / p);
+}
+
+// The sigmoid on [0, 1], sRGB-encoded output: toe below the pivot, shoulder above. Twin of
+// agx.rs agx_sigmoid.
+fn agx_sigmoid(x: f32) -> f32 {
+    let xp = SIGMOID_PIVOT_IN;
+    let yp = SIGMOID_PIVOT_OUT;
+    if (x >= xp) {
+        let k = SIGMOID_SLOPE * (1.0 - xp) / (1.0 - yp);
+        return yp + (1.0 - yp) * rational_curve((x - xp) / (1.0 - xp), k, SIGMOID_SHOULDER_POWER);
+    }
+    let k = SIGMOID_SLOPE * xp / yp;
+    return yp - yp * rational_curve((xp - x) / xp, k, SIGMOID_TOE_POWER);
 }
 
 // sRGB code value → display-linear, per channel (inverse of `linear_to_srgb` in
@@ -73,7 +90,7 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, x <= vec3<f32>(0.04045));
 }
 
-// AgX: exposed scene-linear Rec. 709 RGB (middle grey 0.18) → display-linear RGB in [0, 1].
+// AgX-style: exposed scene-linear Rec. 709 RGB (middle grey 0.18) → display-linear RGB in [0, 1].
 // The sigmoid's output is an sRGB-encoded signal; it is decoded with the exact inverse of the
 // sRGB view's encoder, so the code values on screen are exactly AgX's.
 fn agx(c: vec3<f32>) -> vec3<f32> {
@@ -86,8 +103,8 @@ fn agx(c: vec3<f32>) -> vec3<f32> {
         vec3<f32>(AGX_MAX_EV),
     );
     let x = (ev - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
-    // 3. Default-contrast sigmoid → sRGB-encoded signal.
-    let encoded = agx_default_contrast(x);
+    // 3. Sigmoid → sRGB-encoded signal.
+    let encoded = vec3<f32>(agx_sigmoid(x.x), agx_sigmoid(x.y), agx_sigmoid(x.z));
     // 4. Outset. Bright saturated colours can overshoot [0, 1] here, so clamp to the display.
     let outset = clamp(AGX_OUTSET * encoded, vec3<f32>(0.0), vec3<f32>(1.0));
     // 5. Decode to display-linear.
