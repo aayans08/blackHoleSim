@@ -29,7 +29,7 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
   3. Vertex positions stay local to the object or tile.
 - This is the standard pattern:
   - [Frozen Fractal](https://frozenfractal.com/blog/2024/4/11/around-the-world-14-floating-the-origin/).
-  - KSP2 builds planet meshes relative to the floating origin, not the planet center ([KSP dev insights](https://www.kerbalspaceprogram.com:443/news/dev-diaries-developer-insights-12-planet-tech)).
+  - A commercial space game builds planet meshes relative to the floating origin, not the planet center ([developer diary](https://www.kerbalspaceprogram.com:443/news/dev-diaries-developer-insights-12-planet-tech)).
   - [ralith.com](https://ralith.com/blog/planetary-terrain/) builds matrices in f64 and rounds the combined matrix to f32. f32 resolution at one Earth radius is about 0.5 m.
 
 **f64 is not available on the GPU.** wgpu's `SHADER_F64` is Vulkan-only, and Apple GPUs and Metal have no FP64 ([wgpu Features docs](https://docs.rs/wgpu/latest/wgpu/struct.Features.html), [Apple forums](https://developer.apple.com/forums/thread/709663)).
@@ -49,14 +49,14 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
 
 **[OVERKILL / AVOID] Logarithmic depth.**
 - It needs fragment-shader depth writes. Apple says changing depth in the fragment shader costs performance because the depth test must wait for the shader to run ([Apple](https://developer.apple.com/tutorials/data/documentation/metal/calculating-primitive-visibility-using-depth-testing.md)). That works against tile-based GPUs.
-- Outerra's author, who invented the approach, later noted that a reversed float buffer gives similar benefits ([Outerra](https://outerra.blogspot.com/2009/08/logarithmic-z-buffer.html)).
+- The approach's inventor later noted that a reversed float buffer gives similar benefits ([his blog](https://outerra.blogspot.com/2009/08/logarithmic-z-buffer.html)).
 
 **[WORTH IT] Separate passes by layer, not by depth range:**
 1. A "background at infinity" layer drawn as directions only, with no depth: galaxies, the Milky Way cubemap, stars.
 2. Scene objects with reversed-Z.
 3. Volumes and transparent objects.
 
-**[OVERKILL] Multi-frustum or "scaled space" depth partitioning** (Cesium, KSP). With reversed float Z plus camera-relative coordinates it isn't needed.
+**[OVERKILL] Multi-frustum or "scaled space" depth partitioning** (Cesium, a commercial space game). With reversed float Z plus camera-relative coordinates it isn't needed.
 
 **[ESSENTIAL] Time representation.**
 - f64 seconds since J2000 degrade to about 4 s resolution at 1e9 years.
@@ -75,7 +75,7 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
   4. **Age and metallicity** follow from where the sector is in the galaxy.
   5. **Luminosity, radius and temperature** come from age, mass and metallicity via the Hurley–Pols–Tout (2000) single-star-evolution (SSE) formulas, which are within about 5% of detailed stellar models from the main sequence through the AGB ([arXiv astro-ph/0001295](https://arxiv.org/abs/astro-ph/0001295)).
   6. **Remnants.** The same formulas give white dwarfs, neutron stars and black holes.
-- Elite's Stellar Forge used a similar galaxy-scale mass and age distribution, seeded from one top-down galaxy map ([80.lv](https://80.lv/articles/generating-the-universe-in-elite-dangerous/)). Use only the concept, not their data or look.
+- A commercial space game's galaxy generator used a similar galaxy-scale mass and age distribution, seeded from one top-down galaxy map ([80.lv](https://80.lv/articles/generating-the-universe-in-elite-dangerous/)). Use only the concept, not their data or look.
 
 **[ESSENTIAL] A magnitude-space level-of-detail octree** (Gaia Sky's MS-LOD: bright stars in high octree levels, faint stars deeper, nodes culled by solid angle) ([Sagristà et al. 2019](https://vcg.iwr.uni-heidelberg.de/static/publications/Sagrista2019gaiaSky.pdf), [docs](https://gaia.ari.uni-heidelberg.de/gaiasky/docs/3.5.3/LOD-catalogs.html)).
 - Concretely: store the brightest absolute magnitude M_min in each node.
@@ -161,7 +161,7 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
   - shadows on the ground sampled along the sun direction;
   - 2–3 layers for parallax.
   - This matches the reference image.
-- **[WORTH IT, later]** Volumetric clouds near the surface in the Nubis style, about 2 ms on PS4 ([Schneider 2015](https://www.guerrilla-games.com/read/the-real-time-volumetric-cloudscapes-of-horizon-zero-dawn)).
+- **[WORTH IT, later]** Volumetric clouds near the surface in the Nubis style, about 2 ms on a 2013 games console ([Schneider 2015](https://www.guerrilla-games.com/read/the-real-time-volumetric-cloudscapes-of-horizon-zero-dawn)).
 - **[OVERKILL]** Fluid-simulated clouds ([Nubis Cubed](https://www.guerrilla-games.com/read/nubis-cubed)).
 
 **Oceans:**
@@ -245,7 +245,7 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
 
 ## 7. Wormhole travel, and black holes (same technique)
 
-**Wormhole metric** (Dneg/Interstellar, [James et al. 2015](https://arxiv.org/abs/1502.03809)):
+**Wormhole metric** ([James et al. 2015](https://arxiv.org/abs/1502.03809)):
 - ds² = −dt² + dℓ² + r(ℓ)²dΩ²
 - r = ρ for |ℓ| ≤ a.
 - Outside, r = ρ + 𝓜[x·atan x − ½ln(1+x²)], with x = 2(|ℓ|−a)/(π𝓜).
@@ -264,7 +264,7 @@ Each technique is tagged **[ESSENTIAL]**, **[WORTH IT]** or **[OVERKILL]**. "Ove
   - When ℓ_c changes sign, re-parent the camera to the destination mouth's frame. With the frame tree this is trivial.
   - The table is symmetric in ℓ, so the image stays continuous.
   - For arbitrary long jumps, spawn a pair of mouths: one ahead of the ship and one at the destination.
-- **Choosing the shape.** The paper reports that short wormholes look like a zoom with no parallax, and long ones look like generic tunnels. Nolan used 2a = 0.01ρ and 𝓦 = 0.05ρ. Choose a moderate a/ρ and 𝓦, and add parallax cues inside the throat, such as particles.
+- **Choosing the shape.** The paper reports that short wormholes look like a zoom with no parallax, and long ones look like generic tunnels. The wormhole the paper made for the film used 2a = 0.01ρ and 𝓦 = 0.05ρ. Choose a moderate a/ρ and 𝓦, and add parallax cues inside the throat, such as particles.
 - **Physics honesty.** Label wormholes in the UI as hypothetical: they need exotic matter.
 - **[OVERKILL]** The ray-bundle and geodesic-deviation filtering used by DNGR.
 

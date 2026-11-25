@@ -344,7 +344,7 @@ Order: M0 → M1 → {M2, M3, M4 in parallel; peak about 25–30 agents} → M5 
 3. **Disk:** plan against 3.4 GB (as in the brief) or the 14 GiB free now? How much can go to real data (tier 1 is about 342 MB raw, temporarily)?
 4. **Realism versus looks defaults:**
    - Physically correct exposure would make stars invisible next to a sunlit planet. Should we use a labelled dual exposure instead?
-   - Real disks are blue-white. Do you want an Interstellar-orange option?
+   - Real disks are blue-white. Do you want a film-style orange option?
    - Sgr A* is honestly dim. Is that acceptable?
 5. **Non-physical travel:** jump anywhere via a labelled hypothetical wormhole, or only at placed wormholes? Is a labelled faster-than-light cruise acceptable?
 6. **Time warp range:** thousands of years (enough to watch stars move) or millions and more (stellar evolution, galactic orbits)?

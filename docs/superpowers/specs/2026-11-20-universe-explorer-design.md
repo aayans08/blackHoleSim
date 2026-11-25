@@ -11,7 +11,7 @@
 
 The owner wants one program in which they can **fly anywhere in the universe**, from a planet's surface to its star system, through interstellar space, past black holes, out to the whole Milky Way and on to other galaxies. It should look as good as the owner's reference screenshot and run on **real physics**.
 
-In the owner's words: "a full universe system using high tier graphics and real physics", "be able to go through the universe", "real feel like Space Engine", "nothing too pixilated", "all real physics or as real as you can get via current physics knowledge, like hawking radiation, accretion disk, light bending, gravitational pull".
+In the owner's words: "a full universe system using high tier graphics and real physics", "be able to go through the universe", "real feel like [a commercial space simulator]", "nothing too pixilated", "all real physics or as real as you can get via current physics knowledge, like hawking radiation, accretion disk, light bending, gravitational pull".
 
 The reference screenshot (a Mars-like planet) sets the visual bar:
 - a planet with a thin warm atmospheric rim glow, cloud wisps and a storm vortex
@@ -80,9 +80,9 @@ Details are in `docs/research/2026-11-20-rust.md` and `2026-11-20-docs.md`. The 
 
 ## 3. What the owner decided
 
-- **Travel:** free travel however you like, not an animation. Any speed. Huge jumps through a "wormhole", as in Star Trek.
+- **Travel:** free travel however you like, not an animation. Any speed. Huge jumps through a "wormhole", as in science fiction.
 - **Scale:** real sizes and distances.
-- **Graphics:** use both CPU and GPU so it looks good, with nothing pixelated; "a real feel like Space Engine".
+- **Graphics:** use both CPU and GPU so it looks good, with nothing pixelated; "a real feel like [a commercial space simulator]".
 - **Content:** real objects from known astronomy, plus generated worlds. Generated worlds must be physically realistic in how they formed and how they behave. A rogue star or hypervelocity star must act like one.
 - **Physics:** all real, as far as current knowledge goes: Hawking radiation, accretion disks, light bending, gravitational pull, etc.
 - **Real objects wanted:** real planetary systems, black holes, comets, planets, magnetars, "etc."
@@ -380,7 +380,7 @@ trait RenderFeature {
 
 ## 7. Visual decisions (my call; all toggleable in settings)
 
-1. **Real accretion-disk colours by default:** blue-white and lopsided, with the approaching side much brighter. A labelled "Cinematic (film-style)" toggle removes beaming and colour shift, as the film Interstellar did.
+1. **Real accretion-disk colours by default:** blue-white and lopsided, with the approaching side much brighter. A labelled "Cinematic (film-style)" toggle removes beaming and colour shift, as a well-known 2014 film did.
 2. **Sgr A\* is honestly dim.** It has a radiatively inefficient flow, not a bright disk. A procedural "showcase" hole near the start bookmarks has a bright thin disk.
 3. **Dormant black holes (Gaia BH1–3) have no disk.** They appear only as lenses.
 4. **Dual exposure for stars, on by default, labelled "Eye-adapted stars".** The reference screenshot shows stars next to a sunlit planet, which a physical exposure would hide. A toggle switches to strict photometric exposure.
