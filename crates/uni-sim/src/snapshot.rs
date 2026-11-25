@@ -939,6 +939,14 @@ fn occluders(
 /// Saturn's point also carries its rings: × `photometry::saturn_ring_factor` (Mallama & Hilton
 /// 2018 Eq. 10 over the globe's law, the ring tilts from the camera's and the Sun's latitudes
 /// above Saturn's equator, the plane `RingView` draws the rings in; final review physics I2).
+/// The ring pass (uni-planet, Solar System Scope colours, no opposition surge) is not
+/// calibrated to Eq. 10, so the 1.5 px handover is not continuous for Saturn. A ray-cast twin
+/// of the bodies and rings passes (final fix wave F2 report) puts the drawn disk + rings below
+/// this point by 0.38 mag with the rings open at α 0.1° (β 26°), 0.13 and 0.18 mag at α 14°
+/// and 30° (β 20°), 0.02 mag at the 2026-11-20 geometry (β 7°), and 0.7–0.8 mag when the rings
+/// are backlit, where their shadow and their unlit face dim the globe and no point law models
+/// it (the globe-only point had the same backlit gap, and was 0.26–0.52 mag below the disk
+/// with the rings lit).
 ///
 /// A comet is its nucleus alone (lead ruling "comet double light", Task C6): a p_V 0.04
 /// lunar-Lambert (L = 0.9) body of its (assumed) radius with no observed phase law, the
