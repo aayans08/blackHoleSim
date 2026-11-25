@@ -1519,9 +1519,17 @@ mod tests {
     /// The detail varies the band about the smooth model's: over the band (|b| ≤ 15°, all l) the
     /// clumps alone make it brighter on average, not darker (clumpy dust lets more light through
     /// than smooth dust of the same mean: e^−τ is convex), the named clouds then add dust of their
-    /// own on top of the smooth layer, and the whole detail keeps the mean band within −20 % and
-    /// ×2 of the smooth one (measured: 0.97 at σ_ln 1.2); neighbouring samples 0.5° apart differ,
-    /// where the smooth band is nearly flat.
+    /// own on top of the smooth layer, and the whole detail moves the mean band no further than
+    /// the published spread of the mean in-plane extinction rate does to the smooth model
+    /// (measured ratio 0.97 at σ_ln 1.2). That bound has a source (final review P5, replacing
+    /// B4L's self-chosen −20 %): the smooth layer's 1 mag/kpc midplane rate
+    /// (`DUST_A_V_SUN_MAG_PER_PC`) lies inside the literature's 0.7 mag/kpc (the solar
+    /// neighbourhood's usual value: Gottlieb & Upson 1969, ApJ 157, 611; Milne & Aller 1980,
+    /// AJ 85, 17; Lyngå 1982, A&A 109, 213) to 1.8 mag/kpc (stars near the plane within a few
+    /// kpc: Whittet 2003, *Dust in the Galactic Environment*, 2nd ed., p. 10), so the detailed
+    /// mean must lie between the smooth band's mean at 1.8 mag/kpc (the lower bound) and at
+    /// 0.7 mag/kpc (the upper). Neighbouring samples 0.5° apart differ, where the smooth band is
+    /// nearly flat.
     #[test]
     fn detail_varies_the_band_about_its_mean() {
         let g = GalaxyModel::milky_way();
@@ -1530,6 +1538,14 @@ mod tests {
         for k in 0..NAMED_CLOUD_COUNT {
             clumps.clouds[4 * k][3] = 0.0;
         }
+        // The smooth model at the ends of the published midplane extinction rate [mag/kpc].
+        let at_rate = |mag_per_kpc: f64| {
+            let mut m = GalaxyModel::milky_way_smooth();
+            m.dust[0] *= mag_per_kpc / (DUST_A_V_SUN_MAG_PER_PC * 1.0e3);
+            m
+        };
+        let (dusty, clear) = (at_rate(1.8), at_rate(0.7));
+        let (mut sum_dusty, mut sum_clear) = (0.0, 0.0);
         let mut sum_c = 0.0;
         let sun = g.sun_galactocentric_pc();
         let fp = 2.0 / 512.0;
@@ -1543,6 +1559,8 @@ mod tests {
                 let (d0, d1) = (band(&g, 0.0), band(&g, 0.5));
                 let (s0, s1) = (band(&smooth, 0.0), band(&smooth, 0.5));
                 sum_c += band(&clumps, 0.0);
+                sum_dusty += band(&dusty, 0.0);
+                sum_clear += band(&clear, 0.0);
                 sum_d += d0;
                 sum_s += s0;
                 step_d += (d1 / d0).ln().abs();
@@ -1551,9 +1569,12 @@ mod tests {
             }
         }
         let ratio = sum_d / sum_s;
+        let (lo, hi) = (sum_dusty / sum_s, sum_clear / sum_s);
+        println!("detailed / smooth mean band {ratio}; published-rate range {lo} to {hi}");
+        assert!(lo < 1.0 && hi > 1.0, "{lo} {hi}");
         assert!(
-            (0.8..2.0).contains(&ratio),
-            "detailed / smooth mean band {ratio}"
+            (lo..=hi).contains(&ratio),
+            "detailed / smooth mean band {ratio}, outside {lo} (1.8 mag/kpc) to {hi} (0.7 mag/kpc)"
         );
         assert!(
             sum_c > sum_s,
