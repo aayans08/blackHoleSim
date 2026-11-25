@@ -2245,8 +2245,38 @@ fn intent_22_asteroid_belt_above() {
     for r in ["belt_annulus", "belt_outer"] {
         assert!(m.regions.get(r).is_some_and(|v| !v.is_empty()), "{r}");
     }
-    // No world light on screen: the night EV, as the plan's row for 22 says.
-    assert_paper(world, None, &c, uni_post::NIGHT_EV100, None);
+    // Row 22, re-derived (final review render I2): the Sun (3.5 × 10³ lx, 0.6 px) light-adapts
+    // the eye, so it is world light: its point (the star PSF with the eye's glare, its halo
+    // clamped at 64 px) is drawn before the meter. Every pixel of the 64-px footprint is lit
+    // (π·64² ≈ 12 870 px), so the brightest 0.5 % are those within r₉₉.₅ = √(0.005·64²) =
+    // 4.5 px of the centre, where the halo alone is lit (the σ = 0.65 px core is 1e-10 of its
+    // peak there): the highlight rule puts that pixel at pre 4 (ev_hi = log2 L(r₉₉.₅) −
+    // log2(1.2 × 4), plan B6), above the 50th–95th percentile average (the glow at 14–45 px).
+    // L(r) = E/Ω·h·weight(r) with the halo's shape at the exposure it settles at (a fixed point:
+    // the clamped halo keeps more light as the exposure rises), Ω on the axis.
+    let sun_id = world.sim.find("Sun").unwrap();
+    let pt = c
+        .snap
+        .points
+        .iter()
+        .find(|p| p.id == Some(sun_id))
+        .expect("the Sun as a point");
+    let lux = pt.illuminance_lux as f32;
+    assert!(lux > 3.0e3 && f64::from(lux) >= uni_sky::ADAPTING_LUX);
+    let omega = uni_sky::stars::pixel_solid_angle(c.view.fov_y_rad as f32, H as f32);
+    let h = uni_sky::stars3d::STARS3D_HALO_FRACTION;
+    let r_hi = (0.005_f32 * 64.0 * 64.0).sqrt();
+    let mut ev = 18.0_f32;
+    for _ in 0..6 {
+        let s = uni_sky::stars3d::halo_shape(lux * uni_gfx::exposure_scale(ev) / omega, h);
+        assert_eq!(s.radius_px, 64.0);
+        let weight = uni_sky::stars3d::stars3d_halo_weight(r_hi, s.radius_px, s.scale, s.taper);
+        ev = (lux / omega * h * weight).log2() - (1.2_f32 * 4.0).log2();
+    }
+    println!("row 22: the Sun's glare meters to EV {ev}");
+    assert!((17.0..20.0).contains(&ev), "{ev}");
+    let lit = std::f64::consts::PI * 64.0 * 64.0;
+    assert_paper(world, None, &c, ev, Some(lit));
 }
 
 #[test]

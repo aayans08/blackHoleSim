@@ -162,10 +162,14 @@ pub fn gpu_probes(gpu: &GpuContext, lib: &mut ShaderLib) -> Vec<ProbeResult> {
     lib.add(PSF_PROBE, PSF_PROBE_WGSL);
     lib.add(HALO_PROBE, HALO_PROBE_WGSL);
     lib.add(DETAIL_PROBE, DETAIL_PROBE_WGSL);
+    lib.add(TAPER_PROBE, TAPER_PROBE_WGSL);
+    lib.add(WORLD_POINTS_PROBE, WORLD_POINTS_PROBE_WGSL);
     let mut results = vec![
         result("stars3d_mag_dir", check_mag_dir(gpu, lib)),
         result("stars3d_psf", check_psf(gpu, lib)),
         result("stars3d_halo", check_halo(gpu, lib)),
+        result("stars3d_halo_taper", check_taper(gpu, lib)),
+        result("world_points_shape", check_world_points(gpu, lib)),
         result("galaxy_detail", check_galaxy_detail(gpu, lib)),
     ];
     results.extend(crate::band::band_probes(gpu, lib));
@@ -435,7 +439,7 @@ const HALO_PROBE_WGSL: &str = r#"// sky/probe_stars3d_halo.wgsl: `universe --sel
 
 // x: r [px]; y: footprint radius R [px]; zw: 0.
 @group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
-// x: stars3d_moffat(r); y: stars3d_halo_energy(R); z: stars3d_halo_weight(r, R, 1/E(R)); w: 0.
+// x: stars3d_moffat(r); y: stars3d_halo_energy(R); z: stars3d_halo_weight(r, R, 1/E(R), 2); w: 0.
 @group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
 
 @compute @workgroup_size(64, 1, 1)
@@ -445,8 +449,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let c = probe_in[gid.x];
     let e = stars3d_halo_energy(c.y);
-    probe_out[gid.x] = vec4<f32>(stars3d_moffat(c.x), e, stars3d_halo_weight(c.x, c.y, 1.0 / e),
-        0.0);
+    probe_out[gid.x] = vec4<f32>(stars3d_moffat(c.x), e,
+        stars3d_halo_weight(c.x, c.y, 1.0 / e, 2.0), 0.0);
 }
 "#;
 
@@ -478,7 +482,7 @@ fn halo_expected(c: &[f32; 4]) -> [f32; 4] {
     [
         stars3d_moffat(r),
         e,
-        stars3d_halo_weight(r, radius, 1.0 / e),
+        stars3d_halo_weight(r, radius, 1.0 / e, 2.0),
         0.0,
     ]
 }
@@ -497,7 +501,7 @@ fn halo_worst(inputs: &[[f32; 4]], out: &[[f32; 4]]) -> [f32; 3] {
         let scale = [
             stars3d_moffat(0.0),
             1.0,
-            stars3d_halo_weight(0.0, c[1], 1.0 / cpu[1]),
+            stars3d_halo_weight(0.0, c[1], 1.0 / cpu[1], 2.0),
         ];
         for k in 0..3 {
             worst[k] = nan_max(worst[k], (g[k] - cpu[k]).abs() / scale[k]);
@@ -531,6 +535,178 @@ fn check_halo(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String
             "{n} (r, R) pairs, R 2–64 px: moffat {:.1e}, halo energy {:.1e}, windowed weight \
              {:.1e} (relative to scale; tolerance {HALO_TOLERANCE:.0e})",
             worst[0], worst[1], worst[2]
+        ),
+    ))
+}
+
+/// Shader path of the clamped-halo probe (final review render I2).
+const TAPER_PROBE: &str = "sky/probe_stars3d_taper.wgsl";
+const TAPER_PROBE_WGSL: &str = r#"// sky/probe_stars3d_taper.wgsl: `universe --selftest` probe of the clamped
+// halo's shape (final review render I2; crates/uni-sky/src/probes.rs). Group 2: stars3d.wgsl
+// declares groups 0 and 1.
+#import "sky/stars3d.wgsl"
+
+// x: display energy; y: r [px]; zw: 0.
+@group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
+// x: R; y: weight scale; z: window exponent n (stars3d_halo_shape(energy, h)); w: the halo
+// weight at r with that shape.
+@group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_in)) {
+        return;
+    }
+    let c = probe_in[gid.x];
+    let s = stars3d_halo_shape(c.x, STARS3D_HALO_FRACTION);
+    probe_out[gid.x] = vec4<f32>(s, stars3d_halo_weight(c.y, s.x, s.y, s.z));
+}
+"#;
+
+/// The clamped-halo probe's tolerance, relative (logs and pows of up to 1e30 on the GPU).
+const TAPER_TOLERANCE: f32 = 1e-3;
+
+/// 64 (energy, r) pairs: display energies from 1e2 (unclamped) to the 1e30 cap, 8 radii each
+/// from the centre to the edge.
+fn taper_inputs() -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(64);
+    for i in 0..8 {
+        let energy = 10f32.powi(2 + 4 * i);
+        for k in 0..8 {
+            out.push([energy.min(1.0e30), 64.5 * k as f32 / 7.0, 0.0, 0.0]);
+        }
+    }
+    out
+}
+
+/// The CPU twins' answer for one taper input (the probe's output layout).
+fn taper_expected(c: &[f32; 4]) -> [f32; 4] {
+    use crate::stars3d::{STARS3D_HALO_FRACTION, halo_shape, stars3d_halo_weight};
+    let s = halo_shape(c[0], STARS3D_HALO_FRACTION);
+    [
+        s.radius_px,
+        s.scale,
+        s.taper,
+        stars3d_halo_weight(c[1], s.radius_px, s.scale, s.taper),
+    ]
+}
+
+/// Worst relative GPU − CPU difference of the taper probe: R, scale and n each relative to
+/// themselves, the weight relative to the footprint's central weight. NaN or a short read-back
+/// gives NaN.
+fn taper_worst(inputs: &[[f32; 4]], out: &[[f32; 4]]) -> f32 {
+    use crate::stars3d::{stars3d_halo_weight, stars3d_moffat};
+    if out.len() != inputs.len() {
+        return f32::NAN;
+    }
+    let mut worst = 0.0_f32;
+    for (c, g) in inputs.iter().zip(out) {
+        let cpu = taper_expected(c);
+        let centre =
+            stars3d_halo_weight(0.0, cpu[0], cpu[1], cpu[2]).max(stars3d_moffat(0.0) * 1e-6);
+        let scale = [cpu[0], cpu[1], cpu[2], centre];
+        for k in 0..4 {
+            worst = nan_max(worst, (g[k] - cpu[k]).abs() / scale[k].abs());
+        }
+    }
+    worst
+}
+
+fn check_taper(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    let inputs = taper_inputs();
+    let src = lib.compose(TAPER_PROBE)?;
+    let n = u32::try_from(inputs.len()).context("too many probe inputs")?;
+    let bytes = run_compute(
+        gpu,
+        &src,
+        "cs_main",
+        bytemuck::cast_slice(&inputs),
+        (inputs.len() * std::mem::size_of::<[f32; 4]>()) as u64,
+        [n.div_ceil(64), 1, 1],
+    )?;
+    let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+    let worst = taper_worst(&inputs, &out);
+    Ok((
+        worst <= TAPER_TOLERANCE,
+        format!(
+            "{n} (energy 1e2–1e30, r) pairs: halo radius, scale, taper and weight within \
+             {worst:.1e} (relative; tolerance {TAPER_TOLERANCE:.0e})"
+        ),
+    ))
+}
+
+/// Shader path of the world-point probe (final review render I2): the world-light splat's
+/// footprint and weight at scene exposure, through `splat_vertex_at`'s maths.
+const WORLD_POINTS_PROBE: &str = "sky/probe_world_points.wgsl";
+const WORLD_POINTS_PROBE_WGSL: &str = r#"// sky/probe_world_points.wgsl: `universe --selftest` probe of
+// the world-light point's PSF weight (crates/uni-sky/src/probes.rs). Group 2: stars3d.wgsl
+// declares groups 0 and 1.
+#import "sky/stars3d.wgsl"
+
+// x: display energy; y, z: pixel offset from the splat's centre [px] (pixel index − centre);
+// w: 0.
+@group(2) @binding(0) var<storage, read> probe_in: array<vec4<f32>>;
+// x: psf_weight at that pixel with the energy's halo shape; yzw: 0.
+@group(2) @binding(1) var<storage, read_write> probe_out: array<vec4<f32>>;
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= arrayLength(&probe_in)) {
+        return;
+    }
+    let c = probe_in[gid.x];
+    let h = STARS3D_HALO_FRACTION;
+    let s = stars3d_halo_shape(c.x, h);
+    let w = psf_weight(c.yz, vec2<f32>(0.0), vec4<f32>(h, s));
+    probe_out[gid.x] = vec4<f32>(w, 0.0, 0.0, 0.0);
+}
+"#;
+
+/// 64 (energy, pixel) inputs: the belt view's Sun at scene exposure (≈ 7e3) and at star
+/// exposure (≈ 2e11), a Sirius-like 650 and 1e6, 16 pixels each from the centre out to the edge.
+fn world_point_inputs() -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(64);
+    for energy in [650.0_f32, 7.0e3, 1.0e6, 2.0e11] {
+        for k in 0..16 {
+            let d = k as f32 * 4.3 - 0.37;
+            out.push([energy, d, 0.6 * d - 0.21, 0.0]);
+        }
+    }
+    out
+}
+
+fn check_world_points(gpu: &GpuContext, lib: &ShaderLib) -> anyhow::Result<(bool, String)> {
+    use crate::stars3d::{STARS3D_HALO_FRACTION, halo_shape, psf_weight};
+    let inputs = world_point_inputs();
+    let src = lib.compose(WORLD_POINTS_PROBE)?;
+    let n = u32::try_from(inputs.len()).context("too many probe inputs")?;
+    let bytes = run_compute(
+        gpu,
+        &src,
+        "cs_main",
+        bytemuck::cast_slice(&inputs),
+        (inputs.len() * std::mem::size_of::<[f32; 4]>()) as u64,
+        [n.div_ceil(64), 1, 1],
+    )?;
+    let out: Vec<[f32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+    let h = STARS3D_HALO_FRACTION;
+    let mut worst = if out.len() == inputs.len() {
+        0.0_f32
+    } else {
+        f32::NAN
+    };
+    for (c, g) in inputs.iter().zip(&out) {
+        let s = halo_shape(c[0], h);
+        let cpu = psf_weight(glam::Vec2::new(c[1], c[2]), glam::Vec2::ZERO, h, &s);
+        // Relative to the footprint's peak pixel weight.
+        let peak = psf_weight(glam::Vec2::ZERO, glam::Vec2::ZERO, h, &s);
+        worst = nan_max(worst, (g[0] - cpu).abs() / peak);
+    }
+    Ok((
+        worst <= HALO_TOLERANCE,
+        format!(
+            "{n} pixels of 4 splats (energy 650–2e11): PSF weight within {worst:.1e} of the \
+             CPU twin, relative to the peak (tolerance {HALO_TOLERANCE:.0e})"
         ),
     ))
 }
@@ -805,6 +981,18 @@ mod tests {
                     "stars3d_halo_energy",
                     "stars3d_halo_weight",
                 ][..],
+            ),
+            (
+                TAPER_PROBE,
+                TAPER_PROBE_WGSL,
+                2,
+                &["stars3d_halo_shape", "stars3d_halo_weight"][..],
+            ),
+            (
+                WORLD_POINTS_PROBE,
+                WORLD_POINTS_PROBE_WGSL,
+                2,
+                &["stars3d_halo_shape", "psf_weight"][..],
             ),
             (
                 DETAIL_PROBE,

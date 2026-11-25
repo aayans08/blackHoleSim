@@ -20,6 +20,11 @@
 //!
 //! The app pre-tints star colours through [`crate::vivid_color`]; this pass applies no colour
 //! change of its own.
+//!
+//! A sprite at a light that light-adapts the eye (one of `FrameCtx::lights` at ≥
+//! [`crate::ADAPTING_LUX`] at the camera: the Sun inside ~356 AU) is skipped: the star-surface
+//! pass draws it as world light, before the meter (final review render I2,
+//! [`crate::world_points`]).
 
 use glam::{DVec3, Vec3};
 use uni_gfx::{
@@ -32,6 +37,7 @@ use crate::stars3d::{
     LENS_MASK_BINDING, QUAD_INDICES, StarInput, begin_splat_pass, lens_mask_entry,
     quad_index_buffer, splat_pipeline, vertex_buffer_entry,
 };
+use crate::world_points::is_adapting_light_sprite;
 
 /// Group-1 binding of the point instances. `points.wgsl` imports `stars3d.wgsl`, and with it
 /// M0's `stars.wgsl`, whose declarations hold bindings 0–5 (the lens mask at
@@ -260,7 +266,7 @@ impl RenderFeature for PointSprites {
 
     /// Packs this frame's sprites (skipping undrawable ones), grows the instance buffer when
     /// needed and uploads them, and writes the uniform from the star input.
-    fn prepare(&mut self, gpu: &GpuContext, _ctx: &FrameCtx, targets: &FrameTargets) {
+    fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, targets: &FrameTargets) {
         let params = match &self.stars {
             Some(stars) => stars.with(|s| points_params(Some(s))),
             None => points_params(None),
@@ -269,8 +275,15 @@ impl RenderFeature for PointSprites {
             .write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        self.input
-            .with(|points| scratch.extend(points.iter().filter_map(point_gpu)));
+        // A light-adapting light's sprite is the star-surface pass's world light (module docs).
+        self.input.with(|points| {
+            scratch.extend(
+                points
+                    .iter()
+                    .filter(|p| !is_adapting_light_sprite(p.rel_pos_m, &ctx.lights))
+                    .filter_map(point_gpu),
+            );
+        });
         if scratch.len() > self.capacity {
             self.capacity = scratch.len().next_power_of_two();
             self.instance_buffer = instance_buffer(&gpu.device, self.capacity);

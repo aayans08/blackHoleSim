@@ -228,7 +228,7 @@ impl GrainGpu {
 
 /// Glow (coma, ion ribbon and dust splats) whose brightest point would be written below this
 /// pre-exposed value is not drawn (C1L): 1/1 000 of AgX's black point 2^−12.47393 = 1.75 × 10⁻⁴
-/// (uni-post `agx`, after Sobotka's AgX and Wrensch 2023), so even a thousand such splats on one
+/// (uni-post `agx`, after Sobotka's AgX: log2 0.18 − 10), so even a thousand such splats on one
 /// pixel stay below black. Twin of `GLOW_CULL_PRE` in `comet.wgsl`. It removes the fill of faint
 /// comets' comae and tails, which no exposure the frame has could show.
 pub const GLOW_CULL_PRE: f64 = 1.75e-7;

@@ -10,6 +10,10 @@
 //! M1 Wave C: Task C0 added [`asteroids`] and [`belt`] (C2's real asteroids and procedural belt,
 //! pass "asteroids") with the shader `sky/asteroids.wgsl`, and the `asteroid_probes` call in
 //! [`probes`].
+//!
+//! M1 final fix wave (F3, final review render I2): [`world_points`], the light-adapting point
+//! lights (the Sun beyond ~3 AU) drawn as world light by the star-surface pass, with the shader
+//! `sky/world_points.wgsl`.
 
 pub mod asteroids;
 pub mod band;
@@ -20,6 +24,7 @@ pub mod psf;
 pub mod sectors;
 pub mod stars;
 pub mod stars3d;
+pub mod world_points;
 
 pub use asteroids::{
     AsteroidField, AsteroidInput, BELT_HIGHLIGHT_GAIN, belt_highlight_v, kepler_f32, split_f64,
@@ -34,6 +39,9 @@ pub use stars::{DEFAULT_STAR_EV100, STARS_SHADER, StarField, StarInstance, star_
 pub use stars3d::{
     STARS3D_MIN_RADIUS_PX, StarField3, StarInput, star_apparent_mag, visible_star_count,
     vivid_color,
+};
+pub use world_points::{
+    ADAPTING_LUX, WorldPoint, WorldPointDrawer, is_adapting_light_sprite, light_adapts_eye,
 };
 
 // A dependency the library does not use yet (B0 added every Wave B manifest entry, review I8);
@@ -69,6 +77,10 @@ pub fn register_shaders(lib: &mut uni_gfx::ShaderLib) {
     );
     lib.add(BAND_DRAW_WGSL, include_str!("../shaders/band_draw.wgsl"));
     lib.add(ASTEROIDS_WGSL, include_str!("../shaders/asteroids.wgsl"));
+    lib.add(
+        world_points::WORLD_POINTS_WGSL,
+        include_str!("../shaders/world_points.wgsl"),
+    );
 }
 
 #[cfg(test)]
@@ -90,6 +102,7 @@ mod tests {
             BAND_UPDATE_WGSL,
             BAND_DRAW_WGSL,
             ASTEROIDS_WGSL,
+            world_points::WORLD_POINTS_WGSL,
         ] {
             let src = lib.compose(path).unwrap();
             if let Err(e) = validate_wgsl(&src) {

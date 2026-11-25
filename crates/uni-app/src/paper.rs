@@ -29,13 +29,22 @@
 //! tail (≈ 0.02 × the coma's light along a 10⁵ km ribbon, C1L fix round 2) and the km-sized
 //! nucleus are left out.
 //!
-//! Points (unresolved bodies) are sky light at star exposure and are not metered.
+//! Points (unresolved bodies) are sky light at star exposure and are not metered, except a light
+//! that light-adapts the eye (final review render I2: the Sun inside ~356 AU, at ≥
+//! `uni_sky::ADAPTING_LUX`): below 1.5 px the star-surface pass draws it as world light before
+//! the meter, the star pass's PSF with the eye's glare at the scene exposure
+//! (`uni_planet::world_points`, `uni_sky::world_points::world_splat`), and so does the paper
+//! ([`world_point_glare`]), on every pixel no resolved body covers. Its footprint depends on the
+//! exposure (the clamped halo's kept light and taper), so the paper iterates the meter to the
+//! fixed point. In the LOD band its disk is × the cross-fade's f (`uni_planet::light_disk_fade`)
+//! and the point carries 1 − f. Atmospheres and rings over the glare are left out.
 //!
 //! The luminances go through B6's CPU meter (`Histogram::from_luminances(...).meter`,
 //! `target_ev`), every pixel of the frame.
 
 use glam::{DQuat, DVec2, DVec3, UVec2};
 use uni_core::CameraView;
+use uni_gfx::LightView;
 #[cfg(test)]
 use uni_physics::photometry::{Brdf, disk_phase_function};
 use uni_physics::photometry::{
@@ -365,6 +374,7 @@ pub fn world_luminance(
             best = Some((t, l));
         }
     };
+    let lights = snapshot_lights(snap);
     for s in &snap.star_surfaces {
         if let Some(t) = hit_ellipsoid(-s.rel_pos_m, dir, DQuat::IDENTITY, DVec3::splat(s.radius_m))
         {
@@ -372,7 +382,9 @@ pub fn world_luminance(
             let mu = (-n.dot(dir)) as f32;
             let ld = uni_planet::limb_darkening(mu).y / uni_planet::limb_darkening_mean().y;
             let mean = s.luminous_intensity_cd / (std::f64::consts::PI * s.radius_m * s.radius_m);
-            offer(t, mean * f64::from(ld));
+            // A light-adapting light's disk in the point → disk cross-fade (module docs).
+            let fade = uni_planet::light_disk_fade(s, &lights).map_or(1.0, f64::from);
+            offer(t, mean * f64::from(ld) * fade);
         }
     }
     for b in &snap.bodies {
@@ -424,6 +436,97 @@ pub fn world_luminance(
         }
     }
     l
+}
+
+/// The frame's lights as the app builds them (`scene::frame_ctx`: the snapshot's Sun).
+pub fn snapshot_lights(snap: &Snapshot) -> Vec<LightView> {
+    snap.sun
+        .iter()
+        .map(|s| LightView {
+            rel_pos_m: s.rel_pos_m,
+            radius_m: s.radius_m,
+            luminous_intensity_cd: s.intensity_cd,
+            color: s.color,
+        })
+        .collect()
+}
+
+/// Whether a resolved body or star surface lies along unit `dir` nearer than `depth_m`: the
+/// passes drawn after the `sun` pass's world-light point cover it there.
+fn covered(snap: &Snapshot, dir: DVec3, depth_m: f64) -> bool {
+    snap.bodies
+        .iter()
+        .any(|b| hit_body(&drawn(b), dir).is_some_and(|t| t < depth_m))
+        || snap.star_surfaces.iter().any(|s| {
+            hit_ellipsoid(-s.rel_pos_m, dir, DQuat::IDENTITY, DVec3::splat(s.radius_m))
+                .is_some_and(|t| t < depth_m)
+        })
+}
+
+/// The world luminance [cd/m²] the light-adapting lights' points (`uni_planet::world_points`) add
+/// to each pixel of a `size` frame of `view` written at scene exposure `pre`, row-major: each
+/// point's splat (`uni_sky::world_points::world_splat`, the `sun` pass's maths) on every pixel of
+/// its footprint that no resolved body or star surface covers. Empty when there is none.
+pub fn world_point_glare(
+    snap: &Snapshot,
+    view: &CameraView,
+    size: UVec2,
+    cam: &Cam,
+    pre: f32,
+) -> Vec<f64> {
+    let lights = snapshot_lights(snap);
+    let scene = uni_planet::BodyScene {
+        stars: snap.star_surfaces.clone(),
+        ..Default::default()
+    };
+    let points = uni_planet::world_points(&scene, &lights, view.fov_y_rad, f64::from(size.y));
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let (w, h) = (size.x as usize, size.y as usize);
+    let mut out = vec![0.0; w * h];
+    let view_rot = crate::scene::view_rot(view.orient);
+    let aspect = size.x as f32 / size.y as f32;
+    let proj = uni_gfx::reversed_z_infinite_proj(
+        view.fov_y_rad as f32,
+        aspect,
+        crate::scene::NEAR_PLANE_M,
+    );
+    let fsize = glam::Vec2::new(size.x as f32, size.y as f32);
+    for p in &points {
+        let dir = p.rel_pos_m.normalize();
+        let Some(splat) = uni_sky::world_points::world_splat(
+            view_rot,
+            proj,
+            fsize,
+            view.fov_y_rad as f32,
+            dir.as_vec3(),
+            p.illuminance_lux as f32,
+            pre,
+        ) else {
+            continue;
+        };
+        let r = splat.shape.radius_px + 1.0;
+        let lo = (splat.centre_px - glam::Vec2::splat(r))
+            .floor()
+            .max(glam::Vec2::ZERO);
+        let hi = (splat.centre_px + glam::Vec2::splat(r))
+            .ceil()
+            .min(fsize - glam::Vec2::ONE);
+        for y in lo.y as u32..=hi.y as u32 {
+            for x in lo.x as u32..=hi.x as u32 {
+                let l = splat.luminance_at(glam::Vec2::new(x as f32, y as f32));
+                if !(l > 0.0) {
+                    continue;
+                }
+                let ray = cam.ray(DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
+                if !covered(snap, ray, p.depth_m) {
+                    out[y as usize * w + x as usize] += f64::from(l);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The ellipsoid the bodies pass draws: Venus's cloud deck, 70 km above its solid radius (B1).
@@ -521,23 +624,46 @@ pub fn on_paper_model(
     let comae = coma_raster(&snap.comets, &cam, size);
     let dust = uni_planet::dust_tail_luminance(&snap.comets, world.epoch(), view, size);
     let w = STRIDE * STRIDE;
-    let mut lums = Vec::new();
+    // Every sampled pixel's world light without the light-adapting points (index, luminance).
+    let mut base = Vec::new();
     for y in (0..size.y).step_by(STRIDE as usize) {
         for x in (0..size.x).step_by(STRIDE as usize) {
             let p = DVec2::new(f64::from(x) + 0.5, f64::from(y) + 0.5);
             let ray = cam.ray(p);
-            let l = world_luminance(&snap, ray, rings, earth_k, venus)
-                + comae[y as usize * size.x as usize + x as usize]
-                + dust.at(x, y);
+            let i = y as usize * size.x as usize + x as usize;
+            let l = world_luminance(&snap, ray, rings, earth_k, venus) + comae[i] + dust.at(x, y);
+            base.push((i, l));
+        }
+    }
+    let lums_at = |glare: &[f64]| -> Vec<f32> {
+        let mut lums = Vec::new();
+        for &(i, l) in &base {
+            let l = l + glare.get(i).copied().unwrap_or(0.0);
             if l > 0.0 {
                 for _ in 0..w {
                     lums.push(l as f32);
                 }
             }
         }
-    }
+        lums
+    };
     let total = size.x * size.y;
-    let (meter, target, pre) = settled_meter(&lums, total, subnormals);
+    let mut lums = lums_at(&[]);
+    let (mut meter, mut target, mut pre) = settled_meter(&lums, total, subnormals);
+    // A light-adapting point's glare is drawn at the scene exposure, and its footprint depends on
+    // it: iterate to the fixed point (module docs; it settles in 2–4 steps).
+    for _ in 0..SETTLE_STEPS {
+        let glare = world_point_glare(&snap, view, size, &cam, pre);
+        if glare.is_empty() {
+            break;
+        }
+        lums = lums_at(&glare);
+        let previous = target;
+        (meter, target, pre) = settled_meter(&lums, total, subnormals);
+        if (target - previous).abs() < 1.0e-3 {
+            break;
+        }
+    }
     let mut lit: Vec<f32> = lums
         .into_iter()
         .map(|l| through_f16(l, pre, subnormals))

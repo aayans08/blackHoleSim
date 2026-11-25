@@ -2767,6 +2767,7 @@ dependencies = [
  "uni-gfx",
  "uni-physics",
  "uni-sim",
+ "uni-sky",
  "wgpu",
 ]
 

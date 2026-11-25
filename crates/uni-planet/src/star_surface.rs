@@ -21,6 +21,17 @@
 //! `lens_mask.g` gets the coverage and `lens_mask.a` the star share 1 − w, per instance
 //! ([`crate::body::star_share`], lead ruling B6 I1), both with `Max`.
 //!
+//! **Light-adapting lights** (final review render I2, F3): a light in `FrameCtx::lights` bright
+//! enough to light-adapt the eye at the camera (`uni_sky::ADAPTING_LUX`, 1 lx: the Sun inside
+//! ~356 AU) is world light at every size. Below `POINT_LOD_PX` (1.5 px), where uni-sim hands it
+//! over as a point, this pass draws its point (the star pass's PSF with the eye's glare,
+//! `uni_sky::WorldPointDrawer`) at the scene exposure, before the meter, so the auto exposure
+//! adapts to its glare; the point pass skips its sprite. Between `POINT_LOD_PX` and
+//! `BLEND_LOD_PX` (4 px) the disk is drawn at the scene exposure (no star-exposure blend) and
+//! cross-fades with the point: the disk × f, the point × (1 − f), f =
+//! [`crate::lod_exposure_mix`] (0 at 1.5 px, 1 at 4 px), so the light, the exposure and the
+//! metered glare are continuous across the handover ([`world_points`], [`plan_stars`]).
+//!
 //! **Approximations**, labelled on the card as `Granulation: procedural (measured cell size and
 //! lifetime)`: the granulation pattern is procedural; the Sun's limb darkening is used for every
 //! star; other stars' granules are scaled from the Sun's (see [`granule_cell_m`]); no sunspots,
@@ -38,6 +49,10 @@ use uni_gfx::{
 };
 use uni_sim::snapshot::StarSurfaceView;
 use wgpu::util::DeviceExt as _;
+
+use uni_gfx::LightView;
+use uni_sim::snapshot::POINT_LOD_PX;
+use uni_sky::{WorldPoint, WorldPointDrawer, light_adapts_eye};
 
 use crate::body::{BodyScene, exposure_weight, lens_mask_target};
 use crate::{CAP_RINGS, CAP_SEGMENTS, cap_indices, cap_mesh};
@@ -65,6 +80,8 @@ pub struct StarSurfaceRenderer {
     /// Stars drawn this frame.
     count: u32,
     warnings: Vec<String>,
+    /// The light-adapting lights drawn as points ([`world_points`]).
+    world: WorldPointDrawer,
 }
 
 impl StarSurfaceRenderer {
@@ -154,6 +171,8 @@ impl StarSurfaceRenderer {
         if let Some(err) = pollster::block_on(scope.pop()) {
             anyhow::bail!("creating the star-surface pass: {err}");
         }
+        let world = WorldPointDrawer::new(gpu, lib, camera_bgl)
+            .context("creating the star-surface pass's world points")?;
         Ok(Self {
             input,
             pipeline,
@@ -166,6 +185,7 @@ impl StarSurfaceRenderer {
             capacity,
             count: 0,
             warnings: Vec::new(),
+            world,
         })
     }
 
@@ -220,9 +240,14 @@ impl RenderFeature for StarSurfaceRenderer {
     }
 
     fn prepare(&mut self, gpu: &GpuContext, ctx: &FrameCtx, _targets: &FrameTargets) {
-        let mut frame = self
-            .input
-            .with(|scene| plan_stars(scene, ctx.camera.fov_y_rad, f64::from(ctx.viewport.y)));
+        let (fov, height) = (ctx.camera.fov_y_rad, f64::from(ctx.viewport.y));
+        let (mut frame, points) = self.input.with(|scene| {
+            (
+                plan_stars(scene, &ctx.lights, fov, height),
+                world_points(scene, &ctx.lights, fov, height),
+            )
+        });
+        self.world.prepare(gpu, &points);
         // A cap wholly outside the view draws nothing; with none left the pass is not encoded
         // (task B9p: the empty pass still loaded and stored hdr, lens_mask and depth).
         let view_proj = ctx.proj * ctx.view_rot;
@@ -258,7 +283,7 @@ impl RenderFeature for StarSurfaceRenderer {
         _output: &wgpu::TextureView,
         timer: &mut PassTimer,
     ) {
-        if self.count == 0 {
+        if self.count == 0 && self.world.count() == 0 {
             return;
         }
         let load = wgpu::Operations {
@@ -293,19 +318,23 @@ impl RenderFeature for StarSurfaceRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, frame.camera, &[]);
-        pass.set_bind_group(1, &self.bind_group, &[]);
-        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        for k in 0..self.count {
-            // Star k's cap starts at vertex k·CAP_VERTICES; its record is instance k.
-            pass.draw_indexed(
-                0..self.index_count,
-                (k as usize * CAP_VERTICES) as i32,
-                k..k + 1,
-            );
+        if self.count > 0 {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(1, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            for k in 0..self.count {
+                // Star k's cap starts at vertex k·CAP_VERTICES; its record is instance k.
+                pass.draw_indexed(
+                    0..self.index_count,
+                    (k as usize * CAP_VERTICES) as i32,
+                    k..k + 1,
+                );
+            }
         }
+        // Last, after the disks (their depth is written): a light-adapting light's point.
+        self.world.draw(&mut pass);
     }
 }
 
@@ -805,7 +834,16 @@ pub(crate) fn star_gpu(view: &StarSurfaceView, exposure_mix: f32) -> StarGpu {
 ///   then f32, and its [`star_gpu`] record with the exposure blend
 ///   [`exposure_weight`]`(proj_radius_px, eye_adapted)`: `lod_exposure_mix(proj_radius_px)`,
 ///   snapped to 1 when 1 − w < 2⁻¹⁴, while eye-adapted stars are in effect (1 otherwise).
-pub(crate) fn plan_stars(scene: &BodyScene, fov_y_rad: f64, height_px: f64) -> StarFrame {
+/// - A star that is one of `lights` and light-adapts the eye ([`light_disk_fade`]) is world
+///   light at any size: exposure weight 1, and its luminance × f =
+///   `lod_exposure_mix(proj_radius_px)`, the disk's share of the point → disk cross-fade
+///   ([`world_points`] draws the rest as a point).
+pub(crate) fn plan_stars(
+    scene: &BodyScene,
+    lights: &[LightView],
+    fov_y_rad: f64,
+    height_px: f64,
+) -> StarFrame {
     let px_angle = 2.0 * (0.5 * fov_y_rad).tan() / height_px.max(1.0);
     let mut frame = StarFrame {
         draws: Vec::new(),
@@ -837,9 +875,19 @@ pub(crate) fn plan_stars(scene: &BodyScene, fov_y_rad: f64, height_px: f64) -> S
         if unit.len() != CAP_VERTICES {
             continue;
         }
-        let mix = exposure_weight(view.proj_radius_px, scene.eye_adapted);
+        let fade = light_disk_fade(view, lights);
+        let mix = match fade {
+            Some(_) => 1.0,
+            None => exposure_weight(view.proj_radius_px, scene.eye_adapted),
+        };
+        let mut gpu = star_gpu(view, mix);
+        if let Some(f) = fade {
+            for c in &mut gpu.l0[..3] {
+                *c *= f;
+            }
+        }
         frame.draws.push(StarDraw {
-            gpu: star_gpu(view, mix),
+            gpu,
             vertices: unit
                 .iter()
                 .map(|v| (rel + *v * r_mesh).as_vec3().to_array())
@@ -847,6 +895,67 @@ pub(crate) fn plan_stars(scene: &BodyScene, fov_y_rad: f64, height_px: f64) -> S
         });
     }
     frame
+}
+
+/// The light of `lights` that star `view` is, when it light-adapts the eye
+/// (`uni_sky::light_adapts_eye`); positions match to 1e-9 of the distance (one snapshot).
+fn adapting_light<'a>(view: &StarSurfaceView, lights: &'a [LightView]) -> Option<&'a LightView> {
+    lights.iter().find(|l| {
+        light_adapts_eye(l)
+            && (view.rel_pos_m - l.rel_pos_m).length() <= 1e-9 * l.rel_pos_m.length().max(1.0)
+    })
+}
+
+/// The disk's share f of a light-adapting light's point → disk cross-fade, for star `view`:
+/// `Some(lod_exposure_mix(proj_radius_px))` (0 at 1.5 px, 1 from 4 px on) when it is such a light,
+/// `None` for any other star (module docs).
+pub fn light_disk_fade(view: &StarSurfaceView, lights: &[LightView]) -> Option<f32> {
+    adapting_light(view, lights).map(|_| crate::lod_exposure_mix(view.proj_radius_px))
+}
+
+/// The light-adapting lights this pass draws as world-light points (module docs): each light of
+/// `lights` that light-adapts the eye, with the camera outside it,
+/// - with weight 1 when uni-sim drew no surface for it and it projects below `POINT_LOD_PX`
+///   (`uni_sim::snapshot::proj_radius_px`, the same formula; uni-sim made it a point sprite,
+///   which the point pass now skips), on screen or not (its glare may reach into the frame);
+/// - with weight 1 − f while its disk is drawn in the cross-fade (`f` = [`light_disk_fade`] < 1);
+/// - not at all once its disk is at least `BLEND_LOD_PX`.
+///
+/// Its illuminance × the weight, its colour, and its depth taken 2 radii in front of its centre
+/// (at least half way to it), so its own disk never hides it.
+pub fn world_points(
+    scene: &BodyScene,
+    lights: &[LightView],
+    fov_y_rad: f64,
+    height_px: f64,
+) -> Vec<WorldPoint> {
+    let mut out = Vec::new();
+    for light in lights.iter().filter(|l| light_adapts_eye(l)) {
+        let d = light.rel_pos_m.length();
+        if !(d > light.radius_m) {
+            continue;
+        }
+        let surface = scene
+            .stars
+            .iter()
+            .find(|s| adapting_light(s, std::slice::from_ref(light)).is_some());
+        let weight = match surface {
+            Some(s) => 1.0 - f64::from(crate::lod_exposure_mix(s.proj_radius_px)),
+            None => {
+                let px = uni_sim::snapshot::proj_radius_px(light.radius_m, d, fov_y_rad, height_px);
+                if px < POINT_LOD_PX { 1.0 } else { 0.0 }
+            }
+        };
+        if weight > 0.0 {
+            out.push(WorldPoint {
+                rel_pos_m: light.rel_pos_m,
+                illuminance_lux: uni_sky::world_points::light_illuminance_lux(light) * weight,
+                color: light.color,
+                depth_m: (d - 2.0 * light.radius_m).max(0.5 * d),
+            });
+        }
+    }
+    out
 }
 
 // ---- GPU probes ----------------------------------------------------------------------------
@@ -1425,6 +1534,80 @@ mod tests {
         );
     }
 
+    /// Final review render I2: a light-adapting light (the Sun inside ~356 AU) is world light at
+    /// every size. As a point (below 1.5 px, no surface) this pass draws it with weight 1; from
+    /// TestBH-1's 1000 AU (0.13 lx) it stays the point pass's sky light; in the LOD band its disk
+    /// is at the scene exposure and cross-fades with the point (f + (1 − f) = the whole light);
+    /// from 4 px on only the disk; a star that is not a light keeps the star-exposure blend.
+    #[test]
+    fn light_adapting_light_is_world_light_at_every_size() {
+        let sun_cd = intensity_cd(M_V_SUN);
+        let dir = DVec3::new(0.2, -0.3, -0.9).normalize();
+        let light = |d: f64| LightView {
+            rel_pos_m: dir * d,
+            radius_m: R_SUN_M,
+            luminous_intensity_cd: sun_cd,
+            color: Vec3::ONE,
+        };
+        let empty = BodyScene {
+            eye_adapted: true,
+            ..Default::default()
+        };
+        // 6 AU at 70°/1080 px: 0.6 px, a point; weight 1, 3.5e3 lx.
+        let fov = 70f64.to_radians();
+        let l6 = light(6.0 * AU);
+        let pts = world_points(&empty, std::slice::from_ref(&l6), fov, 1080.0);
+        assert_eq!(pts.len(), 1);
+        let lux = sun_cd / (36.0 * AU * AU);
+        assert!((pts[0].illuminance_lux / lux - 1.0).abs() < 1e-12 && lux > 3.0e3);
+        assert_eq!(pts[0].rel_pos_m, l6.rel_pos_m);
+        assert!((pts[0].depth_m - (6.0 * AU - 2.0 * R_SUN_M)).abs() < 1.0);
+        // 1000 AU: 0.13 lx, below ADAPTING_LUX.
+        assert!(world_points(&empty, &[light(1000.0 * AU)], fov, 1080.0).is_empty());
+        // Resolved by the formula but with no surface (uni-sim drew none): nothing here.
+        assert!(world_points(&empty, &[light(0.5 * AU)], fov, 1080.0).is_empty());
+        // In the band: disk × f at weight 1, point × (1 − f).
+        let l2 = light(2.0 * AU);
+        for (px, f_want) in [
+            (1.5, 0.0),
+            (2.4495, 0.5),
+            (3.0, -1.0),
+            (4.0, 1.0),
+            (9.0, 1.0),
+        ] {
+            let mut v = star_view(l2.rel_pos_m, R_SUN_M, TEFF_SUN_K, M_V_SUN);
+            v.luminous_intensity_cd = sun_cd;
+            v.proj_radius_px = px;
+            let scene = BodyScene {
+                stars: vec![v.clone()],
+                eye_adapted: true,
+                ..Default::default()
+            };
+            let f = crate::lod_exposure_mix(px);
+            if f_want >= 0.0 {
+                assert!((f - f_want).abs() < 1e-4, "{px}: {f}");
+            }
+            let lit = plan_stars(&scene, std::slice::from_ref(&l2), fov, 1080.0);
+            let plain = plan_stars(&scene, &[], fov, 1080.0);
+            let (a, b) = (lit.draws[0].gpu, plain.draws[0].gpu);
+            assert_eq!(a.l0[3], 1.0, "{px}: scene exposure");
+            assert!((a.l0[1] - b.l0[1] * f).abs() <= 1e-6 * b.l0[1], "{px}");
+            assert_eq!(
+                b.l0[3],
+                exposure_weight(px, true),
+                "{px}: other stars unchanged"
+            );
+            let pts = world_points(&scene, std::slice::from_ref(&l2), fov, 1080.0);
+            let point = pts.first().map_or(0.0, |p| p.illuminance_lux);
+            let whole = sun_cd / (4.0 * AU * AU);
+            assert!(
+                (point / whole - (1.0 - f64::from(f))).abs() < 1e-6,
+                "{px}: {point}"
+            );
+            assert_eq!(pts.is_empty(), f >= 1.0, "{px}");
+        }
+    }
+
     /// Lead ruling B6 I1 (task B10): each star's record carries its own snapped exposure weight
     /// ([`exposure_weight`]), which the instanced draw stores per instance as the share 1 − w in
     /// `lens_mask.a` (no draw split). Two stars at different sizes in one frame keep their own
@@ -1443,7 +1626,7 @@ mod tests {
             ..Default::default()
         };
         let weights = |scene: &BodyScene| -> Vec<f32> {
-            plan_stars(scene, 1.0, 1080.0)
+            plan_stars(scene, &[], 1.0, 1080.0)
                 .draws
                 .iter()
                 .map(|d| d.gpu.l0[3])
@@ -1473,7 +1656,10 @@ mod tests {
                 names: vec![(0, "Sun".to_owned())],
                 ..Default::default()
             };
-            plan_stars(&scene, 1.0, 1080.0).draws.remove(0).vertices
+            plan_stars(&scene, &[], 1.0, 1080.0)
+                .draws
+                .remove(0)
+                .vertices
         };
         let ahead = cap(DVec3::new(0.0, 0.0, -10.0 * R_SUN_M));
         let behind = cap(DVec3::new(0.0, 0.0, 10.0 * R_SUN_M));
@@ -1507,7 +1693,7 @@ mod tests {
                 names: vec![(0, "Sun".to_owned())],
                 ..Default::default()
             };
-            let frame = plan_stars(&scene, 1.0, 1080.0);
+            let frame = plan_stars(&scene, &[], 1.0, 1080.0);
             assert!(frame.draws.is_empty(), "camera at {rel}");
             assert_eq!(frame.warnings, vec!["Inside Sun".to_owned()]);
         }
@@ -1522,7 +1708,7 @@ mod tests {
             names: vec![(0, "Sun".to_owned())],
             ..Default::default()
         };
-        let frame = plan_stars(&scene, 1.0, 1080.0);
+        let frame = plan_stars(&scene, &[], 1.0, 1080.0);
         assert!(frame.warnings.is_empty());
         assert_eq!(frame.draws.len(), 1);
         let draw = &frame.draws[0];

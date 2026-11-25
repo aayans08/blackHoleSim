@@ -10,10 +10,11 @@
 //! ## Exposure split (pre-exposed HDR)
 //!
 //! `hdr` holds light × exposure (`shaders/common/exposure.wgsl`); the tonemap adds none.
-//! - *World light* (bodies, the Sun's disk, rings, atmospheres, comet nuclei, comae and tails):
-//!   luminance [cd/m²] × `scene_pre()`.
-//! - *Sky light and point sources* (catalogue stars, the Milky Way band, planets, the Sun and
-//!   asteroids drawn as points): luminance × `star_pre()`. With "Eye-adapted stars" in effect
+//! - *World light* (bodies, the Sun's disk, rings, atmospheres, comet nuclei, comae and tails,
+//!   and a light that light-adapts the eye drawn as a point, below): luminance [cd/m²] ×
+//!   `scene_pre()`.
+//! - *Sky light and point sources* (catalogue stars, the Milky Way band, planets, the Sun beyond
+//!   ~356 AU and asteroids drawn as points): luminance × `star_pre()`. With "Eye-adapted stars" in effect
 //!   `star_pre` comes from a fixed dark-adapted EV, otherwise `star_pre == scene_pre`: design §7
 //!   item 4's dual exposure, extended to every unresolved source so a planet and a star of equal
 //!   magnitude look equally bright (ruling 5).
@@ -32,6 +33,17 @@
 //!   4 px.) The blend is labelled as part of "Eye-adapted stars". Its rings and its atmosphere
 //!   use the body's own weight, and every such writer stores its star share in `lens_mask.a`
 //!   (below).
+//! - *Light-adapting lights* (final review render I2): a light of `FrameCtx::lights` whose
+//!   illuminance at the camera is at least `uni_sky::ADAPTING_LUX` (1 lx; the Sun inside
+//!   ~356 AU) is world light at every size, because its glare light-adapts the eye. Below
+//!   `POINT_LOD_PX` the `sun` pass (4) draws its point, the star pass's PSF with the eye's glare
+//!   halo, × `scene_pre()` and before the meter (`uni_sky::WorldPointDrawer`, additive into `hdr`
+//!   only, depth tested and never written), and the `points` pass (13) skips its sprite. In the
+//!   LOD band its disk is at `scene_pre` (no star-exposure blend, share 0) and cross-fades with
+//!   that point: disk × w, point × (1 − w). Bodies drawn later cover its glare where they are in
+//!   front, as they hide any point (glare over a body in front is not drawn: an approximation);
+//!   the lens pass would repaint it inside a traced rectangle (unreachable in M1: TestBH-1 is
+//!   1000 AU out, where the Sun gives 0.13 lx).
 //! - Auto-exposure meters world light only: the meter (pass 9) runs before any sky light or
 //!   point source is written. It reads each pixel at the pre it was written with,
 //!   `pre_mix(scene_pre, star_pre, lens_mask.a)`, so a body in the LOD band is metered at its
@@ -89,7 +101,7 @@
 //! | 1 | `exposure` (auto-exposure resolve; own bind group: imports `common/exposure.wgsl`, never group 0) | uni-post | exposure buffer (storage) | — |
 //! | 2 | `band-update` (one environment cube face per frame, when needed) | uni-sky | environment cubemap | — |
 //! | 3 | `background` (the M0 debug grid; only with `LensEnv::DebugGrid` and a traced lens; display-referred, so the app runs Manual exposure whenever `DebugGrid` is selected) | uni-rel | hdr | — |
-//! | 4 | `sun` (star surfaces) | uni-planet | hdr (world), g, a | write, `Greater` |
+//! | 4 | `sun` (star surfaces; then light-adapting lights below 1.5 px, and in the LOD band's cross-fade, as world-light points) | uni-planet (points: uni-sky's drawer) | hdr (world), g, a (points: hdr only) | write, `Greater` (points: test `Greater`, never written) |
 //! | 5 | `bodies` | uni-planet | hdr (world), g, a | write, `Greater` |
 //! | 6 | `rings` | uni-planet | hdr (world), g, a | test only |
 //! | 7 | `comets` (Wave C) | uni-planet | hdr (world), g (nucleus) | nucleus write; coma and tails test only |
@@ -98,7 +110,7 @@
 //! | 10 | `lens` (reads `depth`; skips pixels with depth ≠ 0) | uni-rel | hdr (sky, star exposure), r, g = 0, b | — |
 //! | 11 | `band` | uni-sky | hdr (sky) × (1 − r)(1 − g)(1 − b) | none: no depth attachment (B9c ruling) |
 //! | 12 | `stars` | uni-sky | hdr (sky) × (1 − r)(1 − g) | none: no depth attachment (B9c ruling) |
-//! | 13 | `points` (bodies, the Sun and near stars as points) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
+//! | 13 | `points` (bodies, near stars and the Sun beyond ~356 AU as points; skips a light-adapting light's sprite) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
 //! | 14 | `asteroids` (Wave C) | uni-sky | hdr (sky) × (1 − r) | test `Greater` at true depth |
 //! | 15 | `bloom` (input clamped to `BLOOM_INPUT_MAX`) | uni-post | hdr | — |
 //! | 16 | `tonemap` (upscale + AgX + dither) | uni-post | output view | — |

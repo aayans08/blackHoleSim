@@ -39,7 +39,10 @@ pub use eclipse::sun_visible_fraction;
 pub use lod::lod_exposure_mix;
 pub use probes::gpu_probes;
 pub use rings::{RingRenderer, planet_shadow_on_ring, ring_phase};
-pub use star_surface::{StarSurfaceRenderer, granulation, limb_darkening, limb_darkening_mean};
+pub use star_surface::{
+    StarSurfaceRenderer, granulation, light_disk_fade, limb_darkening, limb_darkening_mean,
+    world_points,
+};
 
 /// `ShaderLib` path of the bodies pass (B1).
 pub const BODY_WGSL: &str = "planet/body.wgsl";

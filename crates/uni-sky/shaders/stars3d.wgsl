@@ -99,6 +99,21 @@ const STARS3D_HALO_BETA: f32 = 1.36;
 // The halo's part of a footprint ends at the display's black, AgX's 2^−12.47393 (stars3d.rs
 // STARS3D_HALO_CUTOFF); the core keeps M0's VISIBILITY_CUTOFF.
 const STARS3D_HALO_CUTOFF: f32 = 1.76e-4;
+// A clamped halo (final review render I2; stars3d.rs `halo_shape`): its last pixel ring is
+// tapered to at most STARS3D_TAPER_TARGET × STARS3D_HALO_CUTOFF, with the window
+// (1 − r²/R²)^n, n in [2, STARS3D_TAPER_N_MAX], found in STARS3D_TAPER_STEPS fixed-point steps.
+const STARS3D_TAPER_TARGET: f32 = 0.5;
+const STARS3D_TAPER_N_MAX: f32 = 24.0;
+const STARS3D_TAPER_STEPS: i32 = 3;
+// The windowed halo's energy inside R = MAX_RADIUS_PX for window exponent n = 2, 3, …, 24
+// (W_n = ∫₀^R 2πr Moffat(r) (1 − r²/R²)^n dr; stars3d.rs STARS3D_TAPER_ENERGY, checked there by
+// quadrature). Interpolated linearly in ln W between integer n.
+const STARS3D_TAPER_ENERGY: array<f32, 23> = array<f32, 23>(
+    8.5661991e-01, 8.3783808e-01, 8.2252838e-01, 8.0946014e-01, 7.9797919e-01, 7.8769169e-01,
+    7.7834007e-01, 7.6974557e-01, 7.6177848e-01, 7.5434132e-01, 7.4735878e-01, 7.4077131e-01,
+    7.3453093e-01, 7.2859831e-01, 7.2294081e-01, 7.1753097e-01, 7.1234546e-01, 7.0736426e-01,
+    7.0257006e-01, 6.9794776e-01, 6.9348413e-01, 6.8916749e-01, 6.8498744e-01
+);
 // 1 km/s in pc per Julian year (IAU 1976 year, IAU 2012 B2 parsec).
 const PC_PER_YR_PER_KMS: f32 = 1.02271217e-6;
 // log10(2) and log2(10): WGSL has log2 and exp2 only.
@@ -143,23 +158,43 @@ fn stars3d_halo_energy(radius: f32) -> f32 {
     return (b - 1.0) * (f_edge - f_centre);
 }
 
-// Halo weight of a pixel whose centre is r px from the star, given inv_energy =
-// 1 / stars3d_halo_energy(radius): stars3d_moffat × the window (1 − r²/R²)², smoothly 0 at the
-// footprint radius, renormalised to unit energy inside it (no ring where the radius is
-// clamped). Twin of `uni_sky::stars3d::stars3d_halo_weight`.
-fn stars3d_halo_weight(r: f32, radius: f32, inv_energy: f32) -> f32 {
+// Halo weight of a pixel whose centre is r px from the star, for a footprint of `radius` px with
+// weight scale `scale` and window exponent `taper` (stars3d_halo_shape): stars3d_moffat × the
+// window (1 − r²/R²)^n, smoothly 0 at the footprint radius, × scale (1 / its energy inside R for
+// an unclamped footprint: unit energy, no ring; for a clamped one the light the halo really has
+// inside R). n = 2 is evaluated as a square, exactly as before the taper existed. Twin of
+// `uni_sky::stars3d::stars3d_halo_weight`.
+fn stars3d_halo_weight(r: f32, radius: f32, scale: f32, taper: f32) -> f32 {
     if (!(r < radius)) {
         return 0.0;
     }
     let window = 1.0 - (r * r) / (radius * radius);
-    return stars3d_moffat(r) * window * window * inv_energy;
+    let w = select(pow(window, taper), window * window, taper <= 2.0);
+    return stars3d_moffat(r) * w * scale;
 }
 
-// Footprint radius [px]: where the core has fallen below VISIBILITY_CUTOFF and the 3-D halo
-// below STARS3D_HALO_CUTOFF, clamped to [STARS3D_MIN_RADIUS_PX, MAX_RADIUS_PX]: M0's
+// The Moffat halo's energy inside radius rho [px], 1 − (1 + ρ²/α²)^(1 − β) (Moffat 1969). Twin
+// of `uni_sky::stars3d::stars3d_moffat_energy`.
+fn stars3d_moffat_energy(rho: f32) -> f32 {
+    let a2 = STARS3D_HALO_ALPHA_PX * STARS3D_HALO_ALPHA_PX;
+    return 1.0 - pow(1.0 + rho * rho / a2, 1.0 - STARS3D_HALO_BETA);
+}
+
+// W_n at R = MAX_RADIUS_PX for n in [2, STARS3D_TAPER_N_MAX] from STARS3D_TAPER_ENERGY. Twin of
+// `uni_sky::stars3d::stars3d_taper_energy`.
+fn stars3d_taper_energy(n: f32) -> f32 {
+    let x = clamp(n, 2.0, STARS3D_TAPER_N_MAX) - 2.0;
+    let i = min(u32(x), 21u);
+    let f = x - f32(i);
+    var table = STARS3D_TAPER_ENERGY;
+    return exp(mix(log(table[i]), log(table[i + 1u]), f));
+}
+
+// Footprint radius [px] before the clamp: where the core has fallen below VISIBILITY_CUTOFF and
+// the 3-D halo below STARS3D_HALO_CUTOFF, at least STARS3D_MIN_RADIUS_PX: M0's
 // footprint_radius_px (sky/stars.wgsl) with the 3-D halo and the 2-px minimum. Twin of
-// `uni_sky::stars3d::footprint_radius_px`.
-fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
+// `uni_sky::stars3d::footprint_radius_unclamped_px`.
+fn stars3d_footprint_radius_unclamped(energy: f32, halo_fraction: f32) -> f32 {
     var r = STARS3D_MIN_RADIUS_PX;
     let core_peak = (1.0 - halo_fraction) * energy / (TAU * CORE_SIGMA_PX * CORE_SIGMA_PX);
     if (core_peak > VISIBILITY_CUTOFF) {
@@ -170,7 +205,40 @@ fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
         let q = pow(halo_peak / STARS3D_HALO_CUTOFF, 1.0 / STARS3D_HALO_BETA);
         r = max(r, STARS3D_HALO_ALPHA_PX * sqrt(q - 1.0));
     }
-    return min(r, MAX_RADIUS_PX);
+    return r;
+}
+
+// Footprint radius [px]: stars3d_footprint_radius_unclamped clamped to MAX_RADIUS_PX. Twin of
+// `uni_sky::stars3d::footprint_radius_px`.
+fn stars3d_footprint_radius_px(energy: f32, halo_fraction: f32) -> f32 {
+    return min(stars3d_footprint_radius_unclamped(energy, halo_fraction), MAX_RADIUS_PX);
+}
+
+// The halo's footprint for a splat of display energy `energy` and halo share h: x the radius R,
+// y the weight scale, z the window exponent n (final review render I2). Unclamped (the halo
+// reaches black inside MAX_RADIUS_PX): n = 2, scale = 1 / its windowed energy (unit energy, as
+// B4L). Clamped, the light is kept up to the clamp and the rest dropped: the halo holds
+// M(R) + (1 − M(R_unclamped)) of its light (its own light inside R plus the tail that was below
+// black anyway, so the scale is continuous where the clamp starts), and n grows until the
+// halo's last pixel ring (r = R − 1) is at most STARS3D_TAPER_TARGET × STARS3D_HALO_CUTOFF, so
+// the glow ends at the display's black whatever its light. Twin of
+// `uni_sky::stars3d::halo_shape`.
+fn stars3d_halo_shape(energy: f32, h: f32) -> vec3<f32> {
+    let r_free = stars3d_footprint_radius_unclamped(energy, h);
+    if (!(r_free > MAX_RADIUS_PX)) {
+        return vec3<f32>(r_free, 1.0 / stars3d_halo_energy(r_free), 2.0);
+    }
+    let radius = MAX_RADIUS_PX;
+    let kept = 1.0 - max(stars3d_moffat_energy(r_free) - stars3d_moffat_energy(radius), 0.0);
+    let edge = h * energy * stars3d_moffat(radius - 1.0);
+    let ring = 1.0 - (radius - 1.0) * (radius - 1.0) / (radius * radius);
+    var n = 2.0;
+    for (var i = 0; i < STARS3D_TAPER_STEPS; i++) {
+        let scale = kept / stars3d_taper_energy(n);
+        let need = log(STARS3D_TAPER_TARGET * STARS3D_HALO_CUTOFF / (edge * scale)) / log(ring);
+        n = clamp(need, 2.0, STARS3D_TAPER_N_MAX);
+    }
+    return vec3<f32>(radius, kept / stars3d_taper_energy(n), n);
 }
 
 // Whether a splat's core peak or halo peak rises above VISIBILITY_CUTOFF. Twin of
@@ -289,8 +357,9 @@ struct SplatOut {
     @location(0) @interpolate(flat) centre_px: vec2<f32>,
     // Pre-exposed hdr value per unit PSF weight, before the lens mask: colour·E/Ω(θ)·star_pre().
     @location(1) @interpolate(flat) radiance: vec3<f32>,
-    // x: halo share h; y: footprint radius R [px]; z: 1 / the windowed halo's energy inside R.
-    @location(2) @interpolate(flat) halo: vec3<f32>,
+    // x: halo share h; y: footprint radius R [px]; z: the halo's weight scale; w: its window
+    // exponent n (stars3d_halo_shape).
+    @location(2) @interpolate(flat) halo: vec4<f32>,
 }
 
 fn culled_splat() -> SplatOut {
@@ -298,17 +367,18 @@ fn culled_splat() -> SplatOut {
     out.pos = CULLED;
     out.centre_px = vec2<f32>(0.0);
     out.radiance = vec3<f32>(0.0);
-    out.halo = vec3<f32>(0.0);
+    out.halo = vec4<f32>(0.0);
     return out;
 }
 
 // Vertex vi of the splat of a source in unit direction `dir` (root axes) with steady illuminance
 // `lux` [lx] scaled by `twinkle` (1 for a steady source) and colour `colour` (luminance 1), at
-// NDC depth `depth` (0 for stars at the far plane). Culled behind the camera, without light,
-// below VISIBILITY_CUTOFF or off screen by more than its footprint. Twin of
-// `uni_sky::stars3d::twin::splat` and `vertex`.
-fn splat_vertex(
+// NDC depth `depth` (0 for stars at the far plane), on a target of `size` px, written × `pre`
+// (an exposure factor). Culled behind the camera, without light, below VISIBILITY_CUTOFF or off
+// screen by more than its footprint. Twin of `uni_sky::stars3d::twin::splat_at` and `vertex`.
+fn splat_vertex_at(
     vi: u32, dir: vec3<f32>, lux: f32, twinkle: f32, colour: vec3<f32>, depth: f32,
+    size: vec2<f32>, pre: f32,
 ) -> SplatOut {
     let out_culled = culled_splat();
     // Directions go in with w = 0: the reversed-Z infinite projection maps view (x, y, z, 0) to
@@ -318,21 +388,20 @@ fn splat_vertex(
     if (!(clip.w > MIN_CLIP_W) || !(lux > 0.0)) {
         return out_culled;
     }
-    // The rasteriser maps NDC onto the attachment, so use the attachment's size (M0).
-    let size = vec2<f32>(textureDimensions(lens_mask));
     let ndc = clip.xy / clip.w;
     let centre = vec2<f32>(0.5 * (ndc.x + 1.0) * size.x, 0.5 * (1.0 - ndc.y) * size.y);
     let cos_theta = -view_dir.z / length(view_dir);
     let omega = pixel_solid_angle_off_axis(camera.time.z, size.y, cos_theta);
     // Display-normalised energy: the footprint's sum of pre-exposed hdr values.
-    let energy = min(lux * twinkle * star_pre() / omega, MAX_SPLAT_ENERGY);
+    let energy = min(lux * twinkle * pre / omega, MAX_SPLAT_ENERGY);
     // Every star has the eye's halo (B4L): its share never depends on the star's light (nor
     // switches at the twinkle rate, review r0 M7).
     let h = STARS3D_HALO_FRACTION;
     if (!star_is_visible(energy, h)) {
         return out_culled;
     }
-    let radius = stars3d_footprint_radius_px(energy, h);
+    let shape = stars3d_halo_shape(energy, h);
+    let radius = shape.x;
     let reach = vec2<f32>(radius + 1.0);
     if (!(all(centre > -reach) && all(centre < size + reach))) {
         return out_culled;
@@ -342,19 +411,29 @@ fn splat_vertex(
     out.pos = vec4<f32>(ndc + splat_corner(vi) * (radius + 0.5) * 2.0 / size, depth, 1.0);
     out.centre_px = centre;
     out.radiance = colour * energy;
-    out.halo = vec3<f32>(h, radius, 1.0 / stars3d_halo_energy(radius));
+    out.halo = vec4<f32>(h, shape);
     return out;
 }
 
+// splat_vertex_at on the lens mask's size (the attachment's: the rasteriser maps NDC onto it,
+// M0) at the star exposure, for the star, point and asteroid passes. Twin of
+// `uni_sky::stars3d::twin::splat`.
+fn splat_vertex(
+    vi: u32, dir: vec3<f32>, lux: f32, twinkle: f32, colour: vec3<f32>, depth: f32,
+) -> SplatOut {
+    return splat_vertex_at(
+        vi, dir, lux, twinkle, colour, depth, vec2<f32>(textureDimensions(lens_mask)), star_pre());
+}
+
 // PSF weight of pixel `pix` (integer index) for a splat centred at `centre` with halo
-// (h, R, 1/energy): (1 − h)·Gaussian core integrated over the pixel + h·windowed 3-D Moffat halo
-// at the pixel's centre.
-fn psf_weight(pix: vec2<f32>, centre: vec2<f32>, halo: vec3<f32>) -> f32 {
+// (h, R, scale, n): (1 − h)·Gaussian core integrated over the pixel + h·windowed 3-D Moffat halo
+// at the pixel's centre. Twin of `uni_sky::stars3d::psf_weight`.
+fn psf_weight(pix: vec2<f32>, centre: vec2<f32>, halo: vec4<f32>) -> f32 {
     let edge = pix - centre;
     var weight = (1.0 - halo.x) * pixel_coverage(edge.x) * pixel_coverage(edge.y);
     if (halo.x > 0.0) {
         let r = length(pix + vec2<f32>(0.5) - centre);
-        weight += halo.x * stars3d_halo_weight(r, halo.y, halo.z);
+        weight += halo.x * stars3d_halo_weight(r, halo.y, halo.z, halo.w);
     }
     return weight;
 }
