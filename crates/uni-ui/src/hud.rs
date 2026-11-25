@@ -89,22 +89,21 @@ const HEADLESS_MAX_RUNS: usize = 4;
 /// Gap between neighbouring panels [pt]; also the least gap a notes block keeps from the
 /// other HUD blocks ([`rise`], [`fall`]).
 const PANEL_GAP: f32 = 16.0;
-/// The window's least inner size [pt] (lead rulings C4w-I1 and C4w r2 (4); uni-app sets it
-/// on the window). Chosen from the C4w size sweep (`honesty_notes_stay_whole_on_screen`, with
-/// M1's worst honesty set, `worst_honesty` in the tests):
+/// The window's least inner size [pt] (lead rulings C4w-I1, C4w r2 (4) and C4w r4; uni-app
+/// sets it on the window). 700 pt fits a 1280 × 800 pt display under the menu and title bars
+/// (the owner's is 1280 × 832; S1's 840 pt could not show there):
 /// - 960 pt keeps the honesty line beside the perf block (its 560 pt least width and the perf
 ///   block need about 880 pt) and the 520 pt Speed panel on screen, clear of the Location
 ///   column (x 340–860);
-/// - 840 pt gives the expanded notes stack, from under Location (its top at 180.5 pt) to Gravity,
-///   H − 331 = 509 pt for the worst set's 20 honesty notes, 496.5 pt with their wrapped lines
-///   (12.5 pt spare; 10 pt with a card open and the warp panel shown, which put the stack 2.5 pt
-///   lower: `worst_set_fits_the_least_window` prints it). F1 raised it from 740 to 780 pt: the
-///   horizon label ("view not simulated") and the lens label (its blueshift clause) wrap to two
-///   lines each. The post-wave sync (S1) raised it to 840 pt for F2's two amber moon labels
-///   (mean elements, frozen), two lines each: at 780 pt the stack overran Gravity by 31.5 pt.
-///   The owner's default display (1470 × 956 pt) holds it in a window; a 1280 × 832 pt display
-///   cannot (nor could it hold 780 pt with the menu and title bars).
-pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 840.0];
+/// - at 700 pt M1's worst honesty set (`worst_honesty` in the tests: 20 notes, 496.5 pt in one
+///   column) no longer fits under Location and over Gravity, so those give way
+///   ([`stack_layout`]): Gravity, then Location for the one-line place line; the whole stack
+///   (599.5 pt with its informational notes) then runs from 66 to 665.5 pt. With the card and
+///   the warp panel open the warp panel pushes it down to 179.5 pt, and its honesty notes end
+///   on the bottom margin (676 pt). The collapsed pop-up holds the set in one column (564.5 pt,
+///   92 to 656.5 pt). More notes than that flow into two columns
+///   (`worst_set_fits_the_least_window`, `honesty_notes_flow_into_two_columns`).
+pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 700.0];
 /// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
 /// line's area, which hangs 4 pt lower than the margin).
 const POPUP_GAP: f32 = 10.0;
@@ -378,6 +377,17 @@ impl Hud {
         (self.render(gpu, enc, target, size_px, out), hud)
     }
 
+    /// The blocks the last draw showed, by the names the capture JSON's `hud.panels` uses:
+    /// "place line", "location", "gravity", "speed", "card", "warp", "time", "time line",
+    /// "perf line", "notes line" (the honesty line), "notes list" (its pop-up, or the stack) and
+    /// "controls" (F1). Only what was drawn: Gravity and Location are left out when they gave way
+    /// to the honesty notes (lead rulings C4w r3 and r4; tested against the areas egui shows).
+    pub fn drawn_blocks(&self) -> Vec<&'static str> {
+        self.ctx
+            .data(|d| d.get_temp::<Vec<&'static str>>(blocks_id()))
+            .unwrap_or_default()
+    }
+
     /// Tessellates one egui output and records it into `enc` over `target`.
     fn render(
         &mut self,
@@ -595,8 +605,10 @@ fn wants_repaint_now(out: &egui::FullOutput) -> bool {
 fn draw_hidden(ctx: &egui::Context, data: &HudData, c: &HudControls) {
     let notes = hud_notes(data, c);
     if notes.is_empty() {
+        record_blocks(ctx, Vec::new());
         return;
     }
+    record_blocks(ctx, vec!["notes line"]);
     let screen = ctx.content_rect();
     let m = SCREEN_MARGIN;
     let line_w = NOTES_LINE_MAX_WIDTH.max(screen.width() - 2.0 * m);
@@ -649,6 +661,49 @@ fn draw_hud(
     let mut taken: Vec<egui::Rect> = Vec::new();
     // Every block drawn, for the overlay to keep off.
     let mut drawn: Vec<egui::Rect> = Vec::new();
+    // Their names, for the capture JSON ([`Hud::drawn_blocks`]).
+    let mut names: Vec<&'static str> = Vec::new();
+
+    // Expanded, the left column first gives way to the honesty notes (lead ruling C4w r4):
+    // which blocks it shows is decided from this pass's heights before any is drawn.
+    let stack = if expanded {
+        block_notes(&notes, &data.warnings, &stack_skips(data))
+    } else {
+        Vec::new()
+    };
+    let stack_h = |fit: NotesFit| {
+        let width = notes_width(fit, LOCATION_WIDTH);
+        measure(ctx, "notes stack", width, |ui| notes_stack(ui, &stack, fit)).y
+    };
+    let stack_gap = ctx.global_style().spacing.item_spacing.y + 8.0;
+    let column = LeftColumn {
+        top: screen.top() + m,
+        bottom: screen.bottom() - m,
+        location_h: if expanded {
+            measure(ctx, "location layout", LOCATION_WIDTH, |ui| {
+                panels::show_location(ui, &data.location);
+            })
+            .y
+        } else {
+            0.0
+        },
+        place_h: measure(ctx, "place layout", screen.width(), |ui| {
+            panels::show_place(ui, &data.nav_line, expanded);
+        })
+        .y,
+        gravity_h: data.gravity.as_ref().filter(|_| expanded).map(|g| {
+            measure(ctx, "gravity layout", SPEED_WIDTH, |ui| {
+                panels::show_gravity(ui, g)
+            })
+            .y
+        }),
+        stack_gap,
+    };
+    let layout = if expanded && stack.iter().any(|n| n.honesty) {
+        stack_layout(stack_h(NotesFit::HONESTY_ONLY), column)
+    } else {
+        StackLayout::FULL
+    };
 
     // The bottom row, each block placed from its size this pass.
     let hint = if card.is_some() {
@@ -670,14 +725,16 @@ fn draw_hud(
         |ui| perf_block(ui, &perf_lines),
     );
     taken.push(perf);
+    names.push("perf line");
     if expanded {
-        if let Some(g) = &data.gravity {
+        if let Some(g) = data.gravity.as_ref().filter(|_| layout.gravity) {
             let rect = show_measured(
                 ctx,
                 Measured::bottom_left("gravity", egui::pos2(left, screen.bottom() - m)),
                 |ui| panels::show_gravity(ui, g),
             );
             taken.push(rect);
+            names.push("gravity");
         }
         // Centred, but on a narrow screen clear of the Gravity panel and of the Location
         // column, whose notes stack then runs down to Gravity rather than to the taller Speed
@@ -690,6 +747,7 @@ fn draw_hud(
             |ui| panels::show_speed(ui, &data.speed),
         );
         taken.push(rect);
+        names.push("speed");
     }
 
     // The top row. The card takes the height down to the blocks under it (C4w r3).
@@ -711,21 +769,30 @@ fn draw_hud(
                 ui.is_sizing_pass()
             });
         taken.extend(shown_rect(&rect));
+        names.push("card");
     }
-    if !expanded {
+    // The place line: the collapsed HUD's, or expanded in Location's place once Location has
+    // given way to the honesty notes (its "i" then closes the panels, as Location's does).
+    if !expanded || !layout.location {
         let rect = area("place", Order::Middle)
             .anchor(Align2::LEFT_TOP, [m, m])
             .show(ctx, |ui| {
                 let halo = ui.painter().add(egui::Shape::Noop);
-                let line = panels::show_place(ui, &data.nav_line, false);
+                let line = panels::show_place(ui, &data.nav_line, expanded);
                 ui.painter()
                     .set(halo, theme::halo_shape(line.rect.expand(6.0)));
                 if line.clicked() {
-                    c.card_expanded = true;
+                    c.card_expanded = !expanded;
                 }
                 ui.is_sizing_pass()
             });
-        taken.extend(shown_rect(&rect));
+        if expanded {
+            // The stack hangs from it (measured), so it is not in its way.
+            drawn.extend(shown_rect(&rect));
+        } else {
+            taken.extend(shown_rect(&rect));
+        }
+        names.push("place line");
     }
 
     // Time: the warp panel (T), the Time panel (expanded, no card) or the one-line time.
@@ -745,6 +812,7 @@ fn draw_hud(
                 }
                 ui.is_sizing_pass()
             });
+        names.push("warp");
         shown_rect(&warp)
     } else if expanded && card.is_none() {
         let panel = area("time", Order::Middle)
@@ -753,6 +821,7 @@ fn draw_hud(
                 panels::show_time(ui, &data.time);
                 ui.is_sizing_pass()
             });
+        names.push("time");
         shown_rect(&panel)
     } else {
         // Centred from its width this pass: a new rate changes it (review C4w M4).
@@ -765,6 +834,7 @@ fn draw_hud(
             max_width: screen.width(),
             interactable: false,
         };
+        names.push("time line");
         Some(show_measured(ctx, line, |ui| {
             let font = mono_font(TIME_LINE_SIZE, Weight::Regular);
             haloed(ui, |ui| theme::text(ui, &time_line, font, INK_SOFT));
@@ -773,38 +843,50 @@ fn draw_hud(
     taken.extend(time);
 
     if expanded {
-        // Anchored at its top left, so its rect holds even on egui's sizing pass.
-        let location = area("location", Order::Middle)
-            .anchor(Align2::LEFT_TOP, [m, m])
-            .show(ctx, |ui| {
-                if panels::show_location(ui, &data.location) {
-                    c.card_expanded = false;
-                }
-            })
-            .response
-            .rect;
-        drawn.push(location);
-        // The notes stack under Location (12 pt, in tone; the flight label is the Speed
-        // header, and the FTL label its amber row: [`stack_skips`]), 11 pt under it as in C4
-        // (egui's item spacing and 8 pt). It ends
-        // `PANEL_GAP` over the Gravity panel (or any block below it); with less room, its
-        // honesty notes stay whole and the others scroll or are left out ([`plan_notes`]).
-        let stack = block_notes(&notes, &data.warnings, &stack_skips(data));
-        if !stack.is_empty() {
-            let height = |fit| {
-                measure(ctx, "notes stack", LOCATION_WIDTH, |ui| {
-                    notes_stack(ui, &stack, fit)
+        let head_h = if layout.location {
+            // Anchored at its top left, so its rect holds even on egui's sizing pass.
+            let location = area("location", Order::Middle)
+                .anchor(Align2::LEFT_TOP, [m, m])
+                .show(ctx, |ui| {
+                    if panels::show_location(ui, &data.location) {
+                        c.card_expanded = false;
+                    }
                 })
-                .y
-            };
-            let all = height(NotesFit::All);
-            let x = egui::Rangef::new(left, left + LOCATION_WIDTH);
-            let top = location.bottom() + ctx.global_style().spacing.item_spacing.y + 8.0;
-            let slot = fall(x, top, all, screen.bottom() - m, &taken, PANEL_GAP);
-            let (fit, h) = plan_notes(slot.height, all, || height(NotesFit::HONESTY_ONLY));
-            // Honesty notes past the room are drawn whole: on screen, up over Location if
-            // they must (ruling C4w r2 (3)).
+                .response
+                .rect;
+            drawn.push(location);
+            names.push("location");
+            column.location_h
+        } else {
+            column.place_h
+        };
+        // The notes stack under Location or the place line (12 pt, in tone; the flight label
+        // is the Speed header, and the FTL label its amber row: [`stack_skips`]), 11 pt under
+        // it as in C4 (egui's item spacing and 8 pt). It ends `PANEL_GAP` over the Gravity
+        // panel (or any block below it); with less room its honesty notes stay whole and the
+        // others scroll or are left out ([`plan_notes`]), and past that the left column gives
+        // way ([`stack_layout`]).
+        if !stack.is_empty() {
+            let top = column.top + head_h + stack_gap;
             let bottom = screen.bottom() - m;
+            let (fit, slot, h) = if layout.columns == 2 {
+                let split = honesty_split(ctx, "stack", &stack, LOCATION_WIDTH, note_text);
+                let fit = NotesFit::Columns {
+                    split,
+                    width: LOCATION_WIDTH,
+                };
+                let h = stack_h(fit);
+                let x = egui::Rangef::new(left, left + notes_width(fit, LOCATION_WIDTH));
+                (fit, fall(x, top, h, bottom, &taken, PANEL_GAP), h)
+            } else {
+                let all = stack_h(NotesFit::All);
+                let x = egui::Rangef::new(left, left + LOCATION_WIDTH);
+                let slot = fall(x, top, all, bottom, &taken, PANEL_GAP);
+                let (fit, h) = plan_notes(slot.height, all, || stack_h(NotesFit::HONESTY_ONLY));
+                (fit, slot, h)
+            };
+            // Honesty notes past the room are drawn whole: on screen, up over the head if they
+            // must (ruling C4w r2 (3)).
             let top = if slot.top + h > bottom {
                 (bottom - h).max(screen.top() + m)
             } else {
@@ -812,12 +894,13 @@ fn draw_hud(
             };
             let rect = placed("notes stack", Order::Middle, egui::pos2(left, top))
                 .show(ctx, |ui| {
-                    ui.set_max_width(LOCATION_WIDTH);
+                    ui.set_max_width(notes_width(fit, LOCATION_WIDTH));
                     notes_stack(ui, &stack, fit);
                 })
                 .response
                 .rect;
             drawn.push(rect);
+            names.push("notes list");
         }
     } else if !notes.is_empty() {
         // The honesty line, bottom left: beside the perf block when the line's least width fits
@@ -849,20 +932,35 @@ fn draw_hud(
             })
             .inner;
         drawn.push(line);
+        names.push("notes line");
         // Its pop-up stands on it, from its height this pass, and stops under the top row;
         // with less room, its honesty notes stay whole and the others scroll or are left out.
         if c.notes_expanded {
             let popup = block_notes(&notes, &data.warnings, &[]);
             let size = |fit| {
-                measure(ctx, "notes popup", NOTES_POPUP_WIDTH, |ui| {
+                measure(ctx, "notes popup", screen.width(), |ui| {
                     notes_popup(ui, &popup, fit)
                 })
             };
             let all = size(NotesFit::All);
             let x = egui::Rangef::new(left, left + all.x);
             let bottom = line.top() - POPUP_GAP;
-            let slot = rise(x, bottom, all.y, screen.top() + m, &taken, PANEL_GAP);
-            let (fit, h) = plan_notes(slot.height, all.y, || size(NotesFit::HONESTY_ONLY).y);
+            let ceiling = screen.top() + m;
+            let mut slot = rise(x, bottom, all.y, ceiling, &taken, PANEL_GAP);
+            let (mut fit, mut h) =
+                plan_notes(slot.height, all.y, || size(NotesFit::HONESTY_ONLY).y);
+            if h > slot.height + 0.5 {
+                // The honesty notes alone overrun the room: two columns (lead ruling C4w r4).
+                let split = honesty_split(ctx, "popup", &popup, POPUP_INNER_WIDTH, popup_row);
+                fit = NotesFit::Columns {
+                    split,
+                    width: POPUP_INNER_WIDTH,
+                };
+                let two = size(fit);
+                let x = egui::Rangef::new(left, left + two.x);
+                slot = rise(x, bottom, two.y, ceiling, &taken, PANEL_GAP);
+                h = two.y;
+            }
             // Honesty notes past the room are drawn whole: on screen, down over the line if
             // they must (ruling C4w r2 (3)).
             let top = (slot.top + slot.height - h).max(screen.top() + m);
@@ -871,12 +969,15 @@ fn draw_hud(
                 .response
                 .rect;
             drawn.push(rect);
+            names.push("notes list");
         }
     }
 
     if c.show_help {
         drawn.extend(show_controls_window(ctx, data, c));
+        names.push("controls");
     }
+    record_blocks(ctx, names);
 
     // The overlay last, so it knows every block: under them all (Background) and kept off
     // them, since the panels' glass would show it through (lead ruling C4w r3).
@@ -1073,6 +1174,10 @@ enum NotesFit {
     /// Its honesty notes first, whole, in order; then the others in a scroll area at most
     /// `room` tall, or none when `room` is 0.
     HonestyFirst { room: f32 },
+    /// Its honesty notes alone, whole, in two columns `width` pt wide: the first `split` in the
+    /// left one, the rest in the right (lead ruling C4w r4: they flow into two columns once the
+    /// informational blocks have given way).
+    Columns { split: usize, width: f32 },
 }
 
 impl NotesFit {
@@ -1082,6 +1187,97 @@ impl NotesFit {
 
 /// The vertical gap between a block's note rows [pt] (also before its scroll area).
 const NOTE_ROW_GAP: f32 = 4.0;
+/// The gap between the two columns of a notes block [pt] ([`NotesFit::Columns`]).
+const COLUMN_GAP: f32 = 16.0;
+
+/// The width a notes block lays its rows out at for `fit`: `one` for one column, two columns
+/// and their gap for [`NotesFit::Columns`].
+fn notes_width(fit: NotesFit, one: f32) -> f32 {
+    match fit {
+        NotesFit::Columns { width, .. } => 2.0 * width + COLUMN_GAP,
+        _ => one,
+    }
+}
+
+/// The split of rows `heights` [pt] (stacked with `gap`) into two columns, the first `k` on the
+/// left, that keeps the taller column the shortest, in order (lead ruling C4w r4); of equal
+/// splits, the one with more on the left (it reads first).
+fn balance_split(heights: &[f32], gap: f32) -> usize {
+    let column =
+        |rows: &[f32]| rows.iter().sum::<f32>() + gap * rows.len().saturating_sub(1) as f32;
+    (0..=heights.len())
+        .rev()
+        .min_by(|&a, &b| {
+            let tall = |k: usize| column(&heights[..k]).max(column(&heights[k..]));
+            tall(a).total_cmp(&tall(b))
+        })
+        .unwrap_or(0)
+}
+
+/// The expanded HUD's left column, from the top margin (`top`) to the bottom margin (`bottom`):
+/// Location, `location_h` tall, or once collapsed the one-line place line, `place_h`; the notes
+/// stack `stack_gap` under it; Gravity, `gravity_h` tall, on the bottom margin [pt, measured
+/// this pass].
+#[derive(Clone, Copy, Debug)]
+struct LeftColumn {
+    top: f32,
+    bottom: f32,
+    location_h: f32,
+    place_h: f32,
+    gravity_h: Option<f32>,
+    stack_gap: f32,
+}
+
+/// What the expanded HUD's left column shows (lead ruling C4w r4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StackLayout {
+    /// The Gravity panel (when there is one).
+    gravity: bool,
+    /// The Location panel; else the one-line place line in its place.
+    location: bool,
+    /// The honesty notes' columns, 1 or 2.
+    columns: usize,
+}
+
+impl StackLayout {
+    /// Nothing gives way.
+    const FULL: Self = Self {
+        gravity: true,
+        location: true,
+        columns: 1,
+    };
+}
+
+/// What gives way so the notes stack's honesty notes (`honesty_h` pt in one column) fit in the
+/// left column (lead ruling C4w r4: the informational blocks collapse first, then the honesty
+/// notes flow into two columns; they are never hidden): Gravity goes first, then Location
+/// becomes the one-line place line, then the notes take two columns. Informational notes give
+/// way before any of it ([`plan_notes`]).
+fn stack_layout(honesty_h: f32, col: LeftColumn) -> StackLayout {
+    let fits = |head_h: f32, gravity: bool| {
+        let top = col.top + head_h + col.stack_gap;
+        let floor = match col.gravity_h.filter(|_| gravity) {
+            Some(g) => col.bottom - g - PANEL_GAP,
+            None => col.bottom,
+        };
+        honesty_h <= floor - top + 0.5
+    };
+    let layout = |gravity, location, columns| StackLayout {
+        gravity,
+        location,
+        columns,
+    };
+    let has_gravity = col.gravity_h.is_some();
+    if fits(col.location_h, has_gravity) {
+        layout(true, true, 1)
+    } else if fits(col.location_h, false) {
+        layout(false, true, 1)
+    } else if fits(col.place_h, false) {
+        layout(false, false, 1)
+    } else {
+        layout(false, false, 2)
+    }
+}
 /// The least scroll area for the informational notes [pt]: a 12 pt row is about 15 pt, so
 /// less would show a sliver; they are then left out.
 const MIN_SCROLL_ROOM: f32 = 24.0;
@@ -1121,6 +1317,21 @@ fn note_rows(
 ) {
     match fit {
         NotesFit::All => notes.iter().for_each(|n| row(ui, n)),
+        NotesFit::Columns { split, width } => {
+            let honest: Vec<&Note<'_>> = notes.iter().filter(|n| n.honesty).collect();
+            let (left, right) = honest.split_at(split.min(honest.len()));
+            ui.horizontal_top(|ui| {
+                let gap = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                for column in [left, right] {
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.y = gap;
+                        column.iter().for_each(|n| row(ui, n));
+                    });
+                }
+            });
+        }
         NotesFit::HonestyFirst { room } => {
             notes.iter().filter(|n| n.honesty).for_each(|n| row(ui, n));
             if room > 0.0 {
@@ -1236,59 +1447,15 @@ fn haloed(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.painter().set(halo, theme::halo_shape(rect.expand(6.0)));
 }
 
-/// The blocks the HUD draws for `data` under `controls`, by the names the capture JSON's
-/// `hud.panels` uses: "place line", "location", "gravity", "speed", "card", "warp", "time",
-/// "time line", "perf line", "notes line" (the collapsed honesty line), "notes list" (its
-/// pop-up, or the stack under Location) and "controls" (F1). The same conditions as
-/// [`draw_hud`], so the JSON lists only what is drawn (lead ruling C4w r3; tested against the
-/// areas egui shows).
-pub fn drawn_blocks(data: &HudData, controls: &HudControls) -> Vec<&'static str> {
-    let c = controls;
-    let notes = hud_notes(data, c);
-    if !c.visible {
-        // Tab: the honesty line alone ([`draw_hidden`]).
-        return if notes.is_empty() {
-            Vec::new()
-        } else {
-            vec!["notes line"]
-        };
-    }
-    let card = c.card_expanded && data.target.is_some();
-    let mut out = Vec::new();
-    if c.card_expanded {
-        out.push("location");
-        if data.gravity.is_some() {
-            out.push("gravity");
-        }
-        out.push("speed");
-        if card {
-            out.push("card");
-        }
-    } else {
-        out.push("place line");
-    }
-    out.push(if c.show_warp {
-        "warp"
-    } else if c.card_expanded && !card {
-        "time"
-    } else {
-        "time line"
-    });
-    out.push("perf line");
-    if c.card_expanded {
-        if !block_notes(&notes, &data.warnings, &stack_skips(data)).is_empty() {
-            out.push("notes list");
-        }
-    } else if !notes.is_empty() {
-        out.push("notes line");
-        if c.notes_expanded {
-            out.push("notes list");
-        }
-    }
-    if c.show_help {
-        out.push("controls");
-    }
-    out
+/// The key under which [`draw_hud`] and [`draw_hidden`] leave the names of the blocks they drew.
+fn blocks_id() -> Id {
+    Id::unique("hud drawn blocks")
+}
+
+/// Records `names`, the blocks the HUD drew this pass, by the names the capture JSON's
+/// `hud.panels` uses ([`Hud::drawn_blocks`]).
+fn record_blocks(ctx: &egui::Context, names: Vec<&'static str>) {
+    ctx.data_mut(|d| d.insert_temp(blocks_id(), names));
 }
 
 /// The notes and warnings of a frame, as uni-app's `hud_data` builds them (lead ruling C4w r2
@@ -1482,7 +1649,7 @@ fn notes_popup(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
     theme::panel_frame(theme::HAIRLINE)
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
-            ui.set_width(panels::inner_width(NOTES_POPUP_WIDTH, 14.0));
+            ui.set_width(notes_width(fit, POPUP_INNER_WIDTH));
             ui.spacing_mut().item_spacing = egui::vec2(8.0, NOTE_ROW_GAP);
             theme::kicker(
                 ui,
@@ -1492,18 +1659,41 @@ fn notes_popup(ui: &mut egui::Ui, notes: &[Note<'_>], fit: NotesFit) {
                 KICKER_TRACKING_EM,
             );
             ui.add_space(2.0);
-            note_rows(ui, "notes popup", notes, fit, |ui, n| {
-                ui.horizontal_top(|ui| {
-                    let (dot, _) = ui.allocate_exact_size(
-                        egui::vec2(NOTE_DOT, NOTES_SIZE + 2.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter()
-                        .circle_filled(dot.center(), NOTE_DOT / 2.0, tone_color(n.tone));
-                    note_text(ui, n);
-                });
-            });
+            note_rows(ui, "notes popup", notes, fit, popup_row);
         });
+}
+
+/// The pop-up's content width [pt] (one column).
+const POPUP_INNER_WIDTH: f32 = NOTES_POPUP_WIDTH - 2.0 * 14.0 - 2.0 * theme::BORDER_PT;
+
+/// One pop-up row: the note's dot in its tone, then its text.
+fn popup_row(ui: &mut egui::Ui, n: &Note<'_>) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (dot, _) =
+            ui.allocate_exact_size(egui::vec2(NOTE_DOT, NOTES_SIZE + 2.0), egui::Sense::hover());
+        ui.painter()
+            .circle_filled(dot.center(), NOTE_DOT / 2.0, tone_color(n.tone));
+        note_text(ui, n);
+    });
+}
+
+/// The two-column split of `notes`' honesty notes for rows drawn by `row` at `width` pt
+/// ([`balance_split`] over each row's height measured this pass).
+fn honesty_split(
+    ctx: &egui::Context,
+    id: &str,
+    notes: &[Note<'_>],
+    width: f32,
+    row: impl Fn(&mut egui::Ui, &Note<'_>),
+) -> usize {
+    let heights: Vec<f32> = notes
+        .iter()
+        .filter(|n| n.honesty)
+        .enumerate()
+        .map(|(i, n)| measure(ctx, &format!("{id} row {i}"), width, |ui| row(ui, n)).y)
+        .collect();
+    balance_split(&heights, NOTE_ROW_GAP)
 }
 
 /// The notes stack under the Location panel: each note in full, 12 pt, in its tone, as `fit`
@@ -3058,8 +3248,15 @@ mod tests {
         }
     }
 
-    /// Lead ruling C4w r3 (TRAPPIST-1 has no Gravity panel but the capture JSON listed one):
-    /// `drawn_blocks` lists exactly the areas the HUD shows, whatever its state.
+    /// The blocks the last draw on `ctx` recorded ([`Hud::drawn_blocks`]).
+    fn recorded(ctx: &egui::Context) -> Vec<&'static str> {
+        ctx.data(|d| d.get_temp::<Vec<&'static str>>(blocks_id()))
+            .unwrap_or_default()
+    }
+
+    /// Lead rulings C4w r3 and r4 (TRAPPIST-1 has no Gravity panel but the capture JSON listed
+    /// one; Gravity and Location give way to the honesty notes): the recorded blocks are exactly
+    /// the areas the HUD shows, whatever its state.
     #[test]
     fn drawn_blocks_match_the_areas_shown() {
         fn json_name(area: &'static str) -> &'static str {
@@ -3100,7 +3297,7 @@ mod tests {
                     o.textures_delta.clear();
                     let mut shown: Vec<&str> =
                         blocks(&ctx).iter().map(|b| json_name(b.0)).collect();
-                    let mut listed = drawn_blocks(&d, &c);
+                    let mut listed = recorded(&ctx);
                     shown.sort_unstable();
                     shown.dedup();
                     listed.sort_unstable();
@@ -3124,10 +3321,13 @@ mod tests {
         o.textures_delta.clear();
         let shown: Vec<&str> = blocks(&ctx).iter().map(|b| json_name(b.0)).collect();
         assert_eq!(shown, ["notes line"]);
-        assert_eq!(drawn_blocks(&d, &hidden), ["notes line"]);
+        assert_eq!(recorded(&ctx), ["notes line"]);
         d.notes.clear();
         d.speed.header.clear();
-        assert!(drawn_blocks(&d, &hidden).is_empty());
+        let (mut o, _, _) =
+            run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &Overlay::default(), &mut c1);
+        o.textures_delta.clear();
+        assert!(recorded(&ctx).is_empty());
     }
 
     /// Review C4w M3: what the HUD's measuring costs. Prints the mean of one settled HUD run
@@ -3445,20 +3645,33 @@ mod tests {
         cases
     }
 
-    /// The room the worst honesty set leaves at the window's least size ([`MIN_WINDOW_PT`]),
-    /// expanded (the tallest stack; the pop-up has more room): the stack ends at least
-    /// `PANEL_GAP` above every block under it. Prints the stack's height and the spare room, the
-    /// numbers `MIN_WINDOW_PT`'s doc quotes.
+    /// Lead ruling C4w r4: at the window's least size ([`MIN_WINDOW_PT`]) the worst honesty set
+    /// shows whole, expanded (card and warp panel on and off) and collapsed (the pop-up): every
+    /// honesty note in full and on screen, the notes block clear of every other block, with
+    /// Gravity and Location given way as needed. Prints what gave way and the room, the numbers
+    /// `MIN_WINDOW_PT`'s doc quotes.
     #[test]
     fn worst_set_fits_the_least_window() {
         let size_px = [
             (2.0 * MIN_WINDOW_PT[0]) as u32,
             (2.0 * MIN_WINDOW_PT[1]) as u32,
         ];
-        for (card, show_warp) in [(false, false), (false, true), (true, false), (true, true)] {
+        let screen = egui::Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(MIN_WINDOW_PT[0] as f32, MIN_WINDOW_PT[1] as f32),
+        );
+        let cases = [
+            (true, false, false),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+            (false, false, false),
+            (false, false, true),
+        ];
+        for (expanded, card, show_warp) in cases {
             let mut d = data();
             let mut c = HudControls {
-                card_expanded: true,
+                card_expanded: expanded,
                 notes_expanded: true,
                 show_warp,
                 ..controls()
@@ -3467,31 +3680,169 @@ mod tests {
             d.eye_adapted_stars = true;
             d.lens_on_screen = true;
             worst_honesty(&mut d, &mut c);
-            let (ctx, _) = draw_grown(size_px, 2.0, &d, c);
+            let case = format!("expanded {expanded}, card {card}, warp {show_warp}");
+            let (ctx, f) = draw_grown(size_px, 2.0, &d, c);
             let blocks = blocks(&ctx);
-            let stack = blocks
+            let name = if expanded {
+                "notes stack"
+            } else {
+                "notes popup"
+            };
+            let notes = blocks
                 .iter()
-                .find(|b| b.0 == "notes stack")
+                .find(|b| b.0 == name)
                 .map(|b| b.1)
-                .expect("notes stack");
-            let below = blocks
-                .iter()
-                .filter(|(name, r)| {
-                    *name != "notes stack"
-                        && r.top() >= stack.top()
-                        && r.x_range().intersects(stack.x_range())
-                })
-                .map(|(_, r)| r.top())
-                .fold(f32::INFINITY, f32::min);
-            let spare = below - PANEL_GAP - stack.bottom();
+                .unwrap_or_else(|| panic!("{case}: no {name}"));
+            for (other, r) in &blocks {
+                if *other != name {
+                    assert!(
+                        !notes.shrink(0.5).intersects(*r),
+                        "{case}: {name} {notes:?} touches {other} {r:?}"
+                    );
+                }
+            }
+            assert!(screen.expand(0.5).contains_rect(notes), "{case}: {notes:?}");
+            for text in honesty_texts(&d, &c) {
+                let p = f
+                    .texts
+                    .iter()
+                    .find(|p| p.text == text && p.font.size == NOTES_SIZE)
+                    .unwrap_or_else(|| panic!("{case}: {text:?} not drawn"));
+                let r = egui::Rect::from_min_size(p.pos, p.size);
+                assert!(
+                    p.clip.expand(0.5).contains_rect(r) && screen.expand(0.5).contains_rect(r),
+                    "{case}: {text:?} cut"
+                );
+            }
+            let shown = recorded(&ctx);
             println!(
-                "least window, worst set (card {card}, warp {show_warp}): stack {:.1} pt from \
-                 {:.1} to {:.1}, next block at {below:.1}, spare {spare:.1} pt",
-                stack.height(),
-                stack.top(),
-                stack.bottom()
+                "least window {:?} pt, worst set ({case}): {name} {:.1} × {:.1} pt from y \
+                 {:.1} to {:.1}; blocks {shown:?}",
+                MIN_WINDOW_PT,
+                notes.width(),
+                notes.height(),
+                notes.top(),
+                notes.bottom(),
             );
-            assert!(spare >= -0.5, "the worst set overruns by {:.1} pt", -spare);
+        }
+    }
+
+    /// Lead ruling C4w r4: Gravity gives way first, then Location (for the one-line place line),
+    /// then the honesty notes take two columns; nothing gives way while they fit.
+    #[test]
+    fn left_column_gives_way_in_order() {
+        let col = LeftColumn {
+            top: 24.0,
+            bottom: 676.0,
+            location_h: 146.0,
+            place_h: 30.0,
+            gravity_h: Some(108.0),
+            stack_gap: 11.0,
+        };
+        // Room: 676 − 108 − 16 − (24 + 146 + 11) = 371 with Gravity; 495 without it; 611 with
+        // the place line.
+        let at = |h: f32| stack_layout(h, col);
+        let layout = |gravity, location, columns| StackLayout {
+            gravity,
+            location,
+            columns,
+        };
+        assert_eq!(at(371.0), layout(true, true, 1));
+        assert_eq!(at(372.0), layout(false, true, 1));
+        assert_eq!(at(495.0), layout(false, true, 1));
+        assert_eq!(at(496.5), layout(false, false, 1));
+        assert_eq!(at(611.0), layout(false, false, 1));
+        assert_eq!(at(612.0), layout(false, false, 2));
+        // No Gravity panel: Location goes first.
+        let bare = LeftColumn {
+            gravity_h: None,
+            ..col
+        };
+        assert_eq!(stack_layout(495.0, bare), layout(true, true, 1));
+        assert_eq!(stack_layout(496.0, bare), layout(false, false, 1));
+    }
+
+    /// The two columns are balanced in order: the split keeps the taller column the shortest.
+    #[test]
+    fn balance_split_evens_the_columns() {
+        assert_eq!(balance_split(&[], 4.0), 0);
+        assert_eq!(balance_split(&[15.0], 4.0), 1);
+        assert_eq!(balance_split(&[15.0, 15.0], 4.0), 1);
+        // Seven equal rows: four on the left.
+        assert_eq!(balance_split(&[15.0; 7], 4.0), 4);
+        // A tall row first: alone on the left.
+        assert_eq!(balance_split(&[100.0, 15.0, 15.0, 15.0], 4.0), 1);
+        assert_eq!(balance_split(&[15.0, 15.0, 15.0, 100.0], 4.0), 3);
+    }
+
+    /// Lead ruling C4w r4: past what the left column can give, the honesty notes flow into two
+    /// columns, in the stack and in the pop-up, whole and on screen, never over another block.
+    #[test]
+    fn honesty_notes_flow_into_two_columns() {
+        let size_px = [
+            (2.0 * MIN_WINDOW_PT[0]) as u32,
+            (2.0 * MIN_WINDOW_PT[1]) as u32,
+        ];
+        let screen = egui::Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(MIN_WINDOW_PT[0] as f32, MIN_WINDOW_PT[1] as f32),
+        );
+        for expanded in [true, false] {
+            let mut d = data();
+            let mut c = HudControls {
+                card_expanded: expanded,
+                notes_expanded: true,
+                ..controls()
+            };
+            worst_honesty(&mut d, &mut c);
+            // Ten more amber notes, a line each.
+            for i in 0..10 {
+                d.notes
+                    .push((format!("Extra amber note {i}"), LabelTone::NonPhysical));
+            }
+            let case = format!("expanded {expanded}");
+            let (ctx, f) = draw_grown(size_px, 2.0, &d, c);
+            let blocks = blocks(&ctx);
+            let name = if expanded {
+                "notes stack"
+            } else {
+                "notes popup"
+            };
+            let notes = blocks
+                .iter()
+                .find(|b| b.0 == name)
+                .map(|b| b.1)
+                .unwrap_or_else(|| panic!("{case}: no {name}"));
+            let one_column = if expanded {
+                LOCATION_WIDTH
+            } else {
+                NOTES_POPUP_WIDTH
+            };
+            assert!(notes.width() > 1.5 * one_column, "{case}: {notes:?}");
+            for (other, r) in &blocks {
+                if *other != name {
+                    assert!(!notes.shrink(0.5).intersects(*r), "{case}: touches {other}");
+                }
+            }
+            if expanded {
+                let shown = recorded(&ctx);
+                assert!(
+                    !shown.contains(&"gravity") && !shown.contains(&"location"),
+                    "{case}: {shown:?}"
+                );
+            }
+            for text in honesty_texts(&d, &c) {
+                let p = f
+                    .texts
+                    .iter()
+                    .find(|p| p.text == text && p.font.size == NOTES_SIZE)
+                    .unwrap_or_else(|| panic!("{case}: {text:?} not drawn"));
+                let r = egui::Rect::from_min_size(p.pos, p.size);
+                assert!(
+                    p.clip.expand(0.5).contains_rect(r) && screen.expand(0.5).contains_rect(r),
+                    "{case}: {text:?} cut"
+                );
+            }
         }
     }
 

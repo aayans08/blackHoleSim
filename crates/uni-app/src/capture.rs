@@ -120,7 +120,7 @@ pub struct HudInfo {
     pub card_rows: Vec<String>,
     /// The card's kicker and title ("TARGET", "Mars"), when there is one.
     pub card: Option<[String; 2]>,
-    /// The HUD blocks drawn (`uni_ui::hud::drawn_blocks`): the collapsed lines or the expanded
+    /// The HUD blocks drawn (`uni_ui::Hud::drawn_blocks`): the collapsed lines or the expanded
     /// panels, the card, the time line or panel, the notes line and list.
     pub panels: Vec<String>,
     /// The notes the HUD showed, in order.
@@ -609,7 +609,7 @@ fn render_one(
         );
         cmds.extend(hud_cmds);
         cmds.push(enc.finish());
-        info = Some(hud_info(&data, &c));
+        info = Some(hud_info(&data, hud.drawn_blocks()));
     }
     let cpu_ms = start.elapsed().as_secs_f32() * 1e3;
     submit_and_wait(gpu, cmds, &format!("capture frame of {:?}", job.name))?;
@@ -617,20 +617,18 @@ fn render_one(
     Ok((frame, cpu_ms, info))
 }
 
-/// The capture JSON's `hud` block for what the HUD drew from `data` with `controls`.
-fn hud_info(data: &uni_ui::HudData, controls: &uni_ui::HudControls) -> HudInfo {
+/// The capture JSON's `hud` block for what the HUD drew from `data`; `blocks` are the blocks
+/// its last draw showed (`uni_ui::Hud::drawn_blocks`).
+fn hud_info(data: &uni_ui::HudData, blocks: Vec<&'static str>) -> HudInfo {
     let card_rows = data
         .target
         .iter()
         .flat_map(|c| c.live.iter().chain(c.facts.iter()))
         .map(|r| r.label.clone())
         .collect();
-    // Only what the HUD draws: the same conditions as its layout (lead ruling C4w r3; the
-    // TRAPPIST-1 capture listed a Gravity panel it did not draw).
-    let panels = uni_ui::hud::drawn_blocks(data, controls)
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+    // Only what the HUD drew (lead rulings C4w r3 and r4: the TRAPPIST-1 capture listed a
+    // Gravity panel it did not draw; Gravity and Location give way to the honesty notes).
+    let panels = blocks.into_iter().map(str::to_owned).collect();
     HudInfo {
         card_rows,
         card: data
