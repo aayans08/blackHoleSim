@@ -682,16 +682,18 @@ fn span_ms(begin: u64, end: u64, period_ns: f32) -> Option<f32> {
 /// bracket), given its own `(begin, end)` ticks, the opening bracket's begin tick and the closing
 /// bracket's begin tick (final review render I1).
 ///
-/// In sustained runs Metal often has not written the end-of-fragment sample of the frame's last
-/// render pass (the tonemap, which draws into the output view) when the slot is resolved: C6
-/// logged it as 0, or as a stale tick from an earlier frame (the slot's query reused when the
-/// label list shifts), in 75–99.9 % of frames. The closing bracket is ordered after that pass by
-/// Metal's hazard tracking, because the last pass reads the anchor texel the bracket writes (the
-/// tonemap samples `hdr`; write after read), and C6 found the bracket's ticks always written. So
-/// when the last pass's end is unwritten, not after its own begin, or before the frame's begin,
-/// the closing bracket's BEGIN tick stands in for it: an upper bound on the pass's end, late by
-/// the bracket's launch latency (measured on the M3 in serial runs, where both ticks are valid:
-/// final-fix-F3-report.md). A valid end is kept as it is. `None` leaves the pass unmeasured.
+/// A fallback since the deferred resolve (module docs), which made every sample current in
+/// sustained runs (F3: tonemap valid in all frames of `--bench --sustained 6`, all ten views).
+/// Before it, C6 logged the tonemap's end as 0 or as a stale tick in 75–99.9 % of frames; F3's
+/// tick log showed the closing bracket's two ticks stale in those frames too, so the stand-in
+/// alone could not help there (a stale bracket tick is not after the pass's begin and is
+/// rejected). The closing bracket is ordered after the last pass by Metal's hazard tracking,
+/// because that pass reads the anchor texel the bracket writes (the tonemap samples `hdr`;
+/// write after read). So when the last pass's end is unwritten, not after its own begin, or
+/// before the frame's begin, while the bracket's begin is current, that BEGIN tick stands in for
+/// it: an upper bound on the pass's end, late by the bracket's launch latency (0.83–0.88 µs on
+/// the M3 where both were valid: final-fix-F3-report.md). A valid end is kept as it is. `None`
+/// leaves the pass unmeasured.
 fn last_pass_end(own: (u64, u64), frame_begin: Option<u64>, bracket_begin: u64) -> Option<u64> {
     let unwritten = |t: u64| t == 0 || t == u64::MAX;
     let (begin, end) = own;
