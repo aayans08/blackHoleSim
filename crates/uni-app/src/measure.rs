@@ -2,7 +2,11 @@
 //! capture so `uni-verify` (B8) can check it, computed from the World, the frame's camera and
 //! the CPU twins.
 //!
-//! - `projected`: every pick item on screen ({name, x, y, radius_px}; radius 0 for a point).
+//! - `projected`: every pick item on screen ({name, x, y, radius_px}): a resolved body's or star
+//!   surface's projected radius; for a point, the radius of its saturated core as drawn
+//!   ([`bright_radius_px`]; 0 when it never exceeds 1 pre-exposed). A light that light-adapts
+//!   the eye (the Sun inside ~356 AU, `uni_sky::world_points`) is drawn below 1.5 px as world
+//!   light at the scene exposure by the `sun` pass, so its radius is taken at the scene EV.
 //! - `metrics`: `star_count_drawn` (catalogue stars in frame above the star pass's visibility
 //!   cut, `uni_sky::stars3d::star_is_visible`), `sun_v_mag_from_camera` (M_V☉ + 5 log₁₀(d/10 pc)),
 //!   `band_gc_over_anticentre` (the galaxy model's CPU band radiance toward l = 0° over l = 180°,
@@ -403,7 +407,7 @@ pub fn measure(input: &Input<'_>) -> Measurements {
     let snap = &frame.snapshot;
     let cam = Cam::new(&frame.ctx.camera, frame.ctx.viewport);
     let mut m = Measurements {
-        projected: projected(world, frame, &cam, input.ev100[1]),
+        projected: projected(world, frame, &cam, input.ev100),
         ..Measurements::default()
     };
     m.metrics = metrics(input, &cam);
@@ -649,9 +653,14 @@ fn venus_night_limb(
 
 /// Every pick item on screen with a radius: a resolved body's or star surface's projected
 /// radius; for a point or catalogue star, the radius of its bright core ([`bright_radius_px`]),
-/// so B8's centroid window covers a glare blob whole.
-fn projected(world: &World, frame: &Frame, cam: &Cam, star_ev100: f32) -> Vec<Projected> {
+/// so B8's centroid window covers a glare blob whole. `ev100` is the frame's [scene, star] EV: a
+/// point is drawn at the star EV, except a light that light-adapts the eye
+/// (`uni_sky::is_adapting_light_sprite`), which the `sun` pass draws at the scene EV (final fix
+/// wave F3; before S1 this reported the star-exposure footprint, 64 px for the Sun in
+/// `asteroid-belt-above`).
+fn projected(world: &World, frame: &Frame, cam: &Cam, ev100: [f32; 2]) -> Vec<Projected> {
     let snap = &frame.snapshot;
+    let lights = &frame.ctx.lights;
     let years = frame.ctx.epoch.seconds_since(uni_core::Epoch::J2000) / crate::scene::JULIAN_YEAR_S;
     let cam_pc = crate::scene::camera_icrs_pc(&cam.pos);
     snap.pick
@@ -693,7 +702,12 @@ fn projected(world: &World, frame: &Frame, cam: &Cam, star_ev100: f32) -> Vec<Pr
                     Some((rel, uni_core::star_illuminance_lux(v)))
                 };
                 point.or_else(star).map_or(0.0, |(rel, lux)| {
-                    bright_radius_px(cam, rel, lux, star_ev100)
+                    let ev = if uni_sky::is_adapting_light_sprite(rel, lights) {
+                        ev100[0]
+                    } else {
+                        ev100[1]
+                    };
+                    bright_radius_px(cam, rel, lux, ev)
                 })
             });
             Projected {
@@ -706,18 +720,22 @@ fn projected(world: &World, frame: &Frame, cam: &Cam, star_ev100: f32) -> Vec<Pr
         .collect()
 }
 
-/// Radius [px] within which a point source of illuminance `lux` at `rel` is brighter than 1
-/// pre-exposed (its saturated core in the PNG): the larger of where its Gaussian core and its
-/// glare halo (B4L's Moffat, without the window) fall to 1, at most its footprint; 0 for a
-/// source that never reaches 1.
-pub fn bright_radius_px(cam: &Cam, rel: DVec3, lux: f64, star_ev100: f32) -> f64 {
-    use uni_sky::stars3d::{STARS3D_HALO_ALPHA_PX, STARS3D_HALO_BETA, STARS3D_HALO_FRACTION};
+/// Radius [px] within which a point source of illuminance `lux` at `rel`, drawn at `ev100`, is
+/// brighter than 1 pre-exposed (its saturated core in the PNG): the larger of where its Gaussian
+/// core and its halo as drawn fall to 1, at most its footprint; 0 for a source that never
+/// reaches 1. The halo is B4L's Moffat × the footprint's window and weight scale
+/// (`uni_sky::stars3d::halo_shape`, `stars3d_halo_weight`; since the final fix wave a clamped
+/// halo tapers to black inside its 64-px footprint), so a clamped source reports where its glow
+/// actually saturates, not the clamp. `ev100` is the EV the source is drawn at: the star EV for
+/// sky points, the scene EV for a light that light-adapts the eye ([`projected`]).
+pub fn bright_radius_px(cam: &Cam, rel: DVec3, lux: f64, ev100: f32) -> f64 {
+    use uni_sky::stars3d::{STARS3D_HALO_FRACTION, halo_shape, stars3d_halo_weight};
     let cos = rel.normalize_or_zero().dot(cam.forward()) as f32;
     let e = uni_sky::stars::star_display_energy_off_axis(
         lux as f32,
         cam.fov_y_rad as f32,
         cam.size.y as f32,
-        star_ev100,
+        ev100,
         cos,
     );
     let h = STARS3D_HALO_FRACTION;
@@ -727,9 +745,20 @@ pub fn bright_radius_px(cam: &Cam, rel: DVec3, lux: f64, star_ev100: f32) -> f64
     if core_peak > 1.0 {
         r = r.max(sigma * (2.0 * core_peak.ln()).sqrt());
     }
-    let halo_peak = h * e * uni_sky::stars3d::stars3d_moffat(0.0);
-    if halo_peak > 1.0 {
-        r = r.max(STARS3D_HALO_ALPHA_PX * (halo_peak.powf(1.0 / STARS3D_HALO_BETA) - 1.0).sqrt());
+    let shape = halo_shape(e, h);
+    let halo = |x: f32| h * e * stars3d_halo_weight(x, shape.radius_px, shape.scale, shape.taper);
+    if halo(0.0) > 1.0 {
+        // The drawn halo falls monotonically to 0 at the footprint's radius: bisect for 1.
+        let (mut lo, mut hi) = (0.0_f32, shape.radius_px);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if halo(mid) > 1.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        r = r.max(lo);
     }
     f64::from(r.min(uni_sky::stars3d::footprint_radius_px(e, h)))
 }
@@ -2029,6 +2058,59 @@ mod tests {
         assert_eq!(t[0], [0.0, 0.0]);
         assert!(t[255][0] > 990.0);
         assert_eq!(thin(vec![DVec2::ONE]).len(), 1);
+    }
+
+    #[test]
+    fn bright_radius_follows_the_drawn_splat() {
+        // asteroid-belt-above: the Sun on axis from 6.0 AU (3.5e3 lx) at a 70° field, 1080 lines.
+        let fov = 70_f64.to_radians();
+        let c = cam(DQuat::IDENTITY, fov);
+        let rel = c.forward() * 8.976e11;
+        let lux = 3.5e3;
+        let (scene_ev, star_ev) = (18.04_f32, -6.5_f32);
+        let world = bright_radius_px(&c, rel, lux, scene_ev);
+        let sky = bright_radius_px(&c, rel, lux, star_ev);
+        println!("belt-view Sun: bright radius {world:.2} px at scene EV, {sky:.2} px at star EV");
+        // The `sun` pass's splat at scene exposure (uni_sky::world_points::world_splat):
+        // saturated (> 1 pre-exposed) at a pixel 1 px inside the radius, not 1.5 px outside it.
+        let size = glam::Vec2::new(1920.0, 1080.0);
+        let proj = uni_gfx::reversed_z_infinite_proj(
+            fov as f32,
+            size.x / size.y,
+            crate::scene::NEAR_PLANE_M,
+        );
+        let view_rot = crate::scene::view_rot(DQuat::IDENTITY);
+        let pre = uni_gfx::exposure_scale(scene_ev);
+        let splat = uni_sky::world_points::world_splat(
+            view_rot,
+            proj,
+            size,
+            fov as f32,
+            rel.normalize().as_vec3(),
+            lux as f32,
+            pre,
+        )
+        .unwrap();
+        assert_eq!(splat.shape.radius_px, 64.0, "the belt-view halo is clamped");
+        let at = |r: f32| {
+            let pix = (splat.centre_px + glam::Vec2::new(r, 0.0)).floor();
+            let centre_r = (pix + glam::Vec2::splat(0.5) - splat.centre_px).length();
+            (centre_r, splat.luminance_at(pix) * pre)
+        };
+        let (r_in, v_in) = at(world as f32 - 1.0);
+        let (r_out, v_out) = at(world as f32 + 1.5);
+        assert!(v_in > 1.0, "{v_in} at {r_in} px");
+        assert!(v_out < 1.0, "{v_out} at {r_out} px");
+        // Far inside the 64-px footprint the old star-exposure estimate reported.
+        assert!((3.0..20.0).contains(&world), "{world}");
+        assert!(sky > 3.0 * world, "{sky} vs {world}");
+        assert!(
+            sky < 64.0,
+            "the tapered halo is below 1 at its clamp: {sky}"
+        );
+        // A source that never reaches 1 pre-exposed has no bright core.
+        assert_eq!(bright_radius_px(&c, rel, 1e-12, star_ev), 0.0);
+        assert_eq!(bright_radius_px(&c, rel, f64::NAN, star_ev), 0.0);
     }
 
     #[test]
