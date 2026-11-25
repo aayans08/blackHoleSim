@@ -572,59 +572,13 @@ mod tests {
     use super::*;
     use image::Rgb;
 
-    // ---- Test fixture: a copy of uni-post's AgX CPU twin (crates/uni-post/src/agx.rs at
-    // 58374d2), in plain arrays because uni-verify does not depend on uni-post or glam. Troy
-    // Sobotka's AgX "base" with the default-contrast look in Benjamin Wrensch's real-time form
-    // ("Minimal AgX Implementation", iolite engine blog, 2023); every constant is verbatim. ----
-
-    /// Inset matrix, by columns (Wrensch 2023, `agx_mat`).
-    #[allow(clippy::excessive_precision)]
-    const AGX_INSET: [[f32; 3]; 3] = [
-        [0.842479062253094, 0.0423282422610123, 0.0423756549057051],
-        [0.0784335999999992, 0.878468636469772, 0.0784336],
-        [0.0792237451477643, 0.0791661274605434, 0.879142973793104],
-    ];
-    /// Outset matrix, by columns (Wrensch 2023, `agx_mat_inv`).
-    #[allow(clippy::excessive_precision)]
-    const AGX_OUTSET: [[f32; 3]; 3] = [
-        [1.19687900512017, -0.0528968517574562, -0.0529716355144438],
-        [-0.0980208811401368, 1.15190312990417, -0.0980434501171241],
-        [-0.0990297440797205, -0.0989611768448433, 1.15107367264116],
-    ];
-    const AGX_MIN_EV: f32 = -12.47393;
-    const AGX_MAX_EV: f32 = 4.026069;
-    const AGX_LOG_FLOOR: f32 = 1e-10;
-
-    fn mul_cols(cols: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-        std::array::from_fn(|i| cols[0][i] * v[0] + cols[1][i] * v[1] + cols[2][i] * v[2])
-    }
-
-    /// Wrensch 2023 `agxDefaultContrastApprox`, coefficients and term order verbatim.
-    fn agx_default_contrast(x: f32) -> f32 {
-        let x2 = x * x;
-        let x4 = x2 * x2;
-        15.5 * x4 * x2 - 40.14 * x4 * x + 31.96 * x4 - 6.868 * x2 * x + 0.4298 * x2 + 0.1191 * x
-            - 0.00232
-    }
-
-    /// IEC 61966-2-1:1999 §5.2, sRGB code value → display-linear.
-    fn srgb_to_linear(c: f32) -> f32 {
-        let x = c.max(0.0);
-        if x <= 0.04045 {
-            x / 12.92
-        } else {
-            ((x + 0.055) / 1.055).powf(2.4)
-        }
-    }
+    // ---- Test fixture: uni-post's AgX CPU twin itself (`uni_post::agx`, crates/uni-post/src/agx.rs,
+    // constants re-derived in the M1 final fix wave), through a dev-dependency, so the limbs below
+    // are tonemapped exactly as the app's tonemap pass writes them. ----
 
     /// `uni_post::agx`: pre-exposed scene-linear Rec. 709 → display-linear.
     fn agx(rgb: [f32; 3]) -> [f32; 3] {
-        let inset = mul_cols(&AGX_INSET, rgb);
-        let encoded = inset.map(|c| {
-            let ev = c.max(AGX_LOG_FLOOR).log2().clamp(AGX_MIN_EV, AGX_MAX_EV);
-            agx_default_contrast((ev - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV))
-        });
-        mul_cols(&AGX_OUTSET, encoded).map(|c| srgb_to_linear(c.clamp(0.0, 1.0)))
+        uni_post::agx(glam::Vec3::from_array(rgb)).to_array()
     }
 
     /// The sRGB view's hardware encoder: IEC 61966-2-1:1999 §5.2 (linear → code), then 8 bits.

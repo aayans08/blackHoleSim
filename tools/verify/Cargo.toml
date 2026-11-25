@@ -11,3 +11,8 @@ image.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# disk.rs's synthetic limbs go through the app's own AgX CPU twin (uni_post::agx takes a glam Vec3).
+uni-post.workspace = true
+glam.workspace = true

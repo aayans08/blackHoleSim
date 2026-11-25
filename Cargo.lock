@@ -2859,9 +2859,11 @@ name = "uni-verify"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "glam",
  "image",
  "serde",
  "serde_json",
+ "uni-post",
 ]
 
 [[package]]
