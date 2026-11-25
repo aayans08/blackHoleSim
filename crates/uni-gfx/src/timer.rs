@@ -25,7 +25,9 @@
 //! unwritten (0 or all ones), has no measurement: its time is `None`, shown as "n/a", never as
 //! 0 ms. Render passes are sampled at the start of the vertex stage and the end of the fragment
 //! stage (wgpu-hal 30, Metal), so a render pass's time can include waiting for the pass before
-//! it; compute passes are sampled at the start and end of the encoder.
+//! it; compute passes are sampled at the start and end of the encoder. One exception: the
+//! frame's last pass (the tonemap) often has no end sample yet in sustained runs (C6), so its end
+//! is taken from the closing bracket's begin tick, an upper bound (`last_pass_end`).
 //!
 //! Whole-frame GPU time. [`PassTimer::begin_frame`] and [`PassTimer::end_frame`] encode a timed
 //! one-thread compute pass at the start and end of the frame; the frame time is the end
@@ -82,7 +84,9 @@ pub struct GpuTimings {
     /// Order of the measured frame among the frames this timer recorded (0, 1, 2, ...).
     pub seq: u64,
     /// (pass label, ms) in encode order; `None` where the device returned no valid
-    /// measurement for that pass.
+    /// measurement for that pass. The frame's last pass (the tonemap) may end at the closing
+    /// bracket's begin tick instead of its own unwritten or stale end (`last_pass_end`): its
+    /// time is then an upper bound, late by the bracket's launch latency.
     pub passes: Vec<(&'static str, Option<f32>)>,
     /// (pass label, ms) in encode order: each pass's END tick minus the opening frame bracket's
     /// begin tick; `None` where either tick is unwritten or the end is not after the frame's
@@ -628,33 +632,92 @@ fn span_ms(begin: u64, end: u64, period_ns: f32) -> Option<f32> {
     Some((ns * 1e-6) as f32)
 }
 
+/// The end tick to use for the frame's last pass (the one encoded right before the closing
+/// bracket), given its own `(begin, end)` ticks, the opening bracket's begin tick and the closing
+/// bracket's begin tick (final review render I1).
+///
+/// In sustained runs Metal often has not written the end-of-fragment sample of the frame's last
+/// render pass (the tonemap, which draws into the output view) when the slot is resolved: C6
+/// logged it as 0, or as a stale tick from an earlier frame (the slot's query reused when the
+/// label list shifts), in 75–99.9 % of frames. The closing bracket is ordered after that pass by
+/// Metal's hazard tracking, because the last pass reads the anchor texel the bracket writes (the
+/// tonemap samples `hdr`; write after read), and C6 found the bracket's ticks always written. So
+/// when the last pass's end is unwritten, not after its own begin, or before the frame's begin,
+/// the closing bracket's BEGIN tick stands in for it: an upper bound on the pass's end, late by
+/// the bracket's launch latency (measured on the M3 in serial runs, where both ticks are valid:
+/// final-fix-F3-report.md). A valid end is kept as it is. `None` leaves the pass unmeasured.
+fn last_pass_end(own: (u64, u64), frame_begin: Option<u64>, bracket_begin: u64) -> Option<u64> {
+    let unwritten = |t: u64| t == 0 || t == u64::MAX;
+    let (begin, end) = own;
+    let stale = unwritten(end) || end <= begin || frame_begin.is_some_and(|b| end < b);
+    if !stale {
+        return Some(end);
+    }
+    let usable = !unwritten(bracket_begin)
+        && (unwritten(begin) || bracket_begin > begin)
+        && frame_begin.is_none_or(|b| bracket_begin > b);
+    usable.then_some(bracket_begin)
+}
+
 /// Pairs each label with its (begin, end) ticks: the passes' times, and the whole-frame time
-/// from the begin bracket's begin tick to the end bracket's end tick.
+/// from the begin bracket's begin tick to the end bracket's end tick. The last pass before the
+/// closing bracket takes that bracket's begin tick as its end when its own is unwritten or stale
+/// ([`last_pass_end`]); its time and end stamp are then upper bounds.
 fn timings_from_ticks(
     seq: u64,
     labels: &[&'static str],
     ticks: &[u64],
     period_ns: f32,
 ) -> GpuTimings {
-    let mut passes = Vec::with_capacity(labels.len());
-    let (mut frame_begin, mut frame_end) = (None, None);
-    for (&label, t) in labels.iter().zip(ticks.chunks_exact(2)) {
-        match label {
-            FRAME_BEGIN => frame_begin = Some(t[0]),
-            FRAME_END => frame_end = Some(t[1]),
-            _ => passes.push((label, span_ms(t[0], t[1], period_ns))),
+    let pairs: Vec<(&'static str, (u64, u64))> = labels
+        .iter()
+        .zip(ticks.chunks_exact(2))
+        .map(|(&l, t)| (l, (t[0], t[1])))
+        .collect();
+    let frame_begin = pairs
+        .iter()
+        .find(|(l, _)| *l == FRAME_BEGIN)
+        .map(|(_, t)| t.0);
+    let end_at = pairs.iter().position(|(l, _)| *l == FRAME_END);
+    let frame_end = end_at.map(|i| pairs[i].1.1);
+    // The pass encoded right before the closing bracket (the tonemap in the app).
+    let last = end_at
+        .and_then(|e| e.checked_sub(1))
+        .filter(|&i| !matches!(pairs[i].0, FRAME_BEGIN | FRAME_END));
+    let end_of = |i: usize| -> u64 {
+        let (_, own) = pairs[i];
+        match (last, end_at) {
+            (Some(l), Some(e)) if l == i => {
+                let end = last_pass_end(own, frame_begin, pairs[e].1.0);
+                if end != Some(own.1) {
+                    log::debug!(
+                        "pass timer frame {seq}: {} end {} taken from the closing bracket's \
+                         begin {:?}",
+                        pairs[i].0,
+                        own.1,
+                        end
+                    );
+                }
+                // No usable stand-in: keep the invalid tick, which reads as no measurement.
+                end.unwrap_or(own.1)
+            }
+            _ => own.1,
         }
+    };
+    let mut passes = Vec::with_capacity(labels.len());
+    let mut pass_end_ms = Vec::with_capacity(labels.len());
+    for (i, &(label, (begin, _))) in pairs.iter().enumerate() {
+        if matches!(label, FRAME_BEGIN | FRAME_END) {
+            continue;
+        }
+        let end = end_of(i);
+        passes.push((label, span_ms(begin, end, period_ns)));
+        pass_end_ms.push((label, frame_begin.and_then(|b| span_ms(b, end, period_ns))));
     }
     let frame_ms = match (frame_begin, frame_end) {
         (Some(b), Some(e)) => span_ms(b, e, period_ns),
         _ => None,
     };
-    let pass_end_ms = labels
-        .iter()
-        .zip(ticks.chunks_exact(2))
-        .filter(|(l, _)| !matches!(**l, FRAME_BEGIN | FRAME_END))
-        .map(|(&label, t)| (label, frame_begin.and_then(|b| span_ms(b, t[1], period_ns))))
-        .collect();
     if log::log_enabled!(log::Level::Debug) {
         let pairs: Vec<String> = labels
             .iter()
@@ -772,12 +835,68 @@ mod tests {
             t.passes.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
             ["lens", "tonemap"]
         );
-        assert_eq!(t.passes[1].1, None);
+        // The last pass's bad end is replaced by the closing bracket's begin (9 900 − 9 500).
+        assert!((t.passes[1].1.unwrap() - 0.0004).abs() < 1e-9);
         // 11 000 − 1 000 ticks of 1 ns.
         assert!((t.frame_ms.unwrap() - 0.01).abs() < 1e-7);
         // A backwards bracket is no frame time.
         let t = timings_from_ticks(0, &[FRAME_BEGIN, FRAME_END], &[50, 60, 30, 40], 1.0);
         assert_eq!(t.frame_ms, None);
+    }
+
+    /// Final review render I1: the tonemap's end tick as C6 logged it in sustained runs (0, or
+    /// a stale tick from an earlier frame) is replaced by the closing bracket's begin tick, in
+    /// both the span and the end stamp; a valid end is kept; only the pass right before the
+    /// closing bracket is patched; with no usable bracket tick it stays unmeasured.
+    #[test]
+    fn last_pass_end_falls_back_to_the_closing_bracket() {
+        let labels = [FRAME_BEGIN, "bloom composite", "tonemap", FRAME_END];
+        // Ticks [begin, end] per label, 1 ns each; the frame starts at 10 000 000.
+        let frame = |tonemap_end: u64, bloom_end: u64| {
+            [
+                10_000_000, 10_000_050, // frame begin
+                10_100_000, bloom_end, // bloom composite
+                10_200_000, tonemap_end, // tonemap
+                10_550_000, 10_550_080, // frame end
+            ]
+        };
+        let ms = |t: &GpuTimings, i: usize| t.passes[i].1;
+        let end = |t: &GpuTimings, i: usize| t.pass_end_ms[i].1;
+        // Valid end: kept (0.3 ms).
+        let t = timings_from_ticks(0, &labels, &frame(10_500_000, 10_190_000), 1.0);
+        assert!((ms(&t, 1).unwrap() - 0.3).abs() < 1e-6);
+        assert!((end(&t, 1).unwrap() - 0.5).abs() < 1e-6);
+        // Unwritten (0) and Metal's error value: the bracket's begin, 10 550 000.
+        for bad in [0, u64::MAX] {
+            let t = timings_from_ticks(1, &labels, &frame(bad, 10_190_000), 1.0);
+            assert!((ms(&t, 1).unwrap() - 0.35).abs() < 1e-6, "{bad}");
+            assert!((end(&t, 1).unwrap() - 0.55).abs() < 1e-6, "{bad}");
+            // The pass before it is untouched.
+            assert!((ms(&t, 0).unwrap() - 0.09).abs() < 1e-6);
+        }
+        // Stale: frame N − 1's bloom-composite end (C6's example), before this frame began.
+        let t = timings_from_ticks(2, &labels, &frame(9_190_000, 10_190_000), 1.0);
+        assert!((ms(&t, 1).unwrap() - 0.35).abs() < 1e-6);
+        assert!((end(&t, 1).unwrap() - 0.55).abs() < 1e-6);
+        // An end not after its own begin is stale too.
+        let t = timings_from_ticks(3, &labels, &frame(10_200_000, 10_190_000), 1.0);
+        assert!((ms(&t, 1).unwrap() - 0.35).abs() < 1e-6);
+        // An earlier pass with a bad end is not patched (only the last one is).
+        let t = timings_from_ticks(4, &labels, &frame(10_500_000, 0), 1.0);
+        assert_eq!(ms(&t, 0), None);
+        assert_eq!(end(&t, 0), None);
+        // No usable bracket tick: the last pass stays unmeasured, never 0.
+        let mut ticks = frame(0, 10_190_000);
+        ticks[6] = 0;
+        let t = timings_from_ticks(5, &labels, &ticks, 1.0);
+        assert_eq!(ms(&t, 1), None);
+        assert_eq!(end(&t, 1), None);
+        // Without a closing bracket nothing is patched.
+        let t = timings_from_ticks(6, &labels[..3], &frame(0, 10_190_000)[..6], 1.0);
+        assert_eq!(ms(&t, 1), None);
+        // The frame time is unchanged by the patch.
+        let t = timings_from_ticks(7, &labels, &frame(0, 10_190_000), 1.0);
+        assert!((t.frame_ms.unwrap() - 0.55008).abs() < 1e-6);
     }
 
     #[test]
