@@ -1,5 +1,3 @@
-[build]
-target-dir = "/Users/aayan/.cargo/shared-target/blackhole"
 [profile.dev]
 debug = "line-tables-only"
 incremental = false
