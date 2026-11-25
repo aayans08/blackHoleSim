@@ -1080,7 +1080,10 @@ fn flag_tone(f: HonestyFlag) -> LabelTone {
 }
 
 /// The honesty labels in effect for a frame (`view` at internal size `viewport`) with their
-/// tones, in a fixed order: the flight label (`uni_ui::theme::ui_labels`; ruling 6), the amber
+/// tones, in a fixed order: inside an event horizon the amber "view not simulated" label
+/// (`uni_ui::theme::INSIDE_HORIZON_LABEL`; final review, render I3: the black frame there is a
+/// placeholder, since no static observer exists inside r = 2M), the flight label
+/// (`uni_ui::theme::ui_labels`; ruling 6), the amber
 /// FTL label in free flight above c (`UiState::ftl`; M0 honesty rule, final review app I1),
 /// uni-sim's world-state labels (the band's two, which uni-sim raises together, only while the
 /// band is drawn: ruling, B4L), the procedural belt's (grey) while it is visible, the
@@ -1111,6 +1114,9 @@ pub fn honesty_labels(
     let (flight, rest) = ui
         .split_first()
         .map_or((None, &ui[..]), |(f, r)| (Some(f), r));
+    if inputs.coverage == LensCoverage::InsideHorizon {
+        push(uni_ui::theme::INSIDE_HORIZON_LABEL, LabelTone::NonPhysical);
+    }
     if let Some((text, tone)) = flight {
         push(text, *tone);
     }
@@ -2166,17 +2172,70 @@ mod tests {
         );
     }
 
+    /// Final review, render I3: inside the horizon the view is a placeholder, labelled in amber
+    /// first in the one list the HUD and the capture JSON share; the HUD's flag is set too.
     #[test]
     fn inside_the_horizon_the_hud_says_so() {
+        let horizon = uni_ui::theme::INSIDE_HORIZON_LABEL;
         for r in [1.5, 2.0, 0.0] {
-            let (_, c) = ctx_near_hole(r);
+            let (world, c) = ctx_near_hole(r);
+            let coverage = uni_rel::lens_coverage(&c);
+            assert_eq!(coverage, LensCoverage::InsideHorizon, "r = {r} M");
+            assert!(c.view_rot.is_finite());
+            let snap = world.sim.snapshot(&c.camera, c.viewport);
+            let s = exposure_settings(&default_controls(1.0), ViewChoices::default(), false, true);
+            let labels = honesty_labels(
+                &world,
+                &c.camera,
+                c.viewport,
+                &snap,
+                &s,
+                &LabelInputs {
+                    lens_env: LensEnv::Band,
+                    coverage,
+                    band_on: true,
+                    scintillation: 0.0,
+                    vivid: true,
+                    belt_visible: false,
+                    ui: UiState::default(),
+                },
+            );
             assert_eq!(
-                uni_rel::lens_coverage(&c),
-                LensCoverage::InsideHorizon,
+                labels[0],
+                (horizon.to_owned(), LabelTone::NonPhysical),
                 "r = {r} M"
             );
-            assert!(c.view_rot.is_finite());
+            assert_eq!(labels[1].0, uni_ui::FREE_FLIGHT_LABEL);
+            // No lens is traced from inside: the unlensed-stars label is not raised.
+            assert!(!label_texts(&labels).contains(&UNLENSED_STARS_LABEL.to_owned()));
         }
+        // Outside the horizon: no such label.
+        let (world, c) = ctx_near_hole(30.0);
+        let snap = world.sim.snapshot(&c.camera, c.viewport);
+        let s = exposure_settings(&default_controls(1.0), ViewChoices::default(), false, true);
+        let labels = honesty_labels(
+            &world,
+            &c.camera,
+            c.viewport,
+            &snap,
+            &s,
+            &LabelInputs {
+                lens_env: LensEnv::Band,
+                coverage: uni_rel::lens_coverage(&c),
+                band_on: true,
+                scintillation: 0.0,
+                vivid: true,
+                belt_visible: false,
+                ui: UiState::default(),
+            },
+        );
+        assert!(
+            !label_texts(&labels).contains(&horizon.to_owned()),
+            "{labels:?}"
+        );
+        // P57: the traced lens's label says the blueshift is not applied.
+        assert!(UNLENSED_STARS_LABEL.contains("gravitational blueshift not applied"));
+        assert!(label_texts(&labels).contains(&UNLENSED_STARS_LABEL.to_owned()));
     }
 
     /// Plan C6 Step 1 (re-review r2 minor 1): with "Highlight asteroid belt" on, the point of a

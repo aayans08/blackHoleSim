@@ -197,8 +197,21 @@ pub const BELT_HIGHLIGHT_LABEL: &str = "Asteroid belt brightness exaggerated (no
 /// environment); `HudData::lens_on_screen` never adds it (review C4 r0 I1).
 pub const DEBUG_GRID_LABEL: &str = "Lens background: M0 debug grid";
 /// While a lens is traced: the stars over it are drawn unlensed until M3 (the plan's M1
-/// wording, replacing m0.1's "(M0)"), amber.
-pub const UNLENSED_STARS_LABEL: &str = "Stars near the hole are not yet lensed (M3)";
+/// wording, replacing m0.1's "(M0)"), and the sky is not blueshifted for the camera, which the
+/// tracer treats as hovering (static) near the hole (final review P57 / B7 m9: a static
+/// observer at r sees light from far away blueshifted by 1/√(1 − 2M/r) in frequency, the
+/// Schwarzschild metric's g_tt (Schwarzschild 1916): ×1.035 at r = 30 M, ×1.15 in bolometric
+/// intensity, which goes as the fourth power; M3 applies it), amber.
+pub const UNLENSED_STARS_LABEL: &str =
+    "Stars near the hole not yet lensed; gravitational blueshift not applied (M3)";
+/// While the camera is inside a black hole's event horizon (r ≤ 2M), amber, first in the
+/// notes: the frame there is a black placeholder, not a simulated view. The lens tracer models a
+/// static (hovering) camera, and no static observer exists inside the horizon; an observer
+/// falling in still sees light from outside until close to r = 0, which M3's infalling view
+/// will show (final review, render I3). Replaces m0.1's red "Inside event horizon", which
+/// presented the black frame as physics.
+pub const INSIDE_HORIZON_LABEL: &str = "Inside the event horizon: view not simulated (no static \
+                                        observer inside r = 2M; an infalling view comes in M3)";
 /// While the camera is inside an atmosphere and the stars twinkle (B4 report: Young's law
 /// extrapolated below its aperture range, every star at the zenith), grey.
 pub const TWINKLE_LABEL: &str = "Twinkling: approximate model";
@@ -397,8 +410,6 @@ pub const TIME_LINE_SIZE: f32 = 13.0;
 
 /// The honesty pop-up's title (preview).
 pub const NOTES_POPUP_TITLE: &str = "What is approximate here";
-/// Shown in red while the camera is inside an event horizon (m0.1).
-pub const INSIDE_HORIZON_LABEL: &str = "Inside event horizon";
 /// Bottom-right hints: collapsed (the mockup's "Tab hide HUD · F1 controls" plus the I key of
 /// the owner's collapsed HUD) and while the card is open (the mockup's target artboard).
 pub const HINT_COLLAPSED: &str = "I details · Tab hide HUD · F1 controls";
@@ -945,6 +956,16 @@ mod tests {
         assert_eq!(short_label(FREE_FLIGHT_LABEL), FREE_FLIGHT_LABEL);
         assert_eq!(short_label(CRUISE_LABEL), CRUISE_LABEL);
         assert_eq!(short_label(DEBUG_GRID_LABEL), DEBUG_GRID_LABEL);
+        assert_eq!(short_label(FTL_LABEL), FTL_LABEL);
+        // Final review render I3 and P57: the collapsed line's forms.
+        assert_eq!(
+            short_label(INSIDE_HORIZON_LABEL),
+            "Inside the event horizon: view not simulated"
+        );
+        assert_eq!(
+            short_label(UNLENSED_STARS_LABEL),
+            "Stars near the hole not yet lensed; gravitational blueshift not applied"
+        );
     }
 
     /// The alphas are the mockup's fractions to the nearest 8-bit step.

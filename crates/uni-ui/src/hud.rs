@@ -93,10 +93,12 @@ const PANEL_GAP: f32 = 16.0;
 /// - 960 pt keeps the honesty line beside the perf block (its 560 pt least width and the perf
 ///   block need about 880 pt) and the 520 pt Speed panel on screen, clear of the Location
 ///   column (x 340–860);
-/// - 740 pt gives the expanded notes stack, between Location (its top 180.5 pt) and Gravity,
-///   411.5 pt for the worst set's 18 honesty notes, 387 pt with their wrapped lines (one spare
-///   one-line note); the pop-up then has 625.5 pt for its 451 pt.
-pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 740.0];
+/// - 780 pt gives the expanded notes stack, between Location (its top 180.5 pt) and Gravity,
+///   H − 331 = 449 pt for the worst set's 18 honesty notes, 430.5 pt with their wrapped lines
+///   (18.5 pt spare). F1 raised it from 740 pt: the horizon label ("view not
+///   simulated") and the lens label (its blueshift clause) now wrap to two lines each, so at
+///   740 pt the stack overran the Gravity panel by 5.5 pt.
+pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 780.0];
 /// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
 /// line's area, which hangs 4 pt lower than the margin).
 const POPUP_GAP: f32 = 10.0;
@@ -134,7 +136,9 @@ pub struct HudData {
     /// Earth", "No surface map: …"; [`frame_notes`] builds them as uni-app does). A warning
     /// that is not also in `notes` shows there in amber; the statuses keep their grey.
     pub warnings: Vec<String>,
-    /// Shows "Inside event horizon" in red, first in the notes.
+    /// The camera is inside an event horizon: the notes show [`INSIDE_HORIZON_LABEL`] ("view
+    /// not simulated") first, in amber (final review, render I3; m0.1 showed a red "Inside event
+    /// horizon").
     pub inside_horizon: bool,
     /// True when a lens is traced on screen this frame, in either lens environment (the second
     /// flag of `uni_rel::lens_labels`): the notes then hold, in amber, "Stars near the hole are
@@ -159,7 +163,7 @@ pub struct HudData {
     pub target: Option<TargetCard>,
     /// The notes line: honesty labels and warnings with their tones (world labels from
     /// `uni_sim::honesty`, UI labels from `theme::ui_labels`, the debug-grid label, renderer
-    /// warnings), in any order. The HUD shows "Inside event horizon" first, then the flight
+    /// warnings), in any order. The HUD shows [`INSIDE_HORIZON_LABEL`] first, then the flight
     /// label (the note equal to `speed.header`, added from the Speed panel if missing here), so
     /// the collapsed line always holds it however narrow the window (ruling 6; review C4 r0
     /// I2); then these notes in their order, then the labels of its own flags above (each
@@ -794,7 +798,10 @@ fn draw_hud(
         let size = measure(ctx, "notes line", line_w, |ui| {
             notes_line(ui, &notes, line_w);
         });
-        let x = egui::Rangef::new(left, left + size.x);
+        // Its columns with `PANEL_GAP` to its right, so a line that ends less than a gap short
+        // of the perf block rises over it rather than sitting beside it (F1: the longer horizon
+        // label cut the line 9 pt short of the key hints at 800 pt).
+        let x = egui::Rangef::new(left, left + size.x + PANEL_GAP);
         let bottom = screen.bottom() - m + 4.0;
         let slot = rise(x, bottom, size.y, screen.top() + m, &taken, PANEL_GAP);
         // One line, always drawn whole from the slot's top (it holds the flight label, ruling
@@ -1316,7 +1323,7 @@ fn merge_statuses(statuses: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The notes in their order: "Inside event horizon" (red), the flight label, the app's notes,
+/// The notes in their order: [`INSIDE_HORIZON_LABEL`] (amber), the flight label, the app's notes,
 /// then the labels of the HUD's own flags (the belt toggle, eye-adapted stars, the traced lens)
 /// and the renderer warnings (amber); each text once.
 ///
@@ -1333,7 +1340,7 @@ fn hud_notes(data: &HudData, c: &HudControls) -> Vec<(String, LabelTone)> {
     }
     let mut notes = Vec::new();
     if data.inside_horizon {
-        push(&mut notes, INSIDE_HORIZON_LABEL, LabelTone::Danger);
+        push(&mut notes, INSIDE_HORIZON_LABEL, LabelTone::NonPhysical);
     }
     let flight = data.speed.header.as_str();
     if !flight.is_empty() {
@@ -2156,7 +2163,7 @@ mod tests {
         }
         assert_eq!(
             UNLENSED_STARS_LABEL,
-            "Stars near the hole are not yet lensed (M3)"
+            "Stars near the hole not yet lensed; gravitational blueshift not applied (M3)"
         );
         // The same label from the app's notes and from the flag is drawn once.
         let mut d = data();
@@ -2232,12 +2239,12 @@ mod tests {
     }
 
     /// Review C4 r0 I2 (ruling 6, the lead's collapsed-HUD ruling): collapsed, the honesty line
-    /// is the only place the flight label shows, so it leads the line (after the red "Inside
-    /// event horizon") however many world labels the app lists before it, and survives the "…"
-    /// cut on the owner's 1280–1470 pt wide window (the M3 at 2560 × 1664 px, 2 px per point,
-    /// and macOS's default 1470 × 956 pt) and at the line's least width (560 pt, an 800 pt
-    /// window), with the longer cruise label behind the red one. It leads even when the app's
-    /// notes lack it.
+    /// is the only place the flight label shows, so it leads the line (after the amber "Inside
+    /// the event horizon" label) however many world labels the app lists before it, and
+    /// survives the "…" cut on the owner's 1280–1470 pt wide window (the M3 at 2560 × 1664 px,
+    /// 2 px per point, and macOS's default 1470 × 956 pt) and at the line's least width (560 pt,
+    /// an 800 pt window), with the longer cruise label behind the horizon one. It leads even
+    /// when the app's notes lack it.
     #[test]
     fn flight_label_leads_a_narrow_notes_line() {
         use crate::theme::{SATURN_MOONS_LABEL, VIVID_STAR_COLOURS_LABEL};
@@ -2278,13 +2285,13 @@ mod tests {
                     );
                 }
                 let case = format!("{header:?}, horizon {horizon}, ui_labels {with_ui_labels}");
-                // The order: red horizon, the flight label, then the app's notes in order.
+                // The order: the horizon label, the flight label, then the app's notes in order.
                 let notes = hud_notes(&d, &controls());
                 let lead = usize::from(horizon);
                 if horizon {
                     assert_eq!(
                         notes[0],
-                        (INSIDE_HORIZON_LABEL.to_owned(), LabelTone::Danger),
+                        (INSIDE_HORIZON_LABEL.to_owned(), LabelTone::NonPhysical),
                         "{case}"
                     );
                 }
@@ -2338,8 +2345,8 @@ mod tests {
                         "{case}: {shown:?}"
                     );
                     if horizon {
-                        let red = f.get(INSIDE_HORIZON_LABEL);
-                        assert!(red.pos.x < shown.pos.x, "{case}: {red:?} {shown:?}");
+                        let first = f.get(short_label(INSIDE_HORIZON_LABEL));
+                        assert!(first.pos.x < shown.pos.x, "{case}: {first:?} {shown:?}");
                     } else {
                         // First on the line: just after its amber dot.
                         assert!(
@@ -2357,7 +2364,8 @@ mod tests {
         }
     }
 
-    /// Expanded, the notes stack sits under the Location panel, in tone, 12 pt.
+    /// Expanded, the notes stack sits under the Location panel, in tone, 12 pt; inside a
+    /// horizon its first note is the amber "view not simulated" label (final review, render I3).
     #[test]
     fn notes_stack_under_location_when_expanded() {
         let mut d = data();
@@ -2365,13 +2373,18 @@ mod tests {
         d.warnings.push("Inside Sun".into());
         let f = draw(&d, expanded());
         let kicker = f.get("LOCATION");
-        let red = f.get("Inside event horizon");
-        assert_eq!(red.color, crate::theme::DANGER);
+        let horizon = f.get("Inside the event horizon: view not simulated");
+        assert_eq!(horizon.color, NON_PHYSICAL);
         assert!(
-            red.pos.x < 60.0 && red.pos.y > kicker.pos.y + 80.0,
-            "{red:?}"
+            horizon.pos.x < 60.0 && horizon.pos.y > kicker.pos.y + 80.0,
+            "{horizon:?}"
         );
-        assert_eq!(red.font.size, 12.0);
+        assert_eq!(horizon.font.size, 12.0);
+        let notes = hud_notes(&d, &expanded());
+        assert_eq!(
+            notes[0],
+            (INSIDE_HORIZON_LABEL.to_owned(), LabelTone::NonPhysical)
+        );
         assert_eq!(f.get("Inside Sun").color, NON_PHYSICAL);
     }
 
@@ -2635,7 +2648,7 @@ mod tests {
         let notes: Vec<(String, LabelTone)> = [
             (FREE_FLIGHT_LABEL, LabelTone::NonPhysical),
             ("Milky Way band: galaxy model v0", LabelTone::Neutral),
-            (INSIDE_HORIZON_LABEL, LabelTone::Danger),
+            (INSIDE_HORIZON_LABEL, LabelTone::NonPhysical),
             ("No surface map: uniform albedo", LabelTone::Neutral),
         ]
         .into_iter()
@@ -3223,9 +3236,10 @@ mod tests {
     /// `hud_data` builds them ([`frame_notes`]):
     /// - free flight above c, so the Speed panel has its FTL row and the app lists the FTL
     ///   label;
-    /// - every amber flag that can hold together: inside a traced hole's horizon (red) on the
-    ///   debug grid with the stars unlensed, the four extrapolation and catching-up labels, the
-    ///   belt highlighted, eye-adapted stars, vivid colours. Being inside a body ("Inside X")
+    /// - every amber flag, as if they could hold together: inside a hole's horizon ("view not
+    ///   simulated") on the debug grid with the stars unlensed (and not blueshifted), the four
+    ///   extrapolation and catching-up labels, the belt highlighted, eye-adapted stars, vivid
+    ///   colours. Being inside a body ("Inside X")
     ///   or beyond the lens's reach (the coverage warning) excludes a traced lens, so neither
     ///   is here: they are one line against the three lens lines;
     /// - the most warnings: the 3 GPU errors the app keeps, the flash message, a data notice,
