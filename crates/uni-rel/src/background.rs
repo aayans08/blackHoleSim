@@ -44,8 +44,9 @@ pub fn debug_background_draws(coverage: LensCoverage, env: LensEnv) -> bool {
 }
 
 /// Which lens honesty labels the HUD shows for this coverage and environment: (the debug-grid
-/// label "Lens background: M0 debug grid", the unlensed-stars label "Stars near the hole are not
-/// yet lensed (M3)"; the strings live in uni-ui, C4).
+/// label "Lens background: M0 debug grid", the unlensed-stars label "Stars near the hole not yet
+/// lensed; gravitational blueshift not applied (M3)"; the strings live in uni-ui's theme.rs,
+/// `DEBUG_GRID_LABEL` and `UNLENSED_STARS_LABEL`, C4 and the final fix wave).
 /// - The debug label exactly while the grid draws ([`debug_background_draws`]): `DebugGrid`
 ///   and `Traced`.
 /// - The unlensed-stars label whenever the lens is traced, in either environment: the star
@@ -337,7 +338,8 @@ mod tests {
     }
 
     /// B7: "Lens background: M0 debug grid" exactly while the grid draws (DebugGrid and Traced);
-    /// "Stars near the hole are not yet lensed (M3)" whenever the lens is traced, in either
+    /// "Stars near the hole not yet lensed; gravitational blueshift not applied (M3)" whenever
+    /// the lens is traced, in either
     /// environment, because the star pass draws catalogue stars unlensed over the traced pixels.
     #[test]
     fn lens_labels_by_mode() {

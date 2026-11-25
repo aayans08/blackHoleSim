@@ -201,8 +201,8 @@ pub enum LensCoverage {
     /// ([`inside_horizon`]). That is a placeholder, not a simulated view: an observer inside
     /// r = 2M still receives light from outside (it falls in behind them), but no static
     /// observer exists there and the tracer models only static ones (`static_observer_ray`).
-    /// The app labels it "view not simulated" (final review render I3); M3 adds the infalling
-    /// view.
+    /// The app labels it "Inside the event horizon: view not simulated" (uni-ui's
+    /// `INSIDE_HORIZON_LABEL`; final review render I3); M3 adds the infalling view.
     InsideHorizon,
     /// The lens bends light by at least half a pixel on screen, but the camera is farther than
     /// [`TRACE_REACH`] from it, so the step budget cannot reach the hole. Nothing is traced:
@@ -213,7 +213,8 @@ pub enum LensCoverage {
 
 impl LensCoverage {
     /// The HUD warning for this coverage, if it needs one. The app adds it to the HUD's
-    /// warnings. `InsideHorizon` has its own HUD flag, so it returns `None` here.
+    /// warnings. `InsideHorizon` has its own amber HUD label (uni-ui's `INSIDE_HORIZON_LABEL`),
+    /// so it returns `None` here.
     pub fn warning(self) -> Option<&'static str> {
         match self {
             Self::BeyondReach => Some(BEYOND_REACH_WARNING),
@@ -240,8 +241,9 @@ pub fn lens_coverage(ctx: &FrameCtx) -> LensCoverage {
 /// True when the camera is on or inside the lens's horizon (r < 2(1 + ε) M, the capture
 /// radius of [`binet::trace`]), including at its centre. The lens pass then draws the whole
 /// frame black as a placeholder (no static observer exists for r ≤ 2M, so nothing there is
-/// simulated; [`LensCoverage::InsideHorizon`]); the app shows "inside event horizon" and labels
-/// the view as not simulated (Review Focus 2; final review render I3).
+/// simulated; [`LensCoverage::InsideHorizon`]); the app shows the amber label "Inside the event
+/// horizon: view not simulated (no static observer inside r = 2M; an infalling view comes in
+/// M3)" (uni-ui's `INSIDE_HORIZON_LABEL`; Review Focus 2; final review render I3).
 pub fn inside_horizon(lens: &LensView) -> bool {
     camera_in_m(lens).is_some_and(|c| c.length() < binet::CAPTURE_RADIUS)
 }

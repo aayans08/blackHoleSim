@@ -189,8 +189,9 @@ fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Camera inside the horizon: a placeholder, NOT a simulated view. Light from outside
         // does reach an observer inside r = 2M in Schwarzschild (it falls in behind them), but
         // no static observer exists there, and static_observer_ray models only that one, so
-        // nothing is traced and the frame is drawn black. The app labels it as not simulated
-        // (final review render I3); an infalling observer's view is M3's.
+        // nothing is traced and the frame is drawn black. The app labels it "Inside the event
+        // horizon: view not simulated" (final review render I3); an infalling observer's view
+        // is M3's.
         textureStore(hdr_out, p, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(lens_mask_out, p, vec4<f32>(1.0, 0.0, 1.0, 0.0));
         return;
