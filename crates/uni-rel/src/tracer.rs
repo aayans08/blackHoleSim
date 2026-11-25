@@ -18,7 +18,8 @@
 //!   [`crate::DebugSkyBackground`] drawing it around the rectangle (ruling 14).
 //!
 //! **Mask** (M1 frame contract): traced pixels get `lens_mask = (captured fraction, 0, 1, 0)`;
-//! captured light is black. **Foreground bodies are not lensed** (design §5.3, review m7): the
+//! captured light is black. From inside the horizon the whole frame is drawn black: a labelled
+//! placeholder, not physics ([`LensCoverage::InsideHorizon`]). **Foreground bodies are not lensed** (design §5.3, review m7): the
 //! resolve reads the depth texture and leaves every pixel with depth ≠ 0 untouched, colour and
 //! mask, also from inside a horizon.
 //!
@@ -196,7 +197,12 @@ pub enum LensCoverage {
     Unlensed,
     /// Geodesics are traced on the GPU over the lens rectangle.
     Traced,
-    /// The camera is on or inside the horizon, so the frame is black ([`inside_horizon`]).
+    /// The camera is on or inside the horizon, and the frame is drawn black
+    /// ([`inside_horizon`]). That is a placeholder, not a simulated view: an observer inside
+    /// r = 2M still receives light from outside (it falls in behind them), but no static
+    /// observer exists there and the tracer models only static ones (`static_observer_ray`).
+    /// The app labels it "view not simulated" (final review render I3); M3 adds the infalling
+    /// view.
     InsideHorizon,
     /// The lens bends light by at least half a pixel on screen, but the camera is farther than
     /// [`TRACE_REACH`] from it, so the step budget cannot reach the hole. Nothing is traced:
@@ -233,7 +239,9 @@ pub fn lens_coverage(ctx: &FrameCtx) -> LensCoverage {
 
 /// True when the camera is on or inside the lens's horizon (r < 2(1 + ε) M, the capture
 /// radius of [`binet::trace`]), including at its centre. The lens pass then draws the whole
-/// frame black; the app shows "inside event horizon" (Review Focus 2).
+/// frame black as a placeholder (no static observer exists for r ≤ 2M, so nothing there is
+/// simulated; [`LensCoverage::InsideHorizon`]); the app shows "inside event horizon" and labels
+/// the view as not simulated (Review Focus 2; final review render I3).
 pub fn inside_horizon(lens: &LensView) -> bool {
     camera_in_m(lens).is_some_and(|c| c.length() < binet::CAPTURE_RADIUS)
 }
@@ -341,7 +349,7 @@ fn gpu_r_far(r_cam: f64) -> f64 {
 ///   its cone is under half a pixel, or its rectangle is off screen. Nothing is traced, and the
 ///   resolve pass draws only the unlensed sky.
 /// - [`LensCoverage::InsideHorizon`]: sets the black-frame flag, with the whole frame as the
-///   rectangle.
+///   rectangle (a placeholder frame, not a simulated view).
 /// - [`LensCoverage::BeyondReach`]: the rectangle is on screen but r_cam > [`TRACE_REACH`].
 ///   Nothing is traced, as for `Unlensed`.
 /// - [`LensCoverage::Traced`]: the rectangle is traced.

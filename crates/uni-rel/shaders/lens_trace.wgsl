@@ -9,7 +9,8 @@
 // 2. cs_resolve, over the lens rectangle only: upsample the samples bilinearly into hdr
 //    (captured → black) and lens_mask (r = captured fraction, g = 0, b = 1, a = 0; M1 frame
 //    contract, crates/uni-gfx/src/targets.rs). If the camera is inside the horizon, the
-//    rectangle is the whole frame and every pixel is black with lens_mask (1, 0, 1, 0).
+//    rectangle is the whole frame and every pixel is black with lens_mask (1, 0, 1, 0): a
+//    placeholder, not physics (no static observer exists for r ≤ 2M; see cs_resolve).
 //    Pixels a body drew (depth ≠ 0) are skipped in both cases: foreground objects are not
 //    lensed (design §5.3, review m7), and they keep their colour and mask.
 //
@@ -185,7 +186,11 @@ fn cs_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     if (lens.grid.w != 0u) {
-        // Camera inside the horizon: no light from outside reaches it.
+        // Camera inside the horizon: a placeholder, NOT a simulated view. Light from outside
+        // does reach an observer inside r = 2M in Schwarzschild (it falls in behind them), but
+        // no static observer exists there, and static_observer_ray models only that one, so
+        // nothing is traced and the frame is drawn black. The app labels it as not simulated
+        // (final review render I3); an infalling observer's view is M3's.
         textureStore(hdr_out, p, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         textureStore(lens_mask_out, p, vec4<f32>(1.0, 0.0, 1.0, 0.0));
         return;
