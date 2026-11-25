@@ -129,7 +129,7 @@ crates/
                 labels: "FTL · non-physical" (free flight set above c; the expanded stack leaves it to the Speed
                 panel's row), "Inside the event horizon: view not simulated (…)" first (replaces the red status),
                 the lens label "Stars near the hole not yet lensed; gravitational blueshift not applied (M3)"; Tab
-                hides the HUD but keeps the honesty line; Inter / IBM Plex Mono; window least size 960 × 840 pt
+                hides the HUD but keeps the honesty line; Inter / IBM Plex Mono; window least size 960 × 700 pt (honesty notes flow into two columns; Gravity and Location give way first)
                 (M1's worst set, 20 honesty notes, `worst_set_fits_the_least_window`). Overlay [C5]: markers,
                 brackets, orbit lines only for the selection or goto target (exoplanet orbits dashed), kept off the
                 HUD panels
