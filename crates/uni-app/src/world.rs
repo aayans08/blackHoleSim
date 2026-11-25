@@ -234,9 +234,46 @@ fn sky_warning(e: &DataError) -> String {
     }
 }
 
-/// `epoch` as `YYYY-MM-DDThh:mm:ssZ` (UTC, whole seconds), the form bookmarks use
-/// (`Epoch::parse_iso_utc`). Built on the HUD's `format_epoch`, so both show the same second.
+/// `epoch` as a bookmark date (UTC, whole seconds) that `crate::scene::parse_bookmark_epoch`
+/// reads back to the same second, so F12 never saves a view `--capture` rejects (final review,
+/// app minor 3):
+/// - `YYYY-MM-DDThh:mm:ssZ` for years 0000–9999 (`Epoch::parse_iso_utc`), built on the HUD's
+///   `format_epoch`, so both show the same second;
+/// - ISO 8601's expanded form `±YYYYY…-MM-DDThh:mm:ssZ` (at least four digits; ISO 8601-1:2019
+///   §4.3.2.2) outside them, built as the parser reads it: the date and time of the epoch
+///   shifted by whole 400-year Gregorian cycles into the years 2000–2399, with the cycles'
+///   years added back. (Formatting the far epoch directly would differ by the change of
+///   TAI − UTC between the two eras, 27 s before 1972, and the parser would land that far off.)
 pub fn iso_utc(epoch: Epoch) -> String {
+    let plain = plain_iso_utc(epoch);
+    let year = |s: &str| {
+        let dash = 1 + s.get(1..)?.find('-')?;
+        Some((s[..dash].parse::<i64>().ok()?, s[dash..].to_owned()))
+    };
+    match year(&plain) {
+        Some((y, _)) if (0..=9999).contains(&y) => plain,
+        Some((y, _)) => {
+            let guess = (y - 2000).div_euclid(400);
+            // The guess is off by one cycle only within seconds of a cycle's first instant.
+            [guess, guess - 1, guess + 1]
+                .into_iter()
+                .find_map(|cycles| {
+                    let shift = cycles as f64 * crate::scene::GREGORIAN_CYCLE_S;
+                    let (base_year, rest) = year(&plain_iso_utc(epoch.add_seconds(-shift)))?;
+                    (2000..2400).contains(&base_year).then(|| {
+                        let y = base_year + 400 * cycles;
+                        let sign = if y < 0 { '-' } else { '+' };
+                        format!("{sign}{:04}{rest}", y.unsigned_abs())
+                    })
+                })
+                .unwrap_or(plain)
+        }
+        None => plain,
+    }
+}
+
+/// `epoch` as `YYYY-MM-DDThh:mm:ssZ` from the HUD's `format_epoch`, the year as it prints it.
+fn plain_iso_utc(epoch: Epoch) -> String {
     let hud = uni_ui::format_epoch(epoch); // "YYYY-MM-DD hh:mm:ss UTC"
     match hud.strip_suffix(" UTC") {
         Some(t) => format!("{}Z", t.replacen(' ', "T", 1)),
@@ -438,6 +475,51 @@ pub(crate) mod tests {
             assert_eq!(iso_utc(e), s);
         }
         assert_eq!(iso_utc(Epoch::J2000), "2000-01-01T11:58:55Z");
+    }
+
+    /// Final review, app minor 3: F12 at years outside 0000–9999 (reachable with warp 10¹² and
+    /// from `sky-orion-50kyr`) saves ISO 8601's expanded form, which bookmark parsing reads back
+    /// to the same second: before, +52026 came out as "52026-…" (no sign) and −500 as "-500-…"
+    /// (three digits), both rejected by `--capture`.
+    #[test]
+    fn far_epochs_round_trip_through_bookmark_parsing() {
+        use crate::scene::parse_bookmark_epoch;
+        let same = |a: Epoch, b: Epoch| a.seconds_since(b).abs() < 1e-3;
+        for s in [
+            "+52026-11-20T00:00:00Z",
+            "-0500-03-21T06:30:15Z",
+            "-0001-06-30T23:59:59Z",
+            "-12345-07-04T12:00:00Z",
+            "+2026000-02-29T01:02:03Z",
+        ] {
+            let e = parse_bookmark_epoch(s).unwrap_or_else(|| panic!("{s} parses"));
+            assert_eq!(iso_utc(e), s);
+        }
+        // Within seconds of the years 0000 and 10000 the two forms meet (TAI − UTC differs by up
+        // to 27 s between the eras); either form reads back to the same second.
+        for s in [
+            "+10000-01-01T00:00:00Z",
+            "-0001-12-31T23:59:59Z",
+            "+9999-12-31T23:59:58Z",
+        ] {
+            let e = parse_bookmark_epoch(s).unwrap_or_else(|| panic!("{s} parses"));
+            let out = iso_utc(e);
+            let back = parse_bookmark_epoch(&out).unwrap_or_else(|| panic!("{out} parses"));
+            assert!(same(back, e), "{s} → {out}");
+        }
+        // An epoch reached by running time (not parsed): its string parses back to the second.
+        let start = Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap();
+        for years in [-2_526.0, -2_027.5, 7_974.0, 50_000.25, -1.0e6] {
+            let e = start.add_seconds(years * 365.25 * uni_core::DAY + 0.4);
+            let s = iso_utc(e);
+            let back = parse_bookmark_epoch(&s).unwrap_or_else(|| panic!("{s} parses"));
+            let off = back.seconds_since(e);
+            assert!((-1.0..=0.0).contains(&off), "{s}: {off} s");
+            assert_eq!(iso_utc(back), s);
+        }
+        // Years 0000–9999 keep the plain form.
+        let e = parse_bookmark_epoch("0001-01-01T00:00:00Z").unwrap();
+        assert_eq!(iso_utc(e), "0001-01-01T00:00:00Z");
     }
 
     #[test]

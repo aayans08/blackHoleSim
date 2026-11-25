@@ -1686,9 +1686,13 @@ pub fn parse_bookmark_epoch(s: &str) -> Option<Epoch> {
     let cycles = (year - 2000).div_euclid(400);
     let base_year = year - 400 * cycles;
     let base = Epoch::parse_iso_utc(&format!("{base_year:04}{}", &body[dash..]))?;
-    const CYCLE_S: f64 = 146_097.0 * DAY;
-    Some(base.add_seconds(cycles as f64 * CYCLE_S))
+    Some(base.add_seconds(cycles as f64 * GREGORIAN_CYCLE_S))
 }
+
+/// One 400-year cycle of the proleptic Gregorian calendar [s]: 146 097 days, after which the
+/// calendar repeats exactly (97 leap years in 400). [`parse_bookmark_epoch`] and
+/// `crate::world::iso_utc` shift expanded-year dates by whole cycles.
+pub const GREGORIAN_CYCLE_S: f64 = 146_097.0 * DAY;
 
 #[cfg(test)]
 mod tests {
