@@ -16,6 +16,8 @@
 //!   positions against brightness centroids (see `points`).
 //! - `bench --json <bench.json> --max-gpu-ms <ms> --max-cpu-ms <ms> --max-interval-ms <ms>
 //!   [--window last10s|first10s|all] [--budgets]` checks bench p95 timings (see `bench`).
+//! - `gate --captures <dir> --hud <dir> [--out <checks.json>]` runs the M1 gate's numeric checks
+//!   (the plan's bookmark table) and writes `checks.json` (see `gate`).
 //! - HDR checks on the `--hdr` capture sidecar (see `hdr`): `ratio`, `stats`, `samples`,
 //!   `profile`, `angle`, `flux`, `limb`, each with `--hdr-json <capture.json>`. They may also
 //!   be written `hdr <check> …`.
@@ -27,6 +29,7 @@
 mod bench;
 mod contact;
 mod disk;
+mod gate;
 mod hdr;
 mod points;
 mod shadow;
@@ -50,6 +53,7 @@ const USAGE: &str = "usage:
   uni-verify points --png <file> --json <capture.json> --names <a,b,...> --tol <px>
   uni-verify bench --json <bench.json> --max-gpu-ms <ms> --max-cpu-ms <ms> --max-interval-ms <ms>
       [--window last10s|first10s|all] [--budgets]
+  uni-verify gate --captures <hdr capture dir> --hud <hud capture dir> [--out <checks.json>]
   uni-verify ratio --hdr-json <capture.json> --num <region> --den <region>
       [--channels r/b|b/r|g|luma] [--stat mean|median] [--min x] [--max x]
       [--expect x --rel-tol t]
@@ -115,6 +119,7 @@ enum Command {
         tol: f64,
     },
     Bench(bench::BenchArgs),
+    Gate(gate::GateArgs),
     Ratio {
         hdr_json: PathBuf,
         args: hdr::RatioArgs,
@@ -409,6 +414,14 @@ fn parse_command(command: &OsString, options: &[OsString]) -> anyhow::Result<Com
                 budgets: o.switch("--budgets"),
             }))
         }
+        "gate" => {
+            let o = parse_options(options, &["--captures", "--hud", "--out"], &[])?;
+            Ok(Command::Gate(gate::GateArgs {
+                captures: o.path("--captures")?,
+                hud: o.path("--hud")?,
+                out: o.opt_path("--out"),
+            }))
+        }
         "ratio" => {
             let o = parse_options(
                 options,
@@ -614,6 +627,18 @@ fn run(command: Command) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Gate(args) => Ok(finish(gate::run(&args)?)),
+        check => Ok(finish(verdict(check)?)),
+    }
+}
+
+/// Runs one check command and returns its verdict (the `gate` runs its checks through this);
+/// `sheet`, `contact` and `gate` are not checks and give an error.
+pub(crate) fn verdict(command: Command) -> anyhow::Result<Verdict> {
+    match command {
+        Command::Sheet { .. } | Command::Contact { .. } | Command::Gate(_) => {
+            bail!("not a check command")
+        }
         Command::Shadow {
             source: ShadowSource::Png(png),
             expected_px,
@@ -621,11 +646,10 @@ fn run(command: Command) -> anyhow::Result<ExitCode> {
         } => {
             let measured = shadow::shadow_radius(&shadow::load_rgb8(&png)?);
             let pass = shadow::passes(measured, expected_px, tol);
-            println!("{}", shadow::report_line(measured, expected_px, pass));
-            Ok(finish(Verdict {
-                lines: Vec::new(),
+            Ok(Verdict {
+                lines: vec![shadow::report_line(measured, expected_px, pass)],
                 pass,
-            }))
+            })
         }
         Command::Shadow {
             source: ShadowSource::Hdr(json),
@@ -633,60 +657,45 @@ fn run(command: Command) -> anyhow::Result<ExitCode> {
             tol,
         } => {
             let capture = hdr::HdrCapture::load(&json)?;
-            Ok(finish(shadow::check_hdr(&capture, expected_px, tol)?))
+            shadow::check_hdr(&capture, expected_px, tol)
         }
-        Command::Disk(args) => Ok(finish(disk::run(&args)?)),
+        Command::Disk(args) => disk::run(&args),
         Command::Points {
             png,
             json,
             names,
             tol,
-        } => Ok(finish(points::run(&png, &json, &names, tol)?)),
-        Command::Bench(args) => Ok(finish(bench::run(&args)?)),
+        } => points::run(&png, &json, &names, tol),
+        Command::Bench(args) => bench::run(&args),
         Command::Ratio { hdr_json, args } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_ratio(&capture, &args)?))
+            hdr::check_ratio(&hdr::HdrCapture::load(&hdr_json)?, &args)
         }
         Command::Stats { hdr_json, args } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_stats(&capture, &args)?))
+            hdr::check_stats(&hdr::HdrCapture::load(&hdr_json)?, &args)
         }
         Command::Samples { hdr_json, tol } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_samples(&capture, tol)?))
+            hdr::check_samples(&hdr::HdrCapture::load(&hdr_json)?, tol)
         }
         Command::Profile {
             hdr_json,
             feature,
             tol,
-        } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_profile(&capture, &feature, tol)?))
-        }
+        } => hdr::check_profile(&hdr::HdrCapture::load(&hdr_json)?, &feature, tol),
         Command::Angle {
             hdr_json,
             feature,
             tol_deg,
-        } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_angle(&capture, &feature, tol_deg)?))
-        }
+        } => hdr::check_angle(&hdr::HdrCapture::load(&hdr_json)?, &feature, tol_deg),
         Command::Flux {
             hdr_json,
             name,
             tol,
-        } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_flux(&capture, &name, tol)?))
-        }
+        } => hdr::check_flux(&hdr::HdrCapture::load(&hdr_json)?, &name, tol),
         Command::Limb {
             hdr_json,
             name,
             tol,
-        } => {
-            let capture = hdr::HdrCapture::load(&hdr_json)?;
-            Ok(finish(hdr::check_limb(&capture, &name, tol)?))
-        }
+        } => hdr::check_limb(&hdr::HdrCapture::load(&hdr_json)?, &name, tol),
     }
 }
 
@@ -897,6 +906,42 @@ mod tests {
                 budgets: true,
             })
         );
+    }
+
+    #[test]
+    fn parses_the_gate_command() {
+        assert_eq!(
+            parse(&[
+                "gate",
+                "--captures",
+                "captures/m1-gate",
+                "--hud",
+                "captures/m1-gate-hud",
+            ]),
+            Command::Gate(gate::GateArgs {
+                captures: PathBuf::from("captures/m1-gate"),
+                hud: PathBuf::from("captures/m1-gate-hud"),
+                out: None,
+            })
+        );
+        assert_eq!(
+            parse(&["gate", "--out", "o.json", "--hud", "h", "--captures", "c"]),
+            Command::Gate(gate::GateArgs {
+                captures: PathBuf::from("c"),
+                hud: PathBuf::from("h"),
+                out: Some(PathBuf::from("o.json")),
+            })
+        );
+        for bad in [
+            &["gate", "--captures", "c"][..],
+            &["gate", "--hud", "h"],
+            &["gate", "--captures", "c", "--hud", "h", "--tol", "1"],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "accepted {bad:?}");
+        }
+        // The gate is not a check, so it never runs through `verdict`.
+        let gate = parse(&["gate", "--captures", "c", "--hud", "h"]);
+        assert!(verdict(gate).is_err());
     }
 
     #[test]

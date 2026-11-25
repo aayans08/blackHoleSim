@@ -22,9 +22,10 @@
 //! their pixel lists.
 //!
 //! Above the captures:
-//! - **Checks**, from `<captures>/checks.json` (written by the lead's gate run): an array of
-//!   `{bookmark, check, measured, expected, pass}` (or `{checks: [...]}`), one row each, with
-//!   `pass` shown as PASS or FAIL and a count of each.
+//! - **Checks**, from `<captures>/checks.json` (written by `uni-verify gate`, see `gate`): an
+//!   array of `{row, bookmark, check, output, pass}` or `{bookmark, check, measured, expected,
+//!   pass}` (or `{checks: [...]}`), one row each, with `output` shown as the measured value when
+//!   there is no `measured`, and `pass` shown as PASS or FAIL with a count of each.
 //! - **Performance**, from the bench JSON (`--bench`, else `<captures>/bench.json`; schema in
 //!   `bench`): per bookmark, the first and last 10 s side by side for p95 GPU frame, p95 CPU and
 //!   p95 frame interval, the mean frame rate, and the passes over 1.25 × their budget in the
@@ -116,12 +117,18 @@ enum Loaded<T> {
 /// One row of `checks.json`, read tolerantly: every field may be missing or of any type.
 #[derive(Debug, Default, Deserialize)]
 struct CheckRow {
+    /// The plan row (`gate`).
+    #[serde(default)]
+    row: Option<Value>,
     #[serde(default)]
     bookmark: Option<Value>,
     #[serde(default)]
     check: Option<Value>,
     #[serde(default)]
     measured: Option<Value>,
+    /// The check's last output line (`gate`), shown when there is no `measured`.
+    #[serde(default)]
+    output: Option<Value>,
     #[serde(default)]
     expected: Option<Value>,
     #[serde(default)]
@@ -621,17 +628,18 @@ fn render_checks(html: &mut String, rows: &[CheckRow]) {
     let _ = write!(
         html,
         "<section class=\"panel\">\n<h2>Checks</h2>\n<p class=\"meta\">{summary}</p>\n\
-         <div class=\"scroll\"><table class=\"wide\">\n<thead><tr><th>bookmark</th>\
+         <div class=\"scroll\"><table class=\"wide\">\n<thead><tr><th>row</th><th>bookmark</th>\
          <th>check</th><th>measured</th><th>expected</th><th>result</th></tr></thead>\n<tbody>\n"
     );
     for (row, (word, class)) in rows.iter().zip(&verdicts) {
         let _ = writeln!(
             html,
-            "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
-             <td class=\"{class}\">{}</td></tr>",
+            "<tr><td class=\"num\">{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td>\
+             <td class=\"num\">{}</td><td class=\"{class}\">{}</td></tr>",
+            escape(&text(row.row.as_ref())),
             escape(&text(row.bookmark.as_ref())),
             escape(&text(row.check.as_ref())),
-            escape(&text(row.measured.as_ref())),
+            escape(&text(row.measured.as_ref().or(row.output.as_ref()))),
             escape(&text(row.expected.as_ref())),
             escape(word),
         );
@@ -1011,6 +1019,38 @@ mod tests {
             generated.len() == 23 && generated.ends_with(" UTC"),
             "generated {generated:?}"
         );
+    }
+
+    /// `uni-verify gate` writes `{row, bookmark, check, pass, output}`: the row and the output
+    /// line are shown (as the measured value), with each verdict.
+    #[test]
+    fn sheet_shows_gate_checks() {
+        let caps = temp_dir("sheet_shows_gate_checks");
+        RgbImage::from_pixel(4, 2, Rgb([9, 9, 9]))
+            .save(caps.join("sun-closeup.png"))
+            .expect("write PNG");
+        fs::write(
+            caps.join("checks.json"),
+            r#"[{"row": 11, "bookmark": "sun-closeup", "check": "JSON ev100 within limits",
+                 "pass": true, "output": "ev100 [33.97, -6.5] within [-30, 40], no NaN PASS"},
+                {"row": 27, "bookmark": "bh-lens-seam", "check": "ratio seam",
+                 "pass": false, "output": "error: cannot read bh-lens-seam.hdr.bin FAIL"}]"#,
+        )
+        .expect("write checks");
+        let out = caps.join("index.html");
+        write_sheet(&caps, &out, None).expect("sheet");
+        let html = fs::read_to_string(&out).expect("read sheet");
+        let _ = fs::remove_dir_all(&caps);
+        assert!(html.contains("<th>row</th>"), "{html}");
+        for text in [
+            "<td class=\"num\">11</td>",
+            "<td class=\"num\">27</td>",
+            "ev100 [33.97, -6.5] within [-30, 40], no NaN PASS",
+            "error: cannot read bh-lens-seam.hdr.bin FAIL",
+            "1 PASS · 1 FAIL",
+        ] {
+            assert!(html.contains(text), "missing {text:?}");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "uni-verify"
-description = "Capture verification: HTML contact sheet and black-hole shadow measurement."
+description = "Capture verification: sheets, contact PNGs, the shadow, disk, points and HDR checks, bench timings and the M1 gate."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
