@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use glam::DVec3;
 use uni_core::FrameId;
-use uni_physics::photometry::Brdf;
+use uni_physics::photometry::{Brdf, PhaseLaw};
 
 /// Index of an object in the world's registry.
 pub type ObjectId = u32;
@@ -76,6 +76,11 @@ pub(crate) struct Physical {
     pub brdf: Brdf,
     /// V geometric albedo p_V.
     pub geometric_albedo: f64,
+    /// The observed phase law the point path scales the BRDF's flux to
+    /// (`photometry::phase_correction`): Mallama & Hilton for the planets, the lunar law for the
+    /// Moon, H–G with the record's own slope for a catalogue asteroid, none otherwise (final
+    /// review physics I3).
+    pub phase_law: PhaseLaw,
     /// Volumetric mean radius (a·b·c)^⅓ [m]: the size behind a body's disk-integrated flux.
     pub mean_radius_m: f64,
     /// An atmosphere the renderer models (uni-atmo's presets: Venus, Earth, Mars, Titan).

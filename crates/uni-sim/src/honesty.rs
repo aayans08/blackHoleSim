@@ -22,6 +22,15 @@ pub enum HonestyFlag {
     /// The selected comet, or a comet the last snapshot drew, is still being re-osculated
     /// toward the shown date after a date change (amber).
     CometsCatchingUp,
+    /// The epoch is outside the Meeus moon theories' J2000 ± 3000 yr (about 1000 BC – AD 5000)
+    /// and the Moon, the Galileans or Saturn's eight major moons run on their JPL mean elements:
+    /// the Moon's phase and node, and Saturn's moons' angles, are effectively unknown there, and
+    /// the moons (and the Earth, placed from the Moon) jump at the window's edges (final review
+    /// physics I1; uni-physics `EphemFlag::MoonTheoryFallback`) (amber).
+    MoonsMeanElements,
+    /// Outside that window, moons without mean elements (no `sat_elements.ron`) stay at their
+    /// window-edge positions and stop orbiting (uni-physics `EphemFlag::MoonsFrozen`) (amber).
+    MoonsFrozen,
 }
 
 /// The exact on-screen text of `f`.
@@ -44,20 +53,29 @@ pub fn label(f: HonestyFlag) -> &'static str {
         HonestyFlag::CometsCatchingUp => {
             "Comet positions catching up after a date change (approximate)"
         }
+        HonestyFlag::MoonsMeanElements => {
+            "Moon positions: mean elements outside 1000 BC \u{2013} AD 5000 (approximate)"
+        }
+        HonestyFlag::MoonsFrozen => {
+            "Moon positions frozen outside 1000 BC \u{2013} AD 5000 (no mean elements loaded)"
+        }
     }
 }
 
 /// Whether `f` labels something non-physical or extrapolated (amber) rather than an
 /// approximate-but-physical model (neutral grey), per the colour column of the M1 plan's table
 /// "Honesty labels in M1" (Task C0, A4r minor "no severity map"): amber for the three
-/// extrapolation flags and [`HonestyFlag::CometsCatchingUp`] (lead ruling A4 open 1), grey for
-/// the band model, the band's procedural detail and the procedural belt.
+/// extrapolation flags and [`HonestyFlag::CometsCatchingUp`] (lead ruling A4 open 1), and for
+/// the two moon flags (final review physics I1: positions effectively unknown, or frozen), grey
+/// for the band model, the band's procedural detail and the procedural belt.
 pub fn is_non_physical(f: HonestyFlag) -> bool {
     match f {
         HonestyFlag::PlanetsExtrapolated
         | HonestyFlag::PlutoExtrapolated
         | HonestyFlag::StarsExtrapolated
-        | HonestyFlag::CometsCatchingUp => true,
+        | HonestyFlag::CometsCatchingUp
+        | HonestyFlag::MoonsMeanElements
+        | HonestyFlag::MoonsFrozen => true,
         HonestyFlag::BandModel
         | HonestyFlag::MilkyWayDetailProcedural
         | HonestyFlag::ProceduralBelt => false,
@@ -76,6 +94,8 @@ mod tests {
             HonestyFlag::PlutoExtrapolated,
             HonestyFlag::StarsExtrapolated,
             HonestyFlag::CometsCatchingUp,
+            HonestyFlag::MoonsMeanElements,
+            HonestyFlag::MoonsFrozen,
         ];
         let grey = [
             HonestyFlag::BandModel,
@@ -123,6 +143,15 @@ mod tests {
             (
                 HonestyFlag::CometsCatchingUp,
                 "Comet positions catching up after a date change (approximate)",
+            ),
+            // Final review physics I1 (not in the plan's table; the lead's triage asked for it).
+            (
+                HonestyFlag::MoonsMeanElements,
+                "Moon positions: mean elements outside 1000 BC \u{2013} AD 5000 (approximate)",
+            ),
+            (
+                HonestyFlag::MoonsFrozen,
+                "Moon positions frozen outside 1000 BC \u{2013} AD 5000 (no mean elements loaded)",
             ),
         ];
         for (flag, text) in expected {

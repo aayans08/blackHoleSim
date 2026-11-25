@@ -37,7 +37,8 @@ use uni_core::{
 };
 use uni_physics::kepler::Conic;
 use uni_physics::photometry::{
-    Brdf, comet_total_v, disk_phase_function, planet_phase_correction, rho_from_geometric_albedo,
+    Brdf, comet_total_v, disk_phase_function, phase_correction, rho_from_geometric_albedo,
+    saturn_ring_factor,
 };
 use uni_physics::smallbody::heliocentric_state_icrs;
 
@@ -920,14 +921,27 @@ fn occluders(
 ///
 /// A body lit at normal incidence by E☉ sends ρ·[L + 2(1 − L)/3]·E☉·(R/d)²·Φ(α), the
 /// closed form of `photometry::disk_illuminance_lux` (`disk_phase_function`'s doc; lead ruling
-/// after A3: never the 65 536-sample integral per frame), times Mallama & Hilton's C(α)
-/// for the planets, clamped to ≤ 10 as in the disk path (lead ruling). C holds its value
-/// beyond each law's range; for Earth and Mars that hold starts at 170°, A3's choice accepted
-/// by the lead. ρ comes from p_V (`rho_from_geometric_albedo`), R is the volumetric mean
-/// radius.
+/// after A3: never the 65 536-sample integral per frame), times the correction C(α) to the
+/// body's observed phase law (`photometry::phase_correction` with `Physical::phase_law`),
+/// clamped to ≤ 10 as in the disk path (lead ruling). ρ comes from p_V
+/// (`rho_from_geometric_albedo`), R is the volumetric mean radius. The laws (final review
+/// physics I3 for the last two):
+/// - the planets: Mallama & Hilton 2018, the same C the bodies pass applies (it holds beyond
+///   each law's range; for Earth and Mars from 170°, A3's choice accepted by the lead);
+/// - the Moon: Krisciunas & Schaefer 1991 Eq. 9 (Allen 1976), also the bodies pass's C;
+/// - a catalogue asteroid (H ≤ 10): H–G with its record's G, so with its H-consistent albedo
+///   (`World`'s `asteroid_size`) the point is exactly `photometry::asteroid_v`, as uni-sky draws
+///   the fainter ones. The bodies pass calls `planet_phase_correction`, which knows only the
+///   default G 0.15: for the 98 of 8 973 registry asteroids whose SBDB slope differs, the
+///   resolved disk differs from this point by Φ(α; G)/Φ(α; 0.15) until it gets the record's G
+///   (Vesta, G 0.32: 0.20 mag at α 20°, 0.35 mag at 90°).
+///
+/// Saturn's point also carries its rings: × `photometry::saturn_ring_factor` (Mallama & Hilton
+/// 2018 Eq. 10 over the globe's law, the ring tilts from the camera's and the Sun's latitudes
+/// above Saturn's equator, the plane `RingView` draws the rings in; final review physics I2).
 ///
 /// A comet is its nucleus alone (lead ruling "comet double light", Task C6): a p_V 0.04
-/// lunar-Lambert (L = 0.9) body of its (assumed) radius with no planetary phase correction, the
+/// lunar-Lambert (L = 0.9) body of its (assumed) radius with no observed phase law, the
 /// model of `uni_planet::comet::nucleus::nucleus_illuminance_lux` (uni-app's
 /// `comet_point_is_the_nucleus_alone` pins the two equal). The comet pass draws the coma and
 /// tails, which carry the rest of SBDB's total magnitude ([`comet_prominence_lux`]).
@@ -950,13 +964,15 @@ pub(crate) fn reflected_lux(
         Brdf::LunarLambert { l } => l + 2.0 * (1.0 - l) / 3.0,
     };
     let rho = rho_from_geometric_albedo(brdf, physical.geometric_albedo);
-    // A comet's `naif` holds its SBDB SPK-ID (ruling C.9), never a planet's id: no correction.
-    let is_comet = matches!(physical.source, Source::Comet(_));
-    let correction = world.objects[id as usize]
-        .naif
-        .filter(|_| !is_comet)
-        .map_or(1.0, |n| planet_phase_correction(n, brdf, phase))
-        .min(MAX_PHASE_CORRECTION);
+    let correction = phase_correction(physical.phase_law, brdf, phase).min(MAX_PHASE_CORRECTION);
+    let rings =
+        if physical.source == Source::Ephem && world.objects[id as usize].naif == Some(SATURN) {
+            let pole = world.orientation(id) * DVec3::Z;
+            let latitude = |v: DVec3| (pole.dot(v) / v.length()).clamp(-1.0, 1.0).asin();
+            saturn_ring_factor(phase, latitude(-rel), latitude(sun_rel))
+        } else {
+            1.0
+        };
     let ratio = physical.mean_radius_m / d;
     rho * weight
         * (sun_cd / (r_sun * r_sun))
@@ -964,6 +980,7 @@ pub(crate) fn reflected_lux(
         * ratio
         * disk_phase_function(brdf, phase)
         * correction
+        * rings
 }
 
 /// A comet's prominence [lx] at the camera: its total (nucleus + coma) magnitude from its M1, K1

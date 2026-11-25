@@ -217,8 +217,9 @@ pub fn disk_phase_function(brdf: Brdf, phase_rad: f64) -> f64 {
 ///   the sub-Earth-longitude and L_s terms (not modelled here; 0.018 mag at the 2026-11-20
 ///   spot).
 /// - Jupiter, Eq. 8 for α ≤ 12°, Eq. 9 above (Mayorga et al. 2016, Cassini green filter).
-/// - Saturn's globe without its rings, Eq. 11 for α ≤ 6°, Eq. 12 above. The rings are a
-///   separate body in the renderer, so the ringed law (Eq. 10) is not used.
+/// - Saturn's globe without its rings, Eq. 11 for α ≤ 6°, Eq. 12 above. The renderer draws the
+///   rings as their own pass, so the disk's correction is the globe's; the point path adds the
+///   rings with the ringed law, Eq. 10 ([`saturn_ring_factor`]).
 /// - Uranus, Eq. 15 without its −8.4 × 10⁻⁴ φ′ sub-latitude term (≤ 0.07 mag, φ′ ≤ 82°).
 /// - Neptune, Eq. 17 (the post-2000 V(1,0) = −7.00 of Eq. 16).
 fn mallama_hilton_v1(naif: NaifId, a: f64) -> Option<f64> {
@@ -280,37 +281,193 @@ fn mallama_hilton_max_deg(naif: NaifId) -> Option<f64> {
     }
 }
 
-/// Observed-phase-curve correction for planet `naif` drawn with `brdf`: the factor that makes
-/// the BRDF's disk-integrated flux at phase `phase_rad` follow Mallama & Hilton 2018.
+/// The H–G slope used where none was measured: G = 0.15, the value JPL's Small-Body Database
+/// documents as its default and lists for such objects (the slope `uni-data`'s asteroid loader
+/// and uni-sky's procedural belt use).
+pub const DEFAULT_HG_SLOPE: f64 = 0.15;
+
+/// The largest phase angle [deg] at which the Moon's law is evaluated; beyond it
+/// [`phase_correction`] holds its value there. Krisciunas & Schaefer state no upper limit; the
+/// hold keeps C bounded where the BRDF's crescent Φ_brdf → 0 (C would reach 7 at 178°), and
+/// 170° is the hold A3 chose for Earth's and Mars's laws (`mallama_hilton_max_deg`).
+const MOON_LAW_MAX_DEG: f64 = 170.0;
+
+/// The observed disk-integrated phase law a body follows. The BRDF ([`Brdf`]) shapes the
+/// radiance across a resolved disk; [`phase_correction`] scales its total to this law.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PhaseLaw {
+    /// No observed law: the BRDF's own phase function (C = 1).
+    Brdf,
+    /// Mallama & Hilton 2018's law for planet `naif` (Saturn: the globe alone).
+    Planet(NaifId),
+    /// The Moon's observed law, Krisciunas & Schaefer 1991 Eq. 9 (from Allen 1976).
+    Moon,
+    /// The IAU H, G system (Bowell et al. 1989) with slope `g`.
+    HG { g: f64 },
+}
+
+/// NAIF's asteroid id ranges (NAIF, "NAIF Integer ID codes" Required Reading, §Asteroids; the
+/// same ranges as `uni_data::smallbody`): original schema numbered 2 000 001–2 999 999, extended
+/// schema numbered 20 000 001–49 999 999 and provisional 50 000 001–99 999 999.
+fn is_asteroid_naif(naif: NaifId) -> bool {
+    (2_000_001..=2_999_999).contains(&naif) || (20_000_001..=99_999_999).contains(&naif)
+}
+
+impl PhaseLaw {
+    /// The law body `naif` follows when nothing else is known about it: Mallama & Hilton for the
+    /// eight planets, the lunar law for the Moon (301), H–G with [`DEFAULT_HG_SLOPE`] for an
+    /// asteroid id (the caller passes the record's own slope where it has one), the BRDF for
+    /// everything else (the other moons, Pluto, comets).
+    pub fn for_naif(naif: NaifId) -> PhaseLaw {
+        if mallama_hilton_max_deg(naif).is_some() {
+            PhaseLaw::Planet(naif)
+        } else if naif == 301 {
+            PhaseLaw::Moon
+        } else if is_asteroid_naif(naif) {
+            PhaseLaw::HG {
+                g: DEFAULT_HG_SLOPE,
+            }
+        } else {
+            PhaseLaw::Brdf
+        }
+    }
+}
+
+/// The Moon's V(α) − V(0) [mag] at phase `a_deg` ≥ 0: 0.026α + 4 × 10⁻⁹α⁴, α in degrees.
 ///
-/// C(α) = 10^(−0.4[V(1, α) − V(1, 0)]) / Φ_brdf(α), with V(1, ·) the paper's law for the planet
-/// (see `mallama_hilton_v1`) and Φ_brdf = [`disk_phase_function`]. C(0) = 1, so the geometric
-/// albedo calibration ([`rho_from_geometric_albedo`]) is untouched; only the phase dependence
-/// changes. Lambert and lunar-Lambert spheres cannot reproduce the observed curves (A3 review
-/// r0 I1): at the 2026-11-20 spots they put Mercury 1.78 mag too bright at α = 82°, Mars
-/// 0.47 mag too bright at 38° and Venus 0.54 mag too faint at 130°. Multiplying by C brings all
-/// seven planets within 0.1 mag of Horizons (`planet_magnitudes_vs_horizons`).
+/// Krisciunas & Schaefer 1991 (PASP 103, 1033) Eq. 9, m = −12.73 + 0.026|α| + 4 × 10⁻⁹α⁴ at
+/// the mean distance, "see page 144 of Allen 1976" (*Astrophysical Quantities*, 3rd ed.); they
+/// note it agrees at α = 0 with Lane & Irvine 1973 (AJ 78, 267) extrapolated, and that it leaves
+/// out the opposition surge (the full Moon is ~35 % brighter for |α| < 7°), which is not
+/// modelled here either.
+fn moon_dimming_mag(a_deg: f64) -> f64 {
+    0.026 * a_deg + 4.0e-9 * a_deg.powi(4)
+}
+
+/// Observed-phase-curve correction for a body following `law`, drawn with `brdf`: the factor
+/// that makes the BRDF's disk-integrated flux at phase `phase_rad` follow the law.
 ///
-/// Use: multiply the point flux (`disk_illuminance_lux`, or the closed form in
-/// [`disk_phase_function`]'s doc) by C, and the disk's radiance by the same C at every pixel,
-/// so the two paths still agree at the handover. The radiance distribution across the disk
-/// keeps the BRDF's shape; only its total follows the observed curve. Beyond the law's range
-/// (`mallama_hilton_max_deg`) C is held at its value at the limit, so the BRDF's own shape
-/// carries the deeper crescent. Bodies without a law (the Moon, Pluto, moons, small bodies)
-/// get 1. The phase angle is unsigned; NaN gives NaN.
-pub fn planet_phase_correction(naif: NaifId, brdf: Brdf, phase_rad: f64) -> f64 {
+/// C(α) = Φ_law(α) / Φ_brdf(α), with Φ_brdf = [`disk_phase_function`] and Φ_law the law's
+/// brightness relative to α = 0:
+/// - [`PhaseLaw::Planet`]: 10^(−0.4[V(1, α) − V(1, 0)]) with Mallama & Hilton 2018's V(1, ·)
+///   (`mallama_hilton_v1`), held beyond the law's range (`mallama_hilton_max_deg`). Lambert and
+///   lunar-Lambert spheres cannot reproduce the observed curves (A3 review r0 I1): at the
+///   2026-11-20 spots they put Mercury 1.78 mag too bright at α = 82°, Mars 0.47 mag too
+///   bright at 38° and Venus 0.54 mag too faint at 130°; with C all seven planets come within
+///   0.1 mag of Horizons (`planet_magnitudes_vs_horizons`).
+/// - [`PhaseLaw::Moon`]: 10^(−0.4 [`moon_dimming_mag`]) (Krisciunas & Schaefer 1991 Eq. 9),
+///   held beyond 170° ([`MOON_LAW_MAX_DEG`]). Lunar-Lambert L 0.9 alone dims the Moon by
+///   1.07 mag at α = 90°, the observed law by 2.60 mag (final review physics I3).
+/// - [`PhaseLaw::HG`]: Bowell et al.'s Φ(α; G) ([`hg_phase`]) at every phase, as uni-sky draws
+///   the fainter asteroids (`asteroid_v`), so the two agree at H = 10. Lunar-Lambert alone dims
+///   an asteroid by 0.08 mag at α = 20°, H–G (G 0.15) by 1.00 mag.
+/// - [`PhaseLaw::Brdf`]: 1.
+///
+/// C(0) = 1, so the geometric albedo calibration ([`rho_from_geometric_albedo`]) is untouched;
+/// only the phase dependence changes. Use: multiply the point flux (`disk_illuminance_lux`, or
+/// the closed form in [`disk_phase_function`]'s doc) by C, and the disk's radiance by the same C
+/// at every pixel, so the two paths still agree at the handover. The radiance distribution
+/// across the disk keeps the BRDF's shape; only its total follows the observed curve. At α = π
+/// (Φ_brdf = 0, nothing lit is visible) an H–G or lunar law gives 0. The phase angle is
+/// unsigned; NaN gives NaN.
+pub fn phase_correction(law: PhaseLaw, brdf: Brdf, phase_rad: f64) -> f64 {
     if phase_rad.is_nan() {
         return f64::NAN;
     }
-    let (Some(max_deg), Some(v0)) = (mallama_hilton_max_deg(naif), mallama_hilton_v1(naif, 0.0))
-    else {
+    let a_deg = phase_rad.abs().to_degrees().min(180.0);
+    let ratio = |observed: f64, a_deg: f64| {
+        let phi = disk_phase_function(brdf, a_deg.to_radians());
+        if phi > 0.0 { observed / phi } else { 0.0 }
+    };
+    match law {
+        PhaseLaw::Brdf => 1.0,
+        PhaseLaw::Planet(naif) => {
+            let (Some(max_deg), Some(v0)) =
+                (mallama_hilton_max_deg(naif), mallama_hilton_v1(naif, 0.0))
+            else {
+                return 1.0;
+            };
+            let a = a_deg.min(max_deg);
+            let Some(v) = mallama_hilton_v1(naif, a) else {
+                return 1.0;
+            };
+            ratio(10_f64.powf(-0.4 * (v - v0)), a)
+        }
+        PhaseLaw::Moon => {
+            let a = a_deg.min(MOON_LAW_MAX_DEG);
+            ratio(10_f64.powf(-0.4 * moon_dimming_mag(a)), a)
+        }
+        PhaseLaw::HG { g } => ratio(hg_phase(a_deg.to_radians(), g), a_deg),
+    }
+}
+
+/// [`phase_correction`] with the law of body `naif` ([`PhaseLaw::for_naif`]): Mallama & Hilton
+/// for the planets, the lunar law for the Moon, H–G with the default slope for an asteroid id, 1
+/// for every other body. The bodies pass (uni-planet) and the point path both call it, so the
+/// point ↔ disk handover stays continuous; uni-sim's point path passes an asteroid's own slope
+/// through [`phase_correction`] instead.
+pub fn planet_phase_correction(naif: NaifId, brdf: Brdf, phase_rad: f64) -> f64 {
+    phase_correction(PhaseLaw::for_naif(naif), brdf, phase_rad)
+}
+
+/// Mallama & Hilton 2018 Eq. 10: V(1, α) of Saturn *with its rings*, α in degrees, `beta_deg`
+/// the effective ring inclination ([`saturn_effective_ring_tilt_deg`]):
+/// V = −8.914 − 1.825 sin β + 0.026α − 0.378 sin β e^(−2.25α). The paper fits it (Mallama 2012)
+/// for α < 6.5° and β < 27°; it is the ringed magnitude *The Astronomical Almanac* tabulates.
+fn saturn_ringed_v1(a_deg: f64, beta_deg: f64) -> f64 {
+    let s = beta_deg.to_radians().sin();
+    -8.914 - 1.825 * s + 0.026 * a_deg - 0.378 * s * (-2.25 * a_deg).exp()
+}
+
+/// Eq. 10's range: α < 6.5°, β < 27° (Mallama & Hilton 2018 §3.6).
+const SATURN_RING_LAW_MAX_ALPHA_DEG: f64 = 6.5;
+const SATURN_RING_LAW_MAX_BETA_DEG: f64 = 27.0;
+
+/// Eq. 10's effective ring inclination β [deg] from the planetocentric latitudes of the observer
+/// (β_E) and of the Sun (β_S) above Saturn's ring (equatorial) plane, in degrees: (β_E β_S)^½
+/// when they have the same sign, 0 when the Sun lights one face and the observer sees the other
+/// (the rings are "backlit and very faint"; Mallama & Hilton 2018 §3.6). Unsigned.
+pub fn saturn_effective_ring_tilt_deg(observer_lat_deg: f64, sun_lat_deg: f64) -> f64 {
+    let product = observer_lat_deg * sun_lat_deg;
+    if product > 0.0 { product.sqrt() } else { 0.0 }
+}
+
+/// The factor k ≥ 1 by which Saturn's rings brighten Saturn seen as a point: the ringed law
+/// (Eq. 10) over the globe's law that [`planet_phase_correction`] gives (Eq. 11/12), at phase
+/// `phase_rad` with the observer and the Sun at planetocentric latitudes `observer_lat_rad`,
+/// `sun_lat_rad` above the ring plane (final review physics I2).
+///
+/// k = max(1, 10^(−0.4[V₁₀(α, β) − V_globe(α)])), with β = [`saturn_effective_ring_tilt_deg`]
+/// held at 27° and α held at 6.5° beyond Eq. 10's range:
+/// - The floor at 1: Eq. 10 at β = 0 is the globe with a 0.026 mag/deg phase slope that the
+///   paper calls "unrealistically steep for the globe alone, … probably due to aliasing from the
+///   much steeper slope of the ring system", and adopts Eq. 11 for the globe; so the rings'
+///   share is never taken below zero. The floor acts only for β below 1° (α = 0) to 5.7°
+///   (α = 6.5°), where Eq. 10 is 0.036–0.18 mag fainter than the globe law.
+/// - Beyond α = 6.5° the paper has no ringed law ("not enough information available"); k is
+///   held at its 6.5° value, as [`phase_correction`] holds each planet's law beyond its range,
+///   so the rings keep their share of the globe's light. Approximate, and only reached away from
+///   the Earth (Saturn's phase from the Earth never exceeds 6.4°).
+///
+/// At β = 26.7° (rings fully open) and α = 0, k = 2.40 (0.95 mag); at β 20°, α 5°, 1.55
+/// (0.47 mag); backlit rings or edge-on rings give 1. NaN in gives NaN.
+pub fn saturn_ring_factor(phase_rad: f64, observer_lat_rad: f64, sun_lat_rad: f64) -> f64 {
+    if phase_rad.is_nan() || observer_lat_rad.is_nan() || sun_lat_rad.is_nan() {
+        return f64::NAN;
+    }
+    let a = phase_rad
+        .abs()
+        .to_degrees()
+        .min(SATURN_RING_LAW_MAX_ALPHA_DEG);
+    let beta =
+        saturn_effective_ring_tilt_deg(observer_lat_rad.to_degrees(), sun_lat_rad.to_degrees())
+            .min(SATURN_RING_LAW_MAX_BETA_DEG);
+    let Some(globe) = mallama_hilton_v1(699, a) else {
         return 1.0;
     };
-    let a_deg = phase_rad.abs().to_degrees().min(max_deg);
-    let Some(v) = mallama_hilton_v1(naif, a_deg) else {
-        return 1.0;
-    };
-    10_f64.powf(-0.4 * (v - v0)) / disk_phase_function(brdf, a_deg.to_radians())
+    10_f64
+        .powf(-0.4 * (saturn_ringed_v1(a, beta) - globe))
+        .max(1.0)
 }
 
 /// Torres 2010 (AJ 140, 1158), Table 1: Flower's (1996, ApJ 469, 355) BC_V polynomial in
@@ -573,14 +730,15 @@ mod tests {
     }
 
     /// Lambert for bodies with atmospheres and the giants, lunar-Lambert L = 0.9 for Mercury
-    /// (plan B1); bounds 0.3 mag, 0.5 for Mercury, Venus and Saturn (brief, review I4).
+    /// (plan B1); bounds 0.3 mag, 0.5 for Mercury and Venus (brief, review I4). Saturn's was 0.5
+    /// for its rings until the point path drew them (final review physics I2); 0.3 now.
     #[rustfmt::skip]
     const PLANETS: [PlanetCase; 7] = [
         PlanetCase { naif: 199, name: "Mercury", brdf: LUNAR_LAMBERT, bound: 0.5 },
         PlanetCase { naif: 299, name: "Venus", brdf: Brdf::Lambert, bound: 0.5 },
         PlanetCase { naif: 499, name: "Mars", brdf: Brdf::Lambert, bound: 0.3 },
         PlanetCase { naif: 599, name: "Jupiter", brdf: Brdf::Lambert, bound: 0.3 },
-        PlanetCase { naif: 699, name: "Saturn", brdf: Brdf::Lambert, bound: 0.5 },
+        PlanetCase { naif: 699, name: "Saturn", brdf: Brdf::Lambert, bound: 0.3 },
         PlanetCase { naif: 799, name: "Uranus", brdf: Brdf::Lambert, bound: 0.3 },
         PlanetCase { naif: 899, name: "Neptune", brdf: Brdf::Lambert, bound: 0.3 },
     ];
@@ -608,8 +766,9 @@ mod tests {
     /// Review I4 and A3 review r0 I1. The brief's BRDFs alone (Lambert; lunar-Lambert L 0.9 for
     /// Mercury) miss Horizons' APmag by −1.779 (Mercury, α 82°), +0.536 (Venus, 130°) and
     /// −0.466 mag (Mars, 38°): their phase curves are not the planets' observed ones (Mallama &
-    /// Hilton 2018, which Horizons uses). With [`planet_phase_correction`] every planet meets
-    /// the brief's bound (0.3 mag; 0.5 for Mercury, Venus and Saturn). Both columns are printed.
+    /// Hilton 2018, which Horizons uses). With [`planet_phase_correction`] (and Saturn's rings,
+    /// [`saturn_ring_factor`], as the point path draws them) every planet meets the brief's
+    /// bound (0.3 mag; 0.5 for Mercury and Venus). Both columns are printed.
     #[test]
     fn planet_magnitudes_vs_horizons() {
         let spots = load_spots();
@@ -642,7 +801,16 @@ mod tests {
             );
             let e0 = star_illuminance_lux(0.0);
             let brdf_only = -2.5 * (e / e0).log10() - apmag;
-            let c = planet_phase_correction(case.naif, case.brdf, phase_deg.to_radians());
+            let mut c = planet_phase_correction(case.naif, case.brdf, phase_deg.to_radians());
+            if case.naif == 699 {
+                // The point path's rings (`saturn_ring_factor`), the tilts from this crate.
+                let (_, _, _, beta_e, beta_s) = saturn_geometry("2026-11-20T00:00:00Z");
+                c *= saturn_ring_factor(
+                    phase_deg.to_radians(),
+                    beta_e.to_radians(),
+                    beta_s.to_radians(),
+                );
+            }
             let diff = -2.5 * (e * c / e0).log10() - apmag;
             let brdf = match case.brdf {
                 Brdf::Lambert => "Lambert",
@@ -666,11 +834,11 @@ mod tests {
 
     /// The transcription of Mallama & Hilton 2018 against Horizons' APmag (which uses it) at the
     /// same spots: V = V(1, α) + 5 log₁₀(rΔ). Mercury, Venus and Jupiter agree to ≤ 0.001 mag
-    /// (bound 0.002). The others differ by what this module leaves out, each bound just above
+    /// (bound 0.002). The others differ by what this function leaves out, each bound just above
     /// the measured gap: Mars's sub-Earth-longitude and L_s terms (−0.018); Saturn's rings
-    /// (+0.085: APmag is brighter than the globe law, as the ringed Eq. 10 is at a ring opening
-    /// near 7°, which this test does not compute; the 2018 paper says Horizons then reported the
-    /// globe alone); Uranus's −8.4 × 10⁻⁴ φ′ sub-latitude term (+0.065, i.e. φ′ ≈ 77°); Neptune,
+    /// (+0.085: APmag is the ringed Eq. 10, which `saturn_with_rings_vs_mallama_hilton` matches
+    /// to 0.001 mag at this spot; this is the globe law alone, the disk's correction);
+    /// Uranus's −8.4 × 10⁻⁴ φ′ sub-latitude term (+0.065, i.e. φ′ ≈ 77°); Neptune,
     /// whose APmag matches Eq. 16's V(1,0) without Eq. 17's phase term (+0.013, that term at
     /// 1.57°).
     #[test]
@@ -778,10 +946,272 @@ mod tests {
             / disk_phase_function(LUNAR_LAMBERT, 50f64.to_radians());
         let c = planet_phase_correction(199, LUNAR_LAMBERT, 50f64.to_radians());
         assert!((c / want - 1.0).abs() < 1e-12, "{c} vs {want}");
-        // Bodies without a law are left alone; NaN propagates.
-        assert_eq!(planet_phase_correction(301, LUNAR_LAMBERT, 1.0), 1.0);
+        // Bodies without a law are left alone (Pluto, a moon other than ours, a comet's SPK-ID);
+        // the Moon and asteroid ids have laws now (final review physics I3); NaN propagates.
         assert_eq!(planet_phase_correction(999, LUNAR_LAMBERT, 1.0), 1.0);
+        assert_eq!(planet_phase_correction(401, LUNAR_LAMBERT, 1.0), 1.0);
+        assert_eq!(planet_phase_correction(1_000_036, LUNAR_LAMBERT, 1.0), 1.0);
+        assert!(planet_phase_correction(301, LUNAR_LAMBERT, 1.0) < 1.0);
+        assert!(planet_phase_correction(2_000_001, LUNAR_LAMBERT, 1.0) < 1.0);
         assert!(planet_phase_correction(199, LUNAR_LAMBERT, f64::NAN).is_nan());
+    }
+
+    /// The Moon's magnitude at the mean distance against Krisciunas & Schaefer 1991 Eq. 9
+    /// (Allen 1976 p. 144): V = −12.73 + 0.026|α| + 4 × 10⁻⁹α⁴, full (α = 0, without the
+    /// opposition surge the law also leaves out) −12.73 and quarter (α = 90°) −10.13. The model
+    /// is the one the renderer draws: lunar-Lambert L 0.9 with the fact sheet's p_V 0.12 and
+    /// R 1737.4 km, at its semi-major axis 384 400 km and 1 au from the Sun, times C. Before the
+    /// fix (C = 1) the quarter Moon was 1.47 mag too bright (final review physics I3).
+    #[test]
+    fn moon_full_and_quarter_vs_krisciunas_schaefer() {
+        let facts_path = uni_data::data_dir().join("baked").join("body_facts.ron");
+        let facts = uni_data::load_body_facts(&facts_path)
+            .unwrap_or_else(|e| panic!("facts file missing: {} ({e})", facts_path.display()));
+        let moon = facts.iter().find(|f| f.naif == 301).expect("Moon facts");
+        let p_v = moon.geometric_albedo.expect("Moon p_V");
+        let delta_m = moon.semi_major_au.expect("Moon a") * AU;
+        let rho = rho_from_geometric_albedo(LUNAR_LAMBERT, p_v);
+        let e0 = star_illuminance_lux(0.0);
+        let vmag = |alpha_deg: f64, c: f64| {
+            let a = alpha_deg.to_radians();
+            let e = disk_illuminance_lux(
+                LUNAR_LAMBERT,
+                rho,
+                moon.mean_radius_km * 1e3,
+                sun_lux_at(1.0),
+                a,
+                delta_m,
+            );
+            -2.5 * (e * c / e0).log10()
+        };
+        for (alpha, cited) in [(0.0, -12.73), (90.0_f64, -10.13)] {
+            let law = -12.73 + 0.026 * alpha + 4.0e-9 * alpha.powi(4);
+            assert!((law - cited).abs() < 0.005, "{alpha}°: law {law}");
+            let c = phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, alpha.to_radians());
+            let (bare, drawn) = (vmag(alpha, 1.0), vmag(alpha, c));
+            println!(
+                "Moon α {alpha:5.1}°: BRDF alone {bare:7.3}, drawn {drawn:7.3}, Krisciunas & \
+                 Schaefer {law:7.3} (C {c:.4})"
+            );
+            // p_V 0.12 gives −12.71 at α = 0, 0.02 mag from the law's −12.73.
+            assert!((drawn - law).abs() < 0.05, "{alpha}°: {drawn} vs {law}");
+        }
+        // The BRDF alone: 1.07 mag of phase dimming at 90° against the law's 2.60.
+        let bare_dimming = vmag(90.0, 1.0) - vmag(0.0, 1.0);
+        assert!((bare_dimming - 1.072).abs() < 0.01, "{bare_dimming}");
+        // Through the NAIF id, as the bodies pass and the point path call it.
+        for deg in [5.0_f64, 45.0, 90.0, 150.0] {
+            let a = deg.to_radians();
+            assert_eq!(
+                planet_phase_correction(301, LUNAR_LAMBERT, a),
+                phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, a)
+            );
+        }
+        // Held beyond 170°; bounded and positive everywhere.
+        let held = phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, 170f64.to_radians());
+        assert_eq!(
+            phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, 178f64.to_radians()),
+            held
+        );
+        for deg in (0..=180).map(f64::from) {
+            let c = phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, deg.to_radians());
+            assert!(c > 0.0 && c <= 1.0, "{deg}°: {c}");
+        }
+    }
+
+    /// An asteroid's correction makes the lunar-Lambert flux follow Bowell et al.'s H–G law at
+    /// every phase: C·Φ_LL = Φ_HG (final review physics I3). At α = 20° lunar-Lambert alone dims
+    /// by 0.08 mag, H–G (G 0.15) by 1.00 mag; at 65° (the C2 belt view) by 0.60 against 2.30
+    /// (G 0.15) or 2.37 (Ceres's G 0.12). An asteroid NAIF id without a known slope gets G 0.15.
+    #[test]
+    fn asteroid_correction_follows_h_g() {
+        for g in [-0.04, 0.12, 0.15, 0.32, 0.5] {
+            for deg in (0..=175).step_by(5).map(f64::from) {
+                let a = deg.to_radians();
+                let c = phase_correction(PhaseLaw::HG { g }, LUNAR_LAMBERT, a);
+                let followed = c * disk_phase_function(LUNAR_LAMBERT, a);
+                assert!(
+                    (followed - hg_phase(a, g)).abs() < 1e-12,
+                    "G {g} at {deg}°: {followed} vs {}",
+                    hg_phase(a, g)
+                );
+                assert!(
+                    c.is_finite() && (0.0..=1.0).contains(&c),
+                    "G {g} {deg}°: {c}"
+                );
+            }
+            // At α = π nothing lit is visible: 0, never NaN.
+            assert_eq!(phase_correction(PhaseLaw::HG { g }, LUNAR_LAMBERT, PI), 0.0);
+        }
+        let mag = |x: f64| -2.5 * x.log10();
+        let ll = |deg: f64| mag(disk_phase_function(LUNAR_LAMBERT, deg.to_radians()));
+        let hg = |deg: f64, g: f64| mag(hg_phase(deg.to_radians(), g));
+        println!(
+            "dimming [mag]: 20° LL {:.3} HG(0.15) {:.3}; 65° LL {:.3} HG(0.15) {:.3} HG(0.12) {:.3}",
+            ll(20.0),
+            hg(20.0, 0.15),
+            ll(65.0),
+            hg(65.0, 0.15),
+            hg(65.0, 0.12)
+        );
+        assert!((ll(20.0) - 0.08).abs() < 0.01 && (hg(20.0, 0.15) - 1.00).abs() < 0.005);
+        assert!((ll(65.0) - 0.60).abs() < 0.01 && (hg(65.0, 0.12) - 2.37).abs() < 0.01);
+        for naif in [2_000_001, 2_000_004, 20_000_001, 50_000_001] {
+            assert_eq!(
+                PhaseLaw::for_naif(naif),
+                PhaseLaw::HG {
+                    g: DEFAULT_HG_SLOPE
+                },
+                "{naif}"
+            );
+        }
+        assert_eq!(PhaseLaw::for_naif(301), PhaseLaw::Moon);
+        assert_eq!(PhaseLaw::for_naif(699), PhaseLaw::Planet(699));
+        assert_eq!(PhaseLaw::for_naif(999), PhaseLaw::Brdf);
+        assert_eq!(phase_correction(PhaseLaw::Brdf, LUNAR_LAMBERT, 1.0), 1.0);
+        assert!(phase_correction(PhaseLaw::Moon, LUNAR_LAMBERT, f64::NAN).is_nan());
+    }
+
+    /// Saturn's position, the Earth's and the Sun's at `iso` (UTC) from the Ephemeris, and the
+    /// WGCCRE pole: (r [au], Δ [au], α [deg], β_E [deg], β_S [deg]) of Mallama & Hilton's Eq. 10.
+    fn saturn_geometry(iso: &str) -> (f64, f64, f64, f64, f64) {
+        let t = uni_core::Epoch::parse_iso_utc(iso).expect("date");
+        let e = crate::ephemeris::Ephemeris::new(Vec::new());
+        let saturn = e.ssb_position(699, t).expect("Saturn");
+        let to_sun = e.ssb_position(10, t).expect("Sun") - saturn;
+        let to_earth = e.ssb_position(399, t).expect("Earth") - saturn;
+        let pole = crate::rotation::pole_icrs(699, t).expect("Saturn pole");
+        let lat = |v: glam::DVec3| v.normalize().dot(pole).asin().to_degrees();
+        (
+            to_sun.length() / AU,
+            to_earth.length() / AU,
+            to_sun.angle_between(to_earth).to_degrees(),
+            lat(to_earth),
+            lat(to_sun),
+        )
+    }
+
+    /// Final review physics I2. Saturn with its rings (Mallama & Hilton 2018 Eq. 10) against the
+    /// paper's own numbers (§4.6 and Table 5), with this crate's geometry (Standish, the WGCCRE
+    /// pole):
+    /// - Table 5's variations: 0.99 mag from the ring inclination (β 0 → 26.8°, α = 0) and 0.34
+    ///   mag from the phase (α 0 → 6.3°, β 26.8°), each to the table's 0.01;
+    /// - "The brightest magnitude in the time span examined is −0.55 on 2032-Dec-25", rings open
+    ///   (|β| ≥ 20°): Eq. 10 at this crate's geometry within 0.02 mag (the paper's ephemeris and
+    ///   rounding), and Saturn as the point path draws it (globe law × `saturn_ring_factor`)
+    ///   within 0.05 (Eq. 11's globe at α ≈ 0 is 0.036 mag brighter than Eq. 10's β = 0 term);
+    /// - "The faintest would be 1.17 on 2025-Apr-20 when the rings are nearly edge-on": Eq. 10
+    ///   within 0.02; the point path is brighter there by the floor at 1 (Eq. 10's β → 0 globe
+    ///   is 0.036 + 0.026α mag fainter than Eq. 11), stated and bounded (0.117 mag at α 3.3°);
+    /// - Horizons' APmag at the 2026-11-20 golden spot (β 7.2°): the point within 0.01 mag
+    ///   (measured +0.554 against +0.555), so Horizons now reports the ringed law.
+    /// The globe-only law misses the brightest value by 0.90 mag, which is what the point path
+    /// drew before the fix. Measured: 2032-12-25 Eq. 10 −0.548 (β 26.3°, α 0.1°), 2025-04-20
+    /// +1.170 (rings backlit: β_E −1.5°, β_S +0.2°).
+    #[test]
+    fn saturn_with_rings_vs_mallama_hilton() {
+        let incl = saturn_ringed_v1(0.0, 0.0) - saturn_ringed_v1(0.0, 26.8);
+        let phase = saturn_ringed_v1(6.3, 26.8) - saturn_ringed_v1(0.0, 26.8);
+        println!("Table 5: inclination {incl:.4} mag (0.99), phase {phase:.4} mag (0.34)");
+        assert!((incl - 0.99).abs() <= 0.01, "{incl}");
+        assert!((phase - 0.34).abs() <= 0.01, "{phase}");
+
+        for (iso, cited, open) in [
+            ("2032-12-25T00:00:00Z", -0.55, true),
+            ("2025-04-20T00:00:00Z", 1.17, false),
+        ] {
+            let (r, delta, alpha, beta_e, beta_s) = saturn_geometry(iso);
+            let beta = saturn_effective_ring_tilt_deg(beta_e, beta_s);
+            let distance = 5.0 * (r * delta).log10();
+            let eq10 = saturn_ringed_v1(alpha, beta) + distance;
+            let globe = mallama_hilton_v1(699, alpha).unwrap() + distance;
+            let k =
+                saturn_ring_factor(alpha.to_radians(), beta_e.to_radians(), beta_s.to_radians());
+            let point = globe - 2.5 * k.log10();
+            println!(
+                "{iso}: r {r:.4} Δ {delta:.4} α {alpha:.3}° β_E {beta_e:+.3}° β_S {beta_s:+.3}° \
+                 β {beta:.3}°: Eq. 10 {eq10:+.3}, globe {globe:+.3}, point {point:+.3} (k {k:.4}), \
+                 paper {cited:+.2}"
+            );
+            assert!(
+                (eq10 - cited).abs() <= 0.02,
+                "{iso}: Eq. 10 {eq10} vs {cited}"
+            );
+            if open {
+                assert!(beta_e.abs() >= 20.0 && beta >= 20.0, "{iso}: rings open");
+                assert!(
+                    (point - cited).abs() <= 0.05,
+                    "{iso}: point {point} vs {cited}"
+                );
+                assert!(
+                    globe - cited > 0.8,
+                    "{iso}: the globe alone is far too faint"
+                );
+            } else {
+                // Edge-on: the floor keeps the globe; brighter than Eq. 10 by its β = 0 offset.
+                let offset = 0.036 + 0.026 * alpha + 3.7e-4 * alpha - 6.16e-4 * alpha * alpha;
+                assert_eq!(k, 1.0, "{iso}: β {beta}");
+                assert!(
+                    (cited - point - offset).abs() <= 0.03,
+                    "{iso}: point {point}, paper {cited}, expected offset {offset}"
+                );
+            }
+        }
+
+        // Horizons' APmag at the 2026-11-20 golden spot (r, Δ, α from it; β from this crate).
+        let (apmag, r, delta, alpha) = horizons_spot(&load_spots(), 699);
+        let (_, _, _, beta_e, beta_s) = saturn_geometry("2026-11-20T00:00:00Z");
+        let beta = saturn_effective_ring_tilt_deg(beta_e, beta_s);
+        let distance = 5.0 * (r * delta).log10();
+        let eq10 = saturn_ringed_v1(alpha, beta) + distance;
+        let k = saturn_ring_factor(alpha.to_radians(), beta_e.to_radians(), beta_s.to_radians());
+        let point = mallama_hilton_v1(699, alpha).unwrap() + distance - 2.5 * k.log10();
+        println!(
+            "2026-11-20 (Horizons spot): α {alpha:.3}° β_E {beta_e:+.3}° β_S {beta_s:+.3}° β \
+             {beta:.3}°: Eq. 10 {eq10:+.3}, point {point:+.3}, APmag {apmag:+.3}"
+        );
+        // Horizons now reports the ringed law (the 2018 paper says it then gave the globe).
+        assert!((point - apmag).abs() <= 0.01, "{point} vs APmag {apmag}");
+    }
+
+    /// The ring factor's shape: ≥ 1, 1 for backlit or edge-on rings, the floor, the holds
+    /// beyond Eq. 10's α 6.5° and β 27°, continuity across them, unsigned phase, NaN.
+    #[test]
+    fn saturn_ring_factor_properties() {
+        let rad = f64::to_radians;
+        // Fully open (β 26.7°), α 0: 0.954 mag, k = 2.41; β 20°, α 5°: 0.472 mag.
+        let open = saturn_ring_factor(0.0, rad(26.7), rad(26.7));
+        assert!((2.5 * open.log10() - 0.954).abs() < 0.002, "{open}");
+        let mid = saturn_ring_factor(rad(5.0), rad(20.0), rad(20.0));
+        assert!((2.5 * mid.log10() - 0.472).abs() < 0.002, "{mid}");
+        // Backlit (opposite faces) and edge-on: 1.
+        assert_eq!(saturn_ring_factor(rad(3.0), rad(20.0), rad(-20.0)), 1.0);
+        assert_eq!(saturn_ring_factor(rad(3.0), 0.0, rad(20.0)), 1.0);
+        // The floor acts below β ≈ 0.94° at α = 0 and ≈ 5.74° at α = 6.5°.
+        assert_eq!(saturn_ring_factor(0.0, rad(0.9), rad(0.9)), 1.0);
+        assert!(saturn_ring_factor(0.0, rad(1.0), rad(1.0)) > 1.0);
+        assert_eq!(saturn_ring_factor(rad(6.5), rad(5.7), rad(5.7)), 1.0);
+        assert!(saturn_ring_factor(rad(6.5), rad(5.8), rad(5.8)) > 1.0);
+        // Held beyond α 6.5° (continuous there) and β 27°.
+        let at = saturn_ring_factor(rad(6.5), rad(25.0), rad(25.0));
+        assert_eq!(saturn_ring_factor(rad(90.0), rad(25.0), rad(25.0)), at);
+        let below = saturn_ring_factor(rad(6.5 - 1e-9), rad(25.0), rad(25.0));
+        assert!((below / at - 1.0).abs() < 1e-9);
+        assert_eq!(
+            saturn_ring_factor(rad(2.0), rad(80.0), rad(26.0)),
+            saturn_ring_factor(rad(2.0), rad(27.0), rad(27.0))
+        );
+        // ≥ 1 everywhere, unsigned in α and symmetric in the two latitudes.
+        for a in [0.0, 1.0, 3.0, 6.0, 30.0, 120.0] {
+            for b in [-26.0, -10.0, 0.0, 2.0, 15.0, 26.0] {
+                let k = saturn_ring_factor(rad(a), rad(b), rad(b * 0.9));
+                assert!(k >= 1.0 && k.is_finite(), "{a} {b}: {k}");
+                assert_eq!(k, saturn_ring_factor(rad(-a), rad(b), rad(b * 0.9)));
+                assert_eq!(k, saturn_ring_factor(rad(a), rad(b * 0.9), rad(b)));
+            }
+        }
+        assert!(saturn_ring_factor(f64::NAN, 0.3, 0.3).is_nan());
+        assert!(saturn_ring_factor(0.1, f64::NAN, 0.3).is_nan());
     }
 
     #[test]

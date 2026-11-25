@@ -80,10 +80,10 @@ use uni_data::{
 };
 use uni_physics::bodies::{by_naif, system_gm_m3s2};
 use uni_physics::calc::hill_radius;
-use uni_physics::ephemeris::Ephemeris;
+use uni_physics::ephemeris::{EphemFlag, Ephemeris};
 use uni_physics::frames::ecliptic_j2000_to_icrs;
 use uni_physics::kepler::{Conic, perifocal_to_reference, solve_kepler};
-use uni_physics::photometry::star_radius_m;
+use uni_physics::photometry::{DEFAULT_HG_SLOPE, PhaseLaw, star_radius_m};
 use uni_physics::sat_elements::SatElements;
 use uni_physics::smallbody::{
     MAX_STEP_S, STEP_ETA, conic_from_perihelion, heliocentric_state_icrs, osculate_at,
@@ -178,7 +178,6 @@ const SATURN_RINGS_DEFAULT_M: (f64, f64) = (69_933_828.337_874_65, 140_972_084.4
 pub(crate) const SATURN: i32 = 699;
 const SUN: i32 = 10;
 const PLUTO: i32 = 999;
-const CHARON: i32 = 901;
 
 /// A comet is re-osculated once the shown date is this far from its conic's epoch (lead ruling
 /// after A3: "e.g. when the shown date moves > 30 days from the last osculation epoch").
@@ -484,6 +483,11 @@ pub(crate) trait BodySource: Send + Sync {
     fn position_rel_parent(&self, naif: i32, t: Epoch) -> Option<DVec3>;
     /// Body-fixed → ICRS rotation, `None` without a rotation model.
     fn orient(&self, naif: i32, t: Epoch) -> Option<DQuat>;
+    /// The source's labelled conditions at `t` (the Ephemeris's `EphemFlag`s); none by
+    /// default. [`World::honesty`] reads the two moon flags from it.
+    fn flags(&self, _t: Epoch) -> Vec<EphemFlag> {
+        Vec::new()
+    }
 }
 
 impl BodySource for Ephemeris {
@@ -500,6 +504,10 @@ impl BodySource for Ephemeris {
 
     fn orient(&self, naif: i32, t: Epoch) -> Option<DQuat> {
         rotation::body_to_icrs(naif, t)
+    }
+
+    fn flags(&self, t: Epoch) -> Vec<EphemFlag> {
+        Ephemeris::flags(self, t)
     }
 }
 
@@ -1277,6 +1285,7 @@ impl World {
             }),
             mean_radius_m: mean_radius(radii_m),
             has_atmosphere: has_atmosphere(naif),
+            phase_law: PhaseLaw::for_naif(naif),
         };
         let id = self.push(info, physical, &[&name], &[]);
         if naif == SUN && self.sun.is_none() {
@@ -1314,6 +1323,7 @@ impl World {
                 geometric_albedo: COMET_ALBEDO,
                 mean_radius_m: radius,
                 has_atmosphere: false,
+                phase_law: PhaseLaw::Brdf,
             };
             self.comets.push(CometOrbit::new(c));
             let id = self.push(info, physical, &[&c.name], &[]);
@@ -1374,6 +1384,11 @@ impl World {
                 geometric_albedo: albedo,
                 mean_radius_m: radius,
                 has_atmosphere: false,
+                phase_law: PhaseLaw::HG {
+                    g: Some(f64::from(r.g))
+                        .filter(|g| g.is_finite())
+                        .unwrap_or(DEFAULT_HG_SLOPE),
+                },
             };
             self.asteroids.push(AsteroidOrbit::new(r));
             self.push(info, physical, &[asteroid_display_name(&full), &full], &[]);
@@ -1416,6 +1431,7 @@ impl World {
             geometric_albedo: 0.0,
             mean_radius_m: horizon,
             has_atmosphere: false,
+            phase_law: PhaseLaw::Brdf,
         };
         self.lenses.push(Lens {
             name: TEST_BH_NAME.to_owned(),
@@ -1569,6 +1585,7 @@ impl World {
             geometric_albedo: 0.0,
             mean_radius_m: radius,
             has_atmosphere: false,
+            phase_law: PhaseLaw::Brdf,
         };
         let id = self.push(info, physical, names, &[]);
         let motion = self
@@ -2029,23 +2046,44 @@ fn archive_star(sys: &ExoSystem, system_index: u32) -> Option<Star3> {
     ))
 }
 
-/// (diameter [km], p_V) of an asteroid: the catalogue's where it has them, the other from H by
-/// D = 1329 km / √p_V · 10^(−H/5) where it has one, and p_V = 0.14 with D from H where it has
-/// neither.
+/// The diameter–H constant K [km] on the renderer's own photometric zero point: a sphere of V
+/// geometric albedo p and diameter D, which the point path draws with flux p·E☉·(R/Δ)² at zero
+/// phase (the definition of p_V, Russell 1916, ApJ 43, 173), has absolute magnitude H (V at
+/// r = Δ = 1 au, α = 0; Bowell et al. 1989) exactly when D = K/√p · 10^(−H/5), with
+/// K = 2 au · 10^(V☉/5) and V☉ = M_V☉ + 5 log₁₀(1 au / 10 pc) = −26.742, the Sun's apparent V at
+/// 1 au on `star_illuminance_lux`'s zero point (M_V☉ = 4.83, uni-core). K = 1341.3 km; the
+/// literature's 1329 km ([`H_DIAMETER_KM`]) corresponds to V☉ = −26.762, 0.02 mag brighter.
+fn h_diameter_render_km() -> f64 {
+    let sun_v_1au = uni_core::M_V_SUN + 5.0 * (AU / (10.0 * PC)).log10();
+    2.0 * AU / 1e3 * 10_f64.powf(sun_v_1au / 5.0)
+}
+
+/// (diameter [km], drawn p_V) of a registry asteroid (final review physics I3).
+///
+/// The diameter is the catalogue's where it has one, else D = 1329 km / √p_V · 10^(−H/5) with
+/// its p_V, or with 0.14 ([`ASSUMED_ASTEROID_ALBEDO`]) where it has neither. The drawn p_V is
+/// then the one that makes that diameter send exactly the light H says,
+/// (K · 10^(−H/5) / D)² with K = [`h_diameter_render_km`], so the point is
+/// `photometry::asteroid_v(H, G, r, Δ, α)` at every phase (with its H–G law), as uni-sky draws
+/// the asteroids with H > 10, and the resolved disk (the bodies pass with the same p_V) starts
+/// from the same light. SBDB's own p_V and D do not always agree with its H: over the 770
+/// registry asteroids that have both, 2.5 log₁₀(p_SBDB / p_drawn) is +0.03 ± 0.27 mag (extremes
+/// −1.32 and +1.82; Vesta +0.27, Pallas +0.01, Ceres −0.05); the largest drawn p_V is 0.72
+/// (Nysa), under lunar-Lambert's ρ = 1 cap. The info card shows the catalogue's p_V. Ceres's
+/// map is calibrated to SBDB's 0.090 against the drawn 0.094, so its disk starts 0.05 mag below
+/// the point. Without a finite H the catalogue's p_V (or 0.14) is drawn.
 fn asteroid_size(r: &AsteroidRecord) -> (f64, f64) {
     let h = f64::from(r.h);
     let d = Some(f64::from(r.diameter_km)).filter(|d| d.is_finite() && *d > 0.0);
     let p = Some(f64::from(r.albedo)).filter(|p| p.is_finite() && *p > 0.0);
-    let scale = H_DIAMETER_KM * 10_f64.powf(-h / 5.0);
-    match (d, p) {
-        (Some(d), Some(p)) => (d, p),
-        (Some(d), None) => (d, (scale / d).powi(2)),
-        (None, Some(p)) => (scale / p.sqrt(), p),
-        (None, None) => (
-            scale / ASSUMED_ASTEROID_ALBEDO.sqrt(),
-            ASSUMED_ASTEROID_ALBEDO,
-        ),
+    let catalogue_p = p.unwrap_or(ASSUMED_ASTEROID_ALBEDO);
+    if !h.is_finite() {
+        return (d.unwrap_or(0.0), catalogue_p);
     }
+    let scale = H_DIAMETER_KM * 10_f64.powf(-h / 5.0);
+    let diameter = d.unwrap_or_else(|| scale / catalogue_p.sqrt());
+    let drawn = (h_diameter_render_km() * 10_f64.powf(-h / 5.0) / diameter).powi(2);
+    (diameter, drawn)
 }
 
 /// Volumetric mean radius (a·b·c)^⅓ [m].
@@ -2221,10 +2259,12 @@ impl World {
     }
 
     /// The world-state labels in effect: planets outside 3000 BC – AD 3000; Pluto outside
-    /// 1885–2099 while Pluto or Charon is in the view (`view` at internal size `viewport`
-    /// [px]) or selected; stars beyond ±100 000 yr; the band model and its procedural detail
-    /// while the band is enabled (B4L carry, Task C0 carry-over 6), in that order; comets
-    /// catching up. `ProceduralBelt` is the app's (C6).
+    /// 1885–2099 while Pluto, Charon or one of Pluto's small moons is in the view (`view` at
+    /// internal size `viewport` [px]) or selected; the Moon, the Galileans and Saturn's eight
+    /// major moons on mean elements, or frozen, outside 1000 BC – AD 5000 (at any view: the
+    /// Earth is placed from the Moon too; final review physics I1); stars beyond ±100 000 yr;
+    /// the band model and its procedural detail while the band is enabled (B4L carry, Task C0
+    /// carry-over 6), in that order; comets catching up. `ProceduralBelt` is the app's (C6).
     pub fn honesty(&self, view: &CameraView, viewport: UVec2) -> Vec<HonestyFlag> {
         let t = self.epoch;
         let mut flags = Vec::new();
@@ -2233,6 +2273,13 @@ impl World {
         }
         if !pluto::in_window(t) && self.pluto_shown(view, viewport) {
             flags.push(HonestyFlag::PlutoExtrapolated);
+        }
+        let ephem = self.source.flags(t);
+        if ephem.contains(&EphemFlag::MoonTheoryFallback) {
+            flags.push(HonestyFlag::MoonsMeanElements);
+        }
+        if ephem.contains(&EphemFlag::MoonsFrozen) {
+            flags.push(HonestyFlag::MoonsFrozen);
         }
         if self.star_years().abs() > STAR_LINEAR_LIMIT_YR {
             flags.push(HonestyFlag::StarsExtrapolated);
@@ -2267,16 +2314,30 @@ impl World {
             .any(|k| self.comets.get(k).is_some_and(|c| c.needs_work(t)))
     }
 
-    /// Whether Pluto or Charon is selected or in the frame: its sphere reaches into the real
-    /// frustum of `view` at `viewport` (Task C0 carry-over 4: the real frame, not a cone; Task
-    /// C6, C0 review minor: a sphere-vs-frustum plane test, not the centre widened by the
-    /// on-axis pixel radius, which misses a limb near the frame's edge), or the camera is
-    /// inside it.
+    /// Whether Pluto or a body placed from it (Charon, and the small moons Nix, Hydra, Kerberos
+    /// and Styx, whose parent chain reaches Pluto; final review physics minor 5) is selected or
+    /// in the frame: its sphere reaches into the real frustum of `view` at `viewport` (Task C0
+    /// carry-over 4: the real frame, not a cone; Task C6, C0 review minor: a sphere-vs-frustum
+    /// plane test, not the centre widened by the on-axis pixel radius, which misses a limb near
+    /// the frame's edge), or the camera is inside it.
     fn pluto_shown(&self, view: &CameraView, viewport: UVec2) -> bool {
         let proj = Projector::new(view, viewport);
-        self.ephem_order.iter().any(|&id| {
+        // Parent chains are at most moon → planet → Sun; the bound guards a malformed table.
+        let placed_from_pluto = |mut slot: usize| {
+            for _ in 0..8 {
+                if self.objects[self.ephem_order[slot] as usize].naif == Some(PLUTO) {
+                    return true;
+                }
+                match self.ephem_parent[slot] {
+                    Some(parent) => slot = parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+        self.ephem_order.iter().enumerate().any(|(slot, &id)| {
             let info = &self.objects[id as usize];
-            if !matches!(info.naif, Some(PLUTO | CHARON)) {
+            if !placed_from_pluto(slot) {
                 return false;
             }
             if self.selected == Some(id) {
@@ -3050,6 +3111,216 @@ mod tests {
 
     fn real_facts() -> Vec<BodyFacts> {
         uni_data::load_body_facts(&baked("body_facts.ron")).expect("body_facts.ron")
+    }
+
+    /// Final review physics I1: outside the Meeus moon window (J2000 ± 3000 yr) the Moon, the
+    /// Galileans and Saturn's moons run on mean elements, an amber label; without the elements
+    /// they freeze, another amber label. Inside it (AD 2026, AD 4000, 500 BC) neither; the
+    /// planets' own label is separate (2000 BC is inside Standish's Table 2).
+    #[test]
+    fn honesty_flags_moons_outside_their_theory() {
+        let at = |years: f64| Epoch::J2000.add_seconds(years * YEAR_S);
+        let away = looking_along(UniversePos::default().offset(DVec3::Z * AU), DVec3::Z);
+        let flags_at = |sats: Vec<SatRecord>, years: f64| {
+            let mut data = empty_data();
+            data.sats = sats;
+            World::new(data, at(years)).honesty(&away, VIEWPORT)
+        };
+        // J2000 − 4000 yr ≈ 2000 BC and + 4000 yr ≈ AD 6000.
+        for years in [-4_000.0, 4_000.0] {
+            let flags = flags_at(real_sats(), years);
+            assert!(
+                flags.contains(&HonestyFlag::MoonsMeanElements),
+                "{years}: {flags:?}"
+            );
+            assert!(
+                !flags.contains(&HonestyFlag::MoonsFrozen),
+                "{years}: {flags:?}"
+            );
+            let frozen = flags_at(Vec::new(), years);
+            assert!(
+                frozen.contains(&HonestyFlag::MoonsFrozen),
+                "{years}: {frozen:?}"
+            );
+            assert!(
+                !frozen.contains(&HonestyFlag::MoonsMeanElements),
+                "{years}: {frozen:?}"
+            );
+        }
+        assert!(
+            !flags_at(real_sats(), -4_000.0).contains(&HonestyFlag::PlanetsExtrapolated),
+            "2000 BC is inside Standish's Table 2: only the moons are labelled"
+        );
+        for years in [26.9, 2_000.0, -2_500.0] {
+            let flags = flags_at(real_sats(), years);
+            assert!(
+                !flags.contains(&HonestyFlag::MoonsMeanElements)
+                    && !flags.contains(&HonestyFlag::MoonsFrozen),
+                "{years}: {flags:?}"
+            );
+        }
+        for flag in [HonestyFlag::MoonsMeanElements, HonestyFlag::MoonsFrozen] {
+            assert!(crate::honesty::is_non_physical(flag), "{flag:?} is amber");
+            assert!(label(flag).contains("1000 BC \u{2013} AD 5000"), "{flag:?}");
+        }
+    }
+
+    /// Final review physics minor 5: Pluto's small moons are placed from Pluto, so one of them
+    /// selected, or alone in the frame, raises the Pluto label (AD 2300).
+    #[test]
+    fn pluto_small_moons_raise_the_pluto_flag() {
+        let mut data = empty_data();
+        data.sats = real_sats();
+        let mut world = World::new(data, date("2300-01-01T00:00:00Z"));
+        let hydra = id_of(&world, "Hydra");
+        let pluto = world.position(id_of(&world, "Pluto"));
+        let at_hydra = world.position(hydra);
+        let out = at_hydra.delta_from(pluto).normalize();
+        // Elsewhere: no flag; Hydra selected: the flag.
+        let away = looking_along(UniversePos::default().offset(DVec3::Z * AU), DVec3::Z);
+        assert!(
+            !world
+                .honesty(&away, VIEWPORT)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
+        world.set_selected(Some(hydra));
+        assert!(
+            world
+                .honesty(&away, VIEWPORT)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
+        world.set_selected(None);
+        // 1000 km from Hydra on Pluto's side, looking out at Hydra at fov 10°: Pluto and Charon
+        // are behind the camera, Hydra alone is in the frame.
+        let cam = at_hydra.offset(-out * 1.0e6);
+        let view = looking_at(cam, at_hydra, 10.0);
+        let proj = Projector::new(&view, VIEWPORT);
+        for name in ["Pluto", "Charon"] {
+            let id = id_of(&world, name);
+            let r = world.objects()[id as usize].radii_m.max_element();
+            assert!(
+                !proj.sphere_in_frustum(world.position(id).delta_from(cam), r),
+                "{name}"
+            );
+        }
+        assert!(
+            world
+                .honesty(&view, VIEWPORT)
+                .contains(&HonestyFlag::PlutoExtrapolated)
+        );
+    }
+
+    /// Final review physics I2: Saturn's point carries its rings (Mallama & Hilton 2018 Eq. 10).
+    /// From the Earth on 2032-12-25, rings open (β ≈ 26°), the paper gives V = −0.55, its
+    /// brightest of 1987–2046; the drawn point is within 0.05 mag of it, and 2.29× (0.90 mag)
+    /// the globe alone, which is what it drew before.
+    #[test]
+    fn saturn_point_carries_its_rings() {
+        let mut data = empty_data();
+        data.facts = real_facts();
+        let world = World::new(data, date("2032-12-25T00:00:00Z"));
+        let saturn = id_of(&world, "Saturn");
+        let earth = world.position(id_of(&world, "Earth"));
+        let view = looking_at(earth, world.position(saturn), 60.0);
+        let snap = world.snapshot(&view, VIEWPORT);
+        let point = snap
+            .points
+            .iter()
+            .find(|p| p.id == Some(saturn))
+            .expect("Saturn point");
+        let v = -2.5 * (point.illuminance_lux / star_illuminance_lux(0.0)).log10();
+        let rel = world.position(saturn).delta_from(earth);
+        let sun_rel = world
+            .position(id_of(&world, "Sun"))
+            .delta_from(world.position(saturn));
+        let pole = world.orientation(saturn) * DVec3::Z;
+        let lat = |w: DVec3| (pole.dot(w) / w.length()).asin();
+        let phase = sun_rel.angle_between(-rel);
+        let k = uni_physics::photometry::saturn_ring_factor(phase, lat(-rel), lat(sun_rel));
+        println!(
+            "Saturn 2032-12-25 from the Earth: V {v:+.3} (paper −0.55), ring factor {k:.4} \
+             ({:.3} mag), α {:.3}°, β_E {:+.2}°",
+            2.5 * k.log10(),
+            phase.to_degrees(),
+            lat(-rel).to_degrees()
+        );
+        assert!((v + 0.55).abs() <= 0.05, "{v}");
+        assert!(k > 2.2, "{k}");
+    }
+
+    /// Final review physics I3: a registry asteroid's point is the IAU H–G magnitude
+    /// (`photometry::asteroid_v`, Bowell et al. 1989), as uni-sky draws the fainter ones: Ceres
+    /// (SBDB H 3.34, G 0.12) placed 1.9 au from the camera at phase 20° and 65°, within 0.002 mag
+    /// (measured 7.8777 and 9.2104 at r 2.636 au). Before the fix (lunar-Lambert, SBDB's p_V) it
+    /// was 0.91 mag too bright at 20° and 1.73 at 65°. Every registry asteroid's drawn albedo
+    /// reproduces its H at zero phase.
+    #[test]
+    fn registry_asteroids_follow_h_g() {
+        let (asteroids, names) =
+            uni_data::load_asteroids(&baked("asteroids.bin"), &baked("asteroid_names.txt"))
+                .expect("asteroids.bin");
+        let mut data = empty_data();
+        data.asteroids = asteroids;
+        data.asteroid_names = names;
+        let world = World::new(data, date("2026-11-20T00:00:00Z"));
+        let ceres = id_of(&world, "Ceres");
+        let record =
+            world.asteroid_records()[world.asteroid_record_of(ceres).expect("record") as usize];
+        let (h, g) = (f64::from(record.h), f64::from(record.g));
+        assert_eq!(
+            (h, g),
+            (f64::from(3.34_f32), f64::from(0.12_f32)),
+            "SBDB H, G"
+        );
+        let at = world.position(ceres);
+        let to_sun = world.position(id_of(&world, "Sun")).delta_from(at);
+        let r_au = to_sun.length() / AU;
+        let axis = to_sun.normalize().any_orthonormal_vector();
+        for alpha_deg in [20.0_f64, 65.0] {
+            let dir = DQuat::from_axis_angle(axis, alpha_deg.to_radians()) * to_sun.normalize();
+            let cam = at.offset(dir * 1.9 * AU);
+            let snap = world.snapshot(&looking_at(cam, at, 60.0), VIEWPORT);
+            let point = snap
+                .points
+                .iter()
+                .find(|p| p.id == Some(ceres))
+                .expect("Ceres point");
+            let v = -2.5 * (point.illuminance_lux / star_illuminance_lux(0.0)).log10();
+            let want = uni_physics::photometry::asteroid_v(h, g, r_au, 1.9, alpha_deg.to_radians());
+            let a = alpha_deg.to_radians();
+            let ll = uni_physics::photometry::disk_phase_function(Brdf::LunarLambert { l: 0.9 }, a);
+            let drawn_p = world.physical[ceres as usize].geometric_albedo;
+            // Lunar-Lambert alone with SBDB's p_V, as it was drawn before the fix.
+            let before = v
+                - 2.5 * (ll / uni_physics::photometry::hg_phase(a, g)).log10()
+                - 2.5 * (f64::from(record.albedo) / drawn_p).log10();
+            println!(
+                "Ceres α {alpha_deg}° r {r_au:.4} au Δ 1.9 au: V {v:.4}, H–G {want:.4}, before the \
+                 fix {before:.3} (drawn p_V {drawn_p:.4}, SBDB {:.3})",
+                record.albedo
+            );
+            assert!((v - want).abs() < 0.002, "α {alpha_deg}: {v} vs {want}");
+        }
+        // Zero phase: p·(D/2)²·E☉ at r = Δ = 1 au reproduces H for every registry asteroid.
+        let e_sun_1au = sun_intensity_cd() / (AU * AU);
+        let mut checked = 0;
+        for phys in &world.physical {
+            let Source::Asteroid(a) = phys.source else {
+                continue;
+            };
+            let r = &world.asteroid_records()[world.asteroid_record_index[a] as usize];
+            let flux = phys.geometric_albedo * e_sun_1au * (phys.mean_radius_m / AU).powi(2);
+            let h_drawn = -2.5 * (flux / star_illuminance_lux(0.0)).log10();
+            assert!(
+                (h_drawn - f64::from(r.h)).abs() < 1e-9,
+                "{}: {h_drawn} vs {}",
+                r.spkid,
+                r.h
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, world.asteroid_record_index.len());
+        assert!(checked > 8_900, "{checked}");
     }
 
     /// The app may hand the world to other threads (std::thread::scope, ruling 3).

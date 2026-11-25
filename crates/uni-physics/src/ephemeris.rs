@@ -21,7 +21,9 @@
 //! Outside ±3000 yr of J2000 ([`MOON_THEORY_WINDOW_CY`]) the Meeus moon theories, whose
 //! arguments are polynomials in T up to T⁴, are replaced by the same moon's JPL mean-element
 //! orbit and [`EphemFlag::MoonTheoryFallback`] is raised. A Meeus moon whose elements were not
-//! given (no `sat_elements.ron`) stays at its window-edge position there instead.
+//! given (no `sat_elements.ron`) stays at its window-edge position there instead, and
+//! [`EphemFlag::MoonsFrozen`] is raised. uni-sim turns both into on-screen labels
+//! (`HonestyFlag::MoonsMeanElements`, `HonestyFlag::MoonsFrozen`; final review physics I1).
 //!
 //! The ephemeris caches nothing across epochs; uni-sim caches per tick.
 
@@ -52,7 +54,10 @@ pub(crate) fn clamp_to_moon_theory_window(t: Epoch) -> Epoch {
     }
 }
 
-fn in_moon_theory_window(t: Epoch) -> bool {
+/// Whether the Meeus moon theories place the Moon, the Galileans and Saturn's eight major moons
+/// at `t`: |T| ≤ [`MOON_THEORY_WINDOW_CY`] (J2000 ± 3000 Julian years, i.e. about 1000 BC to
+/// AD 5000).
+pub fn in_moon_theory_window(t: Epoch) -> bool {
     t.julian_centuries().abs() <= MOON_THEORY_WINDOW_CY
 }
 
@@ -84,7 +89,12 @@ pub struct EphemBody {
 pub enum EphemFlag {
     PlanetsExtrapolated,
     PlutoExtrapolated,
+    /// Outside the Meeus moon theories' window, at least one of the thirteen Meeus moons (the
+    /// Moon, the Galileans, Saturn's eight) runs on its JPL mean elements.
     MoonTheoryFallback,
+    /// Outside that window, at least one Meeus moon has no mean elements and stays at its
+    /// window-edge position (it stops orbiting).
+    MoonsFrozen,
 }
 
 /// Every body of the M1 Solar System with its theory.
@@ -288,7 +298,9 @@ impl Ephemeris {
     }
 
     /// The labelled conditions at `t`: planets outside 3000 BC – AD 3000, Pluto outside
-    /// 1885–2099, the Meeus moons outside ±3000 yr.
+    /// 1885–2099, and outside ±3000 yr the Meeus moons on mean elements
+    /// ([`EphemFlag::MoonTheoryFallback`], those with elements) or frozen
+    /// ([`EphemFlag::MoonsFrozen`], those without; both when the elements cover only some).
     pub fn flags(&self, t: Epoch) -> Vec<EphemFlag> {
         let mut flags = Vec::new();
         if validity(t) == Validity::Extrapolated {
@@ -298,9 +310,23 @@ impl Ephemeris {
             flags.push(EphemFlag::PlutoExtrapolated);
         }
         if !in_moon_theory_window(t) {
-            flags.push(EphemFlag::MoonTheoryFallback);
+            let (with, without): (Vec<NaifId>, Vec<NaifId>) =
+                Self::meeus_moons().partition(|id| self.sats.contains_key(id));
+            if !with.is_empty() {
+                flags.push(EphemFlag::MoonTheoryFallback);
+            }
+            if !without.is_empty() {
+                flags.push(EphemFlag::MoonsFrozen);
+            }
         }
         flags
+    }
+
+    /// The thirteen moons the Meeus theories place: the Moon, the Galileans, Saturn's eight.
+    fn meeus_moons() -> impl Iterator<Item = NaifId> {
+        std::iter::once(MOON)
+            .chain(GALILEANS.iter().map(|&(id, _)| id))
+            .chain(SATURN_MOONS.iter().map(|&(id, _)| id))
     }
 }
 
@@ -477,6 +503,49 @@ mod tests {
         assert!(f.contains(&EphemFlag::PlanetsExtrapolated));
         assert!(f.contains(&EphemFlag::PlutoExtrapolated));
         assert!(f.contains(&EphemFlag::MoonTheoryFallback));
+        assert!(!f.contains(&EphemFlag::MoonsFrozen));
+    }
+
+    /// Final review physics I1: outside the window, moons without mean elements are frozen at
+    /// the window edge and flagged as such; with only some elements, both flags are raised.
+    #[test]
+    fn moons_without_elements_freeze_and_are_flagged() {
+        let bare = Ephemeris::new(Vec::new());
+        // J2000 − 4000 yr ≈ 2000 BC (planets still in Standish's Table 2), + 3500 yr ≈ AD 5500.
+        for y in [-4_000.0, 3_500.0, 2.0e4] {
+            let t = years(y);
+            let f = bare.flags(t);
+            assert!(f.contains(&EphemFlag::MoonsFrozen), "{y}: {f:?}");
+            assert!(!f.contains(&EphemFlag::MoonTheoryFallback), "{y}: {f:?}");
+        }
+        // Frozen: the same position at two epochs past the AD 5000 edge (the theory at the edge).
+        let a = bare
+            .position_rel_parent(606, years(3_500.0))
+            .expect("Titan");
+        let b = bare
+            .position_rel_parent(606, years(9_000.0))
+            .expect("Titan");
+        let at_edge = bare
+            .position_rel_parent(606, clamp_to_moon_theory_window(years(3_500.0)))
+            .expect("Titan");
+        assert_eq!(a, b);
+        assert_eq!(a, at_edge);
+        // Inside the window neither flag, with or without elements.
+        for y in [-2_999.0, 0.0, 2_999.0] {
+            let f = bare.flags(years(y));
+            assert!(
+                !f.contains(&EphemFlag::MoonsFrozen) && !f.contains(&EphemFlag::MoonTheoryFallback),
+                "{y}: {f:?}"
+            );
+        }
+        // Only the Moon's elements: the Moon runs on them, the twelve others freeze.
+        let moon_only: Vec<SatElements> =
+            jpl_sats().into_iter().filter(|s| s.naif == MOON).collect();
+        let f = Ephemeris::new(moon_only).flags(years(-4_000.0));
+        assert!(f.contains(&EphemFlag::MoonTheoryFallback), "{f:?}");
+        assert!(f.contains(&EphemFlag::MoonsFrozen), "{f:?}");
+        assert!(!in_moon_theory_window(years(-3_000.5)));
+        assert!(in_moon_theory_window(years(-2_999.5)));
     }
 
     /// 2026-11-20T12:00Z: the subsolar point from the Ephemeris and the WGCCRE Earth model
