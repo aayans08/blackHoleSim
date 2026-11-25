@@ -476,7 +476,9 @@ impl Stat {
 }
 
 /// Acceptance bounds for a measured number: at least `min`, at most `max`, and within the
-/// relative tolerance `expect.1` of `expect.0`, each when given. NaN never passes.
+/// relative tolerance `expect.1` of `expect.0`, each when given. A non-finite value (NaN, or
+/// ±∞ from a zero denominator) never passes (final review, app minor 17: ∞ passed every
+/// `--min`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
     pub min: Option<f64>,
@@ -490,12 +492,12 @@ impl Bounds {
     }
 
     pub fn contains(&self, value: f64) -> bool {
-        self.min.is_none_or(|m| value >= m)
+        value.is_finite()
+            && self.min.is_none_or(|m| value >= m)
             && self.max.is_none_or(|m| value <= m)
             && self
                 .expect
                 .is_none_or(|(x, t)| (value - x).abs() <= t * x.abs())
-            && !value.is_nan()
     }
 
     /// e.g. "≥ 1.5", "≤ 0.5", "= 1 ± 10 %".
@@ -1442,6 +1444,53 @@ pub(crate) mod tests {
         close(s[1].rel_err, 4.0 / 4.4 - 1.0, 1e-6, "sample 1 error");
         assert!(check_samples(&cap, 0.10).expect("check").pass);
         assert!(!check_samples(&cap, 0.05).expect("check").pass);
+    }
+
+    /// Final review, app minor 17: a zero denominator gives ±∞ (or 0/0 NaN), which must FAIL
+    /// every bound, `--min` included, instead of passing it.
+    #[test]
+    fn ratio_fails_a_non_finite_ratio() {
+        let mut cap = blank(4, 1, 1.0, [1.0, 1.0]);
+        put(&mut cap, 0, 0, [0.5, 0.5, 0.5]);
+        cap.regions.insert("lit".into(), vec![[0.0, 0.0]]);
+        cap.regions.insert("dark".into(), vec![[1.0, 0.0], [2.0, 0.0]]);
+        let args = |num: &str, den: &str, bounds| RatioArgs {
+            num: num.into(),
+            den: den.into(),
+            channels: Channels::Luma,
+            stat: Stat::Median,
+            bounds,
+        };
+        let min = Bounds {
+            min: Some(1.5),
+            max: None,
+            expect: None,
+        };
+        let max = Bounds {
+            min: None,
+            max: Some(0.5),
+            expect: None,
+        };
+        // lit / dark = +∞ against --min; −∞ never arises from luminance, so test it directly.
+        let v = check_ratio(&cap, &args("lit", "dark", min)).expect("check");
+        assert!(
+            !v.pass && v.lines.last().is_some_and(|l| l.ends_with("FAIL")),
+            "{v:?}"
+        );
+        assert!(v.lines[1].contains("inf"), "{v:?}");
+        // dark / dark = 0/0 = NaN against --max.
+        let v = check_ratio(&cap, &args("dark", "dark", max)).expect("check");
+        assert!(!v.pass, "{v:?}");
+        for b in [min, max] {
+            for x in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                assert!(!b.contains(x), "{b:?} contains {x}");
+            }
+        }
+        // A finite ratio is still judged as before.
+        assert!(min.contains(1.5) && !min.contains(1.49));
+        assert!(max.contains(0.0) && !max.contains(0.51));
+        let v = check_ratio(&cap, &args("dark", "lit", max)).expect("check");
+        assert!(v.pass, "{v:?}");
     }
 
     #[test]
