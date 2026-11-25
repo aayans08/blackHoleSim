@@ -26,7 +26,7 @@ catalogues and photometry. Anything approximate or non-physical is labelled on s
 **Rendering**
 - HDR pipeline: GPU histogram auto-exposure, six-level bloom, AgX-style tonemapping, dithering and upscaling.
 - Planets and moons as analytic ellipsoids with an exact limb, BC7-compressed surface maps, eclipses and shadows, and
-  a point-to-disk handover that never pops.
+  an exposure-blended handover from point of light to resolved disk.
 - Saturn's rings from a measured ring-particle model; star surfaces with limb darkening and granulation.
 - Physically based atmospheres for Earth, Mars, Venus and Titan.
 - About 333 000 stars in 3-D with blackbody colours, a glare model fitted to the CIE glare formula and atmospheric
