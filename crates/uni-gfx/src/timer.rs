@@ -264,7 +264,9 @@ impl TimerGpu {
         let newest_done = newest_done.unwrap_or(0);
         let mut enc: Option<wgpu::CommandEncoder> = None;
         for slot in &mut self.ring {
-            if !matches!(slot.state, SlotState::Completed) || !(force || slot.seq < newest_done) {
+            if !matches!(slot.state, SlotState::Completed)
+                || !resolve_now(slot.seq, newest_done, force)
+            {
                 continue;
             }
             let enc = enc.get_or_insert_with(|| {
@@ -658,6 +660,13 @@ impl Bracket {
     }
 }
 
+/// Whether a completed frame `seq` may be resolved now: always with `force` (headless runs,
+/// after waiting for the GPU), otherwise once a later frame has completed (`newest_done`, the
+/// newest completed frame's seq, is greater; module docs).
+fn resolve_now(seq: u64, newest_done: u64, force: bool) -> bool {
+    force || seq < newest_done
+}
+
 /// Milliseconds from tick `begin` to tick `end`, or `None` when the pair is not a measurement:
 /// either tick unwritten (0, or all ones as Metal's `MTLCounterErrorValue`), or `end ≤ begin`.
 fn span_ms(begin: u64, end: u64, period_ns: f32) -> Option<f32> {
@@ -938,6 +947,19 @@ mod tests {
         // The frame time is unchanged by the patch.
         let t = timings_from_ticks(7, &labels, &frame(0, 10_190_000), 1.0);
         assert!((t.frame_ms.unwrap() - 0.55008).abs() < 1e-6);
+    }
+
+    /// F3: a completed frame waits for a later one before its resolve (its last samples are
+    /// written late in sustained runs), except in headless runs that force it.
+    #[test]
+    fn completed_frame_waits_for_a_later_one() {
+        assert!(
+            !resolve_now(7, 7, false),
+            "the newest completed frame waits"
+        );
+        assert!(resolve_now(6, 7, false));
+        assert!(resolve_now(7, 7, true), "headless runs resolve at once");
+        assert!(!resolve_now(0, 0, false));
     }
 
     #[test]
