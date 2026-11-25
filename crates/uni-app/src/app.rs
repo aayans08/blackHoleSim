@@ -102,13 +102,15 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
         log::warn!("{n}");
     }
     let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
-    let (camera, choice) = start_view(
+    let (camera, choice, ui) = start_view(
         &m1_bookmarks_path(),
         start.unwrap_or(START_BOOKMARK),
         &mut world,
         &mut controls,
         &mut notices,
     );
+    let mut nav = Navigator::new();
+    apply_start_ui(&ui, &mut nav, &mut controls);
 
     let event_loop = EventLoop::new().context("creating the event loop")?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -128,7 +130,7 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
         world,
         controls,
         camera,
-        nav: Navigator::new(),
+        nav,
         last_snap: Snapshot::default(),
         last_view,
         input: InputState::new(),
@@ -152,15 +154,16 @@ pub fn run(start: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// The camera at bookmark `name` in `path` (its epoch, exposure and lens settings applied, its
-/// anchor joined) and its view choices, or a camera at the SSB with the default choices plus a
-/// HUD notice if it cannot be loaded.
+/// anchor joined), its view choices and its UI state (`crate::capture::bookmark_ui`: its
+/// target, belt highlight and cruise, as captures and the bench take them; final review, app
+/// minor 4), or a camera at the SSB with the defaults plus a HUD notice if it cannot be loaded.
 fn start_view(
     path: &Path,
     name: &str,
     world: &mut World,
     controls: &mut HudControls,
     notices: &mut Vec<String>,
-) -> (FlyCamera, ViewChoices) {
+) -> (FlyCamera, ViewChoices, UiState) {
     let start = uni_nav::load_bookmarks(path).and_then(|marks| {
         marks
             .into_iter()
@@ -171,13 +174,15 @@ fn start_view(
     // at the baked data's 2026-11-20).
     let applied = start.and_then(|b| {
         crate::capture::settle_at_bookmark_epoch(&b, world)?;
-        apply_bookmark(&b, world, controls)
+        let applied = apply_bookmark(&b, world, controls)?;
+        let ui = crate::capture::bookmark_ui(&b, world)?;
+        Ok((applied, ui))
     });
     match applied {
-        Ok(applied) => {
+        Ok((applied, ui)) => {
             let mut camera = FlyCamera::new(applied.view);
             camera.reanchor(world.sim.frames(), world.epoch(), applied.anchor);
-            (camera, applied.choice)
+            (camera, applied.choice, ui)
         }
         Err(e) => {
             let msg = format!("Start view unavailable, starting at the SSB: {e:#}");
@@ -189,8 +194,22 @@ fn start_view(
                 fov_y_rad: FALLBACK_FOV_Y_RAD,
                 velocity_mps: DVec3::ZERO,
             };
-            (FlyCamera::new(view), ViewChoices::default())
+            (
+                FlyCamera::new(view),
+                ViewChoices::default(),
+                UiState::default(),
+            )
         }
+    }
+}
+
+/// The start bookmark's UI state in the window, as captures and the bench take it: its target
+/// selected, its belt highlight on, cruise started (the window's HUD stays collapsed).
+fn apply_start_ui(ui: &UiState, nav: &mut Navigator, controls: &mut HudControls) {
+    nav.selected = ui.selected;
+    controls.highlight_belt = ui.highlight_belt;
+    if ui.flight == uni_ui::FlightLabel::Cruise && nav.mode != FlightMode::Cruise {
+        nav.toggle_cruise();
     }
 }
 
@@ -863,7 +882,7 @@ mod tests {
         let mut world = World::bare(Epoch::J2000);
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
         let mut notices = Vec::new();
-        let (camera, choice) = start_view(
+        let (camera, choice, ui) = start_view(
             &m1_bookmarks_path(),
             START_BOOKMARK,
             &mut world,
@@ -872,6 +891,7 @@ mod tests {
         );
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(choice, ViewChoices::default());
+        assert_eq!(ui, UiState::default());
         assert_eq!(
             world.epoch(),
             Epoch::parse_iso_utc("2026-11-20T00:00:00Z").unwrap()
@@ -892,7 +912,7 @@ mod tests {
         let mut world = World::bare(Epoch::J2000);
         let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
         let mut notices = Vec::new();
-        let (camera, _) = start_view(
+        let (camera, _, _) = start_view(
             Path::new("/nonexistent/m1.ron"),
             START_BOOKMARK,
             &mut world,
@@ -902,6 +922,39 @@ mod tests {
         assert_eq!(camera.view.pos, UniversePos::default());
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("/nonexistent/m1.ron"), "{notices:?}");
+    }
+
+    /// Final review, app minor 4: `--start <name>` takes the bookmark's target, belt highlight
+    /// and cruise as captures and the bench do.
+    #[test]
+    fn start_view_takes_the_bookmark_target_highlight_and_cruise() {
+        let mut world = World::bare(Epoch::J2000);
+        for (name, target, highlight, cruise) in [
+            ("hud-target-mars", Some("Mars"), false, false),
+            ("asteroid-belt-above", None, true, false),
+            ("hud-cruise", None, false, true),
+        ] {
+            let mut controls = default_controls(INTERACTIVE_LENS_SCALE);
+            let mut notices = Vec::new();
+            let (_, _, ui) = start_view(
+                &m1_bookmarks_path(),
+                name,
+                &mut world,
+                &mut controls,
+                &mut notices,
+            );
+            assert!(notices.is_empty(), "{name}: {notices:?}");
+            let mut nav = Navigator::new();
+            apply_start_ui(&ui, &mut nav, &mut controls);
+            assert_eq!(
+                nav.selected,
+                target.and_then(|t| world.sim.find(t)),
+                "{name}"
+            );
+            assert_eq!(controls.highlight_belt, highlight, "{name}");
+            assert_eq!(nav.mode == FlightMode::Cruise, cruise, "{name}");
+            assert_eq!(ui.flight == uni_ui::FlightLabel::Cruise, cruise, "{name}");
+        }
     }
 
     /// A6 ruling I2 (the exact app.rs change): F12 saves an anchored camera as the offset from
