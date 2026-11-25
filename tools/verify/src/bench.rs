@@ -12,6 +12,12 @@
 //! must be within the limits. A `null` timing has no valid measurement (CLAUDE.md §2, Timing)
 //! and fails with the reason: "n/a" never passes.
 //!
+//! The 10-s windows are judged only on a run that holds them (final review, app minor 9): a JSON
+//! whose `sustained_s` is not a number of at least [`WINDOW_S`] (a serial run such as the
+//! 120-frame default writes `null`, and its `last10s` is then the whole ~1-s run) FAILs, and so
+//! does a bookmark whose window covers less than [`MIN_WINDOW_COVER`] of [`WINDOW_S`], measured
+//! as the sum of its frame intervals (interval mean × count). `--window all` judges any run.
+//!
 //! `--budgets` also flags every pass whose mean in the window exceeds 1.25 × its budget in the
 //! plan's per-pass table ([`PASS_BUDGETS_MS`], compiled in), and the two CPU sub-budgets
 //! ([`CPU_BUDGETS_MS`]). A feature timed as several passes is budgeted as their sum
@@ -55,7 +61,22 @@ impl Window {
             Self::All => "all",
         }
     }
+
+    /// True for the first and last 10 s, which need a sustained run at least that long.
+    fn is_timed(self) -> bool {
+        matches!(self, Self::Last10s | Self::First10s)
+    }
 }
+
+/// Length of the `first10s` and `last10s` windows [s]: `uni_app::bench::WINDOW_S` (plan
+/// "Performance budget", Gate rule: the first and the last 10 s of a 60-s run).
+pub const WINDOW_S: f64 = 10.0;
+
+/// Least share of [`WINDOW_S`] a bookmark's 10-s window must cover with its frame intervals.
+/// The app cuts the window at `t ≥ end − 10 s`, so a bookmark that ran the whole window sums to
+/// 10 s less at most one frame interval; 0.9 leaves 1 s for that and for frames without an
+/// interval, and FAILs a truncated or serial run (0.8 s for 120 frames at 7 ms).
+pub const MIN_WINDOW_COVER: f64 = 0.9;
 
 /// The frame limits [ms].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -219,14 +240,15 @@ impl BenchWindow {
     }
 }
 
-/// Mean and 95th percentile of one timing [ms]; `null` values are `None` (the sample `count`
-/// is not read).
+/// Mean, 95th percentile and sample count of one timing [ms]; `null` values are `None`.
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 pub struct Stats {
     #[serde(default)]
     pub mean: Option<f64>,
     #[serde(default)]
     pub p95: Option<f64>,
+    #[serde(default)]
+    pub count: Option<f64>,
 }
 
 /// One pass's GPU time: the mean over its valid measurements [ms], how many were valid and how
@@ -358,12 +380,61 @@ pub(crate) fn budget_lines(win: &BenchWindow) -> Vec<(String, bool)> {
     lines
 }
 
+/// The run's `sustained_s` [s] when it is a finite number.
+fn sustained_s(file: &BenchFile) -> Option<f64> {
+    file.sustained_s
+        .as_ref()
+        .and_then(Value::as_f64)
+        .filter(|s| s.is_finite())
+}
+
+/// `window covers <s> s ≥ 0.9 × 10 s` (Σ frame intervals = interval mean × count) or the
+/// reason it cannot be told, and whether the window is long enough (see [`MIN_WINDOW_COVER`]).
+fn cover_part(win: &BenchWindow) -> (String, bool) {
+    let need = MIN_WINDOW_COVER * WINDOW_S;
+    let covered = win
+        .interval_ms
+        .as_ref()
+        .and_then(|s| Some(s.mean? * s.count?))
+        .filter(|ms| ms.is_finite())
+        .map(|ms| ms / 1000.0);
+    match covered {
+        Some(s) => {
+            let ok = s >= need;
+            let sign = if ok { "≥" } else { "<" };
+            (
+                format!(
+                    "window covers {s:.2} s {sign} {MIN_WINDOW_COVER} × {WINDOW_S} s{}",
+                    if ok { "" } else { " (too short)" }
+                ),
+                ok,
+            )
+        }
+        None => (
+            "window length n/a (no interval mean and count)".to_owned(),
+            false,
+        ),
+    }
+}
+
 /// Judges every bookmark of `file` (see the module docs).
 pub fn evaluate(file: &BenchFile, args: &BenchArgs) -> Verdict {
     let key = args.window.key();
     let limits = &args.limits;
     let mut lines = Vec::new();
     let (mut within, mut flags) = (0, 0);
+    // A 10-s window needs a sustained run at least that long (final review, app minor 9).
+    let long_enough = !args.window.is_timed() || sustained_s(file).is_some_and(|s| s >= WINDOW_S);
+    if !long_enough {
+        let got = sustained_s(file).map_or_else(
+            || "null (a serial run)".to_owned(),
+            |s| format!("{s} s"),
+        );
+        lines.push(format!(
+            "run: sustained_s {got} is not a sustained run of at least {WINDOW_S} s, so it has no \
+             {key} window to judge FAIL"
+        ));
+    }
     for bookmark in &file.bookmarks {
         let Some(win) = bookmark.window(args.window) else {
             lines.push(format!(
@@ -372,7 +443,7 @@ pub fn evaluate(file: &BenchFile, args: &BenchArgs) -> Verdict {
             ));
             continue;
         };
-        let parts = [
+        let mut parts = vec![
             limit_part(
                 "GPU frame",
                 win.gpu_frame_ms.as_ref(),
@@ -392,6 +463,9 @@ pub fn evaluate(file: &BenchFile, args: &BenchArgs) -> Verdict {
                 "not measured",
             ),
         ];
+        if args.window.is_timed() {
+            parts.push(cover_part(win));
+        }
         let ok = parts.iter().all(|(_, ok)| *ok);
         within += usize::from(ok);
         let text: Vec<&str> = parts.iter().map(|(t, _)| t.as_str()).collect();
@@ -409,15 +483,25 @@ pub fn evaluate(file: &BenchFile, args: &BenchArgs) -> Verdict {
         }
     }
     let n = file.bookmarks.len();
-    let pass = n > 0 && within == n && flags == 0;
+    let pass = long_enough && n > 0 && within == n && flags == 0;
     let budgets = if args.budgets {
         format!("; {flags} over 1.25 × budget")
     } else {
         String::new()
     };
+    let cover = if args.window.is_timed() {
+        format!(", window ≥ {MIN_WINDOW_COVER} × {WINDOW_S} s")
+    } else {
+        String::new()
+    };
+    let run = if long_enough {
+        ""
+    } else {
+        "; not a sustained run of the window's length"
+    };
     lines.push(format!(
         "bench [{key}]: {within} of {n} bookmarks within GPU frame p95 ≤ {} ms, CPU p95 ≤ {} ms, \
-         interval p95 ≤ {} ms{budgets} {}",
+         interval p95 ≤ {} ms{cover}{budgets}{run} {}",
         limits.max_gpu_ms,
         limits.max_cpu_ms,
         limits.max_interval_ms,
@@ -436,9 +520,15 @@ mod tests {
     use super::*;
 
     /// One window of the B9 Step 3 schema with the given p95s (`None` → `null`) and pass means.
+    /// Each timing's mean is 0.9 × its p95 and its count fills 10 s at that mean, as a sustained
+    /// run's 10-s window does.
     fn window(gpu_p95: Option<f64>, cpu_p95: f64, interval_p95: f64, passes: &str) -> String {
         let stats = |p95: Option<f64>| match p95 {
-            Some(p) => format!(r#"{{"mean": {}, "p95": {p}, "count": 600}}"#, p * 0.9),
+            Some(p) => {
+                let mean = p * 0.9;
+                let count = (1000.0 * WINDOW_S / mean).ceil();
+                format!(r#"{{"mean": {mean}, "p95": {p}, "count": {count}}}"#)
+            }
             None => "null".to_owned(),
         };
         format!(
@@ -522,6 +612,7 @@ mod tests {
 
         // Only the passing bookmark: PASS overall.
         let only_start = BenchFile {
+            sustained_s: file.sustained_s,
             bookmarks: file.bookmarks.into_iter().take(1).collect(),
             ..BenchFile::default()
         };
@@ -566,11 +657,82 @@ mod tests {
         assert!(!v.pass);
 
         // The one passing bookmark with budgets on: bodies 1.2 ms is within 1.25 × 1.5 ms.
+        let full = fixture();
         let file = BenchFile {
-            bookmarks: fixture().bookmarks.into_iter().take(1).collect(),
+            sustained_s: full.sustained_s,
+            bookmarks: full.bookmarks.into_iter().take(1).collect(),
             ..BenchFile::default()
         };
         assert!(evaluate(&file, &args(Window::Last10s, true)).pass);
+    }
+
+    /// Final review, app minor 9: a serial run (`sustained_s` null, 120 frames ≈ 0.8 s) passes
+    /// every frame limit, yet has no last 10 s, so the last-10-s gate FAILs; so does a sustained
+    /// run shorter than the window, or a bookmark whose window holds too few frames. `--window
+    /// all` still judges a serial run.
+    #[test]
+    fn short_runs_fail_the_ten_second_windows() {
+        // C1L r1's serial bench: 120 frames, intervals 6.93 ms mean over 119.
+        let serial_window = r#"{"frames": 120,
+            "frame_ms": {"mean": 6.72, "p95": 6.99, "count": 120},
+            "interval_ms": {"mean": 6.93, "p95": 7.21, "count": 119},
+            "gpu_frame_ms": {"mean": 5.9, "p95": 6.3, "count": 120},
+            "cpu_ms": {"mean": 1.1, "p95": 1.4, "count": 120}, "passes": {}}"#;
+        let serial: BenchFile = serde_json::from_str(&format!(
+            r#"{{"size": [1920, 1080], "frames": 120, "sustained_s": null, "bookmarks": [
+                {{"name": "comet-neowise-2020", "lens_scale": 0.5, "windows": {{
+                    "all": {serial_window}, "first10s": {serial_window},
+                    "last10s": {serial_window}}}}}]}}"#
+        ))
+        .expect("serial fixture");
+        for w in [Window::Last10s, Window::First10s] {
+            let v = evaluate(&serial, &args(w, false));
+            assert!(!v.pass, "{v:#?}");
+            assert!(line(&v, "run:").contains("null (a serial run)"), "{v:#?}");
+            let b = line(&v, "comet-neowise-2020");
+            assert!(
+                b.ends_with("FAIL") && b.contains("window covers 0.82 s < 0.9 × 10 s"),
+                "{v:#?}"
+            );
+            assert!(
+                v.lines.last().is_some_and(|l| l.ends_with("FAIL")),
+                "{v:#?}"
+            );
+        }
+        // The whole serial run is still judged by `--window all`: within the limits, PASS.
+        let all = evaluate(&serial, &args(Window::All, false));
+        assert!(all.pass, "{all:#?}");
+        assert!(!all.lines.iter().any(|l| l.contains("window covers")));
+
+        // A sustained run shorter than the window.
+        let mut short = fixture();
+        short.sustained_s = Some(Value::from(5.0));
+        short.bookmarks.truncate(1);
+        let v = evaluate(&short, &args(Window::Last10s, false));
+        assert!(!v.pass && line(&v, "run:").contains("5 s"), "{v:#?}");
+
+        // A 60-s run with one bookmark whose window covers 6 s (truncated) FAILs that bookmark
+        // only; a window without interval counts cannot be told and FAILs.
+        let mut cut = fixture();
+        cut.bookmarks.truncate(1);
+        let full = evaluate(&cut, &args(Window::Last10s, false));
+        assert!(full.pass, "{full:#?}");
+        assert!(line(&full, "start").contains("window covers 10.0"), "{full:#?}");
+        let set_count = |file: &mut BenchFile, count: Option<f64>| {
+            for w in file.bookmarks[0].windows.values_mut().flatten() {
+                if let Some(s) = w.interval_ms.as_mut() {
+                    s.count = count;
+                }
+            }
+        };
+        set_count(&mut cut, Some(6000.0 / (16.5 * 0.9)));
+        let v = evaluate(&cut, &args(Window::Last10s, false));
+        assert!(!v.pass, "{v:#?}");
+        assert!(line(&v, "start").contains("(too short) FAIL"), "{v:#?}");
+        assert!(!v.lines.iter().any(|l| l.starts_with("run:")), "{v:#?}");
+        set_count(&mut cut, None);
+        let v = evaluate(&cut, &args(Window::Last10s, false));
+        assert!(!v.pass && line(&v, "start").contains("window length n/a"), "{v:#?}");
     }
 
     #[test]
