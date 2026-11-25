@@ -145,7 +145,9 @@ pub const HDR_MAX: f32 = 60000.0;
 const SHARED_USAGE: wgpu::TextureUsages = wgpu::TextureUsages::STORAGE_BINDING
     .union(wgpu::TextureUsages::TEXTURE_BINDING)
     .union(wgpu::TextureUsages::RENDER_ATTACHMENT);
-/// `hdr` is also copied out for the `--hdr` capture sidecar ([`crate::capture::read_hdr`]).
+/// `hdr` is also copied out to a buffer by [`crate::capture::read_hdr`], which the uni-planet and
+/// uni-post GPU probes use. The `--hdr` capture sidecar is not read this way: uni-app's pre-bloom
+/// tap (`tap.rs`) samples `hdr` as a texture in a pass of its own.
 const HDR_USAGE: wgpu::TextureUsages = SHARED_USAGE.union(wgpu::TextureUsages::COPY_SRC);
 const LENS_MASK_USAGE: wgpu::TextureUsages = SHARED_USAGE;
 
@@ -228,7 +230,7 @@ mod tests {
 
     #[test]
     fn hdr_target_has_copy_src() {
-        // The `--hdr` capture sidecar copies hdr to a buffer (`capture::read_hdr`).
+        // `capture::read_hdr` (the uni-planet and uni-post probes) copies hdr to a buffer.
         assert!(HDR_USAGE.contains(wgpu::TextureUsages::COPY_SRC));
         assert!(HDR_USAGE.contains(
             wgpu::TextureUsages::STORAGE_BINDING
