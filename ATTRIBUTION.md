@@ -219,3 +219,7 @@ it adapts any of Hillaire's sample code (MIT): then the MIT notice goes here (M1
   and Scattering of Light by Small Particles" (Wiley, 1983), Appendix A, from its published equations; no code
   copied.
 <!-- /B3 -->
+- **Tonemap (`crates/uni-post/src/agx.rs`, `tonemap.wgsl`)** follows the approach of Troy Sobotka's AgX
+  ([sobotka/AgX](https://github.com/sobotka/AgX)): inset the primaries toward white, log2-encode around middle
+  grey, apply a sigmoid, undo the inset. Only the method is used; its constants (inset and outset matrices, log
+  range, sigmoid) were re-derived in this repository, as `agx.rs` documents (M1 final fix wave, F3).
