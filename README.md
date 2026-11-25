@@ -61,14 +61,29 @@ catalogues and photometry. Anything approximate or non-physical is labelled on s
 On an Apple M3 MacBook Air (fanless, 8-core GPU) at 1920x1080 internal resolution, every benchmark view of the Solar
 System holds well above 60 fps in sustained 60-second runs (132 to 228 fps in the last full benchmark).
 
-## Building
+## Building and running
 
-Requirements: macOS on Apple silicon (the renderer targets Metal) and Rust 1.100 or newer.
+Requirements: macOS on Apple silicon (the renderer targets Metal) and Rust 1.100 or newer
+(install it from https://rustup.rs).
 
 ```sh
+git clone https://github.com/aayans08/blackHoleSim.git
+cd blackHoleSim
 cargo build --release -p uni-app
 ./target/release/universe
 ```
+
+The window opens at the `start` view in the Solar System. A first flight:
+
+1. Hold the right mouse button and drag to look around.
+2. Left-click a planet to select it; press `I` to open its information card.
+3. Press `F` to fly there with the autopilot; `Esc` cancels.
+4. Use `W A S D` to move and the mouse wheel to change speed. Speed runs from walking pace to faster than light
+   (speeds above c are labelled as non-physical).
+5. Press `T` for the time panel, `.` and `,` to speed time up or slow it down, `P` to pause.
+
+To open the window at another view, pass a bookmark name from `bookmarks/m1.ron`, for example
+`./target/release/universe --start saturn-ring-plane`.
 
 Surface maps are large and are not in the repository. Without them the planets render with uniform albedo and the
 HUD says "No surface map". To build them, download the maps listed in `data/manifest.toml` into `data/cache/` and run
@@ -98,11 +113,16 @@ HUD says "No surface map". To build them, download the maps listed in `data/mani
 ## Command line
 
 ```sh
-universe --start <bookmark>
+universe                                   # open the window at the start view
+universe --start <bookmark>                # open the window at a named view
 universe --capture bookmarks/m1.ron --out captures/m1 [--size 1920x1080] [--hud] [--hdr]
+                                           # render every view to PNG + JSON without a window
 universe --bench bookmarks/m1-bench.ron [--sustained 60] [--json out.json]
-universe --selftest
+                                           # measure frame times
+universe --selftest                        # check the GPU shader maths against the CPU
 ```
+
+Contact sheet of a capture folder: `cargo run --release -p uni-verify -- contact --captures captures/m1 --out sheet.png`.
 
 ## Repository layout
 
