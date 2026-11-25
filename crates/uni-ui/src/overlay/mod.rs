@@ -322,12 +322,31 @@ pub fn build_overlay(
 /// Paints `o` with `ui`'s painter: orbits, then the bracket, then the markers. The frame is the
 /// context's content rectangle, the output the overlay was built for.
 pub fn draw_overlay(ui: &egui::Ui, o: &Overlay) {
+    draw_overlay_clear_of(ui, o, &[]);
+}
+
+/// How far the overlay keeps from a HUD panel [pt]: the panels' soft halos reach 6 pt.
+pub(crate) const PANEL_CLEARANCE_PT: f32 = 6.0;
+
+/// [`draw_overlay`], kept off the HUD's `panels` (lead ruling C4w r3: overlay lines and markers
+/// never draw over a panel, whose glass would show them through): orbit lines and the
+/// bracket's corners are cut out of every panel grown by [`PANEL_CLEARANCE_PT`]; the
+/// bracket's labels and every marker (glyph, aim ring and label together) or edge chevron that
+/// meets one are left out.
+pub(crate) fn draw_overlay_clear_of(ui: &egui::Ui, o: &Overlay, panels: &[egui::Rect]) {
+    let keep_out: Vec<egui::Rect> = panels
+        .iter()
+        .map(|r| r.expand(PANEL_CLEARANCE_PT))
+        .collect();
     let painter = ui.painter();
-    orbits::draw(painter, &o.orbits);
+    orbits::draw(
+        painter,
+        &orbits::clip_out_rects(o.orbits.clone(), &keep_out),
+    );
     if let Some(b) = &o.bracket {
-        bracket::draw(painter, b);
+        bracket::draw(painter, b, &keep_out);
     }
-    markers::draw(painter, ui.ctx().content_rect(), &o.markers);
+    markers::draw(painter, ui.ctx().content_rect(), &o.markers, &keep_out);
 }
 
 #[cfg(test)]

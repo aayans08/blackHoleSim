@@ -289,14 +289,17 @@ pub(crate) struct CardClicks {
     pub selected_moon: Option<String>,
 }
 
-/// Paints `card` (mockup target artboard): kicker, title 30 pt light and subtitle; then, in a
-/// scroll area at most `max_body_h` tall, the live rows between hairlines, the facts, the
-/// buttons (≥ 44 pt), the moons list when open, the sources line and the notes.
-pub(crate) fn show_card(ui: &mut egui::Ui, card: &TargetCard, max_body_h: f32) -> CardClicks {
+/// Paints `card` (mockup target artboard) in the height `ui` has (the HUD gives it the room down
+/// to the blocks under the card): kicker, title 30 pt light and subtitle; the live rows between
+/// hairlines, the facts and, when open, the moons list; then the buttons (≥ 44 pt), the sources
+/// line and the notes. The buttons, sources and notes always show; the rows scroll only when
+/// the card does not fit (lead ruling C4w r3; before, the card kept egui's default 400 pt area
+/// height and cut off its rows, buttons and notes at 1080p).
+pub(crate) fn show_card(ui: &mut egui::Ui, card: &TargetCard) -> CardClicks {
     use crate::panels::inner_width;
     use crate::theme::{
         BODY_SIZE, CARD_HAIRLINE, CARD_KICKER_TRACKING_EM, CARD_PADDING_X, CARD_WIDTH, INK, INK_2,
-        INK_3, MUTED, NOTES_SIZE, SMALL_SIZE, TARGET, TITLE_SIZE, Weight, text_font, tone_color,
+        TARGET, TITLE_SIZE, Weight, text_font, tone_color,
     };
 
     let mut clicks = CardClicks::default();
@@ -324,9 +327,21 @@ pub(crate) fn show_card(ui: &mut egui::Ui, card: &TargetCard, max_body_h: f32) -
             LabelTone::Neutral => INK,
             tone => tone_color(tone),
         };
+        let moons_open_id = egui::Id::unique(("hud card moons", card.title.as_str()));
+        let mut moons_open = ui
+            .data(|d| d.get_temp::<bool>(moons_open_id))
+            .unwrap_or(false);
+        // The footer's height this pass, so the rows get the rest.
+        let width = ui.available_width();
+        let footer_h = crate::hud::measure(ui.ctx(), "card footer", width, |ui| {
+            card_footer(ui, card, &mut CardClicks::default(), &mut false);
+        })
+        .y;
+        let rows_room = (ui.available_height() - FOOTER_GAP_PT - footer_h).max(0.0);
         egui::ScrollArea::vertical()
             .id_salt("hud card body")
-            .max_height(max_body_h)
+            .max_height(rows_room)
+            .min_scrolled_height(0.0)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
@@ -349,31 +364,21 @@ pub(crate) fn show_card(ui: &mut egui::Ui, card: &TargetCard, max_body_h: f32) -
                     }
                     theme::row(ui, &r.label, &r.value, r.mono, value_color(r));
                 }
-                ui.add_space(16.0);
-                let moons_open_id = egui::Id::unique(("hud card moons", card.title.as_str()));
-                let mut moons_open = ui
-                    .data(|d| d.get_temp::<bool>(moons_open_id))
-                    .unwrap_or(false);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    let font = text_font(BODY_SIZE, Weight::Medium);
-                    for action in &card.actions {
-                        let (label, kind) = match action {
-                            CardAction::Goto => ("Go to · F", theme::ButtonKind::Nav),
-                            CardAction::Moons => ("Moons", theme::ButtonKind::Neutral),
-                            CardAction::Close => ("Close · Esc", theme::ButtonKind::Neutral),
-                        };
-                        if theme::button(ui, label, font.clone(), None, kind).clicked() {
-                            clicks.actions.push(*action);
-                            if *action == CardAction::Moons {
-                                moons_open = !moons_open;
-                            }
-                        }
-                    }
-                });
-                ui.data_mut(|d| d.insert_temp(moons_open_id, moons_open));
+                // The moons list (long for the giant planets) scrolls with the rows; just opened, it
+                // is scrolled into view.
                 if moons_open && !card.moons.is_empty() {
-                    ui.add_space(8.0);
+                    ui.add_space(16.0);
+                    let reveal = moons_reveal_id(card);
+                    if ui
+                        .data_mut(|d| d.remove_temp::<bool>(reveal))
+                        .unwrap_or(false)
+                    {
+                        // At once: a scroll animation would leave a capture mid-way.
+                        ui.scroll_to_cursor_animation(
+                            Some(egui::Align::Min),
+                            egui::style::ScrollAnimation::none(),
+                        );
+                    }
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                         let font = text_font(BODY_SIZE, Weight::Regular);
@@ -385,22 +390,67 @@ pub(crate) fn show_card(ui: &mut egui::Ui, card: &TargetCard, max_body_h: f32) -
                         }
                     });
                 }
-                if !card.sources.is_empty() {
-                    ui.add_space(16.0);
-                    theme::text(
-                        ui,
-                        &card.sources,
-                        text_font(SMALL_SIZE, Weight::Regular),
-                        INK_3,
-                    );
-                }
-                for note in &card.notes {
-                    ui.add_space(6.0);
-                    theme::text(ui, note, text_font(NOTES_SIZE, Weight::Regular), MUTED);
-                }
             });
+        ui.add_space(FOOTER_GAP_PT);
+        card_footer(ui, card, &mut clicks, &mut moons_open);
+        ui.data_mut(|d| d.insert_temp(moons_open_id, moons_open));
     });
     clicks
+}
+
+/// The temp flag that scrolls `card`'s moons list into view the pass after it opens.
+fn moons_reveal_id(card: &TargetCard) -> egui::Id {
+    egui::Id::unique(("hud card moons reveal", card.title.as_str()))
+}
+
+/// Space between the card's rows and its buttons [pt] (mockup).
+const FOOTER_GAP_PT: f32 = 16.0;
+
+/// The card's footer, always in view: the buttons (≥ 44 pt; Moons toggles `moons_open`), the
+/// sources line and the notes.
+fn card_footer(
+    ui: &mut egui::Ui,
+    card: &TargetCard,
+    clicks: &mut CardClicks,
+    moons_open: &mut bool,
+) {
+    use crate::theme::{BODY_SIZE, INK_3, MUTED, NOTES_SIZE, SMALL_SIZE, Weight, text_font};
+    // The card's spacing, also when measured on its own.
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+        let font = text_font(BODY_SIZE, Weight::Medium);
+        for action in &card.actions {
+            let (label, kind) = match action {
+                CardAction::Goto => ("Go to · F", theme::ButtonKind::Nav),
+                CardAction::Moons => ("Moons", theme::ButtonKind::Neutral),
+                CardAction::Close => ("Close · Esc", theme::ButtonKind::Neutral),
+            };
+            if theme::button(ui, label, font.clone(), None, kind).clicked() {
+                clicks.actions.push(*action);
+                if *action == CardAction::Moons {
+                    *moons_open = !*moons_open;
+                    if *moons_open {
+                        let reveal = moons_reveal_id(card);
+                        ui.data_mut(|d| d.insert_temp(reveal, true));
+                    }
+                }
+            }
+        }
+    });
+    if !card.sources.is_empty() {
+        ui.add_space(16.0);
+        theme::text(
+            ui,
+            &card.sources,
+            text_font(SMALL_SIZE, Weight::Regular),
+            INK_3,
+        );
+    }
+    for note in &card.notes {
+        ui.add_space(6.0);
+        theme::text(ui, note, text_font(NOTES_SIZE, Weight::Regular), MUTED);
+    }
 }
 
 /// The info-card notes of an object (plan table "Honesty labels in M1", info cards; exact

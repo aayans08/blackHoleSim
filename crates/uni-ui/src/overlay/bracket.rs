@@ -75,19 +75,27 @@ pub(crate) fn label_rect(b: &Bracket) -> Rect {
 }
 
 /// Paints `b`: the four corners, then the name and the sub-line under the bracket.
-pub(crate) fn draw(painter: &Painter, b: &Bracket) {
+///
+/// Its corners are cut out of every rect of `keep_out`, and a label that meets one is left out
+/// (lead ruling C4w r3: the overlay never draws over a HUD panel).
+pub(crate) fn draw(painter: &Painter, b: &Bracket, keep_out: &[Rect]) {
     let (c, h, arm) = (b.center_pt, b.half_size_pt, theme::BRACKET_ARM);
     let stroke = Stroke::new(theme::BRACKET_STROKE, theme::TARGET);
-    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        let corner = egui::pos2(c.x + sx * h, c.y + sy * h);
-        painter.add(Shape::line(
-            vec![
-                corner - egui::vec2(sx * arm, 0.0),
+    let corners = [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)].map(|(sx, sy)| {
+        let corner = Vec2::new(c.x + sx * h, c.y + sy * h);
+        super::OrbitLine {
+            pts: vec![
+                corner - Vec2::new(sx * arm, 0.0),
                 corner,
-                corner - egui::vec2(0.0, sy * arm),
+                corner - Vec2::new(0.0, sy * arm),
             ],
-            stroke,
-        ));
+            dashed: false,
+            tone: theme::LabelTone::Nav,
+        }
+    });
+    for run in super::orbits::clip_out_rects(corners.to_vec(), keep_out) {
+        let pts = run.pts.iter().map(|p| egui::pos2(p.x, p.y)).collect();
+        painter.add(Shape::line(pts, stroke));
     }
     let name = TextFormat {
         font_id: super::markers::installed_font(
@@ -111,8 +119,12 @@ pub(crate) fn draw(painter: &Painter, b: &Bracket) {
         ),
         theme::INK,
     );
-    super::markers::paint_text(painter, top, name, 1.0);
-    super::markers::paint_text(painter, sub_top, sub, 1.0);
+    for (at, galley) in [(top, name), (sub_top, sub)] {
+        let r = Rect::from_min_size(at, galley.size());
+        if !keep_out.iter().any(|k| k.intersects(r)) {
+            super::markers::paint_text(painter, at, galley, 1.0);
+        }
+    }
 }
 
 #[cfg(test)]

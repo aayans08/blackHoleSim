@@ -563,7 +563,34 @@ pub(crate) fn clip_out_disks(lines: Vec<OrbitLine>, disks: &[(Vec2, f32)]) -> Ve
     if disks.is_empty() {
         return lines;
     }
-    let inside = |p: Vec2| disks.iter().any(|&(c, r)| p.distance(c) < r);
+    cut_lines(
+        lines,
+        |p| disks.iter().any(|&(c, r)| p.distance(c) < r),
+        |a, b| outside_intervals(a, b, disks),
+    )
+}
+
+/// `lines` with every part inside a rect of `rects` cut out (lead ruling C4w r3: the overlay
+/// never draws over a HUD panel; the caller grows the panels' rects by a margin); a dot inside
+/// one goes.
+pub(crate) fn clip_out_rects(lines: Vec<OrbitLine>, rects: &[egui::Rect]) -> Vec<OrbitLine> {
+    if rects.is_empty() {
+        return lines;
+    }
+    cut_lines(
+        lines,
+        |p| rects.iter().any(|r| r.contains(egui::pos2(p.x, p.y))),
+        |a, b| outside_rect_intervals(a, b, rects),
+    )
+}
+
+/// Splits each line into the runs `keep` leaves of its segments; a one-point line stays unless
+/// `inside` holds there.
+fn cut_lines(
+    lines: Vec<OrbitLine>,
+    inside: impl Fn(Vec2) -> bool,
+    keep: impl Fn(Vec2, Vec2) -> Vec<(f32, f32)>,
+) -> Vec<OrbitLine> {
     let mut out = Vec::new();
     for line in lines {
         let OrbitLine { pts, dashed, tone } = line;
@@ -576,7 +603,7 @@ pub(crate) fn clip_out_disks(lines: Vec<OrbitLine>, disks: &[(Vec2, f32)]) -> Ve
         } else {
             for seg in pts.windows(2) {
                 let (a, b) = (seg[0], seg[1]);
-                for (t0, t1) in outside_intervals(a, b, disks) {
+                for (t0, t1) in keep(a, b) {
                     let (p0, p1) = (a + (b - a) * t0, a + (b - a) * t1);
                     let joins = run.last().is_some_and(|&q| q.distance(p0) < 1e-4);
                     if !joins {
@@ -624,6 +651,43 @@ fn outside_intervals(a: Vec2, b: Vec2, disks: &[(Vec2, f32)]) -> Vec<(f32, f32)>
             cuts.push((t0, t1));
         }
     }
+    complement(cuts)
+}
+
+/// The parameter intervals [t0, t1] ⊂ [0, 1] of segment a → b outside every rect (Liang and
+/// Barsky 1984's parametric clip gives the part inside each), in order.
+fn outside_rect_intervals(a: Vec2, b: Vec2, rects: &[egui::Rect]) -> Vec<(f32, f32)> {
+    let d = b - a;
+    let mut cuts = Vec::new();
+    for r in rects {
+        let (mut t0, mut t1) = (0.0_f32, 1.0_f32);
+        let mut hit = true;
+        for (p, q) in [
+            (-d.x, a.x - r.min.x),
+            (d.x, r.max.x - a.x),
+            (-d.y, a.y - r.min.y),
+            (d.y, r.max.y - a.y),
+        ] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    hit = false;
+                    break;
+                }
+            } else if p < 0.0 {
+                t0 = t0.max(q / p);
+            } else {
+                t1 = t1.min(q / p);
+            }
+        }
+        if hit && t0 < t1 {
+            cuts.push((t0, t1));
+        }
+    }
+    complement(cuts)
+}
+
+/// [0, 1] less the union of `cuts`, in order.
+fn complement(mut cuts: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
     cuts.sort_by(|x, y| x.0.total_cmp(&y.0));
     let mut keep = Vec::new();
     let mut from = 0.0_f32;
@@ -668,6 +732,56 @@ pub(crate) fn draw(painter: &Painter, lines: &[OrbitLine]) {
 #[cfg(test)]
 mod clip_tests {
     use super::*;
+
+    /// Lead ruling C4w r3: an orbit line is cut out of a HUD panel's rect where it crosses it
+    /// (straight through, from a corner, along an edge), a line or dot wholly inside goes, and
+    /// one beside the rect stays whole.
+    #[test]
+    fn orbit_lines_are_cut_out_of_panels() {
+        let line = |pts: Vec<Vec2>| OrbitLine {
+            pts,
+            dashed: true,
+            tone: LabelTone::NonPhysical,
+        };
+        let card = egui::Rect::from_min_max(egui::pos2(100.0, 0.0), egui::pos2(200.0, 50.0));
+        // Through: two runs, ending on the rect's sides; dashing and tone kept.
+        let out = clip_out_rects(
+            vec![line(vec![Vec2::new(0.0, 20.0), Vec2::new(300.0, 20.0)])],
+            &[card],
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].pts, [Vec2::new(0.0, 20.0), Vec2::new(100.0, 20.0)]);
+        assert_eq!(out[1].pts, [Vec2::new(200.0, 20.0), Vec2::new(300.0, 20.0)]);
+        assert!(
+            out.iter()
+                .all(|l| l.dashed && l.tone == LabelTone::NonPhysical)
+        );
+        // A polyline entering through the bottom: cut where it enters, the rest kept joined.
+        let out = clip_out_rects(
+            vec![line(vec![
+                Vec2::new(150.0, 25.0),
+                Vec2::new(150.0, 100.0),
+                Vec2::new(250.0, 100.0),
+            ])],
+            &[card],
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            out[0].pts,
+            [
+                Vec2::new(150.0, 50.0),
+                Vec2::new(150.0, 100.0),
+                Vec2::new(250.0, 100.0)
+            ]
+        );
+        // Inside, or a dot inside: gone. Beside: whole.
+        let inside = line(vec![Vec2::new(120.0, 10.0), Vec2::new(180.0, 40.0)]);
+        let dot = line(vec![Vec2::new(150.0, 25.0)]);
+        let beside = line(vec![Vec2::new(0.0, 60.0), Vec2::new(300.0, 60.0)]);
+        let out = clip_out_rects(vec![inside, dot, beside.clone()], &[card]);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].pts, beside.pts);
+    }
 
     /// Coordinator ruling at Task C6: an orbit line crossing a disk is cut where it enters and
     /// leaves it (with the margin the caller adds), a line wholly inside goes, a dot inside goes.

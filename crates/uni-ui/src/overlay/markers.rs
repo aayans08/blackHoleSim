@@ -358,12 +358,24 @@ pub(crate) fn opacity(m: &Marker) -> f32 {
 }
 
 /// Paints `markers` (most important last, so on top) in `frame` [pt].
-pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
+///
+/// A marker whose glyph, aim ring or label meets a rect of `keep_out` (the HUD's panels, grown
+/// by a margin) is not drawn at all, nor an edge chevron there (lead ruling C4w r3: the overlay
+/// never draws over a panel).
+pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker], keep_out: &[Rect]) {
     let inner = inner_frame(frame);
+    let meets = |r: Rect| keep_out.iter().any(|k| k.intersects(r));
     for m in markers.iter().rev() {
         let p = pos2(m.pt);
         if !inner.contains(p) {
-            draw_chevron(painter, frame, inner, p);
+            if let Some((tip, dir)) = chevron_tip(frame, inner, p)
+                && !meets(Rect::from_center_size(
+                    tip,
+                    egui::Vec2::splat(2.0 * CHEVRON_HALF_PT),
+                ))
+            {
+                draw_chevron(painter, tip, dir);
+            }
             continue;
         }
         let o = opacity(m);
@@ -375,15 +387,56 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
         } else {
             theme::INK_SOFT
         };
+        let (name, sub) = label_galleys(painter, m, ink, lit, o);
+        let mut footprint = Rect::from_center_size(p, egui::Vec2::splat(GLYPH_BOX_PT));
+        if m.aim_fill > 0.0 {
+            footprint = footprint.union(Rect::from_center_size(
+                p,
+                egui::Vec2::splat(2.0 * theme::AIM_RING_RADIUS + theme::AIM_RING_STROKE),
+            ));
+        }
+        let left = p.x + 0.5 * GLYPH_BOX_PT + NAME_GAP_PT;
+        let name_top_left = |g: &Arc<Galley>| egui::pos2(left, p.y - 0.5 * g.size().y);
+        let sub_left = left + name.as_ref().map_or(0.0, |g| g.size().x) + SUB_GAP_PT;
+        let sub_top_left = |g: &Arc<Galley>| egui::pos2(sub_left, p.y - 0.5 * g.size().y);
+        if let Some(g) = &name {
+            footprint = footprint.union(Rect::from_min_size(name_top_left(g), g.size()));
+        }
+        if let Some(g) = &sub {
+            footprint = footprint.union(Rect::from_min_size(sub_top_left(g), g.size()));
+        }
+        if meets(footprint) {
+            continue;
+        }
         if m.glyph {
             draw_glyph(painter, p, m.kind, ink.gamma_multiply(o));
         }
         if m.aim_fill > 0.0 {
             draw_aim_ring(painter, p, m.aim_fill);
         }
-        let Some(name) = &m.label else {
-            continue;
-        };
+        if let Some(g) = name {
+            let at = name_top_left(&g);
+            paint_text(painter, at, g, o);
+        }
+        if let Some(g) = sub {
+            let at = sub_top_left(&g);
+            paint_text(painter, at, g, o);
+        }
+    }
+}
+
+/// The name and sub-line galleys of `m`'s label (none without one).
+fn label_galleys(
+    painter: &Painter,
+    m: &Marker,
+    ink: Color32,
+    lit: bool,
+    o: f32,
+) -> (Option<Arc<Galley>>, Option<Arc<Galley>>) {
+    let Some(name) = &m.label else {
+        return (None, None);
+    };
+    {
         let name_color = if m.selected || lit {
             theme::TARGET
         } else {
@@ -400,16 +453,8 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
             ..TextFormat::default()
         };
         let name = painter.layout_job(LayoutJob::single_section(name.clone(), format));
-        let left = p.x + 0.5 * GLYPH_BOX_PT + NAME_GAP_PT;
-        let sub_left = left + name.size().x + SUB_GAP_PT;
-        paint_text(
-            painter,
-            egui::pos2(left, p.y - 0.5 * name.size().y),
-            name,
-            o,
-        );
-        if let Some(sub) = &m.sub {
-            let sub = painter.layout_no_wrap(
+        let sub = m.sub.as_ref().map(|sub| {
+            painter.layout_no_wrap(
                 sub.clone(),
                 installed_font(
                     painter,
@@ -417,14 +462,9 @@ pub(crate) fn draw(painter: &Painter, frame: Rect, markers: &[Marker]) {
                     FontFamily::Monospace,
                 ),
                 theme::INK_3.gamma_multiply(o),
-            );
-            paint_text(
-                painter,
-                egui::pos2(sub_left, p.y - 0.5 * sub.size().y),
-                sub,
-                o,
-            );
-        }
+            )
+        });
+        (Some(name), sub)
     }
 }
 
@@ -529,14 +569,15 @@ fn draw_aim_ring(painter: &Painter, c: Pos2, fill: f32) {
     ));
 }
 
-/// The muted chevron for an off-screen destination: where the ray from the frame's centre toward
-/// `toward` leaves the inner frame, inset, pointing outward.
-fn draw_chevron(painter: &Painter, frame: Rect, inner: Rect, toward: Pos2) {
+/// Where the muted chevron for an off-screen destination sits, and its outward direction:
+/// where the ray from the frame's centre toward `toward` leaves the inner frame, inset. `None`
+/// at the centre itself.
+fn chevron_tip(frame: Rect, inner: Rect, toward: Pos2) -> Option<(Pos2, egui::Vec2)> {
     let from = frame.center();
     let d = toward - from;
     let len = d.length();
     if !(len > 0.0) {
-        return;
+        return None;
     }
     let dir = d / len;
     // Distance along the ray to the inner frame's edge, per axis.
@@ -556,6 +597,11 @@ fn draw_chevron(painter: &Painter, frame: Rect, inner: Rect, toward: Pos2) {
         inner.min + egui::vec2(CHEVRON_INSET_PT, CHEVRON_INSET_PT),
         inner.max - egui::vec2(CHEVRON_INSET_PT, CHEVRON_INSET_PT),
     );
+    Some((tip, dir))
+}
+
+/// The edge chevron at `tip`, pointing along `dir`.
+fn draw_chevron(painter: &Painter, tip: Pos2, dir: egui::Vec2) {
     let back = tip - dir * CHEVRON_DEPTH_PT;
     let side = egui::vec2(-dir.y, dir.x) * CHEVRON_HALF_PT;
     painter.add(Shape::line(

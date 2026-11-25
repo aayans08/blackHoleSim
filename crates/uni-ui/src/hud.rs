@@ -36,10 +36,10 @@ use winit::{
 };
 
 use crate::cards::{CardAction, TargetCard, show_card};
-use crate::overlay::{Overlay, draw_overlay};
+use crate::overlay::{Overlay, draw_overlay_clear_of};
 use crate::panels::{self, GravityPanel, LocationPanel, NavLine, SpeedPanel, TimePanel, WarpPick};
 use crate::theme::{
-    self, BELT_HIGHLIGHT_LABEL, BELT_TOGGLE_LABEL, CARD_PADDING_Y, EYE_ADAPTED_STARS_LABEL,
+    self, BELT_HIGHLIGHT_LABEL, BELT_TOGGLE_LABEL, CARD_WIDTH, EYE_ADAPTED_STARS_LABEL,
     GRAVITY_WIDTH, HINT_CARD, HINT_COLLAPSED, INK_2, INK_3, INK_SOFT, INSIDE_HORIZON_LABEL,
     KICKER_TRACKING_EM, LOCATION_WIDTH, LabelTone, MUTED, NON_PHYSICAL_SOFT, NOTE_DOT,
     NOTES_LINE_MAX_WIDTH, NOTES_POPUP_TITLE, NOTES_POPUP_WIDTH, NOTES_SIZE, SCREEN_MARGIN,
@@ -84,8 +84,6 @@ const APP_HOTKEYS: [KeyCode; 3] = [KeyCode::Tab, KeyCode::F1, KeyCode::F12];
 /// `headless_draw_settles_then_costs_one_run`). The rest is margin.
 const HEADLESS_MAX_RUNS: usize = 4;
 
-/// Room kept free at the bottom right for the perf line and hints [pt].
-const PERF_RESERVE: f32 = 40.0;
 /// Gap between neighbouring panels [pt]; also the least gap a notes block keeps from the
 /// other HUD blocks ([`rise`], [`fall`]).
 const PANEL_GAP: f32 = 16.0;
@@ -586,15 +584,17 @@ fn area(id: &str, order: Order) -> egui::Area {
 
 /// Everything the HUD draws in one run (module docs).
 ///
-/// Layout (C4w): the top blocks first, then the bottom ones, then the notes. egui places an
-/// anchored area from the size it had on its last pass, so a bottom block that grew since (a
-/// longer note list, a wrapped note, the FTL line) was drawn too low, over the block under it;
-/// a capture, which draws each bookmark once on one HUD, kept it there. Every bottom block (and
-/// the centred time line) is therefore placed from its size measured this pass ([`measure`],
-/// [`show_measured`]), and the notes blocks (the honesty line, its pop-up, the stack under
-/// Location) keep [`PANEL_GAP`] clear of every block drawn before them ([`rise`], [`fall`]).
-/// A pop-up or stack with too little room keeps its honesty notes whole and first, and scrolls
-/// or leaves out the others ([`plan_notes`]; lead ruling C4w-I1).
+/// Layout (C4w): the bottom blocks first, then the top ones, then the notes, then the overlay.
+/// egui places an anchored area from the size it had on its last pass, so a bottom block that
+/// grew since (a longer note list, a wrapped note, the FTL line) was drawn too low, over the
+/// block under it; a capture, which draws each bookmark once on one HUD, kept it there. Every
+/// bottom block (and the centred time line) is therefore placed from its size measured this
+/// pass ([`measure`], [`show_measured`]). The card gets the height down to the blocks under it
+/// (C4w r3). The notes blocks (the honesty line, its pop-up, the stack under Location) keep
+/// [`PANEL_GAP`] clear of every block drawn before them ([`rise`], [`fall`]); a pop-up or stack
+/// with too little room keeps its honesty notes whole and first, and scrolls or leaves out the
+/// others ([`plan_notes`]; lead ruling C4w-I1). The overlay (markers, bracket, orbits) is drawn
+/// last, under every panel and kept off all of them (lead ruling C4w r3).
 fn draw_hud(
     ctx: &egui::Context,
     data: &HudData,
@@ -604,30 +604,67 @@ fn draw_hud(
 ) {
     let screen = ctx.content_rect();
     let m = SCREEN_MARGIN;
-    area("overlay", Order::Background)
-        .fixed_pos(screen.min)
-        .interactable(false)
-        .show(ctx, |ui| {
-            ui.set_min_size(screen.size());
-            draw_overlay(ui, overlay);
-        });
-
     let notes = hud_notes(data, c);
     // Read once: a click below may close the card, which takes effect on the next pass.
     let expanded = c.card_expanded;
     let card = data.target.as_ref().filter(|_| expanded);
-    // The blocks drawn so far; the notes keep clear of them.
+    let left = screen.left() + m;
+    // The blocks drawn so far; the card and the notes keep clear of them.
     let mut taken: Vec<egui::Rect> = Vec::new();
+    // Every block drawn, for the overlay to keep off.
+    let mut drawn: Vec<egui::Rect> = Vec::new();
 
-    // The top row.
+    // The bottom row, each block placed from its size this pass.
+    let hint = if card.is_some() {
+        HINT_CARD
+    } else {
+        HINT_COLLAPSED
+    };
+    let perf_lines = [perf_line(data), hint.to_owned()];
+    let perf = show_measured(
+        ctx,
+        Measured {
+            id: "perf",
+            order: Order::Middle,
+            align: Align2::RIGHT_BOTTOM,
+            at: screen.right_bottom() + egui::vec2(-m, -m + 2.0),
+            max_width: screen.width(),
+            interactable: false,
+        },
+        |ui| perf_block(ui, &perf_lines),
+    );
+    taken.push(perf);
+    if expanded {
+        if let Some(g) = &data.gravity {
+            let rect = show_measured(
+                ctx,
+                Measured::bottom_left("gravity", egui::pos2(left, screen.bottom() - m)),
+                |ui| panels::show_gravity(ui, g),
+            );
+            taken.push(rect);
+        }
+        // Centred, but on a narrow screen clear of the Gravity panel and of the Location
+        // column, whose notes stack then runs down to Gravity rather than to the taller Speed
+        // panel (C4w r2: 86 pt more room for the honesty notes at 960 pt wide).
+        let speed_left = (screen.center().x - SPEED_WIDTH / 2.0)
+            .max(left + LOCATION_WIDTH.max(GRAVITY_WIDTH) + PANEL_GAP);
+        let rect = show_measured(
+            ctx,
+            Measured::bottom_left("speed", egui::pos2(speed_left, screen.bottom() - m)),
+            |ui| panels::show_speed(ui, &data.speed),
+        );
+        taken.push(rect);
+    }
+
+    // The top row. The card takes the height down to the blocks under it (C4w r3).
     if let Some(card) = card {
+        let x = egui::Rangef::new(screen.right() - m - CARD_WIDTH, screen.right() - m);
+        let room = card_room(x, screen, &taken);
         let rect = area("card", Order::Middle)
             .anchor(Align2::RIGHT_TOP, [-m, m])
             .show(ctx, |ui| {
-                // The header (≈ 90 pt) and the padding stay; the body scrolls.
-                let max_body =
-                    screen.height() - 2.0 * m - 2.0 * CARD_PADDING_Y - 2.0 - 90.0 - PERF_RESERVE;
-                let clicks = show_card(ui, card, max_body.max(80.0));
+                ui.set_max_height(room);
+                let clicks = show_card(ui, card);
                 if clicks.actions.contains(&CardAction::Close) {
                     c.card_expanded = false;
                 }
@@ -699,49 +736,7 @@ fn draw_hud(
     };
     taken.extend(time);
 
-    // The bottom row, each block placed from its size this pass.
-    let hint = if card.is_some() {
-        HINT_CARD
-    } else {
-        HINT_COLLAPSED
-    };
-    let perf_lines = [perf_line(data), hint.to_owned()];
-    let perf = show_measured(
-        ctx,
-        Measured {
-            id: "perf",
-            order: Order::Middle,
-            align: Align2::RIGHT_BOTTOM,
-            at: screen.right_bottom() + egui::vec2(-m, -m + 2.0),
-            max_width: screen.width(),
-            interactable: false,
-        },
-        |ui| perf_block(ui, &perf_lines),
-    );
-    taken.push(perf);
-
-    let left = screen.left() + m;
     if expanded {
-        if let Some(g) = &data.gravity {
-            let rect = show_measured(
-                ctx,
-                Measured::bottom_left("gravity", egui::pos2(left, screen.bottom() - m)),
-                |ui| panels::show_gravity(ui, g),
-            );
-            taken.push(rect);
-        }
-        // Centred, but on a narrow screen clear of the Gravity panel and of the Location
-        // column, whose notes stack then runs down to Gravity rather than to the taller Speed
-        // panel (C4w r2: 86 pt more room for the honesty notes at 960 pt wide).
-        let speed_left = (screen.center().x - SPEED_WIDTH / 2.0)
-            .max(left + LOCATION_WIDTH.max(GRAVITY_WIDTH) + PANEL_GAP);
-        let rect = show_measured(
-            ctx,
-            Measured::bottom_left("speed", egui::pos2(speed_left, screen.bottom() - m)),
-            |ui| panels::show_speed(ui, &data.speed),
-        );
-        taken.push(rect);
-
         // Anchored at its top left, so its rect holds even on egui's sizing pass.
         let location = area("location", Order::Middle)
             .anchor(Align2::LEFT_TOP, [m, m])
@@ -752,6 +747,7 @@ fn draw_hud(
             })
             .response
             .rect;
+        drawn.push(location);
         // The notes stack under Location (12 pt, in tone; the flight label is the Speed
         // header), 11 pt under it as in C4 (egui's item spacing and 8 pt). It ends
         // `PANEL_GAP` over the Gravity panel (or any block below it); with less room, its
@@ -777,10 +773,14 @@ fn draw_hud(
             } else {
                 slot.top
             };
-            placed("notes stack", Order::Middle, egui::pos2(left, top)).show(ctx, |ui| {
-                ui.set_max_width(LOCATION_WIDTH);
-                notes_stack(ui, &stack, fit);
-            });
+            let rect = placed("notes stack", Order::Middle, egui::pos2(left, top))
+                .show(ctx, |ui| {
+                    ui.set_max_width(LOCATION_WIDTH);
+                    notes_stack(ui, &stack, fit);
+                })
+                .response
+                .rect;
+            drawn.push(rect);
         }
     } else if !notes.is_empty() {
         // The honesty line, bottom left: beside the perf block when the line's least width fits
@@ -808,6 +808,7 @@ fn draw_hud(
                 line.rect
             })
             .inner;
+        drawn.push(line);
         // Its pop-up stands on it, from its height this pass, and stops under the top row;
         // with less room, its honesty notes stay whole and the others scroll or are left out.
         if c.notes_expanded {
@@ -825,14 +826,38 @@ fn draw_hud(
             // Honesty notes past the room are drawn whole: on screen, down over the line if
             // they must (ruling C4w r2 (3)).
             let top = (slot.top + slot.height - h).max(screen.top() + m);
-            placed("notes popup", Order::Foreground, egui::pos2(left, top))
-                .show(ctx, |ui| notes_popup(ui, &popup, fit));
+            let rect = placed("notes popup", Order::Foreground, egui::pos2(left, top))
+                .show(ctx, |ui| notes_popup(ui, &popup, fit))
+                .response
+                .rect;
+            drawn.push(rect);
         }
     }
 
     if c.show_help {
-        show_controls_window(ctx, data, c);
+        drawn.extend(show_controls_window(ctx, data, c));
     }
+
+    // The overlay last, so it knows every block: under them all (Background) and kept off
+    // them, since the panels' glass would show it through (lead ruling C4w r3).
+    drawn.extend(taken);
+    area("overlay", Order::Background)
+        .fixed_pos(screen.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_min_size(screen.size());
+            draw_overlay_clear_of(ui, overlay, &drawn);
+        });
+}
+
+/// The height [pt] the target card may take in the columns `x`, from the top margin down to
+/// `PANEL_GAP` over the highest block of `taken` under it (the perf block, or the Speed panel
+/// on a narrow screen), or to the bottom margin (C4w r3: before, egui's default 400 pt area
+/// height cut the card).
+fn card_room(x: egui::Rangef, screen: egui::Rect, taken: &[egui::Rect]) -> f32 {
+    let m = SCREEN_MARGIN;
+    let floor = screen.bottom() - m;
+    fall(x, screen.top() + m, f32::INFINITY, floor, taken, PANEL_GAP).height
 }
 
 /// The rect of a top-row area just shown, whose closure returned `ui.is_sizing_pass()`. None
@@ -903,7 +928,7 @@ fn show_measured(
 /// The size `add` lays out to this pass, at most `max_width` wide: it runs in an invisible,
 /// disabled `Ui` far off screen, so it paints nothing and no pointer reaches it. The text it
 /// lays out is cached, so drawing it again costs little.
-fn measure(
+pub(crate) fn measure(
     ctx: &egui::Context,
     id: &str,
     max_width: f32,
@@ -1161,6 +1186,56 @@ fn haloed(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.painter().set(halo, theme::halo_shape(rect.expand(6.0)));
 }
 
+/// The blocks the HUD draws for `data` under `controls`, by the names the capture JSON's
+/// `hud.panels` uses: "place line", "location", "gravity", "speed", "card", "warp", "time",
+/// "time line", "perf line", "notes line" (the collapsed honesty line), "notes list" (its
+/// pop-up, or the stack under Location) and "controls" (F1). The same conditions as
+/// [`draw_hud`], so the JSON lists only what is drawn (lead ruling C4w r3; tested against the
+/// areas egui shows).
+pub fn drawn_blocks(data: &HudData, controls: &HudControls) -> Vec<&'static str> {
+    let c = controls;
+    if !c.visible {
+        return Vec::new();
+    }
+    let notes = hud_notes(data, c);
+    let card = c.card_expanded && data.target.is_some();
+    let mut out = Vec::new();
+    if c.card_expanded {
+        out.push("location");
+        if data.gravity.is_some() {
+            out.push("gravity");
+        }
+        out.push("speed");
+        if card {
+            out.push("card");
+        }
+    } else {
+        out.push("place line");
+    }
+    out.push(if c.show_warp {
+        "warp"
+    } else if c.card_expanded && !card {
+        "time"
+    } else {
+        "time line"
+    });
+    out.push("perf line");
+    if c.card_expanded {
+        if !block_notes(&notes, &data.warnings, Some(&data.speed.header)).is_empty() {
+            out.push("notes list");
+        }
+    } else if !notes.is_empty() {
+        out.push("notes line");
+        if c.notes_expanded {
+            out.push("notes list");
+        }
+    }
+    if c.show_help {
+        out.push("controls");
+    }
+    out
+}
+
 /// The notes and warnings of a frame, as uni-app's `hud_data` builds them (lead ruling C4w r2
 /// (1)): `labels` (the frame's honesty labels in their tones), then the renderer's pass
 /// statuses (`statuses`: "Inside Sun", "Inside Earth", "No surface map: …", the comet
@@ -1404,12 +1479,19 @@ fn perf_line(data: &HudData) -> String {
 /// The F1 list (top centre): the key map, the settings (exposures, lens scale, "Highlight
 /// asteroid belt" with its amber tag) and the performance detail (render size, GPU ms per
 /// pass). Its "Close · F1" button clears `show_help`.
-fn show_controls_window(ctx: &egui::Context, data: &HudData, c: &mut HudControls) {
-    area("controls", Order::Foreground)
+/// Returns its rect, `None` on egui's sizing pass ([`shown_rect`]).
+fn show_controls_window(
+    ctx: &egui::Context,
+    data: &HudData,
+    c: &mut HudControls,
+) -> Option<egui::Rect> {
+    let window = area("controls", Order::Foreground)
         .anchor(Align2::CENTER_TOP, [0.0, 2.0 * SCREEN_MARGIN + 16.0])
         .show(ctx, |ui| {
             theme::panel_frame(theme::HAIRLINE).show(ui, |ui| controls_list(ui, data, c));
+            ui.is_sizing_pass()
         });
+    shown_rect(&window)
 }
 
 /// The F1 list's content.
@@ -1652,6 +1734,8 @@ mod tests {
         texts: Vec<Painted>,
         rects: Vec<(egui::Rect, Color32, Color32)>,
         circles: Vec<(Pos2, Color32)>,
+        /// Stroked paths: points and solid stroke colour.
+        paths: Vec<(Vec<Pos2>, Color32)>,
     }
 
     impl Frame {
@@ -1691,6 +1775,11 @@ mod tests {
                 }
                 egui::Shape::Rect(r) => f.rects.push((r.rect, r.fill, r.stroke.color)),
                 egui::Shape::Circle(c) => f.circles.push((c.center, c.fill)),
+                egui::Shape::Path(p) => {
+                    if let egui::epaint::ColorMode::Solid(color) = p.stroke.color {
+                        f.paths.push((p.points.clone(), color));
+                    }
+                }
                 _ => {}
             }
         }
@@ -2641,6 +2730,288 @@ mod tests {
         o.textures_delta.clear();
     }
 
+    /// A target card as the app builds it for `title`: 3 live rows, `facts` fact rows, the
+    /// buttons, a sources line and `notes` (the gate's Mars card has 12 facts and one note;
+    /// TRAPPIST-1's 16 facts, two notes and no Moons button).
+    fn big_card(title: &str, facts: usize, notes: usize, moons: bool) -> TargetCard {
+        let mut actions = vec![CardAction::Goto];
+        if moons {
+            actions.push(CardAction::Moons);
+        }
+        actions.push(CardAction::Close);
+        TargetCard {
+            kicker: "TARGET".into(),
+            title: title.into(),
+            subtitle: "Star · 7 known planets · real object".into(),
+            live: vec![
+                row("Distance", "0.200 AU", true),
+                row("Closing speed", "0.0 m/s", true),
+                row("Light time", "1 min 40 s", true),
+            ],
+            facts: (0..facts)
+                .map(|i| row(&format!("Fact {i}"), &format!("{i}.0 units"), true))
+                .collect(),
+            notes: (0..notes)
+                .map(|i| {
+                    format!(
+                        "Card note {i}: planets' orbit orientation unknown, drawn in the sky \
+                         plane (assumed)"
+                    )
+                })
+                .collect(),
+            sources: "Data: NASA Exoplanet Archive (host and planets)".into(),
+            actions,
+            moons: Vec::new(),
+        }
+    }
+
+    /// Lead ruling C4w r3 (the gate's Mars and TRAPPIST-1 cards): the card takes the height down
+    /// to the blocks under it. Before, egui's default 400 pt area height cut it at 1080p (since
+    /// C4, not C4w): Mars lost "Axial tilt" and its buttons, TRAPPIST-1 its notes. At 1080p every
+    /// row, button and note now shows; at the window's least size the buttons, sources and notes
+    /// still show and only rows scroll; the card never reaches the Speed panel or the perf block.
+    #[test]
+    fn card_uses_the_room_down_to_the_blocks_under_it() {
+        let min = [
+            (2.0 * MIN_WINDOW_PT[0]) as u32,
+            (2.0 * MIN_WINDOW_PT[1]) as u32,
+        ];
+        for (size_px, ppp) in [([1920_u32, 1080_u32], 1.0_f32), (min, 2.0)] {
+            for card in [
+                big_card("Mars", 12, 1, true),
+                big_card("TRAPPIST-1", 16, 2, false),
+            ] {
+                let case = format!("{size_px:?} @ {ppp}, {}", card.title);
+                let mut d = data();
+                d.target = Some(card.clone());
+                let ctx = headless_context();
+                let mut c = expanded();
+                let (mut o, _, _) =
+                    run_hud_settled(&ctx, size_px, ppp, 8192, &d, &Overlay::default(), &mut c);
+                o.textures_delta.clear();
+                let f = collect(&o);
+                let whole = |text: &str| {
+                    f.texts.iter().any(|p| {
+                        let r = egui::Rect::from_min_size(p.pos, p.size);
+                        p.text == text && p.clip.expand(0.5).contains_rect(r)
+                    })
+                };
+                let mut always: Vec<String> =
+                    ["Go to · F", "Close · Esc"].map(str::to_owned).to_vec();
+                if card.actions.contains(&CardAction::Moons) {
+                    always.push("Moons".into());
+                }
+                always.push(card.sources.clone());
+                always.extend(card.notes.iter().cloned());
+                for text in &always {
+                    assert!(whole(text), "{case}: {text:?} cut or missing");
+                }
+                let rows: Vec<&String> = card
+                    .live
+                    .iter()
+                    .chain(&card.facts)
+                    .map(|r| &r.label)
+                    .collect();
+                let shown = rows.iter().filter(|r| whole(r)).count();
+                if ppp == 1.0 {
+                    assert_eq!(shown, rows.len(), "{case}: every row at 1080p");
+                } else {
+                    println!("{case}: {shown} of {} rows in view", rows.len());
+                }
+                let blocks = blocks(&ctx);
+                let get = |name: &str| blocks.iter().find(|b| b.0 == name).map(|b| b.1);
+                let card_rect = get("card").expect("card");
+                for other in ["speed", "perf", "gravity"] {
+                    if let Some(r) = get(other) {
+                        assert!(
+                            !card_rect.intersects(r),
+                            "{case}: card {card_rect:?} on {other}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// C4w r3: the moons list scrolls with the card's rows, so on a card at its room (the
+    /// window's least size, Saturn-like moons) the list just opened is scrolled into view.
+    #[test]
+    fn opened_moons_list_is_scrolled_into_view() {
+        let size = [
+            (2.0 * MIN_WINDOW_PT[0]) as u32,
+            (2.0 * MIN_WINDOW_PT[1]) as u32,
+        ];
+        let mut card = big_card("Saturn", 12, 1, true);
+        card.moons = (0..20).map(|i| format!("Moon {i}")).collect();
+        let mut d = data();
+        d.target = Some(card);
+        let ctx = headless_context();
+        let ov = Overlay::default();
+        let mut c = expanded();
+        let draw = |c: &mut HudControls, events: Vec<egui::Event>| {
+            let mut raw = headless_input(size, 2.0, 8192);
+            raw.events = events;
+            let (mut o, hud) = run_hud(&ctx, raw, &d, &ov, c);
+            o.textures_delta.clear();
+            (collect(&o), hud)
+        };
+        let (mut o, _, _) = run_hud_settled(&ctx, size, 2.0, 8192, &d, &ov, &mut c);
+        o.textures_delta.clear();
+        let f = collect(&o);
+        assert!(f.find("Moon 0").is_none());
+        let at = f.get("Moons").center();
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        draw(&mut c, vec![egui::Event::PointerMoved(at), press(true)]);
+        let (_, hud) = draw(&mut c, vec![press(false)]);
+        assert_eq!(hud.actions, [CardAction::Moons]);
+        // Within the next frames (egui applies the scroll a pass later) it is in view.
+        draw(&mut c, Vec::new());
+        draw(&mut c, Vec::new());
+        let (f, _) = draw(&mut c, Vec::new());
+        let moon = f.get("Moon 0");
+        let r = egui::Rect::from_min_size(moon.pos, moon.size);
+        assert!(moon.clip.contains_rect(r), "{moon:?}");
+        let close = f.get("Close · Esc");
+        assert!(
+            close
+                .clip
+                .contains_rect(egui::Rect::from_min_size(close.pos, close.size))
+        );
+    }
+
+    /// Lead ruling C4w r3 (the gate's orbit line over the Mars card, "nu Oph" under Speed): the
+    /// overlay is drawn under the panels and kept off them: an orbit line crossing the card is
+    /// cut out of it, a marker whose label meets the Speed panel is not drawn, one in free sky
+    /// is.
+    #[test]
+    fn overlay_never_draws_over_panels() {
+        use crate::overlay::{Marker, MarkerKind, OrbitLine};
+        let marker = |name: &str, x: f32, y: f32| Marker {
+            id: 0,
+            pt: glam::Vec2::new(x, y),
+            glyph: true,
+            label: Some(name.to_owned()),
+            kind: MarkerKind::Star,
+            selected: false,
+            sub: Some("42.46 pc (138.48 ly)".into()),
+            aim_fill: 0.0,
+            target: false,
+            off_axis_rad: 0.0,
+        };
+        let overlay = Overlay {
+            bracket: None,
+            markers: vec![
+                marker("nu Oph", 1130.0, 1015.0),
+                marker("Polaris", 400.0, 600.0),
+            ],
+            orbits: vec![OrbitLine {
+                pts: vec![glam::Vec2::new(0.0, 300.0), glam::Vec2::new(1920.0, 330.0)],
+                dashed: false,
+                tone: LabelTone::Neutral,
+            }],
+        };
+        let mut d = data();
+        d.target = Some(big_card("Mars", 12, 1, true));
+        let ctx = headless_context();
+        let mut c = expanded();
+        let (mut o, _, _) = run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &overlay, &mut c);
+        o.textures_delta.clear();
+        let f = collect(&o);
+        assert!(f.find("Polaris").is_some(), "{:?}", f.all_text());
+        assert!(
+            f.find("nu Oph").is_none(),
+            "under Speed: {:?}",
+            f.all_text()
+        );
+        let orbit = tone_color(LabelTone::Neutral).gamma_multiply(theme::ORBIT_ALPHA);
+        let lines: Vec<&Vec<Pos2>> = f
+            .paths
+            .iter()
+            .filter(|(_, c)| *c == orbit)
+            .map(|(p, _)| p)
+            .collect();
+        assert!(
+            !lines.is_empty(),
+            "the orbit line outside the panels is drawn"
+        );
+        let panels: Vec<(&str, egui::Rect)> = blocks(&ctx);
+        for pts in lines {
+            for w in pts.windows(2) {
+                for k in 0..=20 {
+                    let p = w[0] + (w[1] - w[0]) * (k as f32 / 20.0);
+                    for (name, r) in &panels {
+                        assert!(
+                            !r.shrink(0.5).contains(p),
+                            "orbit at {p:?} inside {name} {r:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lead ruling C4w r3 (TRAPPIST-1 has no Gravity panel but the capture JSON listed one):
+    /// `drawn_blocks` lists exactly the areas the HUD shows, whatever its state.
+    #[test]
+    fn drawn_blocks_match_the_areas_shown() {
+        fn json_name(area: &'static str) -> &'static str {
+            match area {
+                "place" => "place line",
+                "perf" => "perf line",
+                "notes" => "notes line",
+                "notes popup" | "notes stack" => "notes list",
+                other => other,
+            }
+        }
+        for gravity in [true, false] {
+            for target in [true, false] {
+                for (card_expanded, notes_expanded, show_warp, show_help) in [
+                    (false, false, false, false),
+                    (false, true, false, false),
+                    (true, false, false, false),
+                    (true, true, true, false),
+                    (false, true, true, true),
+                ] {
+                    let mut d = data();
+                    if !gravity {
+                        d.gravity = None;
+                    }
+                    d.target = target.then(mars_card);
+                    let c = HudControls {
+                        card_expanded,
+                        notes_expanded,
+                        show_warp,
+                        show_help,
+                        ..controls()
+                    };
+                    let case = format!("gravity {gravity}, target {target}, {c:?}");
+                    let ctx = headless_context();
+                    let mut c1 = c;
+                    let (mut o, _, _) =
+                        run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &Overlay::default(), &mut c1);
+                    o.textures_delta.clear();
+                    let mut shown: Vec<&str> =
+                        blocks(&ctx).iter().map(|b| json_name(b.0)).collect();
+                    let mut listed = drawn_blocks(&d, &c);
+                    shown.sort_unstable();
+                    shown.dedup();
+                    listed.sort_unstable();
+                    assert_eq!(listed, shown, "{case}");
+                }
+            }
+        }
+        let hidden = HudControls {
+            visible: false,
+            ..controls()
+        };
+        assert!(drawn_blocks(&data(), &hidden).is_empty());
+    }
+
     /// Review C4w M3: what the HUD's measuring costs. Prints the mean of one settled HUD run
     /// (collapsed with the pop-up; expanded with the card) and of one frame's measure calls
     /// alone (all six measured blocks, more than either mode makes)
@@ -2718,7 +3089,7 @@ mod tests {
 
     /// The HUD's visible blocks after the last run on `ctx`: (area name, rect).
     fn blocks(ctx: &egui::Context) -> Vec<(&'static str, egui::Rect)> {
-        const NAMES: [&str; 12] = [
+        const NAMES: [&str; 13] = [
             "card",
             "place",
             "warp",
@@ -2731,6 +3102,7 @@ mod tests {
             "notes stack",
             "notes",
             "notes popup",
+            "controls",
         ];
         ctx.memory(|mem| {
             let visible = mem.areas().visible_layer_ids();
@@ -3145,9 +3517,11 @@ mod tests {
         assert_eq!(out.actions, [CardAction::Goto]);
         let out = click(&d, &mut c, f.get("Moons").center());
         assert_eq!(out.actions, [CardAction::Moons]);
-        let phobos = look(&ctx, 1.0, &d, &mut c).get("Phobos").center();
-        let out = click(&d, &mut c, phobos);
+        // The open list sits over the buttons (it scrolls with the rows, C4w r3).
+        let f = look(&ctx, 1.0, &d, &mut c);
+        let out = click(&d, &mut c, f.get("Phobos").center());
         assert_eq!(out.selected_moon.as_deref(), Some("Phobos"));
+        assert!(f.get("Phobos").pos.y < f.get("Close · Esc").pos.y);
         let out = click(&d, &mut c, f.get("Close · Esc").center());
         assert_eq!(out.actions, [CardAction::Close]);
         assert!(!c.card_expanded);

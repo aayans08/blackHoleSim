@@ -120,7 +120,8 @@ pub struct HudInfo {
     pub card_rows: Vec<String>,
     /// The card's kicker and title ("TARGET", "Mars"), when there is one.
     pub card: Option<[String; 2]>,
-    /// The panels drawn: the collapsed lines, or the expanded panels and the card.
+    /// The HUD blocks drawn (`uni_ui::hud::drawn_blocks`): the collapsed lines or the expanded
+    /// panels, the card, the time line or panel, the notes line and list.
     pub panels: Vec<String>,
     /// The notes the HUD showed, in order.
     pub notes: Vec<String>,
@@ -612,20 +613,12 @@ fn hud_info(data: &uni_ui::HudData, controls: &uni_ui::HudControls) -> HudInfo {
         .flat_map(|c| c.live.iter().chain(c.facts.iter()))
         .map(|r| r.label.clone())
         .collect();
-    let mut panels = Vec::new();
-    if controls.card_expanded {
-        panels.extend(["location", "gravity", "speed"].map(str::to_owned));
-        if data.target.is_some() {
-            panels.push("card".to_owned());
-        }
-    } else {
-        panels.extend(["place line", "time line", "perf line"].map(str::to_owned));
-    }
-    panels.push(if controls.notes_expanded {
-        "notes list".to_owned()
-    } else {
-        "notes line".to_owned()
-    });
+    // Only what the HUD draws: the same conditions as its layout (lead ruling C4w r3; the
+    // TRAPPIST-1 capture listed a Gravity panel it did not draw).
+    let panels = uni_ui::hud::drawn_blocks(data, controls)
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     HudInfo {
         card_rows,
         card: data
