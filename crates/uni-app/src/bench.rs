@@ -468,6 +468,12 @@ pub fn run(args: &BenchArgs) -> Result<(), CaptureError> {
             }
         }
         scene.frame_tag.set(None);
+        // An error raised by the last frames or the final read-back fails this bookmark (final
+        // review, app minor 6).
+        crate::capture::check_gpu_errors(
+            &gpu,
+            &format!("bench {:?} after its last frame", b.name),
+        )?;
         let result = BookmarkResult {
             name: b.name.clone(),
             lens_scale: scene.lens_scale(),

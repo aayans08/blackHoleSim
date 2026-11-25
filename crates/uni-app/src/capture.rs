@@ -185,6 +185,15 @@ pub fn submit_and_wait(
     what: &str,
 ) -> anyhow::Result<()> {
     gpu.queue.submit(cmds);
+    check_gpu_errors(gpu, what)
+}
+
+/// Waits until the GPU has finished everything submitted, then fails on any uncaptured GPU
+/// error raised so far, naming `what`. Captures call it after a bookmark's read-backs (the PNG
+/// and the taps submit their own copies after the frame's check) and the bench after its final
+/// drain, so an error raised there fails the run and is blamed on its own bookmark, not the
+/// next one, or on none after the last (final review, app minor 6).
+pub fn check_gpu_errors(gpu: &GpuContext, what: &str) -> anyhow::Result<()> {
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .with_context(|| format!("waiting for {what}"))?;
@@ -360,6 +369,7 @@ pub fn run(args: &CaptureArgs) -> Result<(), CaptureError> {
         target.save_png(&gpu, &png)?;
         let world_img = scene.world_tap.take(&gpu)?;
         let hdr_img = scene.hdr_tap.take(&gpu)?;
+        check_gpu_errors(&gpu, &format!("read-backs of {:?}", b.name))?;
         let ev100 = scene.resolved_ev100();
         let ev = ev100.unwrap_or([
             frame.settings.manual.scene_ev100,
