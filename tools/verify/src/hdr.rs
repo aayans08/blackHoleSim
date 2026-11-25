@@ -1453,7 +1453,8 @@ pub(crate) mod tests {
         let mut cap = blank(4, 1, 1.0, [1.0, 1.0]);
         put(&mut cap, 0, 0, [0.5, 0.5, 0.5]);
         cap.regions.insert("lit".into(), vec![[0.0, 0.0]]);
-        cap.regions.insert("dark".into(), vec![[1.0, 0.0], [2.0, 0.0]]);
+        cap.regions
+            .insert("dark".into(), vec![[1.0, 0.0], [2.0, 0.0]]);
         let args = |num: &str, den: &str, bounds| RatioArgs {
             num: num.into(),
             den: den.into(),

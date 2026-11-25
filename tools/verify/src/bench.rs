@@ -426,10 +426,8 @@ pub fn evaluate(file: &BenchFile, args: &BenchArgs) -> Verdict {
     // A 10-s window needs a sustained run at least that long (final review, app minor 9).
     let long_enough = !args.window.is_timed() || sustained_s(file).is_some_and(|s| s >= WINDOW_S);
     if !long_enough {
-        let got = sustained_s(file).map_or_else(
-            || "null (a serial run)".to_owned(),
-            |s| format!("{s} s"),
-        );
+        let got = sustained_s(file)
+            .map_or_else(|| "null (a serial run)".to_owned(), |s| format!("{s} s"));
         lines.push(format!(
             "run: sustained_s {got} is not a sustained run of at least {WINDOW_S} s, so it has no \
              {key} window to judge FAIL"
@@ -717,7 +715,10 @@ mod tests {
         cut.bookmarks.truncate(1);
         let full = evaluate(&cut, &args(Window::Last10s, false));
         assert!(full.pass, "{full:#?}");
-        assert!(line(&full, "start").contains("window covers 10.0"), "{full:#?}");
+        assert!(
+            line(&full, "start").contains("window covers 10.0"),
+            "{full:#?}"
+        );
         let set_count = |file: &mut BenchFile, count: Option<f64>| {
             for w in file.bookmarks[0].windows.values_mut().flatten() {
                 if let Some(s) = w.interval_ms.as_mut() {
@@ -732,7 +733,10 @@ mod tests {
         assert!(!v.lines.iter().any(|l| l.starts_with("run:")), "{v:#?}");
         set_count(&mut cut, None);
         let v = evaluate(&cut, &args(Window::Last10s, false));
-        assert!(!v.pass && line(&v, "start").contains("window length n/a"), "{v:#?}");
+        assert!(
+            !v.pass && line(&v, "start").contains("window length n/a"),
+            "{v:#?}"
+        );
     }
 
     #[test]
