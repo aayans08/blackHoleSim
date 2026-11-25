@@ -95,12 +95,16 @@ const PANEL_GAP: f32 = 16.0;
 /// - 960 pt keeps the honesty line beside the perf block (its 560 pt least width and the perf
 ///   block need about 880 pt) and the 520 pt Speed panel on screen, clear of the Location
 ///   column (x 340–860);
-/// - 780 pt gives the expanded notes stack, between Location (its top 180.5 pt) and Gravity,
-///   H − 331 = 449 pt for the worst set's 18 honesty notes, 430.5 pt with their wrapped lines
-///   (18.5 pt spare). F1 raised it from 740 pt: the horizon label ("view not
-///   simulated") and the lens label (its blueshift clause) now wrap to two lines each, so at
-///   740 pt the stack overran the Gravity panel by 5.5 pt.
-pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 780.0];
+/// - 840 pt gives the expanded notes stack, from under Location (its top at 180.5 pt) to Gravity,
+///   H − 331 = 509 pt for the worst set's 20 honesty notes, 496.5 pt with their wrapped lines
+///   (12.5 pt spare; 10 pt with a card open and the warp panel shown, which put the stack 2.5 pt
+///   lower: `worst_set_fits_the_least_window` prints it). F1 raised it from 740 to 780 pt: the
+///   horizon label ("view not simulated") and the lens label (its blueshift clause) wrap to two
+///   lines each. The post-wave sync (S1) raised it to 840 pt for F2's two amber moon labels
+///   (mean elements, frozen), two lines each: at 780 pt the stack overran Gravity by 31.5 pt.
+///   The owner's default display (1470 × 956 pt) holds it in a window; a 1280 × 832 pt display
+///   cannot (nor could it hold 780 pt with the menu and title bars).
+pub const MIN_WINDOW_PT: [f64; 2] = [960.0, 840.0];
 /// Gap from the honesty line's top to its pop-up's bottom [pt] (C4's geometry: 6 pt over the
 /// line's area, which hangs 4 pt lower than the margin).
 const POPUP_GAP: f32 = 10.0;
@@ -3286,13 +3290,14 @@ mod tests {
     ///   label;
     /// - every amber flag, as if they could hold together: inside a hole's horizon ("view not
     ///   simulated") on the debug grid with the stars unlensed (and not blueshifted), the four
-    ///   extrapolation and catching-up labels, the belt highlighted, eye-adapted stars, vivid
-    ///   colours. Being inside a body ("Inside X")
-    ///   or beyond the lens's reach (the coverage warning) excludes a traced lens, so neither
-    ///   is here: they are one line against the three lens lines;
+    ///   extrapolation and catching-up labels, both moon labels (mean elements and frozen: raised
+    ///   together when only some moons have elements, F2), the belt highlighted, eye-adapted
+    ///   stars, vivid colours. Being inside a body ("Inside X") or beyond the lens's reach (the
+    ///   coverage warning) excludes a traced lens, so neither is here: they are one line
+    ///   against the three lens lines;
     /// - the most warnings: the 3 GPU errors the app keeps, the flash message, a data notice,
     ///   and the renderer's statuses (three bodies without maps, merged into one line; a map
-    ///   without statistics; the comet partly-drawn note). 18 honesty notes in the stack.
+    ///   without statistics; the comet partly-drawn note). 20 honesty notes in the stack.
     fn worst_honesty(d: &mut HudData, c: &mut HudControls) {
         use crate::theme::{SATURN_MOONS_LABEL, VIVID_STAR_COLOURS_LABEL};
         use uni_sim::honesty::{HonestyFlag, label};
@@ -3312,6 +3317,8 @@ mod tests {
                 HonestyFlag::PlutoExtrapolated,
                 HonestyFlag::StarsExtrapolated,
                 HonestyFlag::CometsCatchingUp,
+                HonestyFlag::MoonsMeanElements,
+                HonestyFlag::MoonsFrozen,
                 HonestyFlag::BandModel,
                 HonestyFlag::MilkyWayDetailProcedural,
                 HonestyFlag::ProceduralBelt,
@@ -3436,6 +3443,56 @@ mod tests {
             }
         }
         cases
+    }
+
+    /// The room the worst honesty set leaves at the window's least size ([`MIN_WINDOW_PT`]),
+    /// expanded (the tallest stack; the pop-up has more room): the stack ends at least
+    /// `PANEL_GAP` above every block under it. Prints the stack's height and the spare room, the
+    /// numbers `MIN_WINDOW_PT`'s doc quotes.
+    #[test]
+    fn worst_set_fits_the_least_window() {
+        let size_px = [
+            (2.0 * MIN_WINDOW_PT[0]) as u32,
+            (2.0 * MIN_WINDOW_PT[1]) as u32,
+        ];
+        for (card, show_warp) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut d = data();
+            let mut c = HudControls {
+                card_expanded: true,
+                notes_expanded: true,
+                show_warp,
+                ..controls()
+            };
+            d.target = card.then(mars_card);
+            d.eye_adapted_stars = true;
+            d.lens_on_screen = true;
+            worst_honesty(&mut d, &mut c);
+            let (ctx, _) = draw_grown(size_px, 2.0, &d, c);
+            let blocks = blocks(&ctx);
+            let stack = blocks
+                .iter()
+                .find(|b| b.0 == "notes stack")
+                .map(|b| b.1)
+                .expect("notes stack");
+            let below = blocks
+                .iter()
+                .filter(|(name, r)| {
+                    *name != "notes stack"
+                        && r.top() >= stack.top()
+                        && r.x_range().intersects(stack.x_range())
+                })
+                .map(|(_, r)| r.top())
+                .fold(f32::INFINITY, f32::min);
+            let spare = below - PANEL_GAP - stack.bottom();
+            println!(
+                "least window, worst set (card {card}, warp {show_warp}): stack {:.1} pt from \
+                 {:.1} to {:.1}, next block at {below:.1}, spare {spare:.1} pt",
+                stack.height(),
+                stack.top(),
+                stack.bottom()
+            );
+            assert!(spare >= -0.5, "the worst set overruns by {:.1} pt", -spare);
+        }
     }
 
     /// C4w (the owner: soft and uncluttered): over the sweep (every size, list, mode, the warp
