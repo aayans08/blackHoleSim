@@ -20,7 +20,9 @@
 //! Every panel is an `egui::Area` laid out at fixed margins (24 pt) and painted with the
 //! mockup's tokens (`crate::theme`). The overlay (markers, brackets, orbits; C5) is drawn first,
 //! in a full-screen, non-interactive area at `Order::Background` (ruling C.7), so it sits under
-//! the panels and never takes a click. Tab (`visible = false`) hides all of it.
+//! the panels and never takes a click. Tab (`visible = false`) hides all of it but the honesty
+//! line, which stays in its place and no longer takes a click ([`draw_hidden`]; final review,
+//! app m12: whatever is hidden, the amber and grey labels stay on screen).
 //!
 //! A windowed HUD ([`Hud::new`]) reads its input and screen size from winit. A headless HUD
 //! ([`Hud::new_headless`], for `--capture ... --hud`) has no window: it is laid out for the
@@ -180,7 +182,8 @@ pub struct HudControls {
     pub star_ev100: f32,
     /// Lens tracer resolution scale, 0.25..=1.0.
     pub lens_scale: f32,
-    /// False hides the whole HUD, the overlay and the controls list included (Tab).
+    /// False hides the HUD, the overlay and the controls list included (Tab), all but the
+    /// honesty line: the labels of what is approximate or non-physical stay on screen.
     pub visible: bool,
     /// Shows the controls and settings list (F1). Its close button clears this.
     pub show_help: bool,
@@ -535,6 +538,8 @@ fn run_hud(
         let mut out = HudOutput::default();
         if c.visible {
             draw_hud(ui.ctx(), data, overlay, &mut c, &mut out);
+        } else {
+            draw_hidden(ui.ctx(), data, &c);
         }
         result = (c, out);
     });
@@ -577,6 +582,29 @@ fn wants_repaint_now(out: &egui::FullOutput) -> bool {
     out.viewport_output
         .get(&egui::ViewportId::ROOT)
         .is_some_and(|v| v.repaint_delay.is_zero())
+}
+
+/// The HUD hidden by Tab: only the honesty line, where the collapsed HUD draws it (bottom left,
+/// standing on the bottom margin, as wide as the screen allows with no perf block beside it),
+/// not clickable, so its pop-up stays shut (final review, app m12: hiding the HUD must not lapse
+/// the "labelled on screen" rule, CLAUDE.md §3). Nothing at all without notes.
+fn draw_hidden(ctx: &egui::Context, data: &HudData, c: &HudControls) {
+    let notes = hud_notes(data, c);
+    if notes.is_empty() {
+        return;
+    }
+    let screen = ctx.content_rect();
+    let m = SCREEN_MARGIN;
+    let line_w = NOTES_LINE_MAX_WIDTH.max(screen.width() - 2.0 * m);
+    let size = measure(ctx, "notes line", line_w, |ui| {
+        notes_line(ui, &notes, line_w);
+    });
+    let top = (screen.bottom() - m + 4.0 - size.y).max(screen.top() + m);
+    placed("notes", Order::Middle, egui::pos2(screen.left() + m, top))
+        .interactable(false)
+        .show(ctx, |ui| {
+            notes_line(ui, &notes, line_w);
+        });
 }
 
 /// A fixed, non-movable HUD area.
@@ -1212,10 +1240,15 @@ fn haloed(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 /// areas egui shows).
 pub fn drawn_blocks(data: &HudData, controls: &HudControls) -> Vec<&'static str> {
     let c = controls;
-    if !c.visible {
-        return Vec::new();
-    }
     let notes = hud_notes(data, c);
+    if !c.visible {
+        // Tab: the honesty line alone ([`draw_hidden`]).
+        return if notes.is_empty() {
+            Vec::new()
+        } else {
+            vec!["notes line"]
+        };
+    }
     let card = c.card_expanded && data.target.is_some();
     let mut out = Vec::new();
     if c.card_expanded {
@@ -3071,11 +3104,26 @@ mod tests {
                 }
             }
         }
+        // Tab: the honesty line alone, or nothing without notes.
         let hidden = HudControls {
             visible: false,
+            notes_expanded: true,
+            card_expanded: true,
             ..controls()
         };
-        assert!(drawn_blocks(&data(), &hidden).is_empty());
+        let mut d = data();
+        d.target = Some(mars_card());
+        let ctx = headless_context();
+        let mut c1 = hidden;
+        let (mut o, _, _) =
+            run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &Overlay::default(), &mut c1);
+        o.textures_delta.clear();
+        let shown: Vec<&str> = blocks(&ctx).iter().map(|b| json_name(b.0)).collect();
+        assert_eq!(shown, ["notes line"]);
+        assert_eq!(drawn_blocks(&d, &hidden), ["notes line"]);
+        d.notes.clear();
+        d.speed.header.clear();
+        assert!(drawn_blocks(&d, &hidden).is_empty());
     }
 
     /// Review C4w M3: what the HUD's measuring costs. Prints the mean of one settled HUD run
@@ -3503,12 +3551,15 @@ mod tests {
         assert!(f.find("GPU n/a").is_some());
     }
 
-    /// Tab hides everything: no shape at all, whatever is open.
+    /// Tab hides everything but the honesty line (final review, app m12), whatever is open: the
+    /// line stays where the collapsed HUD draws it, with every label's short form and its amber
+    /// dots, and takes no click; with no notes at all, no shape is drawn.
     #[test]
-    fn hidden_hud_draws_nothing() {
+    fn hidden_hud_keeps_only_the_honesty_line() {
         let mut d = data();
         d.target = Some(mars_card());
         d.lens_on_screen = true;
+        d.eye_adapted_stars = true;
         let c = HudControls {
             visible: false,
             show_help: true,
@@ -3522,9 +3573,37 @@ mod tests {
         let (mut out, hud, _) =
             run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &Overlay::default(), &mut c2);
         out.textures_delta.clear();
-        assert!(out.shapes.is_empty(), "{} shapes", out.shapes.len());
         assert_eq!(hud, HudOutput::default());
         assert_eq!(c2, c);
+        let f = collect(&out);
+        let expected: Vec<String> = hud_notes(&d, &c)
+            .iter()
+            .map(|(t, _)| one_line(short_label(t)))
+            .collect();
+        assert_eq!(expected.len(), 3, "{expected:?}");
+        let line: Vec<&Painted> = f.texts.iter().filter(|p| p.text != " · ").collect();
+        let texts: Vec<&str> = line.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(texts, expected, "only the honesty line");
+        for p in &line {
+            assert!(p.pos.x < 1500.0 && p.pos.y > 1000.0, "bottom left: {p:?}");
+        }
+        let dots = f
+            .circles
+            .iter()
+            .filter(|(_, fill)| *fill == NON_PHYSICAL_SOFT)
+            .count();
+        assert_eq!(dots, 3, "amber dots: {:?}", f.circles);
+        // Nothing to label, nothing drawn.
+        d.notes.clear();
+        d.speed.header.clear();
+        d.lens_on_screen = false;
+        d.eye_adapted_stars = false;
+        let ctx = headless_context();
+        let mut c3 = c;
+        let (mut out, _, _) =
+            run_hud_settled(&ctx, SIZE, 1.0, 8192, &d, &Overlay::default(), &mut c3);
+        out.textures_delta.clear();
+        assert!(out.shapes.is_empty(), "{} shapes", out.shapes.len());
     }
 
     /// T: six touch-sized buttons, the current rate's in cyan, and the mockup's line for it.
