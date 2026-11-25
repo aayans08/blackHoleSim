@@ -232,7 +232,10 @@ mod tests {
     /// Standish error tables (`standish::tests::PEAK_OVER_1800_2050`). Each is asserted to be
     /// over its bound, so the list holds exactly the exceedances, and at or below a ceiling:
     /// the measured value × 1.1, rounded up to three significant figures. The ceiling is a
-    /// regression guard pending the lead's ruling (fix round 2, concern 2). Measured → ceiling:
+    /// regression guard. The lead ruled (M1 ledger `progress.md`, Task A1 ruling I2): the test
+    /// asserts the measured 1.27″ (2050) and 2.83″ (2090), because Meeus's 0.6″/0.2″ applies to
+    /// his own comparison span, and Pluto is labelled approximate outside 1885–2099 as the plan
+    /// says. Measured → ceiling:
     /// 2050 λ 1.266″ → 1.40″ and φ 0.3106″ → 0.342″; 2090 λ 2.832″ → 3.12″ and |Δr| 104 032 km →
     /// 115 000 km. Every other spot value is within Meeus's and SLALIB's figures.
     #[test]

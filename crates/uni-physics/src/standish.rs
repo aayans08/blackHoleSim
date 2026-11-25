@@ -471,8 +471,10 @@ mod tests {
     /// - that it is over its nominal, so each list holds exactly the entries the goldens
     ///   exceed: an entry back within the page fails the test until it is taken off the list;
     /// - that it is at or below its ceiling: the measured value × 1.1, rounded up to three
-    ///   significant figures. That is a regression guard, not a published figure; whether
-    ///   these exceedances are accepted is the lead's ruling (fix round 2, concern 1).
+    ///   significant figures. That is a regression guard, not a published figure. The lead
+    ///   ruled on these exceedances (M1 ledger `progress.md`, Task A1 ruling I1): JPL's table
+    ///   gives nominal errors, not maxima, so the tests assert the measured worst against DE441
+    ///   + ~10 % where the table is exceeded; ≤ 80″ is under 1 px from the Earth at fov 60°.
     ///
     /// The page says "nominal errors" and does not say whether they are maxima or RMS values
     /// (re-read 2026-11-22). The tests therefore also assert RMS over the spots ≤ nominal,
