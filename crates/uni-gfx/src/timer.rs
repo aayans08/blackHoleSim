@@ -8,11 +8,14 @@
 //! 2. **In flight**: [`PassTimer::resolve`] closes the record and maps the slot's read-back
 //!    buffer on submit (`map_buffer_on_submit`). That map completes when the frame's command
 //!    buffer has finished on the GPU; it carries no data, only the completion.
-//! 3. **Resolving**: [`PassTimer::read_back`] (non-blocking) sees the completion, then resolves
-//!    the slot's queries into the read-back buffer in a small command buffer of its own, which
-//!    it submits, and maps the buffer again.
-//! 4. A later `read_back` converts the ticks with `queue.get_timestamp_period()` and frees the
-//!    slot. [`PassTimer::read_back_blocking`] runs steps 3–4 to the end for headless runs.
+//! 3. **Completed**: [`PassTimer::read_back`] (non-blocking) sees the completion and holds the
+//!    slot until a LATER frame's command buffer has completed too (final fix wave F3, below).
+//! 4. **Resolving**: it then resolves the slot's queries into the read-back buffer in a small
+//!    command buffer of its own, which it submits, and maps the buffer again.
+//! 5. A later `read_back` converts the ticks with `queue.get_timestamp_period()` and frees the
+//!    slot. [`PassTimer::read_back_blocking`] runs steps 3–5 to the end for headless runs,
+//!    resolving a completed slot without waiting for a later frame (the caller has waited for
+//!    the GPU, and serial runs read every sample).
 //!
 //! Why the resolve waits for the frame (measured on the M3, M0 final fix). Metal writes a
 //! pass's stage-boundary samples into the counter buffer late. A resolve encoded in the same
@@ -20,6 +23,16 @@
 //! tonemap's end and the closing frame bracket, and zeros on the first frame; resolving after
 //! the command buffer completed read every sample. That, not the render pass itself, is why M0
 //! reported "tonemap 0.00 ms" every frame.
+//!
+//! Why a completed frame waits for the next one (final fix wave F3, measured on the M3 with
+//! `RUST_LOG=uni_gfx::timer=debug` in a sustained `--bench`). Even resolved after its command
+//! buffer completed, a frame's LAST samples — the tonemap's end and both ticks of the closing
+//! bracket — still held the values its query slot had two frames earlier in most frames (C6:
+//! the tonemap valid in 0.1–25 % of frames), while every earlier sample was current. Metal
+//! writes those samples some time after the completion callback. Serial runs, which resolve
+//! after waiting for the GPU, read them all. So a slot is resolved only once a frame encoded
+//! after it has completed, one frame of extra lag; the ring is [`RING_LEN`] deep so the wait
+//! does not starve it.
 //!
 //! Validity (review I5). A pass whose end tick is not after its begin tick, or whose ticks are
 //! unwritten (0 or all ones), has no measurement: its time is `None`, shown as "n/a", never as
@@ -50,7 +63,7 @@ use crate::context::GpuContext;
 
 /// Depth of the ring: frames whose timings can be in flight at once (recording, waiting for
 /// the GPU, or being resolved).
-const RING_LEN: usize = 4;
+const RING_LEN: usize = 6;
 
 /// States of a map, written by its callback.
 const MAP_PENDING: u8 = 0;
@@ -141,6 +154,9 @@ enum SlotState {
     Recording,
     /// Submitted with its frame; the map completes when the frame's GPU work has finished.
     InFlight(Arc<AtomicU8>),
+    /// The frame's GPU work has finished; waiting for a later frame's to finish too before the
+    /// resolve (see the module docs).
+    Completed,
     /// Resolved in the timer's own submission; the map completes when the ticks are readable.
     Resolving(Arc<AtomicU8>),
 }
@@ -213,12 +229,17 @@ impl TimerGpu {
         Some((&self.ring[slot].query_set, 2 * i, 2 * i + 1))
     }
 
-    /// Takes every slot whose frame has finished on the GPU, resolves its queries into its
-    /// read-back buffer in one submission of the timer's own, and maps the buffers.
-    fn resolve_finished(&mut self, gpu: &GpuContext) {
-        let mut enc: Option<wgpu::CommandEncoder> = None;
+    /// Moves every slot whose frame has finished on the GPU to `Completed`, then resolves the
+    /// queries of every completed slot that a later finished frame follows (all of them with
+    /// `force`) into its read-back buffer, in one submission of the timer's own, and maps the
+    /// buffers.
+    fn resolve_finished(&mut self, gpu: &GpuContext, force: bool) {
+        let mut newest_done: Option<u64> = None;
         for slot in &mut self.ring {
             let SlotState::InFlight(done) = &slot.state else {
+                if matches!(slot.state, SlotState::Completed) {
+                    newest_done = newest_done.max(Some(slot.seq));
+                }
                 continue;
             };
             match done.load(Ordering::Acquire) {
@@ -226,19 +247,8 @@ impl TimerGpu {
                 MAP_READY => {
                     // The completion map carried no data; release it for the copy.
                     slot.buffer.unmap();
-                    let enc = enc.get_or_insert_with(|| {
-                        gpu.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("pass timer resolve"),
-                            })
-                    });
-                    let queries = 2 * slot.labels.len() as u32; // ≤ 2 × max_passes
-                    let bytes = u64::from(queries) * u64::from(wgpu::QUERY_SIZE);
-                    enc.resolve_query_set(&slot.query_set, 0..queries, &self.resolve_buffer, 0);
-                    enc.copy_buffer_to_buffer(&self.resolve_buffer, 0, &slot.buffer, 0, bytes);
-                    let (state, callback) = map_signal();
-                    enc.map_buffer_on_submit(&slot.buffer, wgpu::MapMode::Read, 0..bytes, callback);
-                    slot.state = SlotState::Resolving(state);
+                    slot.state = SlotState::Completed;
+                    newest_done = newest_done.max(Some(slot.seq));
                 }
                 MAP_FAILED => {
                     // A failed map leaves the buffer unusable for another map; replace it.
@@ -248,6 +258,28 @@ impl TimerGpu {
                 }
                 _ => slot.free(), // MAP_NEVER_SUBMITTED: the frame was never submitted
             }
+        }
+        // Frames complete in submission order, so a completed slot older than the newest
+        // completed one has had a later frame finish after it.
+        let newest_done = newest_done.unwrap_or(0);
+        let mut enc: Option<wgpu::CommandEncoder> = None;
+        for slot in &mut self.ring {
+            if !matches!(slot.state, SlotState::Completed) || !(force || slot.seq < newest_done) {
+                continue;
+            }
+            let enc = enc.get_or_insert_with(|| {
+                gpu.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("pass timer resolve"),
+                    })
+            });
+            let queries = 2 * slot.labels.len() as u32; // ≤ 2 × max_passes
+            let bytes = u64::from(queries) * u64::from(wgpu::QUERY_SIZE);
+            enc.resolve_query_set(&slot.query_set, 0..queries, &self.resolve_buffer, 0);
+            enc.copy_buffer_to_buffer(&self.resolve_buffer, 0, &slot.buffer, 0, bytes);
+            let (state, callback) = map_signal();
+            enc.map_buffer_on_submit(&slot.buffer, wgpu::MapMode::Read, 0..bytes, callback);
+            slot.state = SlotState::Resolving(state);
         }
         if let Some(enc) = enc {
             gpu.queue.submit(std::iter::once(enc.finish()));
@@ -474,8 +506,13 @@ impl PassTimer {
     }
 
     /// Non-blocking read-back. Collects the timings of every frame whose resolve has finished,
-    /// and submits the resolve of every frame that has finished on the GPU since the last call.
+    /// and submits the resolve of every frame that has finished on the GPU and that a later
+    /// finished frame follows (module docs).
     pub fn read_back(&mut self, gpu: &GpuContext) {
+        self.read_back_with(gpu, false);
+    }
+
+    fn read_back_with(&mut self, gpu: &GpuContext, force: bool) {
         let Some(g) = self.gpu.as_mut() else { return };
         if g.ring
             .iter()
@@ -488,7 +525,7 @@ impl PassTimer {
             log::warn!("pass timer: device poll failed: {e}");
         }
         let newest = g.collect_resolved(gpu);
-        g.resolve_finished(gpu);
+        g.resolve_finished(gpu, force);
         // The queue completes submissions in order, so the highest `seq` is the newest frame.
         if let Some(t) = newest.filter(|t| self.last.as_ref().is_none_or(|l| t.seq > l.seq)) {
             self.last = Some(t);
@@ -499,12 +536,12 @@ impl PassTimer {
     /// resolves every finished frame, waits for the resolves and collects them, so the latest
     /// timings are those of the last finished frame.
     pub fn read_back_blocking(&mut self, gpu: &GpuContext) {
-        self.read_back(gpu);
+        self.read_back_with(gpu, true);
         if self.gpu.as_ref().is_some_and(TimerGpu::any_resolving) {
             if let Err(e) = gpu.device.poll(wgpu::PollType::wait_indefinitely()) {
                 log::warn!("pass timer: waiting for the resolve failed: {e}");
             }
-            self.read_back(gpu);
+            self.read_back_with(gpu, true);
         }
     }
 
