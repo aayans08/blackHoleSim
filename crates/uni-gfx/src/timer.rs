@@ -854,10 +854,14 @@ mod tests {
         // Ticks [begin, end] per label, 1 ns each; the frame starts at 10 000 000.
         let frame = |tonemap_end: u64, bloom_end: u64| {
             [
-                10_000_000, 10_000_050, // frame begin
-                10_100_000, bloom_end, // bloom composite
-                10_200_000, tonemap_end, // tonemap
-                10_550_000, 10_550_080, // frame end
+                10_000_000,
+                10_000_050, // frame begin
+                10_100_000,
+                bloom_end, // bloom composite
+                10_200_000,
+                tonemap_end, // tonemap
+                10_550_000,
+                10_550_080, // frame end
             ]
         };
         let ms = |t: &GpuTimings, i: usize| t.passes[i].1;

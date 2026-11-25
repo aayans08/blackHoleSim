@@ -57,7 +57,11 @@ const AGX_INSET: Mat3 = Mat3::from_cols(
 const AGX_OUTSET: Mat3 = Mat3::from_cols(
     Vec3::new(1.197001338688086, -0.0529986613119143, -0.0529986613119143),
     Vec3::new(-0.09803770638107989, 1.15196229361892, -0.09803770638107989),
-    Vec3::new(-0.09896363230700582, -0.09896363230700582, 1.151036367692994),
+    Vec3::new(
+        -0.09896363230700582,
+        -0.09896363230700582,
+        1.151036367692994,
+    ),
 );
 
 /// Bottom of the log2 encoding range [EV relative to 1.0]: 10 stops below middle grey,
@@ -246,7 +250,10 @@ mod tests {
         close(inset, AGX_INSET, "AGX_INSET");
         close(outset, AGX_OUTSET, "AGX_OUTSET");
         let prod = inset * outset - DMat3::IDENTITY;
-        assert!(prod.to_cols_array().iter().all(|v| v.abs() < 1e-12), "{prod}");
+        assert!(
+            prod.to_cols_array().iter().all(|v| v.abs() < 1e-12),
+            "{prod}"
+        );
         // White kept; each primary 20 % of the way to D65 in xy, on the line to it.
         assert!((inset * DVec3::ONE - DVec3::ONE).abs().max_element() < 1e-12);
         let rgb_to_xyz = p * DMat3::from_diagonal(y);
@@ -259,7 +266,10 @@ mod tests {
             let (dx, dy) = (white.0 - prim[j].0, white.1 - prim[j].1);
             let f = ((moved.0 - prim[j].0) * dx + (moved.1 - prim[j].1) * dy) / (dx * dx + dy * dy);
             let off_line = (moved.0 - prim[j].0) * dy - (moved.1 - prim[j].1) * dx;
-            assert!((f - t).abs() < 1e-12 && off_line.abs() < 1e-12, "primary {j}: {f}");
+            assert!(
+                (f - t).abs() < 1e-12 && off_line.abs() < 1e-12,
+                "primary {j}: {f}"
+            );
         }
         // The log range: 10 stops below and 6.5 above middle grey.
         assert!((f64::from(AGX_MIN_EV) - (0.18f64.log2() - 10.0)).abs() < 1e-6);
@@ -287,8 +297,17 @@ mod tests {
             last = y;
         }
         let grey = agx(Vec3::splat(0.18));
-        let code = grey.map(|v| if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 });
-        assert!((code - Vec3::splat(0.5)).abs().max_element() < 1e-4, "{code}");
+        let code = grey.map(|v| {
+            if v <= 0.003_130_8 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+        });
+        assert!(
+            (code - Vec3::splat(0.5)).abs().max_element() < 1e-4,
+            "{code}"
+        );
     }
 
     /// The look is kept: the previous (M0) sigmoid, sampled at x = k/16 and clamped to [0, 1]
