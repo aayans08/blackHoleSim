@@ -1,7 +1,14 @@
 # Attribution
 
-Every third-party data file, texture and published algorithm used by this project is credited here.
-Downloaded data files are also recorded, with URL and SHA-256, in `data/manifest.toml`.
+**Licences.** The project's MIT licence covers its source code only. Each data, texture-map and font file credited
+here keeps the licence given with it (CC BY 4.0, CC BY-SA 4.0, SIL Open Font License 1.1, or public data), and
+those licences require this file to travel with the files. The AT-HYG-derived files (`data/baked/athyg_m10.bin`,
+`data/baked/athyg_names.ron` and `data/baked/exoplanets.ron`) are licensed CC BY-SA 4.0 and stay so when
+redistributed.
+
+Every third-party data file, texture map and font used by this project, and all third-party code adapted into it,
+is credited here. Published models and algorithms are cited in source comments next to the code that implements
+them. Downloaded data files are also recorded, with URL and SHA-256, in `data/manifest.toml`.
 
 <!-- M1 Wave A sections (pre-split by Task A0b, review I8): each Data task writes only between its own
 opening and closing comment markers, named after the task (A7 and A9 under Data, A8 under Textures; A9 may
@@ -46,7 +53,11 @@ queried 2026-11-22. This research has made use of the NASA Exoplanet Archive, wh
 Institute of Technology, under contract with the National Aeronautics and Space Administration under the Exoplanet
 Exploration Program. Archive paper: Christiansen et al. (2025), *The Planetary Science Journal* (the NASA Exoplanet
 Archive's overview paper, which replaces Akeson et al. 2013). Each planet's parameters come from the publication the
-archive cites for it.
+archive cites for it. `uni-bake exo` also writes AT-HYG-derived values into `exoplanets.ron`: each host's
+cross-match index into `athyg_m10.bin` (`star_index`) and, for hosts without an archive distance, the matched AT-HYG
+star's distance. It also sets an exoplanet-host flag on the matched stars in `athyg_m10.bin`. Because of those
+values, `exoplanets.ron` is licensed CC BY-SA 4.0 as a whole, with the AT-HYG credit above; the archive's own values
+carry no such condition.
 
 Published values used by the star bake (`tools/bake/src/athyg.rs`):
 - Tycho → Johnson photometry, ESA 1997, *The Hipparcos and Tycho Catalogues*, ESA SP-1200 vol. 1, §1.3 Appendix 4
@@ -167,8 +178,10 @@ block-compression reference (bake-side test decoder); lunar-Lambert photometric 
 
 ## Algorithms
 
-None implemented yet. Each published model or algorithm is credited here when its code lands, in addition to the
-source comment required next to the code.
+Published models and algorithms (papers, catalogues, IAU resolutions) are credited in source comments next to the
+code that implements them; every physical constant and formula names its source there. Third-party code adapted
+into this repository, and published sample code followed closely enough to need its licence notice, is listed
+below.
 
 <!-- M1 Wave B section (pre-split by Task B0, review I8): Task B3 writes only between its own markers, and only if
 it adapts any of Hillaire's sample code (MIT): then the MIT notice goes here (M1 global constraints, review m24). -->
