@@ -5,12 +5,25 @@ around Earth to the outer planets, past comets and asteroids, out to nearby star
 sizes and distances, with no loading screens. Positions, brightness and colour come from published ephemerides,
 catalogues and photometry. Anything approximate or non-physical is labelled on screen.
 
+![The Strait of Gibraltar from 1 500 km at noon](docs/images/earth-map-closeup.jpg)
+
+<p>
+<img src="docs/images/jupiter-disk.jpg" width="49%" alt="Jupiter near full phase from 3 million km">
+<img src="docs/images/saturn-night-side.jpg" width="49%" alt="Saturn's night side at phase 150 degrees, the rings lit from the far side">
+<img src="docs/images/comet-neowise-2020.jpg" width="49%" alt="Comet NEOWISE on 2020-07-15 seen from just above Earth">
+<img src="docs/images/bh-lens-band.jpg" width="49%" alt="The Milky Way lensed by a black hole, seen from 30 M">
+<img src="docs/images/hud-target-mars.jpg" width="49%" alt="Mars with its information card open">
+<img src="docs/images/earth-limb-dawn.jpg" width="49%" alt="Earth's limb from 420 km before dawn">
+</p>
+
+All images are unedited frames rendered by the engine at 1920x1080 (scaled down here).
+
 ## Status
 
 | Milestone | Content | State |
 |---|---|---|
 | M0 Foundation | precision model, renderer core, black-hole lensing, capture and benchmark tooling | done |
-| M1 Solar System and sky | planets, moons, rings, atmospheres, 3-D star sky, comets, asteroids, navigation, HUD | final verification |
+| M1 Solar System and sky | planets, moons, rings, atmospheres, 3-D star sky, comets, asteroids, navigation, HUD | done |
 | M2 Planet surfaces | terrain, clouds, oceans | planned |
 | M3 Black holes | accretion disks, relativistic effects | planned |
 | M4 The galaxy | the Milky Way in 3-D | planned |
@@ -58,8 +71,9 @@ catalogues and photometry. Anything approximate or non-physical is labelled on s
 
 ## Measured performance
 
-On an Apple M3 MacBook Air (fanless, 8-core GPU) at 1920x1080 internal resolution, every benchmark view of the Solar
-System holds well above 60 fps in sustained 60-second runs (132 to 228 fps in the last full benchmark).
+On an Apple M3 MacBook Air (fanless, 8-core GPU) at 1920x1080 internal resolution, all ten benchmark views of the
+Solar System hold 112 to 238 fps over the last 10 seconds of sustained 60-second runs, with the 95th-percentile GPU
+time per frame at 4.2 to 9.7 ms and CPU time at 0.9 to 3.9 ms.
 
 ## Building and running
 

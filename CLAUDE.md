@@ -22,24 +22,20 @@ pixelated look; copying a commercial product; docs that lie.
 
 ## 2. Current real layout
 
-> **Updated by the lead after each wave.** Last update: the sync after the M1 final fix wave F1–F5 (task S1,
-> 2026-11-25; ledger `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`, reports `final-fix-F*-report.md`,
-> `task-S1-report.md`). The gate re-runs at the final HEAD (target). Measured in the fix wave: `universe --selftest`
-> 57/57 PASS (F3: uni-sky's new `stars3d_halo_taper` and `world_points_shape` probes); `--bench
-> bookmarks/m1-bench.ron --sustained 6` (F3, busy machine): the tonemap's time valid in every frame of all 10 views,
-> pass sum 100 % of the GPU frame; F3's `--capture bookmarks/m1.ron` 27/27, no GPU error, every view but
-> `asteroid-belt-above` (scene EV 18.04 now, paper 18.05) within 0.031 EV of the gate. The M1 gate, steps 1–5
-> (HEAD `335b309`, gate report `task-M1-gate-report.md`), before the fix wave: `cargo test --workspace --lib --bins`
-> 1 082 passed, 0 failed, 7 ignored; `universe --selftest` 55/55 PASS (every render crate's GPU probes plus
-> `depth_writers_write_g`); `--capture bookmarks/m1.ron --hdr` renders 27/27 with no GPU error (the `--hud` set 27/27,
-> `bookmarks/m0.ron` 6/6); the plan's numeric checks 42/42 PASS (row 27's lens seam ratio 1.043); the M0 shadow
-> regression (bookmark `bh-shadow-30M-grid`) measures 158.745 px. Not yet run at the gate (target): step 6, the
-> 60-s bench, and step 7, the window run. The last 60-s bench (`--bench bookmarks/m1-bench.ron --sustained 60`, C6,
-> 2026-11-24, before C1L's comet changes, machine busy): 10/10 views within GPU p95 ≤ 16 ms, CPU p95 ≤ 4 ms,
-> interval p95 ≤ 16.7 ms over the last 10 s (132–228 fps; 3 views passed only in a re-run). Per-pass budgets
-> re-baselined by ruling: band 0.6 ms, histogram 0.6 ms (≈0.4 ms per pass boundary on this GPU). The app window runs
-> the full M1 stack with the Navigator, HUD v2 and overlay (C6: `start` at 60 fps, CPU 1.9–2.4 ms, no GPU error). M1
-> capture sheet: target (after the gate). Wave B capture sheet:
+> **Updated by the lead after each wave.** Last update: the M1 gate, closed 2026-11-26 at HEAD `de5473f` (ledger
+> `.superpowers/sdd/2026-11-22-m1-solar-system/progress.md`, gate report `captures/m1-final/gate-report.md`, git-ignored).
+> On the M3: `cargo test --workspace --lib --bins` 1 093 passed, 0 failed, 7 ignored, 0 warnings; `universe --selftest`
+> 57/57 PASS; `--capture bookmarks/m1.ron --hdr` 27/27 with no GPU error (the `--hud` set 27/27, `bookmarks/m0.ron`
+> 6/6); `uni-verify gate` 43/43 PASS (the plan's 42 numeric checks plus row 11's EV check); the M0 shadow regression
+> (bookmark `bh-shadow-30M-grid`) 158.745 px. `--bench bookmarks/m1-bench.ron --sustained 60`, last 10 s: 10/10 views
+> within GPU p95 ≤ 16 ms, CPU p95 ≤ 4 ms, interval p95 ≤ 16.7 ms, 112–238 fps (GPU p95 4.2–9.7 ms, CPU p95 0.85–3.86
+> ms). Six views passed in the 2026-11-25 gate run or its re-run with Chrome busy; the other four failed there on CPU
+> p95 only (4.3–8.3 ms) and passed in a quiet re-run on 2026-11-26 (battery, Low Power Mode off). A run in macOS Low
+> Power Mode (every GPU pass ≈ 2× slower) was discarded: run benches with Low Power Mode off and the machine idle. The
+> one per-pass budget over 1.25×, points 0.254 ms at `asteroid-belt-above` (belt highlight on), is ruled frame-gate
+> only. Per-pass budgets re-baselined by ruling: band 0.6 ms, histogram 0.6 ms (≈0.4 ms per pass boundary on this GPU).
+> The window run (gate step 7): 60 fps in the window, picking on the disk, cruise and the 960 × 700 pt minimum, no
+> GPU error. M1 capture sheet: https://claude.ai/artifact/RUf5cECx8XU6Da8QLmoyDD ; Wave B sheet:
 > https://claude.ai/artifact/CxNGdYe4roydB4AvvuhTh7 ; engine sky before/after: https://claude.ai/artifact/58pKRE6QDzjqQLM9CrtkLN
 > Older sheets (M0): https://claude.ai/artifact/826GQeJr5fJL542uRbm9sx (the earlier Ld8A… sheet has corrupted timings).
 
